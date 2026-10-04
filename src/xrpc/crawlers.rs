@@ -108,7 +108,12 @@ pub fn normalize(relay: &str) -> Result<String, String> {
         return Err(format!("{r}: only http(s) relays"));
     }
     let Some(host) = u.host_str().filter(|h| !h.is_empty()) else { return Err(format!("{r}: no host")) };
-    if u.path() != "/" || u.query().is_some() || u.fragment().is_some() || !u.username().is_empty() || u.password().is_some() {
+    if u.path() != "/"
+        || u.query().is_some()
+        || u.fragment().is_some()
+        || !u.username().is_empty()
+        || u.password().is_some()
+    {
         return Err(format!("{r}: a hostname or origin, without path, query or credentials"));
     }
     if !host.contains('.') && !host.starts_with('[') && host != "localhost" {
@@ -144,8 +149,12 @@ pub fn is_local(hostport: &str) -> bool {
         return true;
     }
     match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
-        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00,
+        Ok(std::net::IpAddr::V4(ip)) => {
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xfe00) == 0xfc00
+        }
         Err(_) => false,
     }
 }
@@ -160,17 +169,26 @@ fn now_ms() -> u64 {
 pub fn due(st: Option<&RelayStatus>, activity_ms: u64, now_ms: u64, interval: Duration) -> bool {
     match st {
         None => true,
-        Some(s) => activity_ms > s.last_attempt_ms && now_ms >= s.last_attempt_ms.saturating_add(interval.as_millis() as u64),
+        Some(s) => {
+            activity_ms > s.last_attempt_ms && now_ms >= s.last_attempt_ms.saturating_add(interval.as_millis() as u64)
+        }
     }
 }
 
 /// When the next relay with activity it hasn't been told about falls due.
-pub fn next_due<'a>(relays: impl IntoIterator<Item = &'a String>, doc: &Doc, activity_ms: u64, interval: Duration) -> Option<u64> {
+pub fn next_due<'a>(
+    relays: impl IntoIterator<Item = &'a String>,
+    doc: &Doc,
+    activity_ms: u64,
+    interval: Duration,
+) -> Option<u64> {
     relays
         .into_iter()
         .filter_map(|r| match doc.status.get(r) {
             None => Some(0),
-            Some(s) if activity_ms > s.last_attempt_ms => Some(s.last_attempt_ms.saturating_add(interval.as_millis() as u64)),
+            Some(s) if activity_ms > s.last_attempt_ms => {
+                Some(s.last_attempt_ms.saturating_add(interval.as_millis() as u64))
+            }
             Some(_) => None,
         })
         .min()
@@ -196,8 +214,12 @@ pub async fn load(store: &Store) -> anyhow::Result<(Doc, Option<String>)> {
     })
     .await;
     match got {
-        Ok((b, e)) => Ok((serde_json::from_slice(&b).map_err(|err| anyhow::anyhow!("crawlers.json unreadable: {err}"))?, e)),
-        Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::NotFound { .. })) => Ok((Doc::default(), None)),
+        Ok((b, e)) => {
+            Ok((serde_json::from_slice(&b).map_err(|err| anyhow::anyhow!("crawlers.json unreadable: {err}"))?, e))
+        }
+        Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::NotFound { .. })) => {
+            Ok((Doc::default(), None))
+        }
         Err(e) => Err(e),
     }
 }
@@ -212,9 +234,22 @@ async fn update(store: &Store, f: impl Fn(&mut Doc)) -> anyhow::Result<Doc> {
             None => PutMode::Create,
         };
         let body = serde_json::to_vec_pretty(&doc)?;
-        match bounded(store.raw.put_opts(&path(store), PutPayload::from(body), PutOptions { mode, ..Default::default() })).await {
+        match bounded(store.raw.put_opts(
+            &path(store),
+            PutPayload::from(body),
+            PutOptions { mode, ..Default::default() },
+        ))
+        .await
+        {
             Ok(_) => return Ok(doc),
-            Err(e) if matches!(e.downcast_ref::<object_store::Error>(), Some(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })) => continue,
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<object_store::Error>(),
+                    Some(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. })
+                ) =>
+            {
+                continue
+            }
             Err(e) => return Err(e),
         }
     }
@@ -350,12 +385,17 @@ async fn run(weak: Weak<App>, mut head: tokio::sync::watch::Receiver<u64>) {
 
 /// One leader pass: asks the relays that are due and returns when to look
 /// again (None: after the next activity).
-async fn tick(app: &App, head: &mut tokio::sync::watch::Receiver<u64>, activity_ms: u64) -> anyhow::Result<Option<u64>> {
+async fn tick(
+    app: &App,
+    head: &mut tokio::sync::watch::Receiver<u64>,
+    activity_ms: u64,
+) -> anyhow::Result<Option<u64>> {
     let c = &app.crawlers;
     let (mut doc, _) = load(&app.store).await?;
     let interval = c.interval(&doc);
     let now = now_ms();
-    let asking: Vec<String> = c.relays(&doc).iter().filter(|r| due(doc.status.get(*r), activity_ms, now, interval)).cloned().collect();
+    let asking: Vec<String> =
+        c.relays(&doc).iter().filter(|r| due(doc.status.get(*r), activity_ms, now, interval)).cloned().collect();
     if !asking.is_empty() {
         metrics::init_request_crawl(&asking);
         // activity from here on is news to the relays asked now
@@ -480,7 +520,11 @@ struct RequestCrawlIn {
 /// Asks now, whatever the throttle, and reports each relay's result.
 /// Results for configured relays are recorded, so the sender's throttle
 /// counts them.
-async fn request_crawl(State(app): AppState, Auth(creds): Auth, body: Option<Json<RequestCrawlIn>>) -> XResult<Json<J>> {
+async fn request_crawl(
+    State(app): AppState,
+    Auth(creds): Auth,
+    body: Option<Json<RequestCrawlIn>>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let given = validate_relays(&body.map(|Json(b)| b).unwrap_or_default().relays)?;
     let relays = if given.is_empty() {
@@ -529,7 +573,15 @@ mod tests {
         assert_eq!(normalize("https://bsky.network").unwrap(), "https://bsky.network");
         assert_eq!(normalize("http://127.0.0.1:1234/").unwrap(), "http://127.0.0.1:1234");
         assert_eq!(normalize("https://relay.example.com:443").unwrap(), "https://relay.example.com");
-        for bad in ["", "relay", "ftp://relay.example.com", "https://relay.example.com/xrpc", "relay.example.com?x=1", "https://u:p@relay.example.com", "bad host.com"] {
+        for bad in [
+            "",
+            "relay",
+            "ftp://relay.example.com",
+            "https://relay.example.com/xrpc",
+            "relay.example.com?x=1",
+            "https://u:p@relay.example.com",
+            "bad host.com",
+        ] {
             assert!(normalize(bad).is_err(), "{bad}");
         }
         assert_eq!(endpoint("bsky.network"), "https://bsky.network/xrpc/com.atproto.sync.requestCrawl");
@@ -578,7 +630,10 @@ mod tests {
 
     #[test]
     fn stored_fields_override_flags() {
-        let c = Crawlers::new(&["bsky.network".into(), "".into(), "not a host".into(), "bsky.network/".into()], DEFAULT_INTERVAL);
+        let c = Crawlers::new(
+            &["bsky.network".into(), "".into(), "not a host".into(), "bsky.network/".into()],
+            DEFAULT_INTERVAL,
+        );
         let mut doc = Doc::default();
         assert_eq!(c.relays(&doc), ["bsky.network".to_string()]);
         assert_eq!(c.interval(&doc), DEFAULT_INTERVAL);

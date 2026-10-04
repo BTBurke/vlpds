@@ -7,7 +7,7 @@
 //! twice nor lost. Two in-process nodes on one in-memory object store.
 
 use crate::common::*;
-use crate::ha_auth::{Browser, Client, PUBLIC, as_post, node};
+use crate::ha_auth::{as_post, node, Browser, Client, PUBLIC};
 use std::sync::Arc;
 
 /// Holds requests of `did` reaching pause point `point` until released.
@@ -38,7 +38,9 @@ impl Gate {
     }
 
     async fn reached(&mut self) {
-        tokio::time::timeout(std::time::Duration::from_secs(20), self.reached.recv()).await.expect("request never reached the pause point");
+        tokio::time::timeout(std::time::Duration::from_secs(20), self.reached.recv())
+            .await
+            .expect("request never reached the pause point");
     }
 
     /// Lets the held request (and any retry of it) through.
@@ -51,7 +53,10 @@ impl Gate {
 /// An admin password change (to the same password, so the tests' logins
 /// keep working: the revocation is what matters).
 async fn change_password(s: &TestServer, did: &str) {
-    s.xrpc.post("com.atproto.admin.updateAccountPassword", &json!({"did": did, "password": PASSWORD}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.updateAccountPassword", &json!({"did": did, "password": PASSWORD}), &Auth::Admin)
+        .await
+        .ok();
 }
 
 async fn take_down(s: &TestServer, did: &str) {
@@ -105,7 +110,11 @@ async fn oauth_refresh_racing_a_revocation_does_not_resurrect_the_session() {
             assert_eq!(oauth_sessions(&b, &acct.did).await, 0, "revoked");
             gate.release();
         });
-        assert_eq!((st, j["error"].as_str()), (400, Some("invalid_grant")), "refresh raced a revocation (takedown {takedown}): {j}");
+        assert_eq!(
+            (st, j["error"].as_str()),
+            (400, Some("invalid_grant")),
+            "refresh raced a revocation (takedown {takedown}): {j}"
+        );
         assert_eq!(oauth_sessions(&a, &acct.did).await, 0, "no session survives (takedown {takedown})");
         let (st, _) = client.refresh(&a, &rt).await;
         assert_eq!(st, 400);
@@ -160,11 +169,17 @@ async fn oauth_code_exchange_racing_a_password_change_fails() {
     .await;
     assert_eq!(st, 201, "{j}");
     let request_uri = j["request_uri"].as_str().unwrap().to_string();
-    let (st, _, html) = browser.get(&b, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&client.id), enc(&request_uri))).await;
+    let (st, _, html) = browser
+        .get(&b, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&client.id), enc(&request_uri)))
+        .await;
     assert_eq!(st, 200, "{html}");
     assert!(html.contains("name=\"password\""), "the stale device login is not offered: {html}");
     let (st, h, html) = browser
-        .post(&b, "/oauth/authorize/consent", &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", &acct.did), ("action", "allow")])
+        .post(
+            &b,
+            "/oauth/authorize/consent",
+            &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", &acct.did), ("action", "allow")],
+        )
         .await;
     assert_eq!(st, 401, "consent with a login from before the password change: {h:?} {html}");
 }
@@ -192,7 +207,14 @@ async fn legacy_refresh_and_login_racing_a_password_change_fail() {
     let mut gate = Gate::new(&acct.did, "legacy_login");
     let (r, ()) = tokio::join!(b.create_session(&acct.handle, PASSWORD), async {
         gate.reached().await;
-        b.xrpc.post("com.atproto.admin.updateAccountPassword", &json!({"did": acct.did, "password": "the-third-password"}), &Auth::Admin).await.ok();
+        b.xrpc
+            .post(
+                "com.atproto.admin.updateAccountPassword",
+                &json!({"did": acct.did, "password": "the-third-password"}),
+                &Auth::Admin,
+            )
+            .await
+            .ok();
         gate.release();
     });
     r.err_status(401);

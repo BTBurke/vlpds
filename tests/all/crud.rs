@@ -97,7 +97,9 @@ async fn registers_and_describes_repo() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn creates_gets_lists_and_deletes_records() {
     let (s, a) = setup().await;
-    let rec = RecordRef::from_json(&create(&s, &a, json!({"collection": POST, "record": post_record("Hello, world!")})).await.ok());
+    let rec = RecordRef::from_json(
+        &create(&s, &a, json!({"collection": POST, "record": post_record("Hello, world!")})).await.ok(),
+    );
     assert!(rec.uri.starts_with(&format!("at://{}/{POST}/", a.did)), "{}", rec.uri);
     assert!(is_tid(rec.rkey()), "generated rkey should be a TID: {}", rec.rkey());
     assert!(Cid::parse(&rec.cid).is_ok());
@@ -124,7 +126,14 @@ async fn creates_gets_lists_and_deletes_records() {
     // getRecord pinned to the right cid works, a wrong cid is RecordNotFound
     let pinned = |cid: String| {
         let (x, did, rkey) = (s.xrpc.clone(), a.did.clone(), rec.rkey().to_string());
-        async move { x.get("com.atproto.repo.getRecord", &[("repo", &did), ("collection", POST), ("rkey", &rkey), ("cid", &cid)], &Auth::None).await }
+        async move {
+            x.get(
+                "com.atproto.repo.getRecord",
+                &[("repo", &did), ("collection", POST), ("rkey", &rkey), ("cid", &cid)],
+                &Auth::None,
+            )
+            .await
+        }
     };
     pinned(rec.cid.clone()).await.ok();
     pinned(Cid::dag_cbor(b"nope").to_string()).await.err(400, "RecordNotFound");
@@ -143,9 +152,15 @@ async fn write_requires_auth_and_matching_repo() {
     s.xrpc.post("com.atproto.repo.createRecord", &body, &Auth::None).await.err(401, "AuthenticationRequired");
     let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &Auth::Bearer("garbage.token.here".into())).await;
     // reference auth-verifier: an unverifiable JWT is InvalidRequestError('Token could not be verified', 'InvalidToken') -> 400
-    assert!((r.status, r.error_name()) == (400, Some("InvalidToken")) || r.status == 401, "garbage bearer token: {}", r.text());
+    assert!(
+        (r.status, r.error_name()) == (400, Some("InvalidToken")) || r.status == 401,
+        "garbage bearer token: {}",
+        r.text()
+    );
     // putRecord into someone else's repo fails, and leaves it untouched
-    put(&s, &a, json!({"repo": b.did, "collection": PROFILE, "rkey": "self", "record": profile("evil")})).await.client_err();
+    put(&s, &a, json!({"repo": b.did, "collection": PROFILE, "rkey": "self", "record": profile("evil")}))
+        .await
+        .client_err();
     s.get_record(&b.did, PROFILE, "self").await.err(400, "RecordNotFound");
 }
 
@@ -197,7 +212,9 @@ async fn put_record_by_handle() {
     let (s, a) = setup().await;
     let rkey = "3jzfcijpj2z2a";
     let follow = json!({"$type": "app.bsky.graph.follow", "subject": "did:plc:abc", "createdAt": now_iso()});
-    put(&s, &a, json!({"repo": a.handle, "collection": "app.bsky.graph.follow", "rkey": rkey, "record": follow})).await.ok();
+    put(&s, &a, json!({"repo": a.handle, "collection": "app.bsky.graph.follow", "rkey": rkey, "record": follow}))
+        .await
+        .ok();
     s.get_record(&a.did, "app.bsky.graph.follow", rkey).await.ok();
 }
 
@@ -216,7 +233,9 @@ async fn put_record_noop_does_not_commit() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn defaults_undefined_type() {
     let (s, a) = setup().await;
-    let r = RecordRef::from_json(&create(&s, &a, json!({"collection": POST, "record": {"text": "no type", "createdAt": now_iso()}})).await.ok());
+    let r = RecordRef::from_json(
+        &create(&s, &a, json!({"collection": POST, "record": {"text": "no type", "createdAt": now_iso()}})).await.ok(),
+    );
     assert_eq!(s.get_record(&a.did, POST, r.rkey()).await.ok()["value"]["$type"], json!(POST));
 }
 
@@ -229,25 +248,45 @@ async fn profile_gets_self_rkey() {
     // (repo/prepare.ts validateRecord: `schema.keySchema.safeValidate(rkey)`),
     // so a createRecord without an rkey gets a TID and is rejected.
     let (s, a) = setup().await;
-    let r = create(&s, &a, json!({"collection": PROFILE, "rkey": "self", "record": {"displayName": "alice", "createdAt": now_iso()}})).await.ok();
+    let r = create(
+        &s,
+        &a,
+        json!({"collection": PROFILE, "rkey": "self", "record": {"displayName": "alice", "createdAt": now_iso()}}),
+    )
+    .await
+    .ok();
     assert_eq!(RecordRef::from_json(&r).rkey(), "self", "app.bsky.actor.profile has key literal:self");
     assert_eq!(r["validationStatus"], json!("valid"));
     create(&s, &a, json!({"collection": PROFILE, "record": {"displayName": "alice"}})).await.err(400, "InvalidRequest");
-    put(&s, &a, json!({"collection": PROFILE, "rkey": "other", "record": {"displayName": "alice"}})).await.err(400, "InvalidRequest");
+    put(&s, &a, json!({"collection": PROFILE, "rkey": "other", "record": {"displayName": "alice"}}))
+        .await
+        .err(400, "InvalidRequest");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requires_type_to_match_collection() {
     let (s, a) = setup().await;
-    create(&s, &a, json!({"collection": POST, "record": {"$type": "app.bsky.feed.like"}})).await.err(400, "InvalidRequest");
+    create(&s, &a, json!({"collection": POST, "record": {"$type": "app.bsky.feed.like"}}))
+        .await
+        .err(400, "InvalidRequest");
     // also when unvalidated / unknown lexicon
-    create(&s, &a, json!({"collection": "com.example.record", "record": {"$type": "com.example.other", "blah": "thing"}})).await.err(400, "InvalidRequest");
-    put(&s, &a, json!({"collection": "com.example.record", "rkey": "x", "record": {"$type": "com.example.other"}})).await.err(400, "InvalidRequest");
+    create(
+        &s,
+        &a,
+        json!({"collection": "com.example.record", "record": {"$type": "com.example.other", "blah": "thing"}}),
+    )
+    .await
+    .err(400, "InvalidRequest");
+    put(&s, &a, json!({"collection": "com.example.record", "rkey": "x", "record": {"$type": "com.example.other"}}))
+        .await
+        .err(400, "InvalidRequest");
     let writes = json!([{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "value": {"$type": "com.example.other"}}]);
     apply(&s, &a, json!({"writes": writes})).await.err(400, "InvalidRequest");
     // $type must be a non-empty string when present
     for t in [json!(null), json!(123), json!("")] {
-        create(&s, &a, json!({"collection": "com.example.record", "record": {"$type": t, "a": 1}})).await.err(400, "InvalidRequest");
+        create(&s, &a, json!({"collection": "com.example.record", "record": {"$type": t, "a": 1}}))
+            .await
+            .err(400, "InvalidRequest");
     }
 }
 
@@ -255,10 +294,26 @@ async fn requires_type_to_match_collection() {
 async fn requires_valid_rkey() {
     let (s, a) = setup().await;
     let long = "o".repeat(513);
-    let bad = [".", "..", "a/b", "with space", "#extra", "@handle", "number[3]", "number(3)", "\"quote\"", "dHJ1ZQ==", long.as_str()];
+    let bad = [
+        ".",
+        "..",
+        "a/b",
+        "with space",
+        "#extra",
+        "@handle",
+        "number[3]",
+        "number(3)",
+        "\"quote\"",
+        "dHJ1ZQ==",
+        long.as_str(),
+    ];
     for rk in bad {
-        create(&s, &a, json!({"collection": "com.example.record", "rkey": rk, "record": {"a": 1}})).await.err(400, "InvalidRequest");
-        put(&s, &a, json!({"collection": "com.example.record", "rkey": rk, "record": {"a": 1}})).await.err(400, "InvalidRequest");
+        create(&s, &a, json!({"collection": "com.example.record", "rkey": rk, "record": {"a": 1}}))
+            .await
+            .err(400, "InvalidRequest");
+        put(&s, &a, json!({"collection": "com.example.record", "rkey": rk, "record": {"a": 1}}))
+            .await
+            .err(400, "InvalidRequest");
         let writes = json!([{"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "rkey": rk, "value": {"a": 1}}]);
         apply(&s, &a, json!({"writes": writes})).await.err(400, "InvalidRequest");
     }
@@ -269,7 +324,15 @@ async fn requires_valid_rkey() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn requires_valid_collection_nsid() {
     let (s, a) = setup().await;
-    for c in ["app.bsky", "example.com", "one.two..three", "com.example.foo.*", "not an nsid", "com.atproto.feed.p@st", "a/b.c.d"] {
+    for c in [
+        "app.bsky",
+        "example.com",
+        "one.two..three",
+        "com.example.foo.*",
+        "not an nsid",
+        "com.atproto.feed.p@st",
+        "a/b.c.d",
+    ] {
         let r = create(&s, &a, json!({"collection": c, "record": {"a": 1}})).await;
         assert_eq!((r.status, r.error_name()), (400, Some("InvalidRequest")), "collection {c:?}: {}", r.text());
     }
@@ -279,7 +342,13 @@ async fn requires_valid_collection_nsid() {
 async fn unvalidated_writes_of_unknown_lexicons() {
     let (s, a) = setup().await;
     // validate unset: allowed, status unknown
-    let r = create(&s, &a, json!({"collection": "com.example.record", "record": {"$type": "com.example.record", "blah": "thing"}})).await.ok();
+    let r = create(
+        &s,
+        &a,
+        json!({"collection": "com.example.record", "record": {"$type": "com.example.record", "blah": "thing"}}),
+    )
+    .await
+    .ok();
     assert_eq!(r["validationStatus"], json!("unknown"));
     let g = s.get_record(&a.did, "com.example.record", RecordRef::from_json(&r).rkey()).await.ok();
     assert_eq!(g["value"], json!({"$type": "com.example.record", "blah": "thing"}));
@@ -287,7 +356,12 @@ async fn unvalidated_writes_of_unknown_lexicons() {
     let r = create(&s, &a, json!({"collection": "com.example.record", "validate": false, "record": {"$type": "com.example.record", "blah": "thing2"}})).await.ok();
     assert!(r.get("validationStatus").is_none_or(|v| v.is_null()), "validate=false => no validationStatus: {r}");
     // validate=true on an unknown lexicon: rejected, mentioning the NSID
-    let r = create(&s, &a, json!({"collection": "com.example.foobar", "validate": true, "record": {"$type": "com.example.foobar"}})).await;
+    let r = create(
+        &s,
+        &a,
+        json!({"collection": "com.example.foobar", "validate": true, "record": {"$type": "com.example.foobar"}}),
+    )
+    .await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("com.example.foobar"), "{}", r.text());
 }
@@ -296,7 +370,9 @@ async fn unvalidated_writes_of_unknown_lexicons() {
 async fn validates_known_records_on_write() {
     let (s, a) = setup().await;
     // missing required "text"
-    create(&s, &a, json!({"collection": POST, "record": {"$type": POST, "createdAt": now_iso()}})).await.err(400, "InvalidRequest");
+    create(&s, &a, json!({"collection": POST, "record": {"$type": POST, "createdAt": now_iso()}}))
+        .await
+        .err(400, "InvalidRequest");
     // datetimes are validated rigorously
     let bad_date = json!({"$type": POST, "text": "test", "createdAt": "0000-00-12T23:20:50.123Z"});
     create(&s, &a, json!({"collection": POST, "record": bad_date})).await.err(400, "InvalidRequest");
@@ -309,7 +385,9 @@ async fn rejects_legacy_blob_refs_and_bad_values() {
     let (s, a) = setup().await;
     let cid = s.upload_blob(&a, PNG_1X1, "image/png").await["ref"]["$link"].as_str().unwrap().to_string();
     let legacy = json!({"blah": "thing", "image": {"cid": cid, "mimeType": "image/png"}});
-    create(&s, &a, json!({"collection": "com.example.record", "validate": false, "record": legacy})).await.err(400, "InvalidRequest");
+    create(&s, &a, json!({"collection": "com.example.record", "validate": false, "record": legacy}))
+        .await
+        .err(400, "InvalidRequest");
     // floats are not part of the data model
     create(&s, &a, json!({"collection": "com.example.record", "record": {"a": 1.5}})).await.err(400, "InvalidRequest");
     // blob with a string size is malformed
@@ -322,8 +400,15 @@ async fn rejects_values_too_deep_for_cbor() {
     let (s, a) = setup().await;
     // 4000 levels of nesting (built as raw JSON text; serde_json can't build it)
     let deep = format!("{}1{}", "{\"x\":".repeat(4000), "}".repeat(4000));
-    let body = format!(r#"{{"repo":"{}","collection":"{POST}","record":{{"text":"x","createdAt":"{}","deepObject":{deep}}}}}"#, a.did, now_iso());
-    s.xrpc.post_bytes("com.atproto.repo.createRecord", body.into_bytes(), "application/json", &a.auth()).await.err(400, "InvalidRequest");
+    let body = format!(
+        r#"{{"repo":"{}","collection":"{POST}","record":{{"text":"x","createdAt":"{}","deepObject":{deep}}}}}"#,
+        a.did,
+        now_iso()
+    );
+    s.xrpc
+        .post_bytes("com.atproto.repo.createRecord", body.into_bytes(), "application/json", &a.auth())
+        .await
+        .err(400, "InvalidRequest");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -339,7 +424,9 @@ async fn data_model_values_round_trip() {
         "big": 9007199254740991i64,
         "neg": -9007199254740991i64,
     });
-    let rec = RecordRef::from_json(&create(&s, &a, json!({"collection": "com.example.kitchen", "record": record})).await.ok());
+    let rec = RecordRef::from_json(
+        &create(&s, &a, json!({"collection": "com.example.kitchen", "record": record})).await.ok(),
+    );
     assert_eq!(s.get_record(&a.did, "com.example.kitchen", rec.rkey()).await.ok()["value"], record);
     // the CID is the DAG-CBOR hash of the record, and the exported block
     let v = Value::from_json(&record).unwrap();
@@ -437,11 +524,20 @@ fn wrong_cid() -> String {
 async fn create_record_swap_commit() {
     let (s, a) = setup().await;
     let (head, _) = s.latest_commit(&a.did).await;
-    let r = create(&s, &a, json!({"collection": POST, "swapCommit": head.to_string(), "record": post_record("cas ok")})).await.ok();
+    let r =
+        create(&s, &a, json!({"collection": POST, "swapCommit": head.to_string(), "record": post_record("cas ok")}))
+            .await
+            .ok();
     s.get_record(&a.did, POST, RecordRef::from_json(&r).rkey()).await.ok();
     // head is now stale
     let rk = "3jzfcijpj2z2b";
-    create(&s, &a, json!({"collection": POST, "rkey": rk, "swapCommit": head.to_string(), "record": post_record("cas bad")})).await.err(400, "InvalidSwap");
+    create(
+        &s,
+        &a,
+        json!({"collection": POST, "rkey": rk, "swapCommit": head.to_string(), "record": post_record("cas bad")}),
+    )
+    .await
+    .err(400, "InvalidSwap");
     s.get_record(&a.did, POST, rk).await.err(400, "RecordNotFound");
 }
 
@@ -456,14 +552,18 @@ async fn delete_record_swap_commit_and_record() {
     // bad commit cas
     let (stale, _) = s.latest_commit(&a.did).await;
     let p = s.post(&a, "p2").await;
-    delete(&s, &a, json!({"collection": POST, "rkey": p.rkey(), "swapCommit": stale.to_string()})).await.err(400, "InvalidSwap");
+    delete(&s, &a, json!({"collection": POST, "rkey": p.rkey(), "swapCommit": stale.to_string()}))
+        .await
+        .err(400, "InvalidSwap");
     s.get_record(&a.did, POST, p.rkey()).await.ok();
     // proper record cas
     delete(&s, &a, json!({"collection": POST, "rkey": p.rkey(), "swapRecord": p.cid})).await.ok();
     s.get_record(&a.did, POST, p.rkey()).await.err(400, "RecordNotFound");
     // bad record cas
     let p = s.post(&a, "p3").await;
-    delete(&s, &a, json!({"collection": POST, "rkey": p.rkey(), "swapRecord": wrong_cid()})).await.err(400, "InvalidSwap");
+    delete(&s, &a, json!({"collection": POST, "rkey": p.rkey(), "swapRecord": wrong_cid()}))
+        .await
+        .err(400, "InvalidSwap");
     s.get_record(&a.did, POST, p.rkey()).await.ok();
 }
 
@@ -471,16 +571,30 @@ async fn delete_record_swap_commit_and_record() {
 async fn put_record_swap_commit() {
     let (s, a) = setup().await;
     let (head, _) = s.latest_commit(&a.did).await;
-    let p = put(&s, &a, json!({"collection": PROFILE, "rkey": "self", "swapCommit": head.to_string(), "record": profile("a1")})).await.ok();
+    let p = put(
+        &s,
+        &a,
+        json!({"collection": PROFILE, "rkey": "self", "swapCommit": head.to_string(), "record": profile("a1")}),
+    )
+    .await
+    .ok();
     assert_eq!(s.get_record(&a.did, PROFILE, "self").await.ok()["cid"], p["cid"]);
-    put(&s, &a, json!({"collection": PROFILE, "rkey": "self", "swapCommit": head.to_string(), "record": profile("a2")})).await.err(400, "InvalidSwap");
+    put(
+        &s,
+        &a,
+        json!({"collection": PROFILE, "rkey": "self", "swapCommit": head.to_string(), "record": profile("a2")}),
+    )
+    .await
+    .err(400, "InvalidSwap");
     assert_eq!(s.get_record(&a.did, PROFILE, "self").await.ok()["cid"], p["cid"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn put_record_swap_record() {
     let (s, a) = setup().await;
-    let put_swap = |swap: J, name: &str| put(&s, &a, json!({"collection": PROFILE, "rkey": "self", "swapRecord": swap, "record": profile(name)}));
+    let put_swap = |swap: J, name: &str| {
+        put(&s, &a, json!({"collection": PROFILE, "rkey": "self", "swapRecord": swap, "record": profile(name)}))
+    };
     // swapRecord: null => the record must not exist (create)
     let p1 = put_swap(J::Null, "b1").await.ok();
     assert_eq!(s.get_record(&a.did, PROFILE, "self").await.ok()["cid"], p1["cid"]);
@@ -571,7 +685,9 @@ async fn apply_writes_is_atomic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn apply_writes_limits() {
     let (s, a) = setup().await;
-    let writes = |n: usize| -> J { (0..n).map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "rkey": format!("k{i}"), "value": {"i": i}})).collect() };
+    let writes = |n: usize| -> J {
+        (0..n).map(|i| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": "com.example.record", "rkey": format!("k{i}"), "value": {"i": i}})).collect()
+    };
     apply(&s, &a, json!({"writes": writes(201)})).await.err(400, "InvalidRequest");
     let r = apply(&s, &a, json!({"writes": writes(200)})).await.ok();
     assert_eq!(r["results"].as_array().unwrap().len(), 200);
@@ -591,10 +707,15 @@ async fn record_writes_accept_large_json_bodies() {
     let got = s.get_record(&a.did, "com.example.big", "b").await.ok();
     assert_eq!(got["value"]["data"].as_str().map(str::len), Some(600_000));
     // past 1,000,000 bytes: 413
-    let huge = format!("{{\"repo\":\"{}\",\"collection\":\"com.example.big\",\"record\":{{\"data\":\"{}\"}}}}", a.did, "x".repeat(1_000_000));
+    let huge = format!(
+        "{{\"repo\":\"{}\",\"collection\":\"com.example.big\",\"record\":{{\"data\":\"{}\"}}}}",
+        a.did,
+        "x".repeat(1_000_000)
+    );
     // The server rejects from Content-Length without reading the body, so it may
     // close before the client finishes writing; either outcome is a rejection.
-    match s.xrpc.try_post_bytes("com.atproto.repo.createRecord", huge.into_bytes(), "application/json", &a.auth()).await {
+    match s.xrpc.try_post_bytes("com.atproto.repo.createRecord", huge.into_bytes(), "application/json", &a.auth()).await
+    {
         Ok(r) => r.err(413, "PayloadTooLarge"),
         Err(e) => assert!(e.is_request() || e.is_body(), "unexpected error: {e}"),
     }

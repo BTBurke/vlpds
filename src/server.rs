@@ -321,7 +321,10 @@ impl Default for Config {
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let ui = Arc::new(xrpc::WebUi::load(cfg.ui_dir.as_deref())?);
     let plan = crate::memory::init(cfg.memory_plan()?);
-    let (caps, budget) = crate::caches::resolve(Some(cfg.cache_budget_bytes.unwrap_or(plan.part("in_memory_caches"))), &cfg.cache_entries);
+    let (caps, budget) = crate::caches::resolve(
+        Some(cfg.cache_budget_bytes.unwrap_or(plan.part("in_memory_caches"))),
+        &cfg.cache_entries,
+    );
     crate::caches::apply(&caps);
     if let Some(m) = plan.limit {
         crate::metrics::MEMORY_LIMIT.set(m as i64);
@@ -332,9 +335,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     // everything else, each bounded (objlimit.rs), so a takeover's burst
     // can't starve lease renewals or exhaust ephemeral ports.
     use crate::objlimit::{Limits, Reserve};
-    let log_limits = Limits::new(cfg.log_store_inflight).with_reserved(Reserve::Writes, crate::objlimit::log_write_permits(cfg.log_inflight));
+    let log_limits = Limits::new(cfg.log_store_inflight)
+        .with_reserved(Reserve::Writes, crate::objlimit::log_write_permits(cfg.log_inflight));
     let state_limits = Limits::new(cfg.store_inflight);
-    let ctl_limits = Limits::new(crate::objlimit::CTL_PERMITS).with_reserved(Reserve::LeaseWrites, crate::objlimit::LEASE_PERMITS);
+    let ctl_limits =
+        Limits::new(crate::objlimit::CTL_PERMITS).with_reserved(Reserve::LeaseWrites, crate::objlimit::LEASE_PERMITS);
     let (store, state_store, ctl_store) = match &cfg.s3 {
         None => {
             let m = match &cfg.memory_store {
@@ -350,7 +355,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             Store::s3(s3, &cfg.prefix, None, ctl_limits.connections())?.counted("ctl"),
         ),
     };
-    let (store, state_store, ctl_store) = (store.limited("log", log_limits), state_store.limited("state", state_limits), ctl_store.limited("ctl", ctl_limits));
+    let (store, state_store, ctl_store) = (
+        store.limited("log", log_limits),
+        state_store.limited("state", state_limits),
+        ctl_store.limited("ctl", ctl_limits),
+    );
     let firehose = Firehose::new(crate::firehose::Options {
         ring_bytes: cfg.firehose_ring_bytes,
         max_lag_bytes: cfg.firehose_max_lag_bytes,
@@ -368,14 +377,24 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let lookup_parts = table.clone();
     let lookup: worker::PartitionLookup = Arc::new(move |did: &str| lookup_parts.for_key(did));
     let repo_bytes = crate::memory::current().map_or(0, |s| s.repo) as usize;
-    let limits = worker::CacheLimits { entries: cfg.cache_per_worker, bytes: repo_bytes / cfg.workers.max(1), prefetch_bytes: cfg.lazy_mst_prefetch_bytes, unload_idle: cfg.lazy_mst_unload_idle };
+    let limits = worker::CacheLimits {
+        entries: cfg.cache_per_worker,
+        bytes: repo_bytes / cfg.workers.max(1),
+        prefetch_bytes: cfg.lazy_mst_prefetch_bytes,
+        unload_idle: cfg.lazy_mst_unload_idle,
+    };
     crate::mst_store::NODE_CACHE.set_bytes(cfg.lazy_mst_node_cache_bytes);
     let secrets = Arc::new(crate::secrets::Secrets::from_config(&cfg.kek, cfg.dev_mode)?);
     tracing::info!(kek = secrets.current_kid(), unwrap_keks = ?secrets.kids(), dev = secrets.is_dev(), "secrets at rest");
-    let workers = worker::spawn_with_secrets(cfg.workers, limits, lookup, tokio::runtime::Handle::current(), secrets.clone());
+    let workers =
+        worker::spawn_with_secrets(cfg.workers, limits, lookup, tokio::runtime::Handle::current(), secrets.clone());
     let plc = crate::plc::Plc::from_config(&cfg.plc, &cfg.plc_url, cfg.dev_mode, &secrets).await?;
 
-    let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig { node_id: "single".into(), addr: cfg.public_url.clone(), ..Default::default() });
+    let mut cc = cfg.cluster.clone().unwrap_or_else(|| ClusterConfig {
+        node_id: "single".into(),
+        addr: cfg.public_url.clone(),
+        ..Default::default()
+    });
     cc.shards = n;
     crate::version::init_metrics();
     // before the join, which may fence our own previous incarnation's log
@@ -551,7 +570,10 @@ pub async fn spawn(
     public: tokio::net::TcpListener,
     peer: Option<tokio::net::TcpListener>,
 ) -> anyhow::Result<(Arc<xrpc::App>, std::net::SocketAddr)> {
-    anyhow::ensure!(peer.is_some() == cfg.peer_tls.is_some(), "a peer listener goes with peer TLS, and peer TLS with a peer listener");
+    anyhow::ensure!(
+        peer.is_some() == cfg.peer_tls.is_some(),
+        "a peer listener goes with peer TLS, and peer TLS with a peer listener"
+    );
     let app = build(cfg).await?;
     let addr = public.local_addr()?;
     if let Some(peer) = peer {
@@ -582,7 +604,11 @@ pub fn spawn_metrics_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpLis
 /// The full [`router`] over mTLS, with the peer HTTP/2 profile.
 pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
     let tls = app.config.peer_tls.as_ref().ok_or_else(|| anyhow::anyhow!("a peer listener needs peer TLS"))?;
-    let opts = ServeOptions { h2: H2Profile::Peer, max_connections: app.config.max_connections, tls: Some(tls.server_config()) };
+    let opts = ServeOptions {
+        h2: H2Profile::Peer,
+        max_connections: app.config.max_connections,
+        tls: Some(tls.server_config()),
+    };
     let router = router(app);
     tokio::spawn(async move {
         if let Err(e) = serve_with(listener, router, opts).await {
@@ -593,22 +619,25 @@ pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListen
 }
 
 /// Stripped on [`public_router`], so a client's copy means nothing.
-const PEER_ONLY_HEADERS: [&str; 3] = [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
+const PEER_ONLY_HEADERS: [&str; 3] =
+    [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
 
 /// [`router`] without `/internal/*`, and with the peer-only headers dropped
 /// before anything reads them: a forwarded marker is served as the client
 /// request it is, and `x-vlpds-internal` doesn't skip rate limits.
 pub fn public_router(app: &Arc<xrpc::App>) -> axum::Router {
-    router(app).layer(axum::middleware::from_fn(|mut req: axum::extract::Request, next: axum::middleware::Next| async move {
-        let p = req.uri().path();
-        if p == "/internal" || p.starts_with("/internal/") {
-            return axum::http::StatusCode::NOT_FOUND.into_response();
-        }
-        for h in PEER_ONLY_HEADERS {
-            req.headers_mut().remove(h);
-        }
-        next.run(req).await
-    }))
+    router(app).layer(axum::middleware::from_fn(
+        |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let p = req.uri().path();
+            if p == "/internal" || p.starts_with("/internal/") {
+                return axum::http::StatusCode::NOT_FOUND.into_response();
+            }
+            for h in PEER_ONLY_HEADERS {
+                req.headers_mut().remove(h);
+            }
+            next.run(req).await
+        },
+    ))
 }
 
 const METRICS_PATHS: [&str; 2] = ["/metrics", "/debug/pprof/"];
@@ -662,11 +691,17 @@ pub const DEFAULT_MAX_CONNECTIONS: usize = 50_000;
 
 /// Tests inject failing listeners.
 pub trait Accept: Send + 'static {
-    fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>;
+    fn poll_accept(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>>;
 }
 
 impl Accept for tokio::net::TcpListener {
-    fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
+    fn poll_accept(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
         tokio::net::TcpListener::poll_accept(self, cx)
     }
 }
@@ -744,10 +779,13 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
         let (acceptor, builder) = (acceptor.clone(), builder.clone());
         let svc = TowerToHyperService::new(Track {
-            inner: tower::ServiceExt::map_request(router.clone(), move |mut req: axum::http::Request<hyper::body::Incoming>| {
-                req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
-                req
-            }),
+            inner: tower::ServiceExt::map_request(
+                router.clone(),
+                move |mut req: axum::http::Request<hyper::body::Incoming>| {
+                    req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+                    req
+                },
+            ),
             active: active.clone(),
         });
         tokio::spawn(async move {
@@ -759,19 +797,20 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
                 Some(acceptor) => {
                     // on the connection's task: a slow or silent client
                     // holds only its own slot
-                    let tls = match tokio::time::timeout(crate::peer_tls::HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => {
-                            crate::peer_tls::server_handshake_failed();
-                            tracing::warn!(%peer, "peer TLS handshake failed: {e}");
-                            return;
-                        }
-                        Err(_) => {
-                            crate::peer_tls::server_handshake_failed();
-                            tracing::warn!(%peer, "peer TLS handshake timed out");
-                            return;
-                        }
-                    };
+                    let tls =
+                        match tokio::time::timeout(crate::peer_tls::HANDSHAKE_TIMEOUT, acceptor.accept(sock)).await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                crate::peer_tls::server_handshake_failed();
+                                tracing::warn!(%peer, "peer TLS handshake failed: {e}");
+                                return;
+                            }
+                            Err(_) => {
+                                crate::peer_tls::server_handshake_failed();
+                                tracing::warn!(%peer, "peer TLS handshake timed out");
+                                return;
+                            }
+                        };
                     crate::metrics::HTTP_SERVER_OPEN.inc();
                     let _ = builder.serve_connection_with_upgrades(TokioIo::new(tls), svc).await;
                 }
@@ -955,10 +994,14 @@ mod tests {
             fail: usize,
         }
         impl Accept for Flaky {
-            fn poll_accept(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
+            fn poll_accept(
+                &mut self,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<(tokio::net::TcpStream, std::net::SocketAddr)>> {
                 if self.fail > 0 {
                     self.fail -= 1;
-                    return std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(24))); // EMFILE
+                    return std::task::Poll::Ready(Err(std::io::Error::from_raw_os_error(24)));
+                    // EMFILE
                 }
                 self.inner.poll_accept(cx)
             }
@@ -967,7 +1010,11 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let before = crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.get();
         let router = axum::Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
-        let server = tokio::spawn(serve_with(Flaky { inner: l, fail: 3 }, router, ServeOptions { max_connections: 1, ..Default::default() }));
+        let server = tokio::spawn(serve_with(
+            Flaky { inner: l, fail: 3 },
+            router,
+            ServeOptions { max_connections: 1, ..Default::default() },
+        ));
         let get = || async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -976,7 +1023,8 @@ mod tests {
             let n = c.read(&mut buf).await.unwrap();
             (String::from_utf8_lossy(&buf[..n]).into_owned(), c)
         };
-        let (first, held) = tokio::time::timeout(Duration::from_secs(5), get()).await.expect("served after accept errors");
+        let (first, held) =
+            tokio::time::timeout(Duration::from_secs(5), get()).await.expect("served after accept errors");
         assert!(first.starts_with("HTTP/1.1 200"), "{first}");
         assert!(crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.get() >= before + 3);
         assert!(!server.is_finished(), "accept errors don't end the server");
@@ -985,7 +1033,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(!second.is_finished(), "served past the connection cap");
         drop(held);
-        let (r, _) = tokio::time::timeout(Duration::from_secs(5), second).await.expect("served once a slot freed").unwrap();
+        let (r, _) =
+            tokio::time::timeout(Duration::from_secs(5), second).await.expect("served once a slot freed").unwrap();
         assert!(r.starts_with("HTTP/1.1 200"), "{r}");
         server.abort();
     }

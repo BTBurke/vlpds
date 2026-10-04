@@ -56,7 +56,13 @@ async fn no_longer_serves_repo_data() {
     s.get_blob(did, &f.blob_cid).await.err(400, "RepoDeactivated");
 
     let j = s.xrpc.get("com.atproto.sync.listRepos", &[], &Auth::None).await.ok();
-    let me = j["repos"].as_array().unwrap().iter().find(|r| r["did"] == json!(did)).cloned().expect("deactivated repo still listed");
+    let me = j["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["did"] == json!(did))
+        .cloned()
+        .expect("deactivated repo still listed");
     assert_eq!(me["active"], json!(false));
     assert_eq!(me["status"], json!("deactivated"));
 }

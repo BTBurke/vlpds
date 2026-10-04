@@ -74,7 +74,11 @@ async fn signing_secret(s: &TestServer, did: &str) -> Vec<u8> {
 async fn totp_login(s: &TestServer, a: &TestAccount, secret: &[u8], step_offset: u64) -> Resp {
     let code = vlpds::totp::code_for_step(secret, vlpds::totp::step_at(vlpds::totp::now_secs()) + step_offset);
     s.xrpc
-        .post("com.atproto.server.createSession", &json!({"identifier": a.handle, "password": a.password, "authFactorToken": code}), &Auth::None)
+        .post(
+            "com.atproto.server.createSession",
+            &json!({"identifier": a.handle, "password": a.password, "authFactorToken": code}),
+            &Auth::None,
+        )
         .await
 }
 
@@ -114,7 +118,11 @@ async fn no_plaintext_secrets_in_bucket_or_state() {
     let repo = s.get_repo(&a0.did).await;
     repo.commit().verify(&s.signing_key(&a0.did).await).expect("signed with the new key");
     // a reserved key
-    let dk = s.xrpc.post("com.atproto.server.reserveSigningKey", &json!({"did": "did:plc:reservedfortest2345678"}), &Auth::None).await.ok()["signingKey"]
+    let dk = s
+        .xrpc
+        .post("com.atproto.server.reserveSigningKey", &json!({"did": "did:plc:reservedfortest2345678"}), &Auth::None)
+        .await
+        .ok()["signingKey"]
         .as_str()
         .unwrap()
         .to_string();
@@ -170,7 +178,10 @@ async fn kek_rotation_and_rewrap() {
         accts.push(t);
     }
     let (totp, _) = a.enable_totp(&accts[0]).await;
-    let dk = a.xrpc.post("com.atproto.server.reserveSigningKey", &json!({}), &Auth::None).await.ok()["signingKey"].as_str().unwrap().to_string();
+    let dk = a.xrpc.post("com.atproto.server.reserveSigningKey", &json!({}), &Auth::None).await.ok()["signingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let keys_before: Vec<Vec<u8>> = futures::future::join_all(accts.iter().map(|t| signing_secret(&a, &t.did))).await;
     a.app.log.checkpoint_all().await;
     vlpds::server::shutdown(&a.app).await;
@@ -218,7 +229,14 @@ async fn kek_rotation_and_rewrap() {
     }
     totp_login(&c, &accts[0], &totp, 1).await.ok();
     // the reserved key, rewrapped, still installs
-    c.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": accts[2].did, "signingKey": dk}), &Auth::Admin).await.ok();
+    c.xrpc
+        .post(
+            "com.atproto.admin.updateAccountSigningKey",
+            &json!({"did": accts[2].did, "signingKey": dk}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
     c.post(&accts[2], "with the reserved key").await;
     assert_eq!(format!("did:key:{}", c.app.account(&accts[2].did).await.ok().unwrap().signing_pubkey), dk);
     c.app.log.checkpoint_all().await;
@@ -230,7 +248,11 @@ async fn kek_rotation_and_rewrap() {
     assert_eq!(rec["records"].as_array().unwrap().len(), 3);
     let r = d
         .xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": accts[3].did, "collection": "app.bsky.feed.post", "record": post_record("x")}), &accts[3].auth())
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": accts[3].did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
+            &accts[3].auth(),
+        )
         .await;
     assert!(r.status >= 500, "{} {}", r.status, r.text());
     vlpds::server::shutdown(&d.app).await;
@@ -281,7 +303,8 @@ async fn mock_kms() -> Arc<MockKms> {
             m.encrypts.fetch_add(1, Ordering::SeqCst);
             let pt = b64.decode(body["plaintext"].as_str().unwrap()).unwrap();
             let ct = aead.wrap_sync(&aad, &pt);
-            return axum::Json(json!({"name": format!("{name}/cryptoKeyVersions/1"), "ciphertext": b64.encode(ct)})).into_response();
+            return axum::Json(json!({"name": format!("{name}/cryptoKeyVersions/1"), "ciphertext": b64.encode(ct)}))
+                .into_response();
         }
         if rest.ends_with(":decrypt") {
             m.decrypts.fetch_add(1, Ordering::SeqCst);
@@ -359,7 +382,11 @@ async fn kms_unwraps_are_cached_and_outages_are_retryable() {
     let (head, _) = c.latest_commit(&t.did).await;
     let r = c
         .xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": t.did, "collection": "app.bsky.feed.post", "record": post_record("while down")}), &t.auth())
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": t.did, "collection": "app.bsky.feed.post", "record": post_record("while down")}),
+            &t.auth(),
+        )
         .await;
     assert_eq!(r.status, 503, "{}", r.text());
     assert_eq!(r.json["error"], json!("KeyUnavailable"), "{}", r.text());
@@ -379,7 +406,11 @@ async fn kms_unwraps_are_cached_and_outages_are_retryable() {
     let ok = eventually(Duration::from_secs(10), || async {
         let r = c
             .xrpc
-            .post("com.atproto.repo.createRecord", &json!({"repo": t.did, "collection": "app.bsky.feed.post", "record": post_record("after")}), &t.auth())
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": t.did, "collection": "app.bsky.feed.post", "record": post_record("after")}),
+                &t.auth(),
+            )
             .await;
         (r.status == 200).then_some(())
     })

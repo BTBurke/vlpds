@@ -59,7 +59,9 @@ impl Cluster {
     pub async fn plan_reshard(&self, host: &Arc<dyn ShardHost>, plan: Plan) -> anyhow::Result<Reshard> {
         for _ in 0..5 {
             let path = self.path(LAYOUT);
-            let Some((cur, etag)) = self.get_json::<Layout>(&path).await? else { anyhow::bail!("shard layout missing") };
+            let Some((cur, etag)) = self.get_json::<Layout>(&path).await? else {
+                anyhow::bail!("shard layout missing")
+            };
             let parents = match &plan {
                 Plan::Split { shard, .. } => vec![*shard],
                 Plan::Merge { left, right } => vec![*left, *right],
@@ -96,7 +98,9 @@ impl Cluster {
     pub async fn abort_reshard(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<Option<Reshard>> {
         let path = self.path(LAYOUT);
         let op = loop {
-            let Some((cur, etag)) = self.get_json::<Layout>(&path).await? else { anyhow::bail!("shard layout missing") };
+            let Some((cur, etag)) = self.get_json::<Layout>(&path).await? else {
+                anyhow::bail!("shard layout missing")
+            };
             let Some(op) = cur.op.clone() else { return Ok(None) };
             let next = Layout { op: None, ..cur };
             match self.put_json(&path, &next, if_match(etag)).await {
@@ -226,7 +230,9 @@ impl Cluster {
         match self.put_json(&path, &next, if_match(etag)).await {
             Ok(e) => {
                 tracing::info!(op = op.id, version = next.version, parents = ?op.parents, children = ?op.children.iter().map(|c| c.id).collect::<Vec<_>>(), "reshard flipped");
-                crate::metrics::RESHARD_EVENTS.with_label_values(&[if op.is_split() { "split" } else { "merged" }]).inc();
+                crate::metrics::RESHARD_EVENTS
+                    .with_label_values(&[if op.is_split() { "split" } else { "merged" }])
+                    .inc();
                 self.install_layout(host, next, e);
             }
             Err(e) if is_conflict(&e) => return Ok(()), // re-read next step
@@ -234,7 +240,8 @@ impl Cluster {
         }
         crash_check(&self.cfg.node_id, "flipped")?;
         // they are free shards in the new layout
-        let live_ids: HashSet<String> = self.peers().into_iter().map(|l| l.node_id).chain([self.cfg.node_id.clone()]).collect();
+        let live_ids: HashSet<String> =
+            self.peers().into_iter().map(|l| l.node_id).chain([self.cfg.node_id.clone()]).collect();
         let ids: Vec<ShardId> = op.children.iter().map(|c| c.id).collect();
         let n = ids.len();
         self.acquire(host, ids, n, &live_ids, &HashMap::new(), 0, live_ids.len()).await?;
@@ -274,7 +281,11 @@ impl Cluster {
         let cur = layout.op.as_ref().map(|o| o.id);
         let stale: Vec<(ShardId, u64)> = {
             let assigns = self.assigns.read();
-            layout.ids().into_iter().filter_map(|s| assigns.get(&s).and_then(|(a, _)| a.frozen).filter(|f| Some(*f) != cur).map(|f| (s, f))).collect()
+            layout
+                .ids()
+                .into_iter()
+                .filter_map(|s| assigns.get(&s).and_then(|(a, _)| a.frozen).filter(|f| Some(*f) != cur).map(|f| (s, f)))
+                .collect()
         };
         if stale.is_empty() {
             return Ok(());
@@ -303,7 +314,9 @@ impl Cluster {
                 return Ok(());
             }
             let pick = stats.into_iter().find_map(|(s, bytes, entries)| {
-                let rate = prev.get(&s).map(|(n0, t0)| entries.saturating_sub(*n0) as f64 / now.duration_since(*t0).as_secs_f64().max(1e-3));
+                let rate = prev.get(&s).map(|(n0, t0)| {
+                    entries.saturating_sub(*n0) as f64 / now.duration_since(*t0).as_secs_f64().max(1e-3)
+                });
                 let big = policy.split_bytes.is_some_and(|b| bytes > b);
                 let hot = policy.split_writes_per_sec.zip(rate).is_some_and(|(w, r)| r > w);
                 (big || hot).then_some((s, bytes, rate))

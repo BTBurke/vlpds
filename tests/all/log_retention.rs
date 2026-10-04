@@ -12,7 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn fast() -> Option<vlpds::retention::Config> {
-    Some(vlpds::retention::Config { window: Duration::ZERO, interval: Duration::from_millis(20), max_deletes: 3, ..Default::default() })
+    Some(vlpds::retention::Config {
+        window: Duration::ZERO,
+        interval: Duration::from_millis(20),
+        max_deletes: 3,
+        ..Default::default()
+    })
 }
 
 /// Ordinals of `log`'s objects in the store.
@@ -120,7 +125,11 @@ async fn prune_while_subscribers_backfill() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     driver.await.unwrap();
-    eprintln!("4 subscribers backfilled across pruning; {jumps} OutdatedCursor jumps; segments {} -> {:?}", before.len(), ordinals(&store, &log).await);
+    eprintln!(
+        "4 subscribers backfilled across pruning; {jumps} OutdatedCursor jumps; segments {} -> {:?}",
+        before.len(),
+        ordinals(&store, &log).await
+    );
 
     // history before the floor is gone: OutdatedCursor first, then the rest
     let mut late = s.subscribe(Some(0)).await;
@@ -138,7 +147,12 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServe
     node_with(id, store, fast(), 64 << 20).await
 }
 
-async fn node_with(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>, ring_bytes: usize) -> TestServer {
+async fn node_with(
+    id: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    retention: Option<vlpds::retention::Config>,
+    ring_bytes: usize,
+) -> TestServer {
     cluster_node(id, store.clone(), 8, |c| {
         c.log_retention = retention;
         c.firehose_ring_bytes = ring_bytes;
@@ -202,7 +216,9 @@ async fn restart_after_pruning() {
     let vs = first.app.store.clone();
     first.app.log.checkpoint_all().await;
     // pruned while alive: all but the newest durable segment
-    let pruned = eventually(Duration::from_secs(10), || async { (ordinals(&vs, &old_log).await.len() <= 1).then_some(()) }).await;
+    let pruned =
+        eventually(Duration::from_secs(10), || async { (ordinals(&vs, &old_log).await.len() <= 1).then_some(()) })
+            .await;
     assert!(pruned.is_some(), "own log never pruned: {:?}", ordinals(&vs, &old_log).await);
     vlpds::server::shutdown(&first.app).await;
     let second = node("ret-r", &store).await;
@@ -285,7 +301,11 @@ impl std::fmt::Display for PruneRace {
 
 impl PruneRace {
     fn new(log_get_delay: Duration) -> Arc<PruneRace> {
-        Arc::new(PruneRace { inner: Some(Arc::new(object_store::memory::InMemory::new())), log_get_delay, ..Default::default() })
+        Arc::new(PruneRace {
+            inner: Some(Arc::new(object_store::memory::InMemory::new())),
+            log_get_delay,
+            ..Default::default()
+        })
     }
 
     fn inner(&self) -> &Arc<dyn object_store::ObjectStore> {
@@ -317,13 +337,26 @@ impl PruneRace {
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for PruneRace {
-    async fn put_opts(&self, location: &Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
         self.inner().put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.inner().put_multipart_opts(location, opts).await
     }
-    async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
         let hit = {
             let mut armed = self.armed.lock();
             armed.iter().position(|a| a.trigger == *location).map(|i| armed.remove(i))
@@ -336,10 +369,16 @@ impl object_store::ObjectStore for PruneRace {
         }
         self.inner().get_opts(location, options).await
     }
-    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         self.inner().delete_stream(locations)
     }
-    fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.inner().list(prefix)
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
@@ -353,7 +392,10 @@ impl object_store::ObjectStore for PruneRace {
 /// Firehose frames from `cursor` up to `did`'s commit `head`.
 async fn frames_to(s: &TestServer, cursor: i64, did: &str, head: &Cid) -> Vec<Frame> {
     let mut sub = s.subscribe(Some(cursor)).await;
-    sub.until(Duration::from_secs(20), |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.repo == did && c.commit == *head)).await
+    sub.until(Duration::from_secs(20), |fs| {
+        fs.last().and_then(|f| f.commit()).is_some_and(|c| c.repo == did && c.commit == *head)
+    })
+    .await
 }
 
 /// A cursor inside the retention window must not get OutdatedCursor when a
@@ -399,7 +441,9 @@ async fn pruning_below_the_cursor_under_a_seek_is_not_outdated() {
     let vs = s.app.store.clone();
     let (fence, fenced) = vlpds::nodelog::first_free(&vs, &dead).await.unwrap();
     assert!(fenced);
-    let vlpds::nodelog::Head::Segment(h) = vlpds::nodelog::read_head(&vs, &dead, fence - 1).await.unwrap() else { panic!("no segment before the fence") };
+    let vlpds::nodelog::Head::Segment(h) = vlpds::nodelog::read_head(&vs, &dead, fence - 1).await.unwrap() else {
+        panic!("no segment before the fence")
+    };
     let dead_last = h.last_seq;
     // a cursor past the whole dead log, 10 live events in (behind the ring)
     let cursor = *seqs.iter().filter(|&&q| q > dead_last).nth(10).unwrap();
@@ -441,7 +485,11 @@ struct Proc {
 }
 
 impl Proc {
-    async fn spawn(id: &str, store: &Arc<dyn object_store::ObjectStore>, retention: Option<vlpds::retention::Config>) -> Proc {
+    async fn spawn(
+        id: &str,
+        store: &Arc<dyn object_store::ObjectStore>,
+        retention: Option<vlpds::retention::Config>,
+    ) -> Proc {
         let (id, store) = (id.to_string(), store.clone());
         tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap();
@@ -477,7 +525,12 @@ async fn cursors_inside_the_window_through_restarts_and_reshards() {
     const WINDOW: Duration = Duration::from_secs(3);
     // a probe's cursor age (the margin covers the probe's own backfill)
     const AGE: Duration = Duration::from_millis(750);
-    let ret = Some(vlpds::retention::Config { window: WINDOW, interval: Duration::from_millis(20), max_deletes: 4, fence_retention: None });
+    let ret = Some(vlpds::retention::Config {
+        window: WINDOW,
+        interval: Duration::from_millis(20),
+        max_deletes: 4,
+        fence_retention: None,
+    });
     let store: Arc<dyn object_store::ObjectStore> = PruneRace::new(Duration::from_millis(2));
     let a = node_with("win-a", &store, ret.clone(), 2048).await;
     let accts: Vec<TestAccount> = futures::future::join_all((0..6).map(|_| a.create_account("win"))).await;
@@ -495,7 +548,12 @@ async fn cursors_inside_the_window_through_restarts_and_reshards() {
                 let acct = &accts[n % accts.len()];
                 let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("w{n}"))});
                 // moving shards and a dead peer's answer 503 for a moment: go on
-                let r = http.post(format!("{url}/xrpc/com.atproto.repo.createRecord")).bearer_auth(&acct.access).json(&body).send().await;
+                let r = http
+                    .post(format!("{url}/xrpc/com.atproto.repo.createRecord"))
+                    .bearer_auth(&acct.access)
+                    .json(&body)
+                    .send()
+                    .await;
                 ok += usize::from(r.is_ok_and(|r| r.status().is_success()));
                 n += 1;
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -512,9 +570,20 @@ async fn cursors_inside_the_window_through_restarts_and_reshards() {
                 let now = vlpds::tid::now_micros();
                 let cursor = vlpds::nodelog::seq_floor(now - AGE.as_micros() as u64);
                 let target = vlpds::nodelog::seq_floor(now);
-                let mut sub = Sub::connect(&format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}")).await;
-                let (frames, done) = sub.try_until(Duration::from_secs(20), |fs| fs.last().is_some_and(|f| f.kind() == "#info" || f.seq().is_some_and(|q| q > target))).await;
-                assert!(done, "probe stuck at {:?} (target {target}, firehose at {}, closed {})", frames.last().and_then(|f| f.seq()), app.firehose.position(), sub.closed);
+                let mut sub =
+                    Sub::connect(&format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}")).await;
+                let (frames, done) = sub
+                    .try_until(Duration::from_secs(20), |fs| {
+                        fs.last().is_some_and(|f| f.kind() == "#info" || f.seq().is_some_and(|q| q > target))
+                    })
+                    .await;
+                assert!(
+                    done,
+                    "probe stuck at {:?} (target {target}, firehose at {}, closed {})",
+                    frames.last().and_then(|f| f.seq()),
+                    app.firehose.position(),
+                    sub.closed
+                );
                 let mut last = cursor;
                 let mut prev: std::collections::HashMap<String, String> = Default::default();
                 for f in &frames {
@@ -550,7 +619,15 @@ async fn cursors_inside_the_window_through_restarts_and_reshards() {
                 let target = a.app.partitions.owned().first().expect("a owns a shard").id;
                 a.xrpc.post("vlpds.admin.splitShard", &json!({"shard": target, "wait": true}), &Auth::Admin).await
             }
-            Some(k) => a.xrpc.post("vlpds.admin.mergeShards", &json!({"left": k[0]["id"], "right": k[1]["id"], "wait": true}), &Auth::Admin).await,
+            Some(k) => {
+                a.xrpc
+                    .post(
+                        "vlpds.admin.mergeShards",
+                        &json!({"left": k[0]["id"], "right": k[1]["id"], "wait": true}),
+                        &Auth::Admin,
+                    )
+                    .await
+            }
         };
         if r.is_ok() {
             kids = r.ok()["op"]["children"].as_array().filter(|c| c.len() == 2).cloned();

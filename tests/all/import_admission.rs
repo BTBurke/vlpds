@@ -23,7 +23,14 @@ async fn node(budget: Option<u64>, wait: Duration) -> TestServer {
 
 /// `n` empty bulk accounts from `start`, and their access tokens.
 async fn accounts(s: &TestServer, start: u64, n: u64) -> Vec<(String, String)> {
-    let r = s.xrpc.post("vlpds.admin.bulkCreate", &json!({"start": start, "count": n, "records": 0}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
+    let r = s
+        .xrpc
+        .post(
+            "vlpds.admin.bulkCreate",
+            &json!({"start": start, "count": n, "records": 0}),
+            &Auth::Bearer(ADMIN_TOKEN.into()),
+        )
+        .await;
     assert_eq!(r.status, 200, "{}", r.text());
     (start..start + n).map(|i| (bulk_did(i), s.app.jwt.access(&bulk_did(i)))).collect()
 }
@@ -69,7 +76,9 @@ async fn many_small_imports_run_beside_a_large_one() {
         let n = vlpds::real_dist::draw((i as f64 + 0.5) / 100.0 * 0.9, 0.5) as usize;
         let car = repo_car(i as u64, n);
         let (xrpc, tok) = (s.xrpc.clone(), tok.clone());
-        small.push(tokio::spawn(async move { xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &Auth::Bearer(tok)).await }));
+        small.push(tokio::spawn(async move {
+            xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &Auth::Bearer(tok)).await
+        }));
     }
     wait_until("100 imports held at once", Duration::from_secs(30), || held.load(Ordering::SeqCst) == 100).await;
     let peak = s.app.imports.reserved();
@@ -154,7 +163,9 @@ async fn exhausted_budget_refuses_cleanly() {
     for (i, (did, tok)) in accts[..4].iter().enumerate() {
         hold(did, held.clone(), gos[i].clone());
         let (xrpc, tok, car) = (s.xrpc.clone(), tok.clone(), repo_car(20 + i as u64, 50));
-        running.push(tokio::spawn(async move { xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &Auth::Bearer(tok)).await }));
+        running.push(tokio::spawn(async move {
+            xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &Auth::Bearer(tok)).await
+        }));
     }
     wait_until("4 imports held", Duration::from_secs(10), || held.load(Ordering::SeqCst) == 4).await;
     assert_eq!(s.app.imports.reserved(), 4 * min);
@@ -171,7 +182,8 @@ async fn exhausted_budget_refuses_cleanly() {
     assert_eq!(first.status, 200, "{}", first.text());
     let b = s.app.imports.clone();
     wait_until("one returned", Duration::from_secs(10), move || b.reserved() == 3 * min).await;
-    let (st, text) = raw(&s, &accts[5].1, "Transfer-Encoding: chunked\r\n", &chunked(&repo_car(31, 3_000)), false).await;
+    let (st, text) =
+        raw(&s, &accts[5].1, "Transfer-Encoding: chunked\r\n", &chunked(&repo_car(31, 3_000)), false).await;
     assert_eq!(st, 503, "{text}");
     assert!(text.contains("Overloaded"), "{text}");
     let b = s.app.imports.clone();

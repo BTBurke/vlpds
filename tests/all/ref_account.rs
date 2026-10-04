@@ -43,7 +43,14 @@ async fn ref_create_account_error_messages() {
     let s = TestServer::spawn().await;
     let create = |handle: String, email: String| {
         let x = s.xrpc.clone();
-        async move { x.post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": "test123"}), &Auth::None).await }
+        async move {
+            x.post(
+                "com.atproto.server.createAccount",
+                &json!({"handle": handle, "email": email, "password": "test123"}),
+                &Auth::None,
+            )
+            .await
+        }
     };
     let fresh_email = || format!("{}@test.com", unique_name("e"));
     let msg = |r: &Resp| r.json["message"].as_str().unwrap_or_default().to_string();
@@ -92,13 +99,22 @@ async fn ref_fails_on_disallowed_emails() {
         let (x, email) = (s.xrpc.clone(), email.to_string());
         async move {
             let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("bad-email"));
-            x.post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": "asdf"}), &Auth::None).await
+            x.post(
+                "com.atproto.server.createAccount",
+                &json!({"handle": handle, "email": email, "password": "asdf"}),
+                &Auth::None,
+            )
+            .await
         }
     };
     for email in ["bad-email@disposeamail.com", "Bad-Email@DisposeAMail.com", "x@mailinator.com"] {
         let r = create(email).await;
         r.err(400, "InvalidRequest");
-        assert_eq!(r.json["message"], json!("This email address is not supported, please use a different email."), "{email}");
+        assert_eq!(
+            r.json["message"],
+            json!("This email address is not supported, please use a different email."),
+            "{email}"
+        );
     }
     create(&format!("{}@sub.disposeamail.com", unique_name("ok"))).await.ok();
 }
@@ -120,7 +136,10 @@ async fn ref_password_reset_mail_and_expired_token() {
 
     // 16 minutes old: ExpiredToken, and the password is unchanged
     age_email_token(&s, &a.did, "reset_password", 16 * 60 * 1000).await;
-    let r = s.xrpc.post("com.atproto.server.resetPassword", &json!({"token": token, "password": "the-alt-password"}), &Auth::None).await;
+    let r = s
+        .xrpc
+        .post("com.atproto.server.resetPassword", &json!({"token": token, "password": "the-alt-password"}), &Auth::None)
+        .await;
     r.err(400, "ExpiredToken");
     let r = s.create_session(&a.handle, "the-alt-password").await;
     r.err(401, "AuthenticationRequired");
@@ -146,17 +165,38 @@ async fn ref_delete_account_mail_and_taken_down_delete() {
     assert!(mail["html"].as_str().unwrap().contains("To permanently delete your account"), "{mail}");
     let token = mail["token"].as_str().unwrap().to_string();
 
-    let r = s.xrpc.post("com.atproto.server.deleteAccount", &json!({"did": carol.did, "password": carol.password, "token": "123456"}), &Auth::None).await;
+    let r = s
+        .xrpc
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": carol.did, "password": carol.password, "token": "123456"}),
+            &Auth::None,
+        )
+        .await;
     r.err(400, "InvalidToken");
     assert_eq!(r.json["message"], json!("Token is invalid"));
-    let r = s.xrpc.post("com.atproto.server.deleteAccount", &json!({"did": carol.did, "password": "bad-pass", "token": token}), &Auth::None).await;
+    let r = s
+        .xrpc
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": carol.did, "password": "bad-pass", "token": token}),
+            &Auth::None,
+        )
+        .await;
     r.err(401, "AuthenticationRequired");
     assert_eq!(r.json["message"], json!("Invalid did or password"));
 
     // deletion works on an account that is already taken down
     set_repo_takedown(&s, &carol.did, true).await;
     let mut sub = s.subscribe_from_now().await;
-    s.xrpc.post("com.atproto.server.deleteAccount", &json!({"did": carol.did, "password": carol.password, "token": token}), &Auth::None).await.ok();
+    s.xrpc
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": carol.did, "password": carol.password, "token": token}),
+            &Auth::None,
+        )
+        .await
+        .ok();
     let ev = sub.wait_for(FH_TIMEOUT, &carol.did, "#account").await.pop().unwrap();
     assert_eq!((ev.bool("active"), ev.str("status")), (Some(false), Some("deleted")));
     let r = s.create_session(&carol.handle, &carol.password).await;
@@ -220,7 +260,8 @@ async fn ref_signing_key_rotation_resigns_the_repo() {
     let j = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let new_key = decode_did_key_k256(j["signingKey"].as_str().unwrap()).unwrap();
 
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#sync" && f.did() == Some(a.did.as_str()))).await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#sync" && f.did() == Some(a.did.as_str()))).await;
     let kinds: Vec<&str> = frames.iter().filter(|f| f.did() == Some(a.did.as_str())).map(|f| f.kind()).collect();
     assert_eq!(kinds, vec!["#identity", "#sync"], "{frames:?}");
     let sync = frames.iter().find(|f| f.kind() == "#sync").unwrap().sync().unwrap();
@@ -282,7 +323,11 @@ async fn ref_takendown_session_appeal_is_forwarded() {
     assert_eq!(r.json["message"], json!("Account has been taken down"));
     let j = s
         .xrpc
-        .post("com.atproto.server.createSession", &json!({"identifier": jeff.handle, "password": jeff.password, "allowTakendown": true}), &Auth::None)
+        .post(
+            "com.atproto.server.createSession",
+            &json!({"identifier": jeff.handle, "password": jeff.password, "allowTakendown": true}),
+            &Auth::None,
+        )
         .await
         .ok();
     let tok = Auth::Bearer(j["accessJwt"].as_str().unwrap().to_string());
@@ -307,8 +352,14 @@ async fn ref_takendown_session_appeal_is_forwarded() {
     assert_eq!(claims["aud"], json!("did:web:mod.test"));
     assert_eq!(claims["lxm"], json!("com.atproto.moderation.createReport"));
 
-    let r =
-        s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": jeff.did, "collection": "app.bsky.feed.post", "record": post_record("test")}), &tok).await;
+    let r = s
+        .xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": jeff.did, "collection": "app.bsky.feed.post", "record": post_record("test")}),
+            &tok,
+        )
+        .await;
     r.err(400, "InvalidToken");
     assert_eq!(r.json["message"], json!("Bad token scope"));
 }
@@ -326,7 +377,11 @@ async fn ref_large_upload_is_sniffed_and_hashed_whole() {
     let a = s.create_account("big").await;
     let mut file = vec![0u8; 25 * 1024 * 1024];
     file[..3].copy_from_slice(&[0xff, 0xd8, 0xff]);
-    let r = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", file.clone(), "application/octet-stream", &a.auth()).await.ok();
+    let r = s
+        .xrpc
+        .post_bytes("com.atproto.repo.uploadBlob", file.clone(), "application/octet-stream", &a.auth())
+        .await
+        .ok();
     let blob = &r["blob"];
     assert_eq!(blob["mimeType"], json!("image/jpeg"));
     assert_eq!(blob["size"], json!(file.len()));

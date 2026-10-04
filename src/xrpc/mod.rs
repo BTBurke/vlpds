@@ -4,42 +4,48 @@
 mod account_stats;
 mod admin;
 mod admin_tools;
-pub mod crawlers;
-pub mod cas;
-mod email2fa;
-mod feature_level;
-pub mod extract;
-pub mod internal;
 pub mod authn;
-pub mod blobs;
 mod blob_quota;
-pub mod moderation;
+pub mod blobs;
+pub mod cas;
+pub mod crawlers;
+mod ctl_load;
+mod email2fa;
+pub mod extract;
+mod feature_level;
 mod identity;
+pub mod import_budget;
+mod import_stream;
+pub mod internal;
+pub mod key_rotation;
+pub mod moderation;
+pub mod oauth;
 #[doc(hidden)]
 pub mod private_rows;
-pub mod key_rotation;
-pub mod oauth;
 pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
-pub mod import_budget;
-mod import_stream;
-pub mod staged_import;
 mod server;
-mod ctl_load;
+pub mod staged_import;
 mod sync;
 pub mod syntax;
 mod webui;
 pub use account_stats::{export_account_totals, scan_totals, totals, totals_loading};
 pub use blobs::spawn_blob_gc;
-pub use server::{drop_revocation, set_delete_crash_hook, reset_token_did, revocation_expired, set_stale_claim_grace, spawn_reserved_key_gc, sweep_reserved_keys};
-pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
-pub use sync::{export_memory_bytes, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
 pub use import_budget::ImportBudget;
-pub use webui::WebUi;
 pub use repo::DEFAULT_MAX_IMPORT_BYTES;
-pub use server::{LogMailer, Mail, Mailer};
 pub(crate) use server::SEC;
+pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
+pub use server::{
+    drop_revocation, reset_token_did, revocation_expired, set_delete_crash_hook, set_stale_claim_grace,
+    spawn_reserved_key_gc, sweep_reserved_keys,
+};
+pub use server::{LogMailer, Mail, Mailer};
+pub use sync::{
+    export_memory_bytes, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL,
+    DEFAULT_MAX_EXPORTS,
+};
+pub use webui::WebUi;
 
 #[allow(unused_imports)]
 mod prelude {
@@ -117,18 +123,15 @@ impl App {
         let p = self.partitions.shard_of(did);
         // moving or not reopened yet: nothing was done, so the entry node
         // resends writes (crate::forward)
-        self.partitions
-            .get(p)
-            .ok_or_else(|| XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("partition {p} is not owned by this node")))
+        self.partitions.get(p).ok_or_else(|| {
+            XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("partition {p} is not owned by this node"))
+        })
     }
 
     pub async fn resolve_handle(&self, handle: &str) -> Result<Option<String>, XrpcError> {
-        let path =
-            object_store::path::Path::from(format!("{}/handle/{}", self.store.prefix, handle));
+        let path = object_store::path::Path::from(format!("{}/handle/{}", self.store.prefix, handle));
         match self.store.raw.get(&path).await {
-            Ok(r) => Ok(Some(
-                String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string(),
-            )),
+            Ok(r) => Ok(Some(String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string())),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(XrpcError::from_err(e)),
         }
@@ -209,7 +212,11 @@ impl XrpcError {
         XrpcError { status: StatusCode::UNAUTHORIZED, error: "AuthenticationRequired".into(), message: message.into() }
     }
     pub fn internal(message: impl Into<String>) -> XrpcError {
-        XrpcError { status: StatusCode::INTERNAL_SERVER_ERROR, error: "InternalServerError".into(), message: message.into() }
+        XrpcError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error: "InternalServerError".into(),
+            message: message.into(),
+        }
     }
     pub fn unavailable(error: &str, message: impl Into<String>) -> XrpcError {
         XrpcError { status: StatusCode::SERVICE_UNAVAILABLE, error: error.into(), message: message.into() }
@@ -270,7 +277,8 @@ impl From<crate::secrets::SecretError> for XrpcError {
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         let unavailable = self.status == StatusCode::SERVICE_UNAVAILABLE;
-        let not_applied = unavailable && (self.error == crate::forward::SHARD_MOVED || self.error == crate::forward::REPO_LOADING);
+        let not_applied =
+            unavailable && (self.error == crate::forward::SHARD_MOVED || self.error == crate::forward::REPO_LOADING);
         let mut r = (self.status, Json(json!({"error": self.error, "message": self.message}))).into_response();
         if not_applied {
             r.extensions_mut().insert(crate::forward::NotApplied);
@@ -330,12 +338,10 @@ pub fn router(app: Arc<App>) -> Router {
     };
     r.layer(axum::middleware::from_fn(incorrect_method))
         .layer(axum::middleware::from_fn(track_http))
-        .layer(tower_http::compression::CompressionLayer::new().compress_when(
-            tower_http::compression::Predicate::and(
-                tower_http::compression::predicate::SizeAbove::new(1024),
-                JsonOrCar,
-            ),
-        ))
+        .layer(tower_http::compression::CompressionLayer::new().compress_when(tower_http::compression::Predicate::and(
+            tower_http::compression::predicate::SizeAbove::new(1024),
+            JsonOrCar,
+        )))
         .layer(axum::middleware::from_fn(cors))
         .with_state(app)
 }
@@ -350,11 +356,7 @@ impl tower_http::compression::predicate::Predicate for JsonOrCar {
     where
         B: axum::body::HttpBody,
     {
-        let ct = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let ct = response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
         let ct = ct.split(';').next().unwrap_or("").trim();
         ct == "application/json" || ct == "application/vnd.ipld.car"
     }
@@ -385,7 +387,10 @@ async fn cors(req: axum::extract::Request, next: axum::middleware::Next) -> Resp
         resp = StatusCode::NO_CONTENT.into_response();
         let h = resp.headers_mut();
         h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET,HEAD,PUT,PATCH,POST,DELETE"));
-        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, req_headers.unwrap_or(HeaderValue::from_static(CORS_ALLOW_HEADERS)));
+        h.insert(
+            header::ACCESS_CONTROL_ALLOW_HEADERS,
+            req_headers.unwrap_or(HeaderValue::from_static(CORS_ALLOW_HEADERS)),
+        );
         h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
     }
     let h = resp.headers_mut();
@@ -426,12 +431,8 @@ async fn track_http(req: axum::extract::Request, next: axum::middleware::Next) -
     metrics::HTTP_INFLIGHT.inc();
     let resp = next.run(req).await;
     metrics::HTTP_INFLIGHT.dec();
-    metrics::HTTP_DURATION
-        .with_label_values(&[&method])
-        .observe(start.elapsed().as_secs_f64());
-    metrics::HTTP_REQUESTS
-        .with_label_values(&[&method, resp.status().as_str()])
-        .inc();
+    metrics::HTTP_DURATION.with_label_values(&[&method]).observe(start.elapsed().as_secs_f64());
+    metrics::HTTP_REQUESTS.with_label_values(&[&method, resp.status().as_str()]).inc();
     resp
 }
 
@@ -442,13 +443,21 @@ pub(crate) use authn::{authed_repo, Auth, Credentials, MaybeAuth};
 pub fn inactive_account_error(status: &str) -> XrpcError {
     match status {
         "takendown" | "suspended" => takedown_error(),
-        "deactivated" => XrpcError { status: StatusCode::UNAUTHORIZED, error: "AccountDeactivated".into(), message: "Account is deactivated".into() },
+        "deactivated" => XrpcError {
+            status: StatusCode::UNAUTHORIZED,
+            error: "AccountDeactivated".into(),
+            message: "Account is deactivated".into(),
+        },
         st => XrpcError::bad(&inactive_error(st), format!("repo is {st}")),
     }
 }
 
 pub(crate) fn takedown_error() -> XrpcError {
-    XrpcError { status: StatusCode::UNAUTHORIZED, error: "AccountTakedown".into(), message: "Account has been taken down".into() }
+    XrpcError {
+        status: StatusCode::UNAUTHORIZED,
+        error: "AccountTakedown".into(),
+        message: "Account has been taken down".into(),
+    }
 }
 
 /// RepoDeactivated, RepoTakendown, ...
@@ -464,7 +473,10 @@ pub fn inactive_error(status: &str) -> String {
 /// between the caller's lookup and the enqueue is refused by the log with
 /// nothing written: ShardMoved, so the entry node resends the request to the
 /// new owner (which re-runs any conditional write's checks).
-pub(crate) async fn write_private_local(p: &crate::partition::Partition, muts: Vec<crate::segment::Mutation>) -> Result<(), XrpcError> {
+pub(crate) async fn write_private_local(
+    p: &crate::partition::Partition,
+    muts: Vec<crate::segment::Mutation>,
+) -> Result<(), XrpcError> {
     let (tx, rx) = oneshot::channel();
     let entry = crate::partition::LogEntry {
         shard: p.id,
@@ -480,7 +492,10 @@ pub(crate) async fn write_private_local(p: &crate::partition::Partition, muts: V
     p.tx.send(entry).await.map_err(|_| XrpcError::internal("partition sequencer gone"))?;
     rx.await.map_err(|_| XrpcError::internal("log dropped write"))?.map_err(|e| {
         if e.to_string() == crate::nodelog::NOT_HELD {
-            return XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("partition {} closed under this write", p.id));
+            return XrpcError::unavailable(
+                crate::forward::SHARD_MOVED,
+                format!("partition {} closed under this write", p.id),
+            );
         }
         XrpcError::internal(e.to_string())
     })
@@ -503,7 +518,10 @@ impl App {
         if self.cluster.is_none() {
             return Ok(crypto::random_plc_did());
         }
-        (0..10_000).map(|_| crypto::random_plc_did()).find(|did| self.partitions.for_key(did).is_some()).ok_or_else(no_partitions)
+        (0..10_000)
+            .map(|_| crypto::random_plc_did())
+            .find(|did| self.partitions.for_key(did).is_some())
+            .ok_or_else(no_partitions)
     }
 
     /// (did, genesis op), re-signed until the DID lands in a partition this
@@ -526,7 +544,10 @@ impl App {
 
     /// A repo's latest durable (head, MST) plus a SlateDB snapshot consistent
     /// with it. O(1): the MST is the worker's copy-on-write tree.
-    pub async fn repo_view(&self, did: &str) -> Result<(Arc<crate::worker::DurableView>, Arc<slatedb::DbSnapshot>), XrpcError> {
+    pub async fn repo_view(
+        &self,
+        did: &str,
+    ) -> Result<(Arc<crate::worker::DurableView>, Arc<slatedb::DbSnapshot>), XrpcError> {
         let Ok(permit) = self.read_permits.clone().try_acquire_owned() else {
             return Err(XrpcError::unavailable("Overloaded", "too many reads queued; retry with backoff"));
         };

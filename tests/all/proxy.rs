@@ -1,15 +1,15 @@
 //! Service proxying (atproto-proxy / default AppView), preferences and
 //! createReport, against a fake AppView that verifies the service-auth JWTs.
 
+use crate::common::*;
 use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
 use k256::ecdsa::signature::Verifier;
 use parking_lot::Mutex;
-use crate::common::*;
 use std::sync::Arc;
 
 const APPVIEW_DID: &str = "did:web:appview.test";
@@ -53,7 +53,12 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
         }))
         .into_response();
     }
-    f.seen.lock().push(Seen { method: parts.method.to_string(), uri: parts.uri.to_string(), headers: parts.headers.clone(), body: body.clone() });
+    f.seen.lock().push(Seen {
+        method: parts.method.to_string(),
+        uri: parts.uri.to_string(),
+        headers: parts.headers.clone(),
+        body: body.clone(),
+    });
     let json_err = |status: u16, v: J| (StatusCode::from_u16(status).unwrap(), axum::Json(v)).into_response();
     match path.as_str() {
         "/xrpc/app.bsky.test.err400" => {
@@ -69,7 +74,8 @@ async fn fake_handler(State(f): State<Fake>, req: Request) -> Response {
             let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             e.write_all(br#"{"error":"CustomGz","message":"zipped boom"}"#).unwrap();
             let gz = e.finish().unwrap();
-            (StatusCode::BAD_REQUEST, [("content-type", "application/json"), ("content-encoding", "gzip")], gz).into_response()
+            (StatusCode::BAD_REQUEST, [("content-type", "application/json"), ("content-encoding", "gzip")], gz)
+                .into_response()
         }
         "/xrpc/app.bsky.test.echo" => {
             let ct = parts.headers.get("content-type").cloned().unwrap_or("application/octet-stream".parse().unwrap());
@@ -214,7 +220,12 @@ async fn proxies_to_default_appview_with_service_auth_and_header_rules() {
     assert_eq!(claims["lxm"], "app.bsky.feed.getTimeline");
 
     // Explicit header naming the configured AppView goes to the same place.
-    let r = env.get(Some(&alice), "app.bsky.actor.getProfile?actor=x").header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview")).send().await.unwrap();
+    let r = env
+        .get(Some(&alice), "app.bsky.actor.getProfile?actor=x")
+        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(env.appview.last().uri, "/xrpc/app.bsky.actor.getProfile?actor=x");
 }
@@ -280,7 +291,10 @@ async fn maps_upstream_errors() {
     assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (400, Some("CustomGz"), Some("zipped boom")));
 
     let (s, b) = err_of(env.get(Some(&u), "app.bsky.test.err404plain").send().await.unwrap()).await;
-    assert_eq!((s, b["error"].as_str(), b["message"].as_str()), (404, Some("XRPCNotSupported"), Some("XRPC Not Supported")));
+    assert_eq!(
+        (s, b["error"].as_str(), b["message"].as_str()),
+        (404, Some("XRPCNotSupported"), Some("XRPC Not Supported"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -314,27 +328,44 @@ async fn target_selection_and_rejections() {
     // in that catchall. Clients that set atproto-proxy on every request
     // (e.g. getSession) keep working.
     let seen = env.appview.count();
-    let r = env.get(Some(&u), "com.atproto.server.listAppPasswords").header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview")).send().await.unwrap();
+    let r = env
+        .get(Some(&u), "com.atproto.server.listAppPasswords")
+        .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let b: J = r.json().await.unwrap();
     assert!(b["passwords"].is_array(), "{b}");
     assert_eq!(env.appview.count(), seen, "protected method must not reach the upstream");
     // Malformed headers.
     for bad in ["did:web:x", "#svc", "did:web:x#", "did:web:x#a#b", "did:web:x #a"] {
-        let (s, b) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", bad).send().await.unwrap()).await;
+        let (s, b) =
+            err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", bad).send().await.unwrap())
+                .await;
         assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")), "{bad}");
     }
     // Unresolvable DID.
-    let (s, b) =
-        err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#bsky_appview").send().await.unwrap())
-            .await;
+    let (s, b) = err_of(
+        env.get(Some(&u), "app.bsky.feed.getTimeline")
+            .header("atproto-proxy", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#bsky_appview")
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!((s, b["message"].as_str()), (400, Some("could not resolve proxy did")));
     assert_eq!(env.appview.count(), 0);
 
     // did:web target resolved via /.well-known/did.json (dev mode allows http + loopback).
     let key = env.s.signing_key(&u.did).await;
     let other_did = env.reports.did.lock().clone();
-    let r = env.get(Some(&u), "chat.bsky.convo.listConvos?limit=1").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
+    let r = env
+        .get(Some(&u), "chat.bsky.convo.listConvos?limit=1")
+        .header("atproto-proxy", format!("{other_did}#other_svc"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let seen = env.reports.last();
     assert_eq!(seen.uri, "/xrpc/chat.bsky.convo.listConvos?limit=1");
@@ -346,16 +377,31 @@ async fn target_selection_and_rejections() {
     let (s, b) = err_of(env.get(Some(&u), "Chat.Bsky.convo.listConvos").send().await.unwrap()).await;
     assert_eq!((s, b["error"].as_str()), (400, Some("InvalidRequest")), "{b}");
     // ...and a non-privileged app password can't reach any of them
-    let pw = env.s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "plain", "privileged": false}), &u.auth()).await.ok();
+    let pw = env
+        .s
+        .xrpc
+        .post("com.atproto.server.createAppPassword", &json!({"name": "plain", "privileged": false}), &u.auth())
+        .await
+        .ok();
     let app_pw = env.session(&u, pw["password"].as_str().unwrap(), json!({})).await;
     let before = env.reports.seen.lock().len();
     for lxm in ["chat.bsky.convo.addReaction", "CHAT.bsky.convo.addReaction", "Chat.Bsky.Convo.AddReaction"] {
-        let (s, _) = err_of(env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap()).await;
+        let (s, _) = err_of(
+            env.get(Some(&app_pw), lxm).header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap(),
+        )
+        .await;
         assert!((400..500).contains(&s), "{lxm}: {s}");
     }
     assert_eq!(env.reports.seen.lock().len(), before, "an app password reached a chat method");
     // Unknown service id in a resolvable document.
-    let (s, b) = err_of(env.get(Some(&u), "chat.bsky.convo.listConvos").header("atproto-proxy", format!("{other_did}#nope")).send().await.unwrap()).await;
+    let (s, b) = err_of(
+        env.get(Some(&u), "chat.bsky.convo.listConvos")
+            .header("atproto-proxy", format!("{other_did}#nope"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!((s, b["message"].as_str()), (400, Some("could not resolve proxy did service url")));
 }
 
@@ -365,11 +411,25 @@ async fn ssrf_guard_outside_dev_mode() {
     let u = env.s.create_account("frank").await;
     // A local account's #atproto_pds endpoint is plain http on loopback:
     // refused before connecting.
-    let (s, b) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", format!("{}#atproto_pds", u.did)).send().await.unwrap()).await;
+    let (s, b) = err_of(
+        env.get(Some(&u), "app.bsky.feed.getTimeline")
+            .header("atproto-proxy", format!("{}#atproto_pds", u.did))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!((s, b["error"].as_str()), (502, Some("UpstreamFailure")));
     // did:web on an IP literal is fetched over https (and loopback is refused).
     let other_did = env.reports.did.lock().clone();
-    let (s, _) = err_of(env.get(Some(&u), "app.bsky.feed.getTimeline").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap()).await;
+    let (s, _) = err_of(
+        env.get(Some(&u), "app.bsky.feed.getTimeline")
+            .header("atproto-proxy", format!("{other_did}#other_svc"))
+            .send()
+            .await
+            .unwrap(),
+    )
+    .await;
     assert_eq!(s, 400);
     assert_eq!(env.reports.count(), 0);
     // The operator-configured AppView is trusted even on loopback.
@@ -381,7 +441,9 @@ async fn preferences_round_trip_and_validation() {
     let env = spawn_env(true).await;
     let u = env.s.create_account("gina").await;
 
-    let get = || async { env.get(Some(&u), "app.bsky.actor.getPreferences").send().await.unwrap().json::<J>().await.unwrap() };
+    let get = || async {
+        env.get(Some(&u), "app.bsky.actor.getPreferences").send().await.unwrap().json::<J>().await.unwrap()
+    };
     assert_eq!(get().await, json!({"preferences": []}));
 
     let prefs = json!([
@@ -404,7 +466,10 @@ async fn preferences_round_trip_and_validation() {
         ]
     );
     assert_eq!(got[1], prefs[1]);
-    assert_eq!(got[3], json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true}));
+    assert_eq!(
+        got[3],
+        json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true})
+    );
 
     // Replace: the namespace is overwritten as a whole.
     let r = env
@@ -414,7 +479,10 @@ async fn preferences_round_trip_and_validation() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
-    assert_eq!(get().await, json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]}));
+    assert_eq!(
+        get().await,
+        json!({"preferences": [{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]})
+    );
 
     for (body, msg) in [
         (json!({"preferences": [{"enabled": true}]}), "Preference is missing a $type"),
@@ -441,7 +509,12 @@ async fn preferences_for_another_appview_are_proxied() {
     let env = spawn_env(true).await;
     let u = env.s.create_account("ivy").await;
     let other_did = env.reports.did.lock().clone();
-    let r = env.get(Some(&u), "app.bsky.actor.getPreferences").header("atproto-proxy", format!("{other_did}#other_svc")).send().await.unwrap();
+    let r = env
+        .get(Some(&u), "app.bsky.actor.getPreferences")
+        .header("atproto-proxy", format!("{other_did}#other_svc"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     let seen = env.reports.last();
     assert_eq!(seen.uri, "/xrpc/app.bsky.actor.getPreferences");
@@ -454,8 +527,7 @@ async fn create_report_goes_to_report_service() {
     let env = spawn_env(true).await;
     let u = env.s.create_account("jack").await;
     let key = env.s.signing_key(&u.did).await;
-    let report =
-        json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:spammer"}});
+    let report = json!({"reasonType": "com.atproto.moderation.defs#reasonSpam", "subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "did:plc:spammer"}});
     let r = env.post(&u, "com.atproto.moderation.createReport").json(&report).send().await.unwrap();
     assert_eq!(r.status(), 200);
     let v: J = r.json().await.unwrap();
@@ -470,7 +542,9 @@ async fn create_report_goes_to_report_service() {
     assert_eq!(claims["lxm"], "com.atproto.moderation.createReport");
     assert_eq!(env.appview.count(), 0);
 
-    let (s, _) = err_of(env.post(&u, "com.atproto.moderation.createReport").json(&json!({"subject": {}})).send().await.unwrap()).await;
+    let (s, _) =
+        err_of(env.post(&u, "com.atproto.moderation.createReport").json(&json!({"subject": {}})).send().await.unwrap())
+            .await;
     assert_eq!(s, 400);
 }
 
@@ -514,8 +588,16 @@ async fn get_record_for_unhosted_repo_goes_to_appview() {
     }
     // a local repo is served locally, misses included
     let n = env.appview.count();
-    let (s, e) =
-        err_of(env.get(None, &format!("com.atproto.repo.getRecord?repo={}&collection=app.bsky.actor.profile&rkey=self", u.did)).send().await.unwrap()).await;
+    let (s, e) = err_of(
+        env.get(
+            None,
+            &format!("com.atproto.repo.getRecord?repo={}&collection=app.bsky.actor.profile&rkey=self", u.did),
+        )
+        .send()
+        .await
+        .unwrap(),
+    )
+    .await;
     assert_eq!((s, e["error"].as_str()), (400, Some("RecordNotFound")));
     assert_eq!(env.appview.count(), n);
 }

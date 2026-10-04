@@ -162,9 +162,26 @@ fn pick<'a>(rng: &mut impl Rng, xs: &[&'a str]) -> &'a str {
 
 fn rand_string(rng: &mut impl Rng) -> String {
     const PIECES: &[&str] = &[
-        "a", "z", "text", "$type", "\\\"", "\\\\", "\\n", "\\u00e9", "\\ud83d\\ude00", "é", "日本",
-        "😀", "/", " ", "\\u0000", "blob", "app.bsky.feed.post", "2026-10-01T12:34:56.789Z",
-        "did:plc:ewvi7nxzyoun6zhxrhs64oiz", "en",
+        "a",
+        "z",
+        "text",
+        "$type",
+        "\\\"",
+        "\\\\",
+        "\\n",
+        "\\u00e9",
+        "\\ud83d\\ude00",
+        "é",
+        "日本",
+        "😀",
+        "/",
+        " ",
+        "\\u0000",
+        "blob",
+        "app.bsky.feed.post",
+        "2026-10-01T12:34:56.789Z",
+        "did:plc:ewvi7nxzyoun6zhxrhs64oiz",
+        "en",
     ];
     let n = rng.gen_range(0..4);
     let s: String = (0..n).map(|_| pick(rng, PIECES)).collect();
@@ -190,8 +207,27 @@ fn rand_number(rng: &mut impl Rng) -> String {
 
 /// Keys drawn from a small pool, so maps repeat keys and hit the special ones.
 const KEYS: &[&str] = &[
-    "$type", "$link", "$bytes", "text", "createdAt", "cid", "mimeType", "ref", "size", "a", "bb",
-    "subject", "uri", "langs", "embed", "images", "image", "alt", "facets", "é", "\\u00e9",
+    "$type",
+    "$link",
+    "$bytes",
+    "text",
+    "createdAt",
+    "cid",
+    "mimeType",
+    "ref",
+    "size",
+    "a",
+    "bb",
+    "subject",
+    "uri",
+    "langs",
+    "embed",
+    "images",
+    "image",
+    "alt",
+    "facets",
+    "é",
+    "\\u00e9",
 ];
 
 fn rand_json(rng: &mut impl Rng, depth: usize) -> String {
@@ -206,10 +242,9 @@ fn rand_json(rng: &mut impl Rng, depth: usize) -> String {
             format!("[{}]", items.join(","))
         }
         7 => format!("{{\"$link\":\"{}\"}}", pick(rng, CIDS)),
-        8 => format!(
-            "{{\"$bytes\":\"{}\"}}",
-            pick(rng, &["", "AQID", "AQID==", "AQIDBA", "AQIDBA=", "A", "!!", "AQ=="])
-        ),
+        8 => {
+            format!("{{\"$bytes\":\"{}\"}}", pick(rng, &["", "AQID", "AQID==", "AQIDBA", "AQIDBA=", "A", "!!", "AQ=="]))
+        }
         9 => {
             // blob refs, well-formed and not
             let mut f = vec![
@@ -238,7 +273,16 @@ fn rand_json(rng: &mut impl Rng, depth: usize) -> String {
                     let v = match (k, rng.gen_range(0..3)) {
                         ("$type", 0) => format!(
                             "\"{}\"",
-                            pick(rng, &["app.bsky.feed.post", "app.bsky.embed.images", "blob", "", "app.bsky.richtext.facet#mention"])
+                            pick(
+                                rng,
+                                &[
+                                    "app.bsky.feed.post",
+                                    "app.bsky.embed.images",
+                                    "blob",
+                                    "",
+                                    "app.bsky.richtext.facet#mention"
+                                ]
+                            )
                         ),
                         _ => rand_json(rng, depth + 1),
                     };
@@ -282,8 +326,19 @@ fn mutated_posts_same_verdicts() {
     assert!(check(&base.to_string()));
     let mut rng = rand::rngs::StdRng::seed_from_u64(8);
     let paths: &[&[&str]] = &[
-        &["text"], &["createdAt"], &["langs"], &["facets"], &["reply"], &["reply", "root"], &["reply", "root", "cid"],
-        &["embed"], &["embed", "$type"], &["embed", "images"], &["$type"], &["tags"], &["labels"],
+        &["text"],
+        &["createdAt"],
+        &["langs"],
+        &["facets"],
+        &["reply"],
+        &["reply", "root"],
+        &["reply", "root", "cid"],
+        &["embed"],
+        &["embed", "$type"],
+        &["embed", "images"],
+        &["$type"],
+        &["tags"],
+        &["labels"],
     ];
     let mut valid = 0;
     for _ in 0..20_000 {

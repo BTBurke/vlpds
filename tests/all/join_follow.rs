@@ -15,9 +15,9 @@
 //! node's stream be the union of all logs.
 
 use crate::common::*;
-use crate::firehose_startup::{Writers, collect, mismatch, node_with, s3_union};
-use std::sync::Arc;
+use crate::firehose_startup::{collect, mismatch, node_with, s3_union, Writers};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const SHARDS: usize = 8;
@@ -27,7 +27,10 @@ async fn late_follower_loses_no_joiner_events() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let a = node_with("jf-a", &store, None).await;
     let b = node_with("jf-b", &store, None).await;
-    wait_until("a and b split the shards", Duration::from_secs(10), || owned(&a) == SHARDS / 2 && owned(&b) == SHARDS / 2).await;
+    wait_until("a and b split the shards", Duration::from_secs(10), || {
+        owned(&a) == SHARDS / 2 && owned(&b) == SHARDS / 2
+    })
+    .await;
     let accounts: Vec<TestAccount> = futures::future::join_all((0..16).map(|_| a.create_account("jf"))).await;
     let target = Arc::new(AtomicI64::new(0));
     let a_live = collect(a.subscribe(None).await, target.clone());

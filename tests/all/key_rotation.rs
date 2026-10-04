@@ -36,7 +36,13 @@ fn plc_key(plc: &MockPlc, did: &str) -> String {
 }
 
 async fn create(s: &TestServer, a: &TestAccount, text: &str) -> Resp {
-    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(text)}), &a.auth()).await
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(text)}),
+            &a.auth(),
+        )
+        .await
 }
 
 /// The frames of `did` after the cursor, once its `#sync` arrived.
@@ -101,7 +107,9 @@ async fn rotation_under_concurrent_writes() {
     assert_eq!(local_key(&s, &a.did).await, new_did_key);
 
     let at_rotation = n_acked();
-    eventually(Duration::from_secs(20), || async { (n_acked() >= at_rotation + 40).then_some(()) }).await.expect("writes after");
+    eventually(Duration::from_secs(20), || async { (n_acked() >= at_rotation + 40).then_some(()) })
+        .await
+        .expect("writes after");
     stop.store(true, Ordering::Relaxed);
     for w in writers {
         w.await.unwrap();
@@ -190,8 +198,15 @@ async fn plc_refusal_and_outage() {
     assert!(s.app.account(&a.did).await.ok().unwrap().pending_signing_key.is_some());
     plc.set_down(false);
     // the retry asks for a reserved key: the pending rotation wins
-    let other = s.xrpc.post("com.atproto.server.reserveSigningKey", &json!({"did": a.did}), &Auth::None).await.ok()["signingKey"].as_str().unwrap().to_string();
-    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": other}), &Auth::Admin).await;
+    let other = s.xrpc.post("com.atproto.server.reserveSigningKey", &json!({"did": a.did}), &Auth::None).await.ok()
+        ["signingKey"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let r = s
+        .xrpc
+        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": other}), &Auth::Admin)
+        .await;
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("now finished"), "{}", r.text());
     assert_eq!(local_key(&s, &a.did).await, new_did_key);
@@ -209,7 +224,8 @@ async fn plc_refusal_and_outage() {
     // publishIdentity syncPlc (rotate-keys): re-signed with the held key
     let (head1, rev1) = s.latest_commit(&a.did).await;
     let mut sub = s.subscribe_from_now().await;
-    let j = s.xrpc.post("vlpds.admin.publishIdentity", &json!({"did": a.did, "syncPlc": true}), &Auth::Admin).await.ok();
+    let j =
+        s.xrpc.post("vlpds.admin.publishIdentity", &json!({"did": a.did, "syncPlc": true}), &Auth::Admin).await.ok();
     assert_eq!(j["plcUpdated"], json!(false), "{j}");
     let frames = identity_then_sync(&mut sub, &a.did).await;
     assert_eq!(frames.iter().map(|f| f.kind()).collect::<Vec<_>>(), vec!["#identity", "#sync"]);
@@ -246,7 +262,8 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, plc: &MockPl
         c.checkpoint_every = Duration::from_secs(3600);
         use_plc(c, plc_url, rot);
         let l = lease(c);
-        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
+        (l.ttl, l.renew_every, l.skew) =
+            (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
     })
     .await
 }
@@ -272,7 +289,10 @@ async fn crash_mid_rotation(phase: &'static str, by: FinishBy) {
     let tag = unique_name("kr");
     let a = node(&format!("{tag}-a"), &store, &plc, &rot).await;
     let b = node(&format!("{tag}-b"), &store, &plc, &rot).await;
-    wait_until("both own shards", Duration::from_secs(15), || owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4).await;
+    wait_until("both own shards", Duration::from_secs(15), || {
+        owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4
+    })
+    .await;
     // created on b: in a shard b owns
     let x = b.create_account("krx").await;
     assert!(b.app.partition(&x.did).is_ok());
@@ -319,7 +339,8 @@ async fn crash_mid_rotation(phase: &'static str, by: FinishBy) {
             // the fenced write's kick can't finish against the outage
             plc.set_down(true);
             create(&a, &x, "fenced").await.err(503, "KeyUnavailable");
-            wait_until("the kick's backoff", Duration::from_secs(10), || !vlpds::xrpc::key_rotation::driving(&x.did)).await;
+            wait_until("the kick's backoff", Duration::from_secs(10), || !vlpds::xrpc::key_rotation::driving(&x.did))
+                .await;
             plc.set_down(false);
             assert!(a.app.account(&x.did).await.ok().unwrap().pending_signing_key.is_some());
             let j = rotate(&a, &x.did).await.ok();

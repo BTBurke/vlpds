@@ -49,7 +49,10 @@ pub enum RecvError {
 }
 
 pub fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
-    let inner = Arc::new(Inner { state: Mutex::new(State { queue: VecDeque::new(), senders: 1, receiver: true }), ready: Condvar::new() });
+    let inner = Arc::new(Inner {
+        state: Mutex::new(State { queue: VecDeque::new(), senders: 1, receiver: true }),
+        ready: Condvar::new(),
+    });
     (Sender(inner.clone()), Receiver(inner))
 }
 

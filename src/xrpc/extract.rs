@@ -6,12 +6,12 @@
 
 use super::syntax;
 use super::XrpcError;
+use crate::cbor::JsonValue;
 use axum::extract::{FromRequest, FromRequestParts, OptionalFromRequest, Request};
 use axum::http::request::Parts;
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
-use crate::cbor::JsonValue;
 use serde::de::DeserializeOwned;
 
 const JSON_LIMIT: usize = 150 * 1024;
@@ -86,11 +86,7 @@ fn parse<'a, T: serde::Deserialize<'a>>(body: &'a [u8]) -> Result<T, XrpcError> 
 }
 
 fn input_nsid(req: &Request) -> Option<String> {
-    req.uri()
-        .path()
-        .strip_prefix("/xrpc/")
-        .filter(|n| crate::lexicon::has_input_schema(n))
-        .map(String::from)
+    req.uri().path().strip_prefix("/xrpc/").filter(|n| crate::lexicon::has_input_schema(n)).map(String::from)
 }
 
 fn parse_input<T: DeserializeOwned>(nsid: Option<&str>, body: &[u8]) -> Result<T, XrpcError> {
@@ -177,9 +173,7 @@ pub fn limit_param(v: Option<i64>, default: usize, min: i64, max: i64) -> Result
 pub fn valid_cid_syntax(s: &str) -> bool {
     (8..=256).contains(&s.len())
         && !s.starts_with("Qm")
-        && s
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"+/=-_".contains(&b))
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"+/=-_".contains(&b))
 }
 
 pub fn valid_at_identifier(s: &str) -> bool {
@@ -229,9 +223,7 @@ impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Query<T> {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         validate_params(parts)?;
-        axum::extract::Query::<T>::try_from_uri(&parts.uri)
-            .map(|q| Query(q.0))
-            .map_err(|e| invalid(e.body_text()))
+        axum::extract::Query::<T>::try_from_uri(&parts.uri).map(|q| Query(q.0)).map_err(|e| invalid(e.body_text()))
     }
 }
 
@@ -243,9 +235,7 @@ struct HandlerJson;
 
 /// Debug builds only: a 200 [`Json`] response that doesn't match its output
 /// schema becomes a 500, so handler bugs fail the test suite.
-pub fn debug_output_layer<S: Clone + Send + Sync + 'static>(
-    r: axum::Router<S>,
-) -> axum::Router<S> {
+pub fn debug_output_layer<S: Clone + Send + Sync + 'static>(r: axum::Router<S>) -> axum::Router<S> {
     #[cfg(debug_assertions)]
     let r = r.layer(axum::middleware::from_fn(check_output));
     r

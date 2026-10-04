@@ -117,7 +117,8 @@ fn multibase_and_did_key_agree() {
 #[test]
 fn service_auth_jwt_is_es256k_and_verifies() {
     let kp = vlpds::crypto::Keypair::generate();
-    let tok = vlpds::auth::service_auth_jwt(&kp, "did:plc:abc", "did:web:example.com", Some("com.example.method"), 60).unwrap();
+    let tok = vlpds::auth::service_auth_jwt(&kp, "did:plc:abc", "did:web:example.com", Some("com.example.method"), 60)
+        .unwrap();
     let parts: Vec<&str> = tok.split('.').collect();
     assert_eq!(parts.len(), 3);
     let header: J = serde_json::from_slice(&b64url_decode(parts[0])).unwrap();

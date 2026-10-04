@@ -26,7 +26,13 @@ async fn metric(s: &TestServer, series: &str) -> f64 {
 /// requestEmailConfirmation for `a` through `n`: 200 and one mail, or 429
 /// and none.
 async fn confirm_mail(n: &TestServer, a: &TestAccount, sent: bool) {
-    let (r, _) = mailed_n(n, &a.email, sent as usize, n.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (r, _) = mailed_n(
+        n,
+        &a.email,
+        sent as usize,
+        n.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth()),
+    )
+    .await;
     if sent {
         r.ok();
     } else {
@@ -65,7 +71,13 @@ async fn cluster_budget_is_shared_and_survives_a_node() {
     assert!(metric(&b, series).await > before, "{series} moved");
 
     // a password reset over it answers as if mailed and mails nothing
-    let (r, _) = mailed_n(&b, &on_b[2].email, 0, b.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": on_b[2].email}), &Auth::None)).await;
+    let (r, _) = mailed_n(
+        &b,
+        &on_b[2].email,
+        0,
+        b.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": on_b[2].email}), &Auth::None),
+    )
+    .await;
     r.ok();
     // moderation mail is exempt
     let body = json!({"recipientDid": on_b[2].did, "content": "<p>hello</p>", "senderDid": "did:example:mod"});
@@ -75,14 +87,24 @@ async fn cluster_budget_is_shared_and_survives_a_node() {
     // the console shows the one cluster count and the flag's default
     let s = a.xrpc.get("vlpds.admin.getRateLimits", &[("top", "5")], &Auth::Admin).await.ok();
     let row = s["limiters"].as_array().unwrap().iter().find(|l| l["name"] == "mail-cluster-day").unwrap().clone();
-    assert_eq!((row["key"].as_str(), row["points"].as_u64(), row["default"]["points"].as_u64()), (Some("cluster"), Some(5), Some(5)), "{row}");
+    assert_eq!(
+        (row["key"].as_str(), row["points"].as_u64(), row["default"]["points"].as_u64()),
+        (Some("cluster"), Some(5), Some(5)),
+        "{row}"
+    );
     assert_eq!(row["windowSecs"], 86400);
     let top = &s["top"]["mail-cluster-day"][0];
-    assert_eq!((top["key"].as_str(), top["used"].as_u64(), top["limit"].as_u64()), (Some("cluster"), Some(5), Some(5)), "{s}");
+    assert_eq!(
+        (top["key"].as_str(), top["used"].as_u64(), top["limit"].as_u64()),
+        (Some("cluster"), Some(5), Some(5)),
+        "{s}"
+    );
 
     // b goes down; a takes its accounts and the count stands
     b.app.node.halt();
-    eventually(Duration::from_secs(20), || async { (owned(&a) == SHARDS as usize).then_some(()) }).await.expect("a takes over");
+    eventually(Duration::from_secs(20), || async { (owned(&a) == SHARDS as usize).then_some(()) })
+        .await
+        .expect("a takes over");
     confirm_mail(&a, &on_b[2], false).await;
 
     // raised in the console: two more, then refused again
@@ -127,6 +149,8 @@ async fn a_new_node_reads_the_count() {
     confirm_mail(&a, &y, true).await;
     a.app.node.halt();
     let b = node("b", &store, 2).await;
-    eventually(Duration::from_secs(20), || async { (owned(&b) == SHARDS as usize).then_some(()) }).await.expect("b takes over");
+    eventually(Duration::from_secs(20), || async { (owned(&b) == SHARDS as usize).then_some(()) })
+        .await
+        .expect("b takes over");
     confirm_mail(&b, &x, false).await;
 }

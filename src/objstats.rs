@@ -88,7 +88,12 @@ async fn sleep_lognormal(median_ms: f64, sigma: f64) {
 }
 
 pub fn counted(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str) -> Arc<dyn ObjectStore> {
-    Arc::new(Counting { inner, prefix: prefix.trim_end_matches('/').to_string(), client, latency: Latency::from_env(client) })
+    Arc::new(Counting {
+        inner,
+        prefix: prefix.trim_end_matches('/').to_string(),
+        client,
+        latency: Latency::from_env(client),
+    })
 }
 
 fn count(op: &str, comp: &str, client: &str, result: &str) {
@@ -141,7 +146,9 @@ impl Req {
     fn finish<T>(mut self, r: &Result<T>) {
         self.done = true;
         count(self.op, self.comp, self.client, r.as_ref().map_or_else(result_label, |_| "ok"));
-        crate::metrics::OBJ_DURATION.with_label_values(&[self.op, self.comp]).observe(self.start.elapsed().as_secs_f64());
+        crate::metrics::OBJ_DURATION
+            .with_label_values(&[self.op, self.comp])
+            .observe(self.start.elapsed().as_secs_f64());
     }
 }
 
@@ -172,7 +179,11 @@ impl Counting {
 
     /// Timed to the first page; one more request per 1,000 keys (the
     /// S3/GCS/R2 page size).
-    fn count_list(&self, comp: &'static str, mut s: BoxStream<'static, Result<ObjectMeta>>) -> BoxStream<'static, Result<ObjectMeta>> {
+    fn count_list(
+        &self,
+        comp: &'static str,
+        mut s: BoxStream<'static, Result<ObjectMeta>>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
         let client = self.client;
         let mut first = Some(Req::new("list", comp, client));
         let mut n = 0u64;
@@ -371,7 +382,13 @@ mod tests {
         let s = counted(Arc::new(object_store::memory::InMemory::new()), "objstats-test", "state");
         let p = Path::from("objstats-test/retain/x");
         let c = "retention_report";
-        let (put0, get0, list0, del0, t0) = (n("put_create", c, "ok"), n("get_range", c, "ok"), n("list", c, "ok"), n("delete", c, "ok"), timed("get_range", c));
+        let (put0, get0, list0, del0, t0) = (
+            n("put_create", c, "ok"),
+            n("get_range", c, "ok"),
+            n("list", c, "ok"),
+            n("delete", c, "ok"),
+            timed("get_range", c),
+        );
         s.put_opts(&p, PutPayload::from_static(b"hello"), PutMode::Create.into()).await.unwrap();
         s.get_range(&p, 0..2).await.unwrap();
         let _: Vec<_> = s.list(Some(&Path::from("objstats-test/retain"))).collect().await;
@@ -388,7 +405,8 @@ mod tests {
         let s = counted(Arc::new(object_store::memory::InMemory::new()), "objstats-res", "state");
         let p = Path::from("objstats-res/assign/001");
         let c = "ctl_assign";
-        let (nf0, pre0, empty0) = (n("get", c, "not_found"), n("put_create", c, "precondition"), n("list", "ctl_lease", "ok"));
+        let (nf0, pre0, empty0) =
+            (n("get", c, "not_found"), n("put_create", c, "precondition"), n("list", "ctl_lease", "ok"));
         assert!(matches!(s.get(&p).await, Err(object_store::Error::NotFound { .. })));
         s.put_opts(&p, PutPayload::from_static(b"a"), PutMode::Create.into()).await.unwrap();
         assert!(s.put_opts(&p, PutPayload::from_static(b"b"), PutMode::Create.into()).await.is_err());
@@ -401,7 +419,12 @@ mod tests {
     #[tokio::test]
     async fn dropped_requests_count_as_cancelled() {
         let inner: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        let slow = Counting { inner, prefix: "objstats-cancel".into(), client: "state", latency: Some(Latency { read_ms: 60_000.0, write_ms: 60_000.0, sigma: 0.0 }) };
+        let slow = Counting {
+            inner,
+            prefix: "objstats-cancel".into(),
+            client: "state",
+            latency: Some(Latency { read_ms: 60_000.0, write_ms: 60_000.0, sigma: 0.0 }),
+        };
         let p = Path::from("objstats-cancel/writers/007");
         let (c0, t0) = (n("get", "ctl_writer", "cancelled"), timed("get", "ctl_writer"));
         assert!(tokio::time::timeout(std::time::Duration::from_millis(10), slow.get(&p)).await.is_err());
@@ -411,9 +434,13 @@ mod tests {
 
     #[test]
     fn timeouts_from_the_message_chain() {
-        let t = object_store::Error::Generic { store: "S3", source: "error sending request: operation timed out".into() };
+        let t =
+            object_store::Error::Generic { store: "S3", source: "error sending request: operation timed out".into() };
         assert_eq!(result_label(&t), "timeout");
-        let other = object_store::Error::Generic { store: "S3", source: "Error after 10 retries, retry_timeout: 180s, source: 503 SlowDown".into() };
+        let other = object_store::Error::Generic {
+            store: "S3",
+            source: "Error after 10 retries, retry_timeout: 180s, source: 503 SlowDown".into(),
+        };
         assert_eq!(result_label(&other), "error");
     }
 }

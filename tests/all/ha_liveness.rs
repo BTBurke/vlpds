@@ -55,7 +55,11 @@ async fn skewed_clocks_keep_every_node_live() {
         w.await.unwrap();
     }
     assert!(acked.load(Ordering::Relaxed) > 100, "too few writes acked: {acked:?}");
-    assert_eq!(failed.load(Ordering::Relaxed), failed_after_join, "writes failed in steady state (a node was presumed dead?)");
+    assert_eq!(
+        failed.load(Ordering::Relaxed),
+        failed_after_join,
+        "writes failed in steady state (a node was presumed dead?)"
+    );
     for n in [&fast, &mid, &slow] {
         let c = cluster(n);
         assert!(c.lease_valid(), "{}: lease lapsed", c.cfg.node_id);
@@ -69,11 +73,17 @@ async fn skewed_clocks_keep_every_node_live() {
     let fast_owned = cluster(&fast).owned();
     vlpds::server::shutdown(&fast.app).await;
     assert!(cluster(&fast).owned().is_empty());
-    wait_until(&format!("drained shards {fast_owned:?} taken"), Duration::from_secs(10), || cluster(&mid).owned().len() + cluster(&slow).owned().len() >= SHARDS as usize).await;
+    wait_until(&format!("drained shards {fast_owned:?} taken"), Duration::from_secs(10), || {
+        cluster(&mid).owned().len() + cluster(&slow).owned().len() >= SHARDS as usize
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(300)).await; // routing tables catch up
     for (i, acct) in accounts.iter().enumerate() {
         let n = [&mid, &slow][i % 2];
         n.create_record(acct, "app.bsky.feed.post", post_record("after drain")).await;
     }
-    assert!(cluster(&mid).fenced_logs().is_empty() && cluster(&slow).fenced_logs().is_empty(), "a drain fences nobody else");
+    assert!(
+        cluster(&mid).fenced_logs().is_empty() && cluster(&slow).fenced_logs().is_empty(),
+        "a drain fences nobody else"
+    );
 }

@@ -20,7 +20,8 @@ async fn update_email(s: &TestServer, a: &TestAccount, body: J) -> Resp {
 /// An account whose email is confirmed (the factor needs that).
 async fn confirmed_account(s: &TestServer, prefix: &str) -> TestAccount {
     let a = s.create_account(prefix).await;
-    let (tok, _, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (tok, _, _) =
+        mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     s.xrpc.post("com.atproto.server.confirmEmail", &json!({"email": a.email, "token": tok}), &a.auth()).await.ok();
     assert_eq!(session(s, &a).await["emailConfirmed"], json!(true));
     a
@@ -49,11 +50,15 @@ async fn toggles_like_the_reference() {
     assert_eq!(session(&s, &faye).await["emailAuthFactor"], json!(false));
 
     // enables the auth factor without a token, and without mailing anything
-    let (r, _) = mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": true}))).await;
+    let (r, _) =
+        mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": true})))
+            .await;
     r.ok();
     assert_eq!(session(&s, &faye).await["emailAuthFactor"], json!(true));
     // no-ops when already enabled
-    let (r, _) = mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": true}))).await;
+    let (r, _) =
+        mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": true})))
+            .await;
     r.ok();
 
     // omitting emailAuthFactor is a plain email update: token required
@@ -69,7 +74,9 @@ async fn toggles_like_the_reference() {
     assert_eq!((sess["emailAuthFactor"].clone(), sess["email"].clone()), (json!(true), json!(faye.email)));
 
     // disabling needs a confirmation token: the first call mails one
-    let (r, m) = mailed_n(&s, &faye.email, 1, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false}))).await;
+    let (r, m) =
+        mailed_n(&s, &faye.email, 1, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false})))
+            .await;
     r.err(400, "TokenRequired");
     let m = m.unwrap();
     assert_eq!(m["purpose"], json!("update_email"));
@@ -78,7 +85,9 @@ async fn toggles_like_the_reference() {
 
     // an invalid token has no side effects
     assert_ne!(disable_token, "AAAAA-AAAAA");
-    update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false, "token": "AAAAA-AAAAA"})).await.err(400, "InvalidToken");
+    update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false, "token": "AAAAA-AAAAA"}))
+        .await
+        .err(400, "InvalidToken");
     assert_eq!(session(&s, &faye).await["emailAuthFactor"], json!(true));
 
     // disables with the token; address and confirmation untouched
@@ -90,18 +99,29 @@ async fn toggles_like_the_reference() {
 
     // a requestEmailUpdate token works too (what the Bluesky app sends)
     enable(&s, &faye).await;
-    let (r, m) = mailed_n(&s, &faye.email, 1, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &faye.auth())).await;
+    let (r, m) =
+        mailed_n(&s, &faye.email, 1, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &faye.auth())).await;
     assert_eq!(r.ok()["tokenRequired"], json!(true));
-    update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false, "token": token_of(&m.unwrap())})).await.ok();
+    update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false, "token": token_of(&m.unwrap())}))
+        .await
+        .ok();
     assert_eq!(session(&s, &faye).await["emailAuthFactor"], json!(false));
 
     // no-op (and no mail) when already disabled
-    let (r, _) = mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false}))).await;
+    let (r, _) =
+        mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email, "emailAuthFactor": false})))
+            .await;
     r.ok();
     assert_eq!(session(&s, &faye).await["emailConfirmed"], json!(true));
 
     // the address is matched case-insensitively (a toggle, not a change)
-    let (r, _) = mailed_n(&s, &faye.email, 0, update_email(&s, &faye, json!({"email": faye.email.to_uppercase(), "emailAuthFactor": true}))).await;
+    let (r, _) = mailed_n(
+        &s,
+        &faye.email,
+        0,
+        update_email(&s, &faye, json!({"email": faye.email.to_uppercase(), "emailAuthFactor": true})),
+    )
+    .await;
     r.ok();
     let sess = session(&s, &faye).await;
     assert_eq!(sess["emailAuthFactor"], json!(true));
@@ -110,7 +130,8 @@ async fn toggles_like_the_reference() {
 
     // changing the address drops the factor (codes must not go to an
     // unconfirmed inbox)
-    let (_, m) = mailed_n(&s, &faye.email, 1, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &faye.auth())).await;
+    let (_, m) =
+        mailed_n(&s, &faye.email, 1, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &faye.auth())).await;
     let new = format!("moved-{}", faye.email);
     update_email(&s, &faye, json!({"email": new, "token": token_of(&m.unwrap())})).await.ok();
     let sess = session(&s, &faye).await;

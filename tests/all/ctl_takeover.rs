@@ -127,7 +127,10 @@ async fn takeover_under_load(read_latency: Duration) {
     let rec = c.create_record(victim, "app.bsky.feed.post", post_record("taken down before the kill")).await;
     let sess = a.create_session(&victim.handle, PASSWORD).await.ok();
     let revoked = sess["accessJwt"].as_str().unwrap().to_string();
-    a.xrpc.post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into())).await.ok();
+    a.xrpc
+        .post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into()))
+        .await
+        .ok();
     b.xrpc
         .post(
             "com.atproto.admin.updateSubjectStatus",
@@ -204,7 +207,9 @@ async fn takeover_under_load(read_latency: Duration) {
         unavailable.len()
     );
     for l in vlpds::metrics::render().lines().filter(|l| {
-        l.starts_with("vlpds_security_ctl_loads_total") || l.starts_with("vlpds_write_retries_total") || l.starts_with("vlpds_read_retries_total")
+        l.starts_with("vlpds_security_ctl_loads_total")
+            || l.starts_with("vlpds_write_retries_total")
+            || l.starts_with("vlpds_read_retries_total")
     }) {
         eprintln!("  {l}");
     }
@@ -226,8 +231,11 @@ async fn takeover_under_load(read_latency: Duration) {
     }
     // a request that had reached the dead node when it died may fail;
     // anything after is resent until a survivor serves it
-    let late: Vec<String> =
-        unavailable.iter().filter(|s| since(s) > Duration::from_millis(200)).map(|s| format!("{:?} +{:?} {}", s.kind, since(s), s.error)).collect();
+    let late: Vec<String> = unavailable
+        .iter()
+        .filter(|s| since(s) > Duration::from_millis(200))
+        .map(|s| format!("{:?} +{:?} {}", s.kind, since(s), s.error))
+        .collect();
     assert!(late.len() <= 3, "{} 503s during the takeover: {late:?}", late.len());
 
     for n in [&*a, &*b] {

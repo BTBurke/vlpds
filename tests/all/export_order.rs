@@ -38,7 +38,13 @@ async fn get_repo(s: &TestServer, did: &str, since: Option<&str>) -> Vec<u8> {
 
 /// `car` is the export of `tree` (`since`: records after that rev only), in
 /// the streamable order, holding the old export's block set.
-fn check_export(car: &[u8], tree: &Tree, recs: &BTreeMap<Vec<u8>, (Cid, u64, Vec<u8>)>, since: Option<u64>, what: &str) {
+fn check_export(
+    car: &[u8],
+    tree: &Tree,
+    recs: &BTreeMap<Vec<u8>, (Cid, u64, Vec<u8>)>,
+    since: Option<u64>,
+    what: &str,
+) {
     let (roots, blocks) = vlpds::car::read_car(car).unwrap();
     assert_eq!(blocks[0].0, roots[0], "{what}: the commit first");
     let carried = |k: &[u8]| since.is_none_or(|s| recs[k].1 > s);
@@ -90,11 +96,17 @@ async fn exports_stream_in_spec_order_with_the_same_blocks() {
                 0 => json!({"$type": c, "same": true}),
                 _ => json!({"$type": c, "n": n}),
             };
-            writes.push(json!({"$type": "com.atproto.repo.applyWrites#create", "collection": c, "rkey": rkey, "value": value}));
+            writes.push(
+                json!({"$type": "com.atproto.repo.applyWrites#create", "collection": c, "rkey": rkey, "value": value}),
+            );
             kept.push((c, rkey));
         }
         live.extend(kept);
-        let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        let r = s
+            .xrpc
+            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+            .await
+            .ok();
         if batch == 10 {
             since = r["commit"]["rev"].as_str().unwrap().to_string();
         }
@@ -124,7 +136,13 @@ async fn exports_stream_in_spec_order_with_the_same_blocks() {
         let (s, did, since, tree, recs) = (&s, a.did.clone(), since.clone(), &tree, &recs);
         async move {
             check_export(&get_repo(s, &did, None).await, tree, recs, None, &label);
-            check_export(&get_repo(s, &did, Some(&since)).await, tree, recs, Some(since_rev), &format!("{label}, since"));
+            check_export(
+                &get_repo(s, &did, Some(&since)).await,
+                tree,
+                recs,
+                Some(since_rev),
+                &format!("{label}, since"),
+            );
         }
     };
     // every read-ahead split: whole, height-1 nodes let go, partial, none

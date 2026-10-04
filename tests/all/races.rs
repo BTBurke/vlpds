@@ -82,7 +82,8 @@ async fn concurrent_record_writes_all_land() {
         if i % 4 == 3 {
             for res in j["results"].as_array().unwrap() {
                 let uri = res["uri"].as_str().unwrap();
-                expected.insert(uri.splitn(4, '/').nth(3).unwrap().to_string(), res["cid"].as_str().unwrap().to_string());
+                expected
+                    .insert(uri.splitn(4, '/').nth(3).unwrap().to_string(), res["cid"].as_str().unwrap().to_string());
             }
         } else {
             let rr = RecordRef::from_json(&j);
@@ -123,7 +124,8 @@ async fn concurrent_record_writes_all_land() {
 
     // the firehose chain for this repo is intact and ends at the head
     let (head, rev) = s.latest_commit(&a.did).await;
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.commit().map(|c| c.commit == head).unwrap_or(false))).await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.commit().map(|c| c.commit == head).unwrap_or(false))).await;
     let commits = check_chain(&frames, &a.did);
     assert_eq!(commits.last().unwrap().rev, rev);
     for c in &commits {
@@ -236,8 +238,13 @@ async fn concurrent_writes_across_repos() {
         heads.insert(a.did.clone(), s.latest_commit(&a.did).await.0);
         assert_eq!(s.get_repo(&a.did).await.entries().len(), 15);
     }
-    let frames =
-        sub.until(FH_TIMEOUT, |fs| heads.iter().all(|(d, h)| fs.iter().any(|f| f.commit().map(|c| &c.repo == d && c.commit == *h).unwrap_or(false)))).await;
+    let frames = sub
+        .until(FH_TIMEOUT, |fs| {
+            heads
+                .iter()
+                .all(|(d, h)| fs.iter().any(|f| f.commit().map(|c| &c.repo == d && c.commit == *h).unwrap_or(false)))
+        })
+        .await;
     for a in &accts {
         let commits = check_chain(&frames, &a.did);
         let ops: usize = commits.iter().map(|c| c.ops.len()).sum();

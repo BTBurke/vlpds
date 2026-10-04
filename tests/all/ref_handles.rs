@@ -65,7 +65,9 @@ async fn ref_updates_to_external_handle() {
 async fn ref_unresolvable_external_handle_message() {
     let s = TestServer::spawn_with(|c| c.dev_mode = false).await;
     let a = s.create_account("alice").await;
-    let r = tokio::time::timeout(Duration::from_secs(20), update_handle(&s, &a, "noexist-vlpds-ref.example.com")).await.expect("bounded");
+    let r = tokio::time::timeout(Duration::from_secs(20), update_handle(&s, &a, "noexist-vlpds-ref.example.com"))
+        .await
+        .expect("bounded");
     r.err(400, "InvalidRequest");
     assert!(r.text().contains("External handle did not resolve to DID"), "{}", r.text());
     assert_eq!(describe(&s, &a.did).await["handle"], json!(a.handle));
@@ -93,7 +95,13 @@ async fn ref_handle_length_with_long_service_domain() {
         let s = &s;
         async move {
             let email = format!("{}@example.com", unique_name("e"));
-            s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": handle, "password": "pw-123456", "email": email}), &Auth::None).await
+            s.xrpc
+                .post(
+                    "com.atproto.server.createAccount",
+                    &json!({"handle": handle, "password": "pw-123456", "email": email}),
+                    &Auth::None,
+                )
+                .await
         }
     };
     let r = try_create(format!("usernamepartover18c.{domain}")).await;

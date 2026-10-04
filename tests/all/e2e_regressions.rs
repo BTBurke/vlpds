@@ -82,11 +82,13 @@ async fn list_repos_spans_the_cluster() {
         }
         let by_coll = |extra: Option<(&'static str, String)>| {
             let x = n.xrpc.clone();
-            let q: Vec<(&str, String)> = std::iter::once(("collection", "com.example.e2e".to_string())).chain(extra).collect();
+            let q: Vec<(&str, String)> =
+                std::iter::once(("collection", "com.example.e2e".to_string())).chain(extra).collect();
             async move { x.get_multi("com.atproto.sync.listReposByCollection", &q, &Auth::None).await.ok() }
         };
         let r = by_coll(None).await;
-        let got: HashSet<String> = r["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect();
+        let got: HashSet<String> =
+            r["repos"].as_array().unwrap().iter().map(|r| r["did"].as_str().unwrap().to_string()).collect();
         assert_eq!(got, want);
         // paged by DID
         let r = by_coll(Some(("limit", "4".into()))).await;
@@ -119,7 +121,13 @@ async fn reset_password_through_any_node() {
             }
         }
         let token = token.expect("reset token mailed");
-        let reset_to = |pw: &str| reset.xrpc.post_owned("com.atproto.server.resetPassword", json!({"token": token, "password": pw}), Auth::None);
+        let reset_to = |pw: &str| {
+            reset.xrpc.post_owned(
+                "com.atproto.server.resetPassword",
+                json!({"token": token, "password": pw}),
+                Auth::None,
+            )
+        };
         reset_to("brand-new-pw").await.ok();
         owner.create_session(&acct.handle, "brand-new-pw").await.ok();
         req.create_session(&acct.handle, PASSWORD).await.err(401, "AuthenticationRequired");
@@ -136,7 +144,8 @@ async fn resolve_identity_routes_by_identifier() {
     let acct = a.create_account("ri").await;
     for n in [&b, &c] {
         for ident in [acct.handle.as_str(), acct.did.as_str()] {
-            let r = n.xrpc.get("com.atproto.identity.resolveIdentity", &[("identifier", ident)], &Auth::None).await.ok();
+            let r =
+                n.xrpc.get("com.atproto.identity.resolveIdentity", &[("identifier", ident)], &Auth::None).await.ok();
             assert_eq!(r["did"], json!(acct.did));
             assert_eq!(r["handle"], json!(acct.handle));
             assert_eq!(r["didDoc"]["id"], json!(acct.did));
@@ -151,7 +160,9 @@ async fn well_known_atproto_did_by_host() {
     let (a, b, c) = cluster("e2e-wk").await;
     let acct = a.create_account("wk").await;
     let http = reqwest::Client::new();
-    let get = |n: &TestServer, host: String| http.get(format!("{}/.well-known/atproto-did", n.url)).header("host", host).send();
+    let get = |n: &TestServer, host: String| {
+        http.get(format!("{}/.well-known/atproto-did", n.url)).header("host", host).send()
+    };
     for n in [&a, &b, &c] {
         let r = get(n, acct.handle.clone()).await.unwrap();
         assert_eq!(r.status(), 200);
@@ -218,13 +229,22 @@ async fn tls_check_for_caddy_on_demand_tls() {
 async fn admin_account_calls_reach_the_owner() {
     let (a, b, c) = cluster("e2e-ad").await;
     let accts = [a.create_account("ad").await, b.create_account("ad").await, c.create_account("ad").await];
-    let inv = a.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 1, "forAccount": accts[1].did}), &Auth::Admin).await.ok();
+    let inv = a
+        .xrpc
+        .post("com.atproto.server.createInviteCode", &json!({"useCount": 1, "forAccount": accts[1].did}), &Auth::Admin)
+        .await
+        .ok();
     for (i, n) in [&a, &b, &c].into_iter().enumerate() {
         let acct = &accts[(i + 1) % 3];
         assert!(!owns(n, &acct.did));
         let email = format!("{}@example.org", unique_name("new"));
-        let update =
-            |account: &str, email: &str| n.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), Auth::Admin);
+        let update = |account: &str, email: &str| {
+            n.xrpc.post_owned(
+                "com.atproto.admin.updateAccountEmail",
+                json!({"account": account, "email": email}),
+                Auth::Admin,
+            )
+        };
         update(&acct.did, &email).await.ok();
         assert_eq!(n.account_info(&acct.did).await.ok()["email"], json!(email));
         // by handle too
@@ -238,7 +258,10 @@ async fn admin_account_calls_reach_the_owner() {
         let got: HashSet<&str> = infos.iter().map(|i| i["did"].as_str().unwrap()).collect();
         assert_eq!(got, accts.iter().map(|a| a.did.as_str()).collect::<HashSet<_>>());
         let b_info = infos.iter().find(|i| i["did"] == json!(accts[1].did)).unwrap();
-        assert!(b_info["invites"].as_array().unwrap().iter().any(|c| c["code"] == inv["code"]), "invites of an account owned elsewhere: {b_info}");
+        assert!(
+            b_info["invites"].as_array().unwrap().iter().any(|c| c["code"] == inv["code"]),
+            "invites of an account owned elsewhere: {b_info}"
+        );
     }
 }
 

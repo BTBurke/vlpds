@@ -70,13 +70,10 @@ pub fn validate_record<N: Node>(
         },
     };
     if !key_ok {
-        return Err(format!(
-            "Invalid record key for {collection}: must be {key}, got {rkey:?}"
-        ));
+        return Err(format!("Invalid record key for {collection}: must be {key}, got {rkey:?}"));
     }
     let mut v = Validator::new("record", resolved);
-    v.check(set, &main.schema, record)
-        .map_err(|e| format!("Invalid {collection} record: {e}"))?;
+    v.check(set, &main.schema, record).map_err(|e| format!("Invalid {collection} record: {e}"))?;
     Ok(Some("valid"))
 }
 
@@ -162,10 +159,7 @@ pub fn validate_params(nsid: &str, pairs: &[(String, String)]) -> Result<(), Str
             },
             ParamType::Other => J::String(s.into()),
         };
-        let mut vals = pairs
-            .iter()
-            .filter(|(pk, v)| pk == k && !v.is_empty())
-            .map(|(_, v)| decode(v));
+        let mut vals = pairs.iter().filter(|(pk, v)| pk == k && !v.is_empty()).map(|(_, v)| decode(v));
         let value = if p.is_array {
             let a: Vec<J> = vals.collect();
             (!a.is_empty()).then_some(J::Array(a))
@@ -188,9 +182,15 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(60);
 type Resolution = futures::future::Shared<futures::future::BoxFuture<'static, Option<Arc<Lexicons>>>>;
 
 enum Slot {
-    Done { at: Instant, doc: Option<Arc<Lexicons>> },
+    Done {
+        at: Instant,
+        doc: Option<Arc<Lexicons>>,
+    },
     /// In flight; `prev` is the last good document, served meanwhile.
-    Pending { fut: Resolution, prev: Option<Arc<Lexicons>> },
+    Pending {
+        fut: Resolution,
+        prev: Option<Arc<Lexicons>>,
+    },
 }
 
 impl Slot {
@@ -203,7 +203,8 @@ impl Slot {
 }
 
 /// Resolved, failed or in flight.
-static RESOLVED: LazyLock<Arc<Resolved>> = LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
+static RESOLVED: LazyLock<Arc<Resolved>> =
+    LazyLock::new(|| crate::caches::track(crate::caches::Cache::Lexicons, Default::default()));
 
 struct Resolved(parking_lot::Mutex<lru::LruCache<String, Slot>>);
 
@@ -231,11 +232,7 @@ fn insert_capped(m: &mut lru::LruCache<String, Slot>, k: String, v: Slot) {
 /// Only when resolution is enabled, validation isn't skipped and no schema
 /// is bundled. Waits at most `Config::resolve_lexicons`; None on failure or
 /// timeout. Concurrent writes of the same type share one resolution.
-pub async fn resolve_record_schema(
-    app: &Arc<App>,
-    collection: &str,
-    validate: Option<bool>,
-) -> Option<Arc<Lexicons>> {
+pub async fn resolve_record_schema(app: &Arc<App>, collection: &str, validate: Option<bool>) -> Option<Arc<Lexicons>> {
     let timeout = app.config.resolve_lexicons?;
     if validate == Some(false) || BUNDLE.records.contains_key(collection) || !syntax::valid_nsid(collection) {
         return None;
@@ -264,9 +261,7 @@ pub async fn resolve_record_schema(
 /// keeps serving the last good document.
 fn spawn_resolution(app: Arc<App>, nsid: String, prev: Option<Arc<Lexicons>>) -> Resolution {
     let task = tokio::spawn(async move {
-        let doc = crate::oauth::lexicon::resolve(&app, &nsid)
-            .await
-            .and_then(|(_, doc)| record_lexicon(&nsid, doc));
+        let doc = crate::oauth::lexicon::resolve(&app, &nsid).await.and_then(|(_, doc)| record_lexicon(&nsid, doc));
         let doc = match doc {
             Ok(d) => Some(Arc::new(d)),
             Err(e) => {
@@ -284,9 +279,7 @@ fn record_lexicon(nsid: &str, doc: J) -> Result<Lexicons, String> {
     if doc["lexicon"].as_i64() != Some(1) || doc["id"] != nsid {
         return Err(format!("Invalid Lexicon document for {nsid}"));
     }
-    if !doc["defs"]["main"].get("record").is_some_and(|r| r.is_object())
-        || !is_record(&doc["defs"]["main"])
-    {
+    if !doc["defs"]["main"].get("record").is_some_and(|r| r.is_object()) || !is_record(&doc["defs"]["main"]) {
         return Err(format!("Lexicon {nsid} is not a record type"));
     }
     Ok(Lexicons::resolved(&doc))
@@ -467,27 +460,18 @@ impl Lexicons {
             // a resolved document: its own defs, else the bundle's
             Some(id) if **id == *nsid => self.lookup(nsid, name).map_or(Target::Missing, Target::Local),
             Some(_) => BUNDLE.lookup(nsid, name).map_or(Target::Missing, Target::Bundle),
-            None => self
-                .lookup(nsid, name)
-                .map_or_else(|| Target::Unbundled(nsid.into(), name.into()), Target::Local),
+            None => self.lookup(nsid, name).map_or_else(|| Target::Unbundled(nsid.into(), name.into()), Target::Local),
         }
     }
 
     fn method(&self, m: &J, nsid: &str) -> Method {
         let payload = |which: &str| {
             let p = m.get(which)?;
-            (p["encoding"] == "application/json")
-                .then(|| p.get("schema"))
-                .flatten()
-                .map(|s| self.schema(s, nsid))
+            (p["encoding"] == "application/json").then(|| p.get("schema")).flatten().map(|s| self.schema(s, nsid))
         };
         let params = m.get("parameters").map(|params| {
-            let required = |k: &str| {
-                params
-                    .get("required")
-                    .and_then(|r| r.as_array())
-                    .is_some_and(|r| r.iter().any(|x| x == k))
-            };
+            let required =
+                |k: &str| params.get("required").and_then(|r| r.as_array()).is_some_and(|r| r.iter().any(|x| x == k));
             let props = params.get("properties").and_then(|p| p.as_object());
             props
                 .into_iter()
@@ -554,9 +538,10 @@ impl Lexicons {
                 };
                 Schema::String(Box::new(Str {
                     konst: d.get("const").and_then(|c| c.as_str()).map(Into::into),
-                    enumeration: d.get("enum").and_then(|e| e.as_array()).map(|e| {
-                        (e.iter().filter_map(|x| x.as_str()).map(Into::into).collect(), join(e, "|"))
-                    }),
+                    enumeration: d
+                        .get("enum")
+                        .and_then(|e| e.as_array())
+                        .map(|e| (e.iter().filter_map(|x| x.as_str()).map(Into::into).collect(), join(e, "|"))),
                     max_len: u64_of("maxLength"),
                     min_len: u64_of("minLength"),
                     min_graphemes: u64_of("minGraphemes"),
@@ -577,9 +562,10 @@ impl Lexicons {
             "bytes" => Schema::Bytes { min: u64_of("minLength"), max: u64_of("maxLength") },
             "cid-link" => Schema::CidLink,
             "blob" => Schema::Blob(Box::new(Blob {
-                accept: d.get("accept").and_then(|a| a.as_array()).map(|a| {
-                    (a.iter().filter_map(|x| x.as_str()).map(Into::into).collect(), d["accept"].to_string())
-                }),
+                accept: d
+                    .get("accept")
+                    .and_then(|a| a.as_array())
+                    .map(|a| (a.iter().filter_map(|x| x.as_str()).map(Into::into).collect(), d["accept"].to_string())),
                 max_size: d.get("maxSize").and_then(|m| m.as_i64()),
             })),
             "array" => Schema::Array(Box::new(Array {
@@ -594,11 +580,7 @@ impl Lexicons {
     }
 
     fn object(&self, d: &J, ctx: &str) -> Object {
-        let nullable = |k: &str| {
-            d.get("nullable")
-                .and_then(|n| n.as_array())
-                .is_some_and(|n| n.iter().any(|x| x == k))
-        };
+        let nullable = |k: &str| d.get("nullable").and_then(|n| n.as_array()).is_some_and(|n| n.iter().any(|x| x == k));
         let required = d
             .get("required")
             .and_then(|r| r.as_array())
@@ -667,9 +649,7 @@ impl Node for J {
             J::Array(a) => Kind::Array(a),
             J::Object(o) => match (o.len(), o.get("$link"), o.get("$bytes")) {
                 (1, Some(J::String(_)), _) => Kind::Link,
-                (1, _, Some(J::String(b))) => {
-                    Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4)
-                }
+                (1, _, Some(J::String(b))) => Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4),
                 _ => Kind::Map,
             },
         }
@@ -691,9 +671,7 @@ impl Node for JsonValue<'_> {
             JsonValue::Array(a) => Kind::Array(a),
             JsonValue::Object(o) => match &o[..] {
                 [(k, JsonValue::Str(_))] if k == "$link" => Kind::Link,
-                [(k, JsonValue::Str(b))] if k == "$bytes" => {
-                    Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4)
-                }
+                [(k, JsonValue::Str(b))] if k == "$bytes" => Kind::Bytes(b.trim_end_matches('=').len() * 3 / 4),
                 _ => Kind::Map,
             },
         }
@@ -943,15 +921,16 @@ impl<'a> Validator<'a> {
         }
         if let Some(f) = d.format {
             let (ok, msg) = match f {
-                Format::Datetime => (valid_datetime(s), "must be an valid atproto datetime (both RFC-3339 and ISO-8601)"),
+                Format::Datetime => {
+                    (valid_datetime(s), "must be an valid atproto datetime (both RFC-3339 and ISO-8601)")
+                }
                 Format::Uri => (valid_uri(s), "must be a uri"),
                 Format::AtUri => (valid_at_uri(s), "must be a valid at-uri"),
                 Format::Did => (syntax::valid_did(s), "must be a valid did"),
                 Format::Handle => (syntax::valid_handle(s), "must be a valid handle"),
-                Format::AtIdentifier => (
-                    crate::xrpc::extract::valid_at_identifier(s),
-                    "must be a valid did or a handle",
-                ),
+                Format::AtIdentifier => {
+                    (crate::xrpc::extract::valid_at_identifier(s), "must be a valid did or a handle")
+                }
                 Format::Nsid => (syntax::valid_nsid(s), "must be a valid nsid"),
                 // the syntax check first: it accepts nearly every parseable CID
                 Format::Cid => (
@@ -982,9 +961,7 @@ impl<'a> Validator<'a> {
         };
         if let Some((accept, shown)) = &d.accept {
             let ok = accept.iter().any(|a| {
-                &**a == "*/*"
-                    || **a == *mime
-                    || a.strip_suffix("/*").is_some_and(|p| mime.split('/').next() == Some(p))
+                &**a == "*/*" || **a == *mime || a.strip_suffix("/*").is_some_and(|p| mime.split('/').next() == Some(p))
             });
             if !ok {
                 return Err(self.err(format!("mime type {mime:?} is not accepted (accepted: {shown})")));
@@ -1001,11 +978,7 @@ impl<'a> Validator<'a> {
 
 /// Like JS `Array.join` (strings unquoted).
 fn join(items: &[J], sep: &str) -> String {
-    items
-        .iter()
-        .map(|x| x.as_str().map_or_else(|| x.to_string(), String::from))
-        .collect::<Vec<_>>()
-        .join(sep)
+    items.iter().map(|x| x.as_str().map_or_else(|| x.to_string(), String::from)).collect::<Vec<_>>().join(sep)
 }
 
 fn digits(s: &str) -> Option<u32> {
@@ -1148,18 +1121,39 @@ fn valid_at_uri_fragment(f: &str) -> bool {
 /// primary subtag, and no repeated variant or extension singleton.
 pub fn valid_language(s: &str) -> bool {
     const GRANDFATHERED: &[&str] = &[
-        "en-GB-oed", "i-ami", "i-bnn", "i-default", "i-enochian", "i-hak", "i-klingon", "i-lux",
-        "i-mingo", "i-navajo", "i-pwn", "i-tao", "i-tay", "i-tsu", "sgn-BE-FR", "sgn-BE-NL",
-        "sgn-CH-DE", "art-lojban", "cel-gaulish", "no-bok", "no-nyn", "zh-guoyu", "zh-hakka",
-        "zh-min", "zh-min-nan", "zh-xiang",
+        "en-GB-oed",
+        "i-ami",
+        "i-bnn",
+        "i-default",
+        "i-enochian",
+        "i-hak",
+        "i-klingon",
+        "i-lux",
+        "i-mingo",
+        "i-navajo",
+        "i-pwn",
+        "i-tao",
+        "i-tay",
+        "i-tsu",
+        "sgn-BE-FR",
+        "sgn-BE-NL",
+        "sgn-CH-DE",
+        "art-lojban",
+        "cel-gaulish",
+        "no-bok",
+        "no-nyn",
+        "zh-guoyu",
+        "zh-hakka",
+        "zh-min",
+        "zh-min-nan",
+        "zh-xiang",
     ];
     if GRANDFATHERED.contains(&s) {
         return true;
     }
     let tags: Vec<&str> = s.split('-').collect();
-    let alnum = |t: &str, lo: usize, hi: usize| {
-        (lo..=hi).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric())
-    };
+    let alnum =
+        |t: &str, lo: usize, hi: usize| (lo..=hi).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_alphanumeric());
     let alpha = |t: &str, n: usize| t.len() == n && t.bytes().all(|b| b.is_ascii_alphabetic());
     // privateuse: x-1*8alphanum ...
     let private_use = |rest: &[&str]| !rest.is_empty() && rest.iter().all(|t| alnum(t, 1, 8));
@@ -1178,14 +1172,13 @@ pub fn valid_language(s: &str) -> bool {
     if i < tags.len() && alpha(tags[i], 4) {
         i += 1; // script
     }
-    if i < tags.len()
-        && (alpha(tags[i], 2) || (tags[i].len() == 3 && tags[i].bytes().all(|b| b.is_ascii_digit())))
-    {
+    if i < tags.len() && (alpha(tags[i], 2) || (tags[i].len() == 3 && tags[i].bytes().all(|b| b.is_ascii_digit()))) {
         i += 1; // region
     }
     let mut variants: Vec<String> = Vec::new();
     while i < tags.len()
-        && (alnum(tags[i], 5, 8) || (tags[i].len() == 4 && tags[i].as_bytes()[0].is_ascii_digit() && alnum(tags[i], 4, 4)))
+        && (alnum(tags[i], 5, 8)
+            || (tags[i].len() == 4 && tags[i].as_bytes()[0].is_ascii_digit() && alnum(tags[i], 4, 4)))
     {
         let v = tags[i].to_ascii_lowercase();
         if variants.contains(&v) {
@@ -1224,16 +1217,47 @@ mod tests {
     fn languages_like_the_reference() {
         // @atproto/syntax parseLanguageString (and the interop fixtures)
         for ok in [
-            "ja", "ban", "pt-BR", "hy-Latn-IT-arevela", "zh-Hant", "sgn-BE-NL", "es-419",
-            "en-GB-boont-r-extended-sequence-x-private", "zh-hakka", "i-default", "de-CH-1901",
-            "qaa-Qaaa-QM-x-southern", "X-fr-CH", "x-foo", "de-X-foo", "sl-rozaj-biske",
-            "en-u-co-phonebk-t-en-US", "zh-yue-HK",
+            "ja",
+            "ban",
+            "pt-BR",
+            "hy-Latn-IT-arevela",
+            "zh-Hant",
+            "sgn-BE-NL",
+            "es-419",
+            "en-GB-boont-r-extended-sequence-x-private",
+            "zh-hakka",
+            "i-default",
+            "de-CH-1901",
+            "qaa-Qaaa-QM-x-southern",
+            "X-fr-CH",
+            "x-foo",
+            "de-X-foo",
+            "sl-rozaj-biske",
+            "en-u-co-phonebk-t-en-US",
+            "zh-yue-HK",
         ] {
             assert!(valid_language(ok), "{ok}");
         }
         for bad in [
-            "", "jaja", ".", "123", "JA", "j", "ja-", "a-DE", "x", "i", "i-foo", "enU-9", "en--US",
-            "en-a", "en-a-bb-a-cc", "sl-rozaj-rozaj", "en-US-abc", "en-x", "de-419-DE",
+            "",
+            "jaja",
+            ".",
+            "123",
+            "JA",
+            "j",
+            "ja-",
+            "a-DE",
+            "x",
+            "i",
+            "i-foo",
+            "enU-9",
+            "en--US",
+            "en-a",
+            "en-a-bb-a-cc",
+            "sl-rozaj-rozaj",
+            "en-US-abc",
+            "en-x",
+            "de-419-DE",
         ] {
             assert!(!valid_language(bad), "{bad}");
         }
@@ -1352,7 +1376,10 @@ mod tests {
         let p = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
         let q = "com.atproto.repo.listRecords";
         assert_eq!(validate_params(q, &p(&[("repo", "did:plc:abc"), ("collection", "a.b.c")])), Ok(()));
-        assert_eq!(validate_params(q, &p(&[("repo", "did:plc:abc")])), Err("Params must have the property \"collection\"".into()));
+        assert_eq!(
+            validate_params(q, &p(&[("repo", "did:plc:abc")])),
+            Err("Params must have the property \"collection\"".into())
+        );
         assert_eq!(
             validate_params(q, &p(&[("repo", "did:plc:abc"), ("collection", "a.b.c"), ("limit", "500")])),
             Err("limit can not be greater than 100".into())

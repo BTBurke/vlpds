@@ -237,7 +237,11 @@ fn heap_memo_matches_full_walk() {
         let mut lazy = LazyTree::open(root, pm, &store).unwrap();
         let mut memo = mst_lazy::HeapMemo::default();
         let check = |lazy: &LazyTree, memo: &mut mst_lazy::HeapMemo, after: &str| {
-            assert_eq!(memo.heap_bytes(&lazy.tree.root), heap_bytes(&lazy.tree.root), "seed {seed}: heap bytes after {after}");
+            assert_eq!(
+                memo.heap_bytes(&lazy.tree.root),
+                heap_bytes(&lazy.tree.root),
+                "seed {seed}: heap bytes after {after}"
+            );
         };
         check(&lazy, &mut memo, "open");
         let mut views: Vec<Tree> = Vec::new();
@@ -320,7 +324,9 @@ fn rebuild_and_fallback() {
     let mut rng = StdRng::seed_from_u64(99);
     let mut reference = Tree::new();
     for i in 0..3000u64 {
-        reference.insert_no_proof(format!("app.bsky.feed.like/{}", tid(i * 7919)).as_bytes(), rand_cid(&mut rng)).unwrap();
+        reference
+            .insert_no_proof(format!("app.bsky.feed.like/{}", tid(i * 7919)).as_bytes(), rand_cid(&mut rng))
+            .unwrap();
     }
     let root = reference.root_cid().unwrap();
     let mut recs: Vec<(mst_lazy::Key, Cid)> = Vec::new();
@@ -399,7 +405,10 @@ fn real_repo_fixture_matches_full_tree() {
                         let coll = colls.choose(&mut rng).unwrap();
                         Op::Put(format!("{coll}/{}", tid(clock)).into_bytes(), rand_cid(&mut rng))
                     }
-                    5 => Op::Put(format!("{}/{}", colls.choose(&mut rng).unwrap(), tid(rng.gen())).into_bytes(), rand_cid(&mut rng)),
+                    5 => Op::Put(
+                        format!("{}/{}", colls.choose(&mut rng).unwrap(), tid(rng.gen())).into_bytes(),
+                        rand_cid(&mut rng),
+                    ),
                     6..=7 => Op::Put(live.choose(&mut rng).unwrap().clone(), rand_cid(&mut rng)),
                     _ => Op::Del(live.choose(&mut rng).unwrap().clone()),
                 })
@@ -441,10 +450,13 @@ fn interior_heap(n: &Node) -> usize {
     }
     let own = heap_bytes(&Node { entries: Vec::new(), ..n.clone() })
         + n.entries.capacity() * std::mem::size_of::<Entry>()
-        + n.entries.iter().map(|e| match e {
-            Entry::Value { key, .. } => (16 + key.len()).next_multiple_of(16),
-            _ => 0,
-        }).sum::<usize>();
+        + n.entries
+            .iter()
+            .map(|e| match e {
+                Entry::Value { key, .. } => (16 + key.len()).next_multiple_of(16),
+                _ => 0,
+            })
+            .sum::<usize>();
     own + n
         .entries
         .iter()
@@ -480,7 +492,18 @@ fn synthetic(n: usize, rng: &mut StdRng) -> Vec<(Vec<u8>, Cid)> {
     while out.len() < n {
         t += rng.gen_range(1..1 << 24);
         let mut r = rng.gen_range(0..100);
-        let coll = mix.iter().find(|(_, w)| { if r < *w { true } else { r -= w; false } }).unwrap().0;
+        let coll = mix
+            .iter()
+            .find(|(_, w)| {
+                if r < *w {
+                    true
+                } else {
+                    r -= w;
+                    false
+                }
+            })
+            .unwrap()
+            .0;
         out.insert(format!("{coll}/{}", tid(t)).into_bytes(), rand_cid(rng));
     }
     out.into_iter().collect()
@@ -754,7 +777,10 @@ impl RefRepo {
         let mut overlay: HashMap<&str, bool> = HashMap::new();
         let mut ok = true;
         for (kind, path) in &writes {
-            let cur = overlay.get(path.as_str()).copied().unwrap_or_else(|| self.tree.get(path.as_bytes()).unwrap().is_some());
+            let cur = overlay
+                .get(path.as_str())
+                .copied()
+                .unwrap_or_else(|| self.tree.get(path.as_bytes()).unwrap().is_some());
             ok &= match kind {
                 Kind::Create => !cur,
                 Kind::Update => cur,
@@ -818,7 +844,8 @@ impl RefRepo {
     /// exactly the new records (each block hashing to its CID).
     fn check_commit(what: &str, exp: &ExpCommit, f: &Frame) {
         let c = f.commit().unwrap();
-        let ops: Vec<(String, String, Option<Cid>, Option<Cid>)> = c.ops.iter().map(|o| (o.action.clone(), o.path.clone(), o.cid, o.prev)).collect();
+        let ops: Vec<(String, String, Option<Cid>, Option<Cid>)> =
+            c.ops.iter().map(|o| (o.action.clone(), o.path.clone(), o.cid, o.prev)).collect();
         assert_eq!(ops, exp.ops, "{what}: ops");
         assert_eq!(c.prev_data, Some(exp.prev_data), "{what}: prevData");
         let data = match Value::decode(&c.blocks[&c.commit]).unwrap().get("data") {
@@ -827,7 +854,12 @@ impl RefRepo {
         };
         assert_eq!(data, exp.data, "{what}: data");
         let blocks = commit_blocks(f);
-        assert!(blocks.len() >= exp.mst.len() && blocks[..exp.mst.len()] == exp.mst[..], "{what}: MST blocks differ:\n got {:?}\n want {:?}", blocks.iter().map(|b| b.0).collect::<Vec<_>>(), exp.mst.iter().map(|b| b.0).collect::<Vec<_>>());
+        assert!(
+            blocks.len() >= exp.mst.len() && blocks[..exp.mst.len()] == exp.mst[..],
+            "{what}: MST blocks differ:\n got {:?}\n want {:?}",
+            blocks.iter().map(|b| b.0).collect::<Vec<_>>(),
+            exp.mst.iter().map(|b| b.0).collect::<Vec<_>>()
+        );
         let mut want: Vec<Cid> = Vec::new();
         for (_, _, new, _) in &exp.ops {
             if let Some(n) = new.filter(|n| !want.contains(n)) {
@@ -864,7 +896,9 @@ impl RefRepo {
         for (i, (got, want)) in tail.iter().zip(&want).enumerate() {
             match want {
                 Slot::Node(c, b) => assert!(got.0 == *c && got.1 == *b, "{did}: getRepo block {i}: node {c} differs"),
-                Slot::Record(k, c) => assert_eq!(got.0, *c, "{did}: getRepo block {i}: record {}", String::from_utf8_lossy(k)),
+                Slot::Record(k, c) => {
+                    assert_eq!(got.0, *c, "{did}: getRepo block {i}: record {}", String::from_utf8_lossy(k))
+                }
             }
         }
         let record_bytes: HashMap<Cid, Vec<u8>> = tail.iter().cloned().collect();
@@ -873,14 +907,24 @@ impl RefRepo {
         }
         // getRecord proofs, present and absent keys
         let mut keys: Vec<(String, String)> = Vec::new();
-        for c in ["com.example.feed.post", "com.example.feed.like", "com.example.thing", "com.example.rare", "com.example.none"] {
+        for c in [
+            "com.example.feed.post",
+            "com.example.feed.like",
+            "com.example.thing",
+            "com.example.rare",
+            "com.example.none",
+        ] {
             for k in 0..40 {
                 keys.push((c.into(), format!("k{k}")));
             }
         }
         for (c, r) in keys.iter().step_by(3) {
             let path = format!("{c}/{r}");
-            let p = get("com.atproto.sync.getRecord", vec![("did", did.clone()), ("collection", c.clone()), ("rkey", r.clone())]).await;
+            let p = get(
+                "com.atproto.sync.getRecord",
+                vec![("did", did.clone()), ("collection", c.clone()), ("rkey", r.clone())],
+            )
+            .await;
             let mut want = self.tree.proof_blocks(path.as_bytes()).unwrap();
             match self.tree.get(path.as_bytes()).unwrap() {
                 Some(rc) => {
@@ -901,12 +945,17 @@ impl RefRepo {
         assert_eq!(g.status, 200, "{}", g.text());
         let (_, blocks) = vlpds::car::read_car(&g.body).unwrap();
         let got: HashMap<Cid, Vec<u8>> = blocks.into_iter().map(|(c, b)| (c, b.to_vec())).collect();
-        let expected: HashMap<Cid, Vec<u8>> = nodes.iter().cloned().chain(recs.iter().take(5).map(|r| (r.1, record_bytes[&r.1].clone()))).collect();
+        let expected: HashMap<Cid, Vec<u8>> =
+            nodes.iter().cloned().chain(recs.iter().take(5).map(|r| (r.1, record_bytes[&r.1].clone()))).collect();
         assert!(got == expected, "{did}: getBlocks differs ({} blocks vs {})", got.len(), expected.len());
         // collection index
-        let mut colls: Vec<String> = recs.iter().map(|(k, _)| String::from_utf8(k.clone()).unwrap().split_once('/').unwrap().0.to_string()).collect();
+        let mut colls: Vec<String> = recs
+            .iter()
+            .map(|(k, _)| String::from_utf8(k.clone()).unwrap().split_once('/').unwrap().0.to_string())
+            .collect();
         colls.dedup();
-        let mut listed: Vec<String> = get("com.atproto.repo.describeRepo", vec![("repo", did.clone())]).await.ok()["collections"]
+        let mut listed: Vec<String> = get("com.atproto.repo.describeRepo", vec![("repo", did.clone())]).await.ok()
+            ["collections"]
             .as_array()
             .unwrap()
             .iter()
@@ -916,7 +965,8 @@ impl RefRepo {
         assert_eq!(listed, colls, "{did}: describeRepo collections");
         // migration counts: the commit, the nodes (not an empty root), a block per record
         let m = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
-        let non_empty = nodes.iter().filter(|(c, b)| !vlpds::mst::decode_node(b, *c).unwrap().entries.is_empty()).count();
+        let non_empty =
+            nodes.iter().filter(|(c, b)| !vlpds::mst::decode_node(b, *c).unwrap().entries.is_empty()).count();
         assert_eq!(m["repoBlocks"], json!(1 + non_empty + recs.len()), "{did}: checkAccountStatus");
     }
 }
@@ -979,11 +1029,17 @@ async fn check_stored_nodes(s: &TestServer, did: &str) {
     let commit = Value::decode(&repo.blocks[&repo.root]).unwrap();
     let Some(Value::Link(data)) = commit.get("data") else { panic!() };
     let tree = Tree::load_from_blocks(&repo.blocks, *data).unwrap();
-    let want: HashMap<Cid, Vec<u8>> = mst_lazy::persisted_nodes(&tree, 1).into_iter().map(|(c, b)| (c, b.to_vec())).collect();
+    let want: HashMap<Cid, Vec<u8>> =
+        mst_lazy::persisted_nodes(&tree, 1).into_iter().map(|(c, b)| (c, b.to_vec())).collect();
     let got = stored_nodes(s, did).await;
     let missing = want.keys().filter(|c| !got.contains_key(c)).count();
     let extra = got.keys().filter(|c| !want.contains_key(c)).count();
-    assert!(missing == 0 && extra == 0, "{did}: M/ has {} nodes, the tree {} interior ({missing} missing, {extra} garbage)", got.len(), want.len());
+    assert!(
+        missing == 0 && extra == 0,
+        "{did}: M/ has {} nodes, the tree {} interior ({missing} missing, {extra} garbage)",
+        got.len(),
+        want.len()
+    );
     for (c, b) in &want {
         assert_eq!(&got[c], b, "M/ node {c}");
     }
@@ -1055,9 +1111,17 @@ fn thing(coll: &str, n: i64) -> J {
 /// The XRPC call of a step.
 fn step_request(accts: &[TestAccount], step: &Step) -> (&'static str, J) {
     match step {
-        Step::Create(a, c, r, n) => ("com.atproto.repo.createRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
-        Step::Put(a, c, r, n) => ("com.atproto.repo.putRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)})),
-        Step::Delete(a, c, r) => ("com.atproto.repo.deleteRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r})),
+        Step::Create(a, c, r, n) => (
+            "com.atproto.repo.createRecord",
+            json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)}),
+        ),
+        Step::Put(a, c, r, n) => (
+            "com.atproto.repo.putRecord",
+            json!({"repo": accts[*a].did, "collection": c, "rkey": r, "record": thing(c, *n)}),
+        ),
+        Step::Delete(a, c, r) => {
+            ("com.atproto.repo.deleteRecord", json!({"repo": accts[*a].did, "collection": c, "rkey": r}))
+        }
         Step::Batch(a, w) => ("com.atproto.repo.applyWrites", json!({"repo": accts[*a].did, "writes": w})),
     }
 }
@@ -1117,7 +1181,8 @@ async fn lazy_node_matches_reference() {
         }
         let frames = sub.drain(Duration::from_millis(500)).await;
         for (i, a) in accts.iter().enumerate() {
-            let commits: Vec<&Frame> = frames.iter().filter(|f| f.kind() == "#commit" && f.did() == Some(&a.did)).collect();
+            let commits: Vec<&Frame> =
+                frames.iter().filter(|f| f.kind() == "#commit" && f.did() == Some(&a.did)).collect();
             assert!(commits.len() > 60, "commits seen: {}", commits.len());
             assert_eq!(commits.len(), refs[i].commits.len(), "account {i}: commit count");
             for (j, (f, exp)) in commits.iter().zip(&refs[i].commits).enumerate() {
@@ -1150,7 +1215,8 @@ async fn replay_after_kill_reconstructs_nodes() {
             // nothing checkpointed during the test: the survivor replays it all
             c.checkpoint_every = Duration::from_secs(3600);
             let l = lease(c);
-            (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
+            (l.ttl, l.renew_every, l.skew) =
+                (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
         })
     };
     let a = node("ra").await;
@@ -1168,7 +1234,8 @@ async fn replay_after_kill_reconstructs_nodes() {
     let survivor = if std::ptr::eq(victim, &a) { &b } else { &a };
     let moved: Vec<&TestAccount> = accts.iter().filter(|x| victim.app.partition(&x.did).is_ok()).collect();
     assert!(!moved.is_empty(), "the victim owns some of the repos");
-    let heads: Vec<(Cid, String)> = futures::future::join_all(moved.iter().map(|x| survivor.latest_commit(&x.did))).await;
+    let heads: Vec<(Cid, String)> =
+        futures::future::join_all(moved.iter().map(|x| survivor.latest_commit(&x.did))).await;
     victim.app.node.halt();
     wait_until("survivor takes every shard", Duration::from_secs(20), || owned(survivor) == SHARDS as usize).await;
     for (x, head) in moved.iter().zip(&heads) {
@@ -1235,7 +1302,10 @@ async fn lazy_open_rebuilds_missing_or_bad_nodes() {
         let st = Step::Create(0, "com.example.thing".into(), format!("after-{case}"), 5);
         ref_step(&s, &accts, &mut refs, &st).await;
         assert!(vlpds::metrics::LAZY_MST_FALLBACKS.with_label_values(&[reason]).get() > n0, "{case}: no fallback");
-        assert!(s.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed) > here0, "{case}: not counted on the node");
+        assert!(
+            s.app.workers.lazy_fallbacks.load(std::sync::atomic::Ordering::Relaxed) > here0,
+            "{case}: not counted on the node"
+        );
         refs[0].check_repo(&s, a).await;
         // the backfill is applied with the commit after it
         check_stored_nodes(&s, &a.did).await;
@@ -1277,7 +1347,12 @@ async fn import_and_delete_leave_no_stale_nodes() {
 
 /// A single node (id `id`, 4 shards) on `store`, with nothing preloaded
 /// (every first write is a cold open).
-async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetch: usize, workers: usize) -> TestServer {
+async fn bench_node(
+    id: &str,
+    store: Arc<dyn object_store::ObjectStore>,
+    prefetch: usize,
+    workers: usize,
+) -> TestServer {
     let id = id.to_string();
     let s = TestServer::spawn_with(move |c| {
         c.lazy_mst_prefetch_bytes = prefetch;
@@ -1285,7 +1360,8 @@ async fn bench_node(id: &str, store: Arc<dyn object_store::ObjectStore>, prefetc
         c.shards = 4;
         c.workers = workers;
         c.preload_recent = 0;
-        c.cluster = Some(vlpds::cluster::ClusterConfig { node_id: id, addr: peer_url(c), shards: 4, ..Default::default() });
+        c.cluster =
+            Some(vlpds::cluster::ClusterConfig { node_id: id, addr: peer_url(c), shards: 4, ..Default::default() });
     })
     .await;
     wait_until("all shards owned", Duration::from_secs(60), || owned(&s) == 4).await;
@@ -1316,7 +1392,11 @@ async fn create_post(s: &TestServer, did: &str) -> Duration {
     let t = Instant::now();
     let r = s
         .xrpc
-        .post("com.atproto.repo.createRecord", &json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("bench")}), &Auth::Bearer(s.app.jwt.access(did)))
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("bench")}),
+            &Auth::Bearer(s.app.jwt.access(did)),
+        )
         .await;
     assert_eq!(r.status, 200, "{}", r.text());
     t.elapsed()
@@ -1352,7 +1432,11 @@ fn pct(v: &mut [f64], p: f64) -> f64 {
 #[ignore]
 async fn bench_cold_write() {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
-    let sizes: Vec<u32> = std::env::var("VLPDS_COLD_SIZES").unwrap_or("1000,10000,100000".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    let sizes: Vec<u32> = std::env::var("VLPDS_COLD_SIZES")
+        .unwrap_or("1000,10000,100000".into())
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
     let per: usize = env_or("VLPDS_COLD_REPOS", 3);
     let delay = Duration::from_millis(env_or("VLPDS_COLD_GET_MS", 20));
     let repo_sizes: Vec<u32> = sizes.iter().flat_map(|&n| std::iter::repeat_n(n, per)).collect();
@@ -1374,7 +1458,11 @@ async fn bench_cold_write() {
         vlpds::server::shutdown(&s.app).await;
     }
     let mut report = Vec::new();
-    let prefetch_kb: Vec<usize> = std::env::var("VLPDS_COLD_PREFETCH_KB").unwrap_or("4096,256,0".into()).split(',').map(|s| s.parse().unwrap()).collect();
+    let prefetch_kb: Vec<usize> = std::env::var("VLPDS_COLD_PREFETCH_KB")
+        .unwrap_or("4096,256,0".into())
+        .split(',')
+        .map(|s| s.parse().unwrap())
+        .collect();
     for kb in prefetch_kb {
         let label = format!("prefetch {kb} KiB");
         vlpds::partition::bump_cache_epoch();
@@ -1532,15 +1620,21 @@ async fn bench_readers() {
         // VLPDS_READ_ONLY=getRepo (comma-separated phases) skips the others
         let only: String = env_or("VLPDS_READ_ONLY", String::new());
         let on = |p: &str| only.is_empty() || only.split(',').any(|o| o == p);
-        let get_record = if !on("getRecord") { 0.0 } else { throughput(secs, 32, move |i| {
-            let (x, d, keys) = (x.clone(), d.clone(), keys.clone());
-            async move {
-                let (c, r) = keys[i % keys.len()].split_once('/').unwrap();
-                let resp = x.get("com.atproto.sync.getRecord", &[("did", &d), ("collection", c), ("rkey", r)], &Auth::None).await;
-                assert_eq!(resp.status, 200);
-            }
-        })
-        .await };
+        let get_record = if !on("getRecord") {
+            0.0
+        } else {
+            throughput(secs, 32, move |i| {
+                let (x, d, keys) = (x.clone(), d.clone(), keys.clone());
+                async move {
+                    let (c, r) = keys[i % keys.len()].split_once('/').unwrap();
+                    let resp = x
+                        .get("com.atproto.sync.getRecord", &[("did", &d), ("collection", c), ("rkey", r)], &Auth::None)
+                        .await;
+                    assert_eq!(resp.status, 200);
+                }
+            })
+            .await
+        };
         let blocks = |cids: Arc<Vec<Cid>>, secs: f64, conc: usize| {
             let (x, d) = (s.xrpc.clone(), did.clone());
             throughput(secs, conc, move |i| {
@@ -1556,13 +1650,17 @@ async fn bench_readers() {
         let gb_records = if on("record") { blocks(recs.clone(), secs, 32).await } else { 0.0 };
         let gb_leaves = if on("leaf") { blocks(leaves.clone(), secs, 4).await } else { 0.0 };
         let (x, d) = (s.xrpc.clone(), did.clone());
-        let get_repo = if !on("getRepo") { 0.0 } else { throughput(secs.max(4.0), 4, move |_| {
-            let (x, d) = (x.clone(), d.clone());
-            async move {
-                assert_eq!(x.get("com.atproto.sync.getRepo", &[("did", &d)], &Auth::None).await.status, 200);
-            }
-        })
-        .await };
+        let get_repo = if !on("getRepo") {
+            0.0
+        } else {
+            throughput(secs.max(4.0), 4, move |_| {
+                let (x, d) = (x.clone(), d.clone());
+                async move {
+                    assert_eq!(x.get("com.atproto.sync.getRepo", &[("did", &d)], &Auth::None).await.status, 200);
+                }
+            })
+            .await
+        };
         let line = format!(
             "{n} records: sync.getRecord {get_record:.0}/s; getBlocks interior {gb_interior:.0}/s, record {gb_records:.0}/s, leaf {gb_leaves:.1}/s; getRepo {get_repo:.2}/s ({:.1} MB); CPU us/op {:?}; M instructions/op {:?}",
             r.body.len() as f64 / 1e6,
@@ -1624,7 +1722,8 @@ async fn bench_rss() {
         let took = t.elapsed().as_secs_f64();
         tokio::time::sleep(Duration::from_secs(2)).await;
         let rss1 = vlpds::metrics::resident_bytes().unwrap_or(0);
-        let cache: i64 = (0..8).map(|w| vlpds::metrics::REPO_CACHE_BYTES.with_label_values(&[&w.to_string()]).get()).sum();
+        let cache: i64 =
+            (0..8).map(|w| vlpds::metrics::REPO_CACHE_BYTES.with_label_values(&[&w.to_string()]).get()).sum();
         let line = format!(
             "{repos} repos / {total} records, one write each in {took:.1}s (p50 {:.1} ms, p99 {:.1} ms): RSS +{:.0} MB ({:.0} -> {:.0} MB), repo cache {:.0} MB, node cache {:.0} MB",
             pct(&mut lat, 0.5),
@@ -1674,7 +1773,9 @@ async fn reshard_carries_nodes() {
         cl.layout().shards.iter().find(|r| r.lo <= slot && slot < r.hi).cloned().unwrap()
     };
     let target = shard_of(&accts[0].did);
-    let r = admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true})).await;
+    let r =
+        admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true}))
+            .await;
     assert_eq!(r["done"], json!(true), "{r}");
     vlpds::mst_store::NODE_CACHE.clear();
     for a in &accts {
@@ -1683,7 +1784,12 @@ async fn reshard_carries_nodes() {
     for st in random_steps(&mut rng, accts.len(), 150) {
         run_step(&s, &accts, &st).await;
     }
-    let kids: Vec<vlpds::slots::ShardId> = r["op"]["children"].as_array().unwrap().iter().map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32)).collect();
+    let kids: Vec<vlpds::slots::ShardId> = r["op"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32))
+        .collect();
     let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await;
     assert_eq!(r["done"], json!(true), "{r}");
     vlpds::mst_store::NODE_CACHE.clear();
@@ -1717,7 +1823,11 @@ async fn hot_repo_paths_stay_bounded() {
     }
     let info = || async {
         let (reply, rx) = tokio::sync::oneshot::channel();
-        s.app.workers.route(&a.did).send(vlpds::worker::WorkerMsg::CacheInfo { did: a.did.as_str().into(), reply }).unwrap();
+        s.app
+            .workers
+            .route(&a.did)
+            .send(vlpds::worker::WorkerMsg::CacheInfo { did: a.did.as_str().into(), reply })
+            .unwrap();
         rx.await.unwrap()
     };
     // deletes and re-creates all over the key space, 32 at a time
@@ -1756,7 +1866,9 @@ async fn hot_repo_paths_stay_bounded() {
     // the tree holds exactly the records
     let r = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await;
     let repo = Repo::from_car(&r.body).unwrap();
-    let Some(Value::Link(data)) = Value::decode(&repo.blocks[&repo.root]).unwrap().get("data").cloned() else { panic!() };
+    let Some(Value::Link(data)) = Value::decode(&repo.blocks[&repo.root]).unwrap().get("data").cloned() else {
+        panic!()
+    };
     let tree = Tree::load_from_blocks(&repo.blocks, data).unwrap();
     let mut n = 0;
     tree.walk(&mut |_, c| {
@@ -1779,7 +1891,8 @@ async fn hot_repo_paths_stay_bounded() {
 #[ignore]
 async fn bench_cold_open_blobs() {
     use object_store::throttle::{ThrottleConfig, ThrottledStore};
-    let path = std::env::var("VLPDS_REPO_CAR").unwrap_or_else(|_| format!("{}/repo.car", std::env::var("HOME").unwrap_or_default()));
+    let path = std::env::var("VLPDS_REPO_CAR")
+        .unwrap_or_else(|_| format!("{}/repo.car", std::env::var("HOME").unwrap_or_default()));
     let Ok(car) = std::fs::read(&path) else {
         eprintln!("skipping: no repo CAR at {path}");
         return;
@@ -1793,7 +1906,10 @@ async fn bench_cold_open_blobs() {
         let s = bench_node("bo", base.clone(), 4 << 20, 4).await;
         for _ in 0..copies {
             let a = s.create_account("blobby").await;
-            let r = s.xrpc.post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth()).await;
+            let r = s
+                .xrpc
+                .post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth())
+                .await;
             assert_eq!(r.status, 200, "{}", r.text());
             dids.push(a.did);
         }

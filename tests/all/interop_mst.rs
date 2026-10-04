@@ -2,7 +2,7 @@
 //! commit-proof fixtures (testdata/interop/{mst,firehose}).
 use crate::common::*;
 use std::collections::HashMap;
-use vlpds::mst::{Tree, height_for_key};
+use vlpds::mst::{height_for_key, Tree};
 
 #[derive(serde::Deserialize)]
 struct KeyHeight {
@@ -139,7 +139,10 @@ fn commit_proof_reference_blocks_suffice_for_inversion() {
         let mut inv = Tree::load_from_blocks(&proof, root).unwrap_or_else(|e| panic!("{}: load: {e}", f.comment));
         // invert in reverse order of application
         for k in f.dels.iter().rev() {
-            assert_eq!(inv.insert(k.as_bytes(), v).unwrap_or_else(|e| panic!("{}: reinsert {k}: {e}", f.comment)), None);
+            assert_eq!(
+                inv.insert(k.as_bytes(), v).unwrap_or_else(|e| panic!("{}: reinsert {k}: {e}", f.comment)),
+                None
+            );
         }
         for k in f.adds.iter().rev() {
             assert_eq!(inv.remove(k.as_bytes()).unwrap_or_else(|e| panic!("{}: remove {k}: {e}", f.comment)), Some(v));

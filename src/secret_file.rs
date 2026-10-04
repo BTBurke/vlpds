@@ -32,7 +32,8 @@ mod tests {
     use super::*;
 
     fn tmp(contents: &[u8]) -> std::path::PathBuf {
-        let p = std::env::temp_dir().join(format!("vlpds-secret-file-{}-{}", std::process::id(), rand::random::<u64>()));
+        let p =
+            std::env::temp_dir().join(format!("vlpds-secret-file-{}-{}", std::process::id(), rand::random::<u64>()));
         std::fs::write(&p, contents).unwrap();
         p
     }

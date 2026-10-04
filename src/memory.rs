@@ -70,7 +70,8 @@ impl std::str::FromStr for BudgetSpec {
     fn from_str(s: &str) -> anyhow::Result<BudgetSpec> {
         let s = s.trim();
         if let Some(p) = s.strip_suffix('%') {
-            let p: f64 = p.trim().parse().map_err(|_| anyhow::anyhow!("memory budget {s:?}: expected <MiB> or <percent>%"))?;
+            let p: f64 =
+                p.trim().parse().map_err(|_| anyhow::anyhow!("memory budget {s:?}: expected <MiB> or <percent>%"))?;
             anyhow::ensure!(p > 0.0 && p <= 100.0, "memory budget {s:?}: percent must be in (0, 100]");
             return Ok(BudgetSpec::Fraction(p / 100.0));
         }
@@ -150,7 +151,12 @@ pub fn plan(s: &Settings, f: &Fixed, limit: Option<u64>) -> anyhow::Result<Plan>
         Some(BudgetSpec::Fraction(x)) => (base as f64 * x) as u64,
     };
     if let Some(l) = limit {
-        anyhow::ensure!(budget <= l, "--memory-budget-mb {} MiB is over this node's memory limit ({} MiB: cgroup memory.max or RAM)", mb(budget), mb(l));
+        anyhow::ensure!(
+            budget <= l,
+            "--memory-budget-mb {} MiB is over this node's memory limit ({} MiB: cgroup memory.max or RAM)",
+            mb(budget),
+            mb(l)
+        );
     }
     let in_memory = f.in_memory_caches.unwrap_or((budget as f64 * crate::caches::DEFAULT_BUDGET_FRACTION) as u64);
     let parts = vec![
@@ -378,10 +384,18 @@ mod sys {
 mod sys {
     pub fn physical_memory() -> Option<u64> {
         extern "C" {
-            fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, oldlen: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                oldlen: *mut usize,
+                new: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
         }
         let (mut v, mut len) = (0u64, std::mem::size_of::<u64>());
-        let ok = unsafe { sysctlbyname(c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0) } == 0;
+        let ok = unsafe {
+            sysctlbyname(c"hw.memsize".as_ptr(), &mut v as *mut u64 as *mut _, &mut len, std::ptr::null_mut(), 0)
+        } == 0;
         (ok && v > 0).then_some(v)
     }
 }
@@ -400,7 +414,9 @@ pub fn sst_meta_bytes<'a>(dbs: impl IntoIterator<Item = &'a slatedb::Db>) -> (u6
     let (mut filter, mut index) = (0, 0);
     for db in dbs {
         let m = db.manifest();
-        for h in m.l0().iter().map(|v| &v.sst).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| &v.sst))) {
+        for h in
+            m.l0().iter().map(|v| &v.sst).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| &v.sst)))
+        {
             filter += h.info.filter_len;
             index += h.info.index_len;
         }
@@ -443,7 +459,12 @@ pub fn init(plan: Plan) -> &'static Plan {
                 tick(GLOBAL.get().expect("set before the thread starts"));
             })
             .expect("spawning the memory sizer");
-        Global { plan: sizer.plan.clone(), sizer: parking_lot::Mutex::new(sizer), nodes: Default::default(), short: Default::default() }
+        Global {
+            plan: sizer.plan.clone(),
+            sizer: parking_lot::Mutex::new(sizer),
+            nodes: Default::default(),
+            short: Default::default(),
+        }
     });
     &g.plan
 }
@@ -459,7 +480,11 @@ pub fn register(table: &Arc<PartitionTable>, cluster: &Arc<crate::cluster::Clust
     {
         let mut nodes = g.nodes.lock();
         nodes.retain(|n| n.table.strong_count() > 0);
-        nodes.push(Node { table: Arc::downgrade(table), cluster: Arc::downgrade(cluster), workers: Arc::downgrade(&workers.senders) });
+        nodes.push(Node {
+            table: Arc::downgrade(table),
+            cluster: Arc::downgrade(cluster),
+            workers: Arc::downgrade(&workers.senders),
+        });
     }
     tick(g);
     apply_repo(g, g.sizer.lock().split().repo);
@@ -486,7 +511,13 @@ fn tick(g: &Global) {
     let (filter, index) = sst_meta_bytes(owned.iter().map(|p| &*p.db));
     drop(owned);
     let st = crate::partition::cache_stats();
-    let o = Observation { encoded: filter + index, nodes, meta_cache_bytes: st.meta_used, meta_loads: st.meta_loads, meta_evictions: st.meta_evictions };
+    let o = Observation {
+        encoded: filter + index,
+        nodes,
+        meta_cache_bytes: st.meta_used,
+        meta_loads: st.meta_loads,
+        meta_evictions: st.meta_evictions,
+    };
     let (changed, s, need, ratio) = {
         let mut sizer = g.sizer.lock();
         let changed = sizer.observe(&o, Instant::now());
@@ -495,7 +526,14 @@ fn tick(g: &Global) {
     if changed {
         crate::partition::resize_caches(s.block, s.meta);
         apply_repo(g, s.repo);
-        tracing::info!(meta_mb = mb(s.meta), block_mb = mb(s.block), repo_mb = mb(s.repo), owned_meta_mb = mb(need), nodes, "caches resized");
+        tracing::info!(
+            meta_mb = mb(s.meta),
+            block_mb = mb(s.block),
+            repo_mb = mb(s.repo),
+            owned_meta_mb = mb(need),
+            nodes,
+            "caches resized"
+        );
     }
     use std::sync::atomic::Ordering::Relaxed;
     let was_short = g.short.swap(s.shortfall > 0, Relaxed);
@@ -574,7 +612,17 @@ mod tests {
 
         // a budget given as a share of the limit, headroom floor on small ones
         let small = Settings { budget: Some("50%".parse().unwrap()), ..Default::default() };
-        let tiny = Fixed { mst_node_cache: 64 * MIB, firehose_ring: 64 * MIB, live_ring: 32 * MIB, merge_queue: 32 * MIB, backfill_cache: 32 * MIB, backfill_readahead: 16 * MIB, max_backfills: 4, max_exports: 4, ..fixed() };
+        let tiny = Fixed {
+            mst_node_cache: 64 * MIB,
+            firehose_ring: 64 * MIB,
+            live_ring: 32 * MIB,
+            merge_queue: 32 * MIB,
+            backfill_cache: 32 * MIB,
+            backfill_readahead: 16 * MIB,
+            max_backfills: 4,
+            max_exports: 4,
+            ..fixed()
+        };
         let p = plan(&small, &tiny, Some(5 * GIB)).unwrap();
         assert_eq!(p.budget, 5 * GIB / 2);
         assert_eq!(p.part("headroom"), MIN_HEADROOM);
@@ -590,7 +638,11 @@ mod tests {
         let sp = p.split(10 * GIB);
         assert_eq!((sp.block, sp.meta, sp.repo), (GIB, 512 * MIB, p.pool - GIB - 512 * MIB));
         assert_eq!(sp.shortfall, 10 * GIB - 512 * MIB);
-        assert!("x%".parse::<BudgetSpec>().is_err() && "0".parse::<BudgetSpec>().is_err() && "150%".parse::<BudgetSpec>().is_err());
+        assert!(
+            "x%".parse::<BudgetSpec>().is_err()
+                && "0".parse::<BudgetSpec>().is_err()
+                && "150%".parse::<BudgetSpec>().is_err()
+        );
         assert_eq!("2048".parse::<BudgetSpec>().unwrap(), BudgetSpec::Bytes(2 * GIB));
     }
 
@@ -647,7 +699,8 @@ mod tests {
         assert!(!s.observe(&obs(GIB / 4), t0 + SHRINK_HOLD * 3));
         assert!(!s.observe(&obs(GIB / 4), t0 + SHRINK_HOLD * 3 + SHRINK_HOLD / 2));
         // explicit metadata size: never resized
-        let mut fixed_meta = Sizer::new(plan(&Settings { meta: Some(GIB), ..Default::default() }, &fixed(), Some(32 * GIB)).unwrap());
+        let mut fixed_meta =
+            Sizer::new(plan(&Settings { meta: Some(GIB), ..Default::default() }, &fixed(), Some(32 * GIB)).unwrap());
         assert!(!fixed_meta.observe(&obs(8 * GIB), t0));
         assert_eq!(fixed_meta.split().meta, GIB);
         assert!(fixed_meta.split().shortfall > 0);
@@ -657,7 +710,13 @@ mod tests {
     fn decode_ratio_is_measured_when_quiet() {
         let p = plan(&Settings::default(), &fixed(), Some(32 * GIB)).unwrap();
         let mut s = Sizer::new(p);
-        let o = |bytes, loads| Observation { encoded: 1000, nodes: 1, meta_cache_bytes: bytes, meta_loads: loads, meta_evictions: 0 };
+        let o = |bytes, loads| Observation {
+            encoded: 1000,
+            nodes: 1,
+            meta_cache_bytes: bytes,
+            meta_loads: loads,
+            meta_evictions: 0,
+        };
         s.observe(&o(1600, 1), Instant::now());
         assert_eq!(s.ratio(), DEFAULT_META_DECODE_RATIO, "the first observation has nothing to compare with");
         for _ in 0..50 {

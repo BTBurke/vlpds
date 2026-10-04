@@ -4,6 +4,7 @@
 //! node log without waiting for durability (acks come back in log order).
 
 use crate::car;
+use crate::chan::{Receiver, Sender};
 use crate::cid::Cid;
 use crate::crypto::Keypair;
 use crate::events::{self, RepoOp};
@@ -18,10 +19,9 @@ use crate::state::{self, Head};
 use crate::stats::STATS;
 use crate::tid::{self, Tid};
 use bytes::Bytes;
-use crate::chan::{Receiver, Sender};
+use prometheus::IntCounter;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use prometheus::IntCounter;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -82,7 +82,9 @@ pub enum Write {
 impl Write {
     fn parts(&self) -> (&str, &str) {
         match self {
-            Write::Create { collection, rkey, .. } | Write::Update { collection, rkey, .. } | Write::Delete { collection, rkey, .. } => (collection, rkey),
+            Write::Create { collection, rkey, .. }
+            | Write::Update { collection, rkey, .. }
+            | Write::Delete { collection, rkey, .. } => (collection, rkey),
         }
     }
 
@@ -154,7 +156,8 @@ impl Claim {
 
     /// False if the worker took it already.
     pub fn abandon(&self) -> bool {
-        let won = self.state.compare_exchange(Self::PENDING, Self::ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok();
+        let won =
+            self.state.compare_exchange(Self::PENDING, Self::ABANDONED, Ordering::AcqRel, Ordering::Acquire).is_ok();
         if won {
             self.permit.lock().take();
         }
@@ -209,7 +212,9 @@ pub enum AccountOp {
     Delete,
     /// Emits #account, #identity and #sync of the current commit, as the
     /// reference's sequenceAccountActivation.
-    Activate { mutate: AccountMutation },
+    Activate {
+        mutate: AccountMutation,
+    },
     SigningKey(KeyStep),
     /// importRepo staged under a new generation (`crate::import`, DESIGN.md
     /// "Staged imports").
@@ -232,7 +237,14 @@ pub enum ImportStep {
     /// `root` (its block; None: the empty tree) at the reserved rev, the
     /// account's generation, `S/`, the collection index changes, the old
     /// generation to the garbage, and #sync unless deactivated.
-    Commit { nonce: u64, epoch: u64, root: Option<Bytes>, stats: state::RepoStats, colls_add: Vec<String>, colls_del: Vec<String> },
+    Commit {
+        nonce: u64,
+        epoch: u64,
+        root: Option<Bytes>,
+        stats: state::RepoStats,
+        colls_add: Vec<String>,
+        colls_del: Vec<String>,
+    },
     /// The staged generation becomes garbage. A no-op for another nonce.
     Abort { nonce: u64 },
     /// Deletes of a garbage generation's rows.
@@ -322,11 +334,20 @@ pub enum WorkerMsg {
     Shutdown,
     /// Load a recently written repo ahead of its first request; `done` gets
     /// whether the load was started and cached.
-    Preload { did: Arc<str>, done: oneshot::Sender<bool> },
-    CacheInfo { did: Arc<str>, reply: oneshot::Sender<Option<CachedRepo>> },
+    Preload {
+        did: Arc<str>,
+        done: oneshot::Sender<bool>,
+    },
+    CacheInfo {
+        did: Arc<str>,
+        reply: oneshot::Sender<Option<CachedRepo>>,
+    },
     /// Result of `Worker::start_fetch`: the tree to continue with (None:
     /// unchanged), and the blob refs and backlinks if it read them.
-    Fetched { did: Arc<str>, res: Result<Box<FetchedState>, crate::mst::MstError> },
+    Fetched {
+        did: Arc<str>,
+        res: Result<Box<FetchedState>, crate::mst::MstError>,
+    },
     /// A new [`CacheLimits::bytes`] (src/memory.rs resizes the repo cache).
     SetCacheBytes(usize),
 }
@@ -420,7 +441,12 @@ impl RepoState {
     }
 
     fn durable_view(&self) -> Arc<DurableView> {
-        Arc::new(DurableView { head: self.head.clone(), gen: self.gen(), tree: self.mst.tree.clone(), nodes: self.nodes.clone() })
+        Arc::new(DurableView {
+            head: self.head.clone(),
+            gen: self.gen(),
+            tree: self.mst.tree.clone(),
+            nodes: self.nodes.clone(),
+        })
     }
 }
 
@@ -484,7 +510,12 @@ impl From<usize> for CacheLimits {
 }
 
 fn new_view(head: &Head, gen: u64, mst: &LazyTree, nodes: &crate::mst::SharedNodeIndex) -> ViewCell {
-    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView { head: head.clone(), gen, tree: mst.tree.clone(), nodes: nodes.clone() })))
+    Arc::new(parking_lot::RwLock::new(Arc::new(DurableView {
+        head: head.clone(),
+        gen,
+        tree: mst.tree.clone(),
+        nodes: nodes.clone(),
+    })))
 }
 
 #[derive(Clone)]
@@ -572,10 +603,7 @@ pub fn spawn_with_secrets(
             })
             .unwrap();
     }
-    Workers {
-        senders: Arc::new(WorkerSenders(senders)),
-        lazy_fallbacks,
-    }
+    Workers { senders: Arc::new(WorkerSenders(senders)), lazy_fallbacks }
 }
 
 struct Worker {
@@ -767,14 +795,16 @@ impl Worker {
                 }
             }
             WorkerMsg::DropPartition(p, done) => {
-                let drop: Vec<Arc<str>> = self.cache.iter().filter(|(_, st)| st.partition.id == p).map(|(d, _)| d.clone()).collect();
+                let drop: Vec<Arc<str>> =
+                    self.cache.iter().filter(|(_, st)| st.partition.id == p).map(|(d, _)| d.clone()).collect();
                 for d in drop {
                     self.cache_pop(&d);
                 }
                 // the shard is unrouted (and its close barrier settles the
                 // in-flight commits): buffered requests go through a load,
                 // which fails over as "not owned"
-                let drained: Vec<Arc<str>> = self.draining.iter().filter(|(_, st)| st.partition.id == p).map(|(d, _)| d.clone()).collect();
+                let drained: Vec<Arc<str>> =
+                    self.draining.iter().filter(|(_, st)| st.partition.id == p).map(|(d, _)| d.clone()).collect();
                 for d in drained {
                     self.draining.remove(&d);
                     self.reload_buffered(&d);
@@ -784,14 +814,21 @@ impl Worker {
         }
     }
 
-    fn loaded(&mut self, did: Arc<str>, res: anyhow::Result<Option<RepoState>>, order: &mut Vec<Arc<str>>, groups: &mut HashMap<Arc<str>, Vec<Queued>>) {
+    fn loaded(
+        &mut self,
+        did: Arc<str>,
+        res: anyhow::Result<Option<RepoState>>,
+        order: &mut Vec<Arc<str>>,
+        groups: &mut HashMap<Arc<str>, Vec<Queued>>,
+    ) {
         let buffered = self.loading.remove(&did).unwrap_or_default();
         // The shard closed (and maybe reopened) while the load was in flight:
         // the state belongs to an ownership that ended and must never be
         // cached, or commits built on it chain past whatever the shard saw
         // since. close() purges the cache after unrouting the shard, so
         // checking here closes the window.
-        let current = matches!(&res, Ok(Some(st)) if (self.partitions)(&did).is_some_and(|p| Arc::ptr_eq(&p, &st.partition)));
+        let current =
+            matches!(&res, Ok(Some(st)) if (self.partitions)(&did).is_some_and(|p| Arc::ptr_eq(&p, &st.partition)));
         if let Some(done) = self.preloads.remove(&did) {
             let outcome = match &res {
                 _ if current => "loaded",
@@ -838,7 +875,13 @@ impl Worker {
         }
     }
 
-    fn fetched(&mut self, did: Arc<str>, res: Result<Box<FetchedState>, crate::mst::MstError>, order: &mut Vec<Arc<str>>, groups: &mut HashMap<Arc<str>, Vec<Queued>>) {
+    fn fetched(
+        &mut self,
+        did: Arc<str>,
+        res: Result<Box<FetchedState>, crate::mst::MstError>,
+        order: &mut Vec<Arc<str>>,
+        groups: &mut HashMap<Arc<str>, Vec<Queued>>,
+    ) {
         let buffered = self.loading.remove(&did).unwrap_or_default();
         match (self.cache.peek_mut(&did), res) {
             (Some(st), Ok(fetched)) if st.fetching => {
@@ -895,8 +938,12 @@ impl Worker {
 
     /// Reloads drained repos (see `draining`) whose commits are all durable.
     fn release_drained(&mut self) {
-        let done: Vec<Arc<str>> =
-            self.draining.iter().filter(|(_, st)| st.pending.load(Ordering::Acquire) == 0).map(|(d, _)| d.clone()).collect();
+        let done: Vec<Arc<str>> = self
+            .draining
+            .iter()
+            .filter(|(_, st)| st.pending.load(Ordering::Acquire) == 0)
+            .map(|(d, _)| d.clone())
+            .collect();
         for did in done {
             self.draining.remove(&did);
             self.reload_buffered(&did);
@@ -937,7 +984,10 @@ impl Worker {
         metrics::LOADING_REPOS.inc();
         let (me, fallbacks) = (self.me.clone(), self.fallbacks.clone());
         let Some(partition) = (self.partitions)(&did) else {
-            let _ = me.send(WorkerMsg::Loaded { did, res: Box::new(Err(anyhow::anyhow!("partition not owned by this node"))) });
+            let _ = me.send(WorkerMsg::Loaded {
+                did,
+                res: Box::new(Err(anyhow::anyhow!("partition not owned by this node"))),
+            });
             return;
         };
         let db = preload.then(|| partition.db.clone());
@@ -945,7 +995,10 @@ impl Worker {
             let t = Instant::now();
             // a shard closed under the load moved: retryable like "not owned"
             let res = load_repo_with(partition, did.clone(), opts).await.map_err(|e| {
-                let closed = e.chain().any(|c| c.downcast_ref::<slatedb::Error>().is_some_and(|s| matches!(s.kind(), slatedb::ErrorKind::Closed(_))));
+                let closed = e.chain().any(|c| {
+                    c.downcast_ref::<slatedb::Error>()
+                        .is_some_and(|s| matches!(s.kind(), slatedb::ErrorKind::Closed(_)))
+                });
                 if closed {
                     e.context("partition not owned by this node (closed while loading)")
                 } else {
@@ -985,7 +1038,10 @@ impl Worker {
             return; // charged as loaded until it is unloaded (`evict`)
         }
         let Some(st) = self.cache.peek_mut(did) else { return };
-        let charge = REPO_BASE_BYTES + st.heap.heap_bytes(&st.mst.tree.root) + st.blob_refs.len() * 96 + st.backlinks.heap_bytes();
+        let charge = REPO_BASE_BYTES
+            + st.heap.heap_bytes(&st.mst.tree.root)
+            + st.blob_refs.len() * 96
+            + st.backlinks.heap_bytes();
         debug_assert_eq!(charge, repo_bytes(st));
         if charge > LAZY_REPO_MAX_BYTES {
             self.big.insert(did.clone());
@@ -1057,7 +1113,9 @@ impl Worker {
     /// be read back, and a commit's persistence diff only needs the nodes
     /// its own walks loaded.
     fn unload_paths(&mut self) {
-        let idle = |st: &RepoState| st.pending.load(Ordering::Acquire) == 0 && !st.fetching && st.view.read().head.rev == st.head.rev;
+        let idle = |st: &RepoState| {
+            st.pending.load(Ordering::Acquire) == 0 && !st.fetching && st.view.read().head.rev == st.head.rev
+        };
         let big: Vec<Arc<str>> = self.big.iter().cloned().collect();
         for did in big {
             let Some(st) = self.cache.peek_mut(&did) else {
@@ -1139,7 +1197,14 @@ impl Worker {
         // a new repo's whole tree is in flight until this applies
         let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut backlinks = crate::backlinks::Cache::default();
-        index_backlinks(&did, gen, req.records.iter().map(|(p, _, b)| (p.as_str(), &b[..])), &mut backlinks, &Some(applied.clone()), &mut muts);
+        index_backlinks(
+            &did,
+            gen,
+            req.records.iter().map(|(p, _, b)| (p.as_str(), &b[..])),
+            &mut backlinks,
+            &Some(applied.clone()),
+            &mut muts,
+        );
         let account_json = match gen {
             0 => req.account_json.clone(),
             _ => match account_mutation(&did, &account) {
@@ -1208,21 +1273,29 @@ impl Worker {
 
     /// Everything a CreateRepo needs before it writes: the partition, the
     /// genesis tree, the signed head and the account.
-    fn check_create(&mut self, req: &CreateRepoReq) -> Result<(Arc<Partition>, Tree, Head, state::Account, state::ImportState), WriteError> {
+    fn check_create(
+        &mut self,
+        req: &CreateRepoReq,
+    ) -> Result<(Arc<Partition>, Tree, Head, state::Account, state::ImportState), WriteError> {
         // a deleted repo's cached state doesn't block its DID coming back
         // (migration in), once nothing of it is in flight
-        if self.cache.peek(&req.did).is_some_and(|st| st.account.status.as_deref() == Some("deleted") && st.pending.load(Ordering::Acquire) == 0) {
+        if self.cache.peek(&req.did).is_some_and(|st| {
+            st.account.status.as_deref() == Some("deleted") && st.pending.load(Ordering::Acquire) == 0
+        }) {
             self.cache_pop(&req.did);
         }
         if self.cache.contains(&req.did) || self.loading.contains_key(&req.did) {
             return Err(WriteError::Invalid(REPO_EXISTS.into()));
         }
-        let partition = (self.partitions)(&req.did).ok_or_else(|| WriteError::Unavailable("partition not owned by this node".into()))?;
+        let partition = (self.partitions)(&req.did)
+            .ok_or_else(|| WriteError::Unavailable("partition not owned by this node".into()))?;
         // Not cached is not "doesn't exist": a repo created and then evicted
         // is only in durable state, and two createAccounts for one DID can
         // both pass the handler's check. Not cached also means nothing of it
         // is in flight, so durable state is current.
-        let (hv, gv) = match self.rt.block_on(async { tokio::try_join!(partition.db.get(state::head_key(&req.did)), partition.db.get(state::import_key(&req.did))) }) {
+        let (hv, gv) = match self.rt.block_on(async {
+            tokio::try_join!(partition.db.get(state::head_key(&req.did)), partition.db.get(state::import_key(&req.did)))
+        }) {
             Ok(v) => v,
             Err(e) => return Err(WriteError::Unavailable(format!("repo existence check failed: {e}"))),
         };
@@ -1241,8 +1314,10 @@ impl Worker {
         }
         let data = tree.root_cid().map_err(|e| WriteError::Internal(e.to_string()))?;
         let rev = tid::next_rev(None, self.clock_id);
-        let (commit, commit_block) = sign_commit(&req.did, &rev.to_string(), &data, &req.key).map_err(|e| signature_fault(&e))?;
-        let mut account: state::Account = serde_json::from_slice(&req.account_json).map_err(|e| WriteError::Internal(format!("bad account json: {e}")))?;
+        let (commit, commit_block) =
+            sign_commit(&req.did, &rev.to_string(), &data, &req.key).map_err(|e| signature_fault(&e))?;
+        let mut account: state::Account = serde_json::from_slice(&req.account_json)
+            .map_err(|e| WriteError::Internal(format!("bad account json: {e}")))?;
         account.repo_gen = imports.next_gen(None);
         Ok((partition, tree, Head { commit, data, rev, commit_block }, account, imports))
     }
@@ -1349,7 +1424,12 @@ impl Need {
         self.bl_links.extend(more);
     }
 
-    async fn load_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(&self, db: &R, did: &str, gen: u64) -> anyhow::Result<Option<crate::backlinks::Fetched>> {
+    async fn load_backlinks<R: slatedb::DbReadOps + Sync + ?Sized>(
+        &self,
+        db: &R,
+        did: &str,
+        gen: u64,
+    ) -> anyhow::Result<Option<crate::backlinks::Fetched>> {
         if !self.backlinks_needed() {
             return Ok(None);
         }
@@ -1359,7 +1439,14 @@ impl Need {
     /// Blocking: the blocking pool only. A persisted node found missing is
     /// an error too: the repo is then reopened, which rebuilds the tree and
     /// backfills `M/`.
-    fn load<R: slatedb::DbReadOps + Sync + ?Sized>(&self, mst: &mut LazyTree, db: &R, did: &str, gen: u64, rt: &tokio::runtime::Handle) -> Result<(), crate::mst::MstError> {
+    fn load<R: slatedb::DbReadOps + Sync + ?Sized>(
+        &self,
+        mst: &mut LazyTree,
+        db: &R,
+        did: &str,
+        gen: u64,
+        rt: &tokio::runtime::Handle,
+    ) -> Result<(), crate::mst::MstError> {
         let fallbacks = mst.stats.fallbacks;
         if self.all && !mst.fully_loaded() {
             // one forward scan of the records serves every unloaded leaf
@@ -1387,7 +1474,8 @@ fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, Defe
     need.skip_cached_backlinks(&st.backlinks);
     // a create's conflicts are deleted (their blob refs dropped)
     let bl = &st.backlinks.vals;
-    need.blobs |= !st.blob_refs_loaded && need.bl_prune.iter().any(|l| bl.get(&l[..]).is_some_and(|(v, _)| !v.is_empty()));
+    need.blobs |=
+        !st.blob_refs_loaded && need.bl_prune.iter().any(|l| bl.get(&l[..]).is_some_and(|(v, _)| !v.is_empty()));
     if need.is_empty() {
         return Ok(reqs);
     }
@@ -1438,7 +1526,11 @@ fn pop_applied(st: &mut RepoState) {
 
 /// Marks a repo's log entry that writes MST state as in flight; `done` is
 /// set once it is applied.
-fn track_inflight(st: &mut RepoState, nodes: Option<HashSet<Cid>>, done: Arc<std::sync::atomic::AtomicBool>) -> Arc<std::sync::atomic::AtomicBool> {
+fn track_inflight(
+    st: &mut RepoState,
+    nodes: Option<HashSet<Cid>>,
+    done: Arc<std::sync::atomic::AtomicBool>,
+) -> Arc<std::sync::atomic::AtomicBool> {
     pop_applied(st);
     st.inflight.push_back((done.clone(), nodes));
     done
@@ -1476,7 +1568,15 @@ fn backfill_nodes(st: &mut RepoState) {
     }
     let applied = track_inflight(st, None, Default::default());
     let ack: crate::partition::AckFn = Box::new(move |_| applied.store(true, Ordering::Release));
-    let entry = LogEntry { shard: st.partition.id, frames: Vec::new(), muts, ack: Some(ack), pending: Some(st.pending.clone()), enqueued: Instant::now(), totals: None };
+    let entry = LogEntry {
+        shard: st.partition.id,
+        frames: Vec::new(),
+        muts,
+        ack: Some(ack),
+        pending: Some(st.pending.clone()),
+        enqueued: Instant::now(),
+        totals: None,
+    };
     if let Err(e) = send_entry(st, entry) {
         tracing::warn!(did = %st.did, "MST node backfill not logged: {e}");
     }
@@ -1498,7 +1598,10 @@ const PRELOAD_CONCURRENCY: usize = 32;
 /// with its last checkpoint, newest first and interleaved across shards.
 /// Each shard's set is seeded with what it read, so it carries over to the
 /// next owner. A shard closed meanwhile just fails its loads.
-pub fn spawn_preload(workers: &Workers, shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>, Arc<crate::partition::RecentRepos>)>) {
+pub fn spawn_preload(
+    workers: &Workers,
+    shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>, Arc<crate::partition::RecentRepos>)>,
+) {
     use futures::StreamExt;
     let senders = Arc::downgrade(&workers.senders);
     tokio::spawn(async move {
@@ -1552,7 +1655,12 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(crate::slots::ShardId, Arc<
             .count()
             .await;
         if n > 0 {
-            tracing::info!(recent = n, recent_loaded = loaded, elapsed_ms = t.elapsed().as_millis() as u64, "repos preloaded");
+            tracing::info!(
+                recent = n,
+                recent_loaded = loaded,
+                elapsed_ms = t.elapsed().as_millis() as u64,
+                "repos preloaded"
+            );
         }
     });
 }
@@ -1560,7 +1668,12 @@ pub fn spawn_preload(workers: &Workers, shards: Vec<(crate::slots::ShardId, Arc<
 /// The signed commit block, verified before anything can sequence it
 /// (src/crypto.rs). Err: the signature failed twice (suspected hardware
 /// fault): nothing may be emitted for this commit.
-pub fn sign_commit(did: &str, rev: &str, data: &Cid, key: &Keypair) -> Result<(Cid, Bytes), crate::crypto::SignatureFault> {
+pub fn sign_commit(
+    did: &str,
+    rev: &str,
+    data: &Cid,
+    key: &Keypair,
+) -> Result<(Cid, Bytes), crate::crypto::SignatureFault> {
     let unsigned = events::encode_commit(did, rev, data, None);
     let sig = key.sign_verified(crate::crypto::Purpose::Commit, &unsigned)?;
     let signed = events::encode_commit(did, rev, data, Some(&sig));
@@ -1596,27 +1709,17 @@ pub async fn warm_security<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &
 }
 
 /// Opens a repo cold: its root, nothing else.
-pub async fn load_repo(
-    partition: Arc<Partition>,
-    did: Arc<str>,
-) -> anyhow::Result<Option<RepoState>> {
+pub async fn load_repo(partition: Arc<Partition>, did: Arc<str>) -> anyhow::Result<Option<RepoState>> {
     load_repo_with(partition, did, LoadOpts { prefetch_bytes: DEFAULT_PREFETCH_BYTES, need: None, secrets: None }).await
 }
 
-async fn load_repo_with(
-    partition: Arc<Partition>,
-    did: Arc<str>,
-    opts: LoadOpts,
-) -> anyhow::Result<Option<RepoState>> {
+async fn load_repo_with(partition: Arc<Partition>, did: Arc<str>, opts: LoadOpts) -> anyhow::Result<Option<RepoState>> {
     let db = &partition.db;
     let Some(hv) = db.get(state::head_key(&did)).await? else {
         return load_husk(partition.clone(), did).await;
     };
     let head = Head::decode(&hv)?;
-    let av = db
-        .get(state::account_key(&did))
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("head without account"))?;
+    let av = db.get(state::account_key(&did)).await?.ok_or_else(|| anyhow::anyhow!("head without account"))?;
     let acct: state::Account = serde_json::from_slice(&av)?;
     let gen = acct.repo_gen;
     let (sv, gv) = tokio::try_join!(db.get(state::repo_stats_key(&did)), db.get(state::import_key(&did)))?;
@@ -1676,7 +1779,13 @@ async fn load_repo_with(
 /// link rebuilds the whole tree from the records (nothing is in flight
 /// during a cold open, so `R/` is at the head); the bool tells the caller to
 /// backfill `M/`.
-async fn open_lazy(partition: &Arc<Partition>, did: &Arc<str>, gen: u64, head: &Head, opts: &LoadOpts) -> anyhow::Result<(LazyTree, bool)> {
+async fn open_lazy(
+    partition: &Arc<Partition>,
+    did: &Arc<str>,
+    gen: u64,
+    head: &Head,
+    opts: &LoadOpts,
+) -> anyhow::Result<(LazyTree, bool)> {
     let _permit = LOAD_PERMITS.acquire().await?;
     let (pre, _) = crate::mst_store::prefetch(&*partition.db, did, gen, opts.prefetch_bytes).await?;
     let (db, did, root, need) = (partition.db.clone(), did.clone(), head.data, opts.need.clone().unwrap_or_default());
@@ -1728,18 +1837,18 @@ async fn load_husk(partition: Arc<Partition>, did: Arc<str>) -> anyhow::Result<O
     Ok(Some(st))
 }
 
-async fn load_blob_refs<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> anyhow::Result<BlobRefs> {
+async fn load_blob_refs<R: slatedb::DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+) -> anyhow::Result<BlobRefs> {
     let prefix = state::blob_ref_prefix(did, gen);
     let mut iter = db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
     let mut out = BlobRefs::new();
     while let Some(kv) = iter.next().await? {
         let rest = std::str::from_utf8(&kv.key[prefix.len()..])?;
-        let (cid, path) = rest
-            .split_once('\0')
-            .ok_or_else(|| anyhow::anyhow!("bad blob ref key"))?;
-        out.entry(path.to_string())
-            .or_default()
-            .push(Cid::parse(cid)?);
+        let (cid, path) = rest.split_once('\0').ok_or_else(|| anyhow::anyhow!("bad blob ref key"))?;
+        out.entry(path.to_string()).or_default().push(Cid::parse(cid)?);
     }
     Ok(out)
 }
@@ -1774,11 +1883,7 @@ fn finish_load(
     account: state::Account,
 ) -> anyhow::Result<RepoState> {
     let root = mst.tree.root_cid()?;
-    anyhow::ensure!(
-        root == head.data,
-        "rebuilt MST root {root} != head data {}",
-        head.data
-    );
+    anyhow::ensure!(root == head.data, "rebuilt MST root {root} != head data {}", head.data);
     let nodes = crate::mst::SharedNodeIndex::default();
     let view = new_view(&head, account.repo_gen, &mst, &nodes);
     Ok(RepoState {
@@ -1842,11 +1947,20 @@ impl Batch {
 }
 
 fn valid_path_part(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 512 && s != "." && s != ".." && s.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:~".contains(&b))
+    !s.is_empty()
+        && s.len() <= 512
+        && s != "."
+        && s != ".."
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_:~".contains(&b))
 }
 
 /// Coalesces a repo's queued requests into as few commits as possible.
-fn process(st: &mut RepoState, reqs: Vec<Queued>, clock_id: u64, rt: &tokio::runtime::Handle) -> anyhow::Result<Leftover> {
+fn process(
+    st: &mut RepoState,
+    reqs: Vec<Queued>,
+    clock_id: u64,
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<Leftover> {
     // `lazy_needs` loaded the paths before; the source reads only if an op
     // still finds one missing, on the worker thread (metered)
     let (part, did) = (st.partition.clone(), st.did.clone());
@@ -1898,11 +2012,17 @@ fn import_step(
     frames: &mut Vec<events::Frame>,
     muts: &mut Vec<Mutation>,
 ) -> Result<bool, WriteError> {
-    let epoch_ok = |st: &RepoState, nonce: u64, epoch: u64| st.imports.staging.is_some_and(|s| s.nonce == nonce) && st.partition.epoch == epoch;
+    let epoch_ok = |st: &RepoState, nonce: u64, epoch: u64| {
+        st.imports.staging.is_some_and(|s| s.nonce == nonce) && st.partition.epoch == epoch
+    };
     match step {
         ImportStep::Begin { nonce, ticket } => {
             if let Some(status) = st.account.status.as_ref().filter(|s| *s != "deactivated") {
-                return Err(if status == "deleted" { WriteError::RepoNotFound } else { WriteError::RepoInactive(status.clone()) });
+                return Err(if status == "deleted" {
+                    WriteError::RepoNotFound
+                } else {
+                    WriteError::RepoInactive(status.clone())
+                });
             }
             if st.account.pending_signing_key.is_some() {
                 return Err(key_rotating(&st.did));
@@ -1962,7 +2082,8 @@ fn import_step(
                 }
             }
             let data = tree.root_cid().map_err(|e| WriteError::Internal(e.to_string()))?;
-            let (commit, commit_block) = sign_commit(&st.did, &rev.to_string(), &data, &key).map_err(|e| signature_fault(&e))?;
+            let (commit, commit_block) =
+                sign_commit(&st.did, &rev.to_string(), &data, &key).map_err(|e| signature_fault(&e))?;
             let old_gen = st.gen();
             let mut account = st.account.clone();
             account.repo_gen = staged.gen;
@@ -2005,7 +2126,8 @@ fn import_step(
             Ok(true)
         }
         ImportStep::Sweep { gen, muts: dels } => {
-            if !st.imports.garbage.contains(&gen) || gen == st.gen() && st.account.status.as_deref() != Some("deleted") {
+            if !st.imports.garbage.contains(&gen) || gen == st.gen() && st.account.status.as_deref() != Some("deleted")
+            {
                 return Err(import_interrupted());
             }
             if !under_gen(&st.did, gen, &dels) || dels.iter().any(|m| m.val.is_some()) {
@@ -2056,7 +2178,12 @@ fn flush_pending(st: &mut RepoState, batch: &mut Batch, clock_id: u64, src: &dyn
     flush(st, std::mem::take(batch), clock_id, src)
 }
 
-fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
+fn process_reqs(
+    st: &mut RepoState,
+    reqs: &mut std::vec::IntoIter<Queued>,
+    clock_id: u64,
+    src: &dyn Source,
+) -> anyhow::Result<()> {
     let mut batch = Batch::default();
     for q in reqs {
         let mut req = match q {
@@ -2125,7 +2252,8 @@ fn process_reqs(st: &mut RepoState, reqs: &mut std::vec::IntoIter<Queued>, clock
                 _ => 0,
             })
             .sum();
-        if batch.ops.len() + new_paths > MAX_COMMIT_OPS || batch.record_bytes + incoming_bytes > MAX_COMMIT_RECORD_BYTES {
+        if batch.ops.len() + new_paths > MAX_COMMIT_OPS || batch.record_bytes + incoming_bytes > MAX_COMMIT_RECORD_BYTES
+        {
             flush_pending(st, &mut batch, clock_id, src)?;
         }
         if let Err(e) = validate(st, &req.writes, &paths, src) {
@@ -2189,10 +2317,13 @@ fn backlink_conflicts(st: &mut RepoState, writes: &[Write]) -> anyhow::Result<Ve
         let Write::Create { collection, bytes, prune_backlinks: true, .. } = w else { continue };
         let Some(link) = crate::backlinks::link(collection, bytes) else { continue };
         let bl = &mut st.backlinks;
-        let (rkeys, tag) = bl.vals.get(&link[..]).ok_or_else(|| anyhow::anyhow!("backlink index value of {} not loaded", st.did))?;
+        let (rkeys, tag) =
+            bl.vals.get(&link[..]).ok_or_else(|| anyhow::anyhow!("backlink index value of {} not loaded", st.did))?;
         for r in rkeys.iter().take(room - deletes.len()) {
             // the deleted record's link is this one
-            bl.paths.entry(format!("{collection}/{r}").into()).or_insert_with(|| (Some(link.clone().into()), tag.clone()));
+            bl.paths
+                .entry(format!("{collection}/{r}").into())
+                .or_insert_with(|| (Some(link.clone().into()), tag.clone()));
             deletes.push(Write::Delete { collection: collection.clone(), rkey: r.to_string(), swap: None });
         }
     }
@@ -2202,7 +2333,13 @@ fn backlink_conflicts(st: &mut RepoState, writes: &[Write]) -> anyhow::Result<Ve
 /// Moves the record at `path` from its old link (`existed`: it held a
 /// record) to `new` in the backlink cache, recording in `batch` the values
 /// it changes.
-fn apply_backlink(st: &mut RepoState, batch: &mut Batch, path: &str, existed: bool, new: Option<Vec<u8>>) -> anyhow::Result<()> {
+fn apply_backlink(
+    st: &mut RepoState,
+    batch: &mut Batch,
+    path: &str,
+    existed: bool,
+    new: Option<Vec<u8>>,
+) -> anyhow::Result<()> {
     let bl = &mut st.backlinks;
     let did = &st.did;
     let old = match existed {
@@ -2212,14 +2349,21 @@ fn apply_backlink(st: &mut RepoState, batch: &mut Batch, path: &str, existed: bo
     let new: Option<Box<[u8]>> = new.map(Into::into);
     let rkey = path.split_once('/').map_or(path, |(_, r)| r);
     let tag = Some(batch.applied.clone());
-    fn value<'v>(vals: &'v mut HashMap<Box<[u8]>, (crate::backlinks::Rkeys, crate::backlinks::Tag)>, init: &mut BTreeMap<Box<[u8]>, crate::backlinks::Rkeys>, l: &[u8], tag: &crate::backlinks::Tag) -> anyhow::Result<&'v mut crate::backlinks::Rkeys> {
+    fn value<'v>(
+        vals: &'v mut HashMap<Box<[u8]>, (crate::backlinks::Rkeys, crate::backlinks::Tag)>,
+        init: &mut BTreeMap<Box<[u8]>, crate::backlinks::Rkeys>,
+        l: &[u8],
+        tag: &crate::backlinks::Tag,
+    ) -> anyhow::Result<&'v mut crate::backlinks::Rkeys> {
         let (v, t) = vals.get_mut(l).ok_or_else(|| anyhow::anyhow!("backlink index value not loaded"))?;
         init.entry(l.into()).or_insert_with(|| v.clone());
         *t = tag.clone();
         Ok(v)
     }
     if let Some(o) = old.as_ref().filter(|o| Some(*o) != new.as_ref()) {
-        value(&mut bl.vals, &mut batch.bl_init, o, &tag).map_err(|e| e.context(format!("{did} {path}")))?.retain(|r| &**r != rkey);
+        value(&mut bl.vals, &mut batch.bl_init, o, &tag)
+            .map_err(|e| e.context(format!("{did} {path}")))?
+            .retain(|r| &**r != rkey);
     }
     // the new link's value is visited even when unchanged: the commit's
     // derived put of it may need a stored one after it (flush)
@@ -2356,7 +2500,9 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         }
         match recent.as_mut() {
             Some(r) if r.len() < crate::recent_writes::MAX_RECS => {
-                let bytes = new.filter(|_| crate::recent_writes::keeps_bytes(path)).map(|c| Bytes::copy_from_slice(&batch.records[&c]));
+                let bytes = new
+                    .filter(|_| crate::recent_writes::keeps_bytes(path))
+                    .map(|c| Bytes::copy_from_slice(&batch.records[&c]));
                 r.push((Arc::<str>::from(path.as_str()), new.map(|c| (c, bytes))));
             }
             _ => recent = None,
@@ -2395,19 +2541,30 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
         // (replay derives it); `bl_init` below stores what differs
         if let (Some(_), Some(Some(l))) = (new, batch.links.get(path.as_str())) {
             let rkey = path.split_once('/').map_or(path.as_str(), |(_, r)| r);
-            muts.push(Mutation { key: state::backlink_key(&st.did, gen, l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+            muts.push(Mutation {
+                key: state::backlink_key(&st.did, gen, l).into(),
+                val: Some(Bytes::copy_from_slice(rkey.as_bytes())),
+            });
             derived_bl.insert(&l[..], rkey);
         }
     }
     // backlink index values the derived puts above don't leave as they are now
     for (l, before) in &batch.bl_init {
-        let now = st.backlinks.vals.get(l).map(|(v, _)| v).ok_or_else(|| anyhow::anyhow!("backlink index value left the cache"))?;
+        let now = st
+            .backlinks
+            .vals
+            .get(l)
+            .map(|(v, _)| v)
+            .ok_or_else(|| anyhow::anyhow!("backlink index value left the cache"))?;
         let as_derived = match derived_bl.get(&l[..]) {
             Some(r) => now.len() == 1 && &*now[0] == *r,
             None => now == before,
         };
         if !as_derived {
-            extra.push(Mutation { key: state::backlink_key(&st.did, gen, l).into(), val: (!now.is_empty()).then(|| crate::backlinks::encode(now)) });
+            extra.push(Mutation {
+                key: state::backlink_key(&st.did, gen, l).into(),
+                val: (!now.is_empty()).then(|| crate::backlinks::encode(now)),
+            });
         }
     }
     let head = Head { commit, data, rev, commit_block };
@@ -2417,7 +2574,10 @@ fn flush(st: &mut RepoState, batch: Batch, clock_id: u64, src: &dyn Source) -> a
     for (c, b) in std::mem::take(&mut persist.puts) {
         // exact-size: the memtable keeps the value's allocation, and encode
         // buffers are sized generously
-        muts.push(Mutation { key: state::mst_node_key(&st.did, gen, &c).into(), val: Some(Bytes::from(b.into_boxed_slice())) });
+        muts.push(Mutation {
+            key: state::mst_node_key(&st.did, gen, &c).into(),
+            val: Some(Bytes::from(b.into_boxed_slice())),
+        });
     }
     for c in &persist.deletes {
         extra.push(Mutation { key: state::mst_node_key(&st.did, gen, c).into(), val: None });
@@ -2523,9 +2683,21 @@ fn send_entry(st: &RepoState, entry: LogEntry) -> anyhow::Result<()> {
 
 /// Blob-ref index mutations for one net op. `existed`: the path held a
 /// record before, whose refs are known only once the repo's are loaded.
-fn index_mutations(st: &mut RepoState, rev: u64, path: &str, existed: bool, exists: bool, new_blobs: Option<&Vec<Cid>>, muts: &mut Vec<Mutation>) -> anyhow::Result<()> {
+fn index_mutations(
+    st: &mut RepoState,
+    rev: u64,
+    path: &str,
+    existed: bool,
+    exists: bool,
+    new_blobs: Option<&Vec<Cid>>,
+    muts: &mut Vec<Mutation>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(!existed || st.blob_refs_loaded, "blob refs of {} not loaded for a write to {path}", st.did);
-    anyhow::ensure!(st.blob_refs_loaded || new_blobs.is_none_or(|b| b.is_empty()), "blob refs of {} not loaded for a write adding refs to {path}", st.did);
+    anyhow::ensure!(
+        st.blob_refs_loaded || new_blobs.is_none_or(|b| b.is_empty()),
+        "blob refs of {} not loaded for a write adding refs to {path}",
+        st.did
+    );
     let gen = st.gen();
     let old = st.blob_refs.remove(path).unwrap_or_default();
     let mut new: Vec<Cid> = if exists { new_blobs.cloned().unwrap_or_default() } else { Vec::new() };
@@ -2589,7 +2761,11 @@ fn head_ack(reply: oneshot::Sender<Result<Head, WriteError>>, head: Head) -> cra
 /// Loads the rest of its tree if the fetch before the op didn't, and
 /// returns its persisted (interior) nodes, whose `M/` keys the caller
 /// deletes or keeps.
-fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn Source) -> anyhow::Result<HashMap<Cid, Arc<[u8]>>> {
+fn clear_repo_mutations(
+    st: &mut RepoState,
+    muts: &mut Vec<Mutation>,
+    src: &dyn Source,
+) -> anyhow::Result<HashMap<Cid, Arc<[u8]>>> {
     if !st.mst.fully_loaded() {
         st.mst.load_all(src)?;
     }
@@ -2621,7 +2797,11 @@ fn clear_repo_mutations(st: &mut RepoState, muts: &mut Vec<Mutation>, src: &dyn 
 
 /// Mutations deleting the repo's whole backlink index; the cache says so
 /// until `done` (the clearing entry) is applied.
-fn clear_backlinks(st: &mut RepoState, muts: &mut Vec<Mutation>, done: &Arc<std::sync::atomic::AtomicBool>) -> anyhow::Result<()> {
+fn clear_backlinks(
+    st: &mut RepoState,
+    muts: &mut Vec<Mutation>,
+    done: &Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(st.backlinks.all, "backlink index of {} not loaded to clear it", st.did);
     let gen = st.gen();
     for (l, (v, t)) in st.backlinks.vals.iter_mut() {
@@ -2637,7 +2817,14 @@ fn clear_backlinks(st: &mut RepoState, muts: &mut Vec<Mutation>, done: &Arc<std:
 
 /// The backlink index of a whole repo's `records` (path, bytes): its puts,
 /// and the cache entries (tagged `tag`: durable state may not have them).
-fn index_backlinks<'a>(did: &str, gen: u64, records: impl Iterator<Item = (&'a str, &'a [u8])>, cache: &mut crate::backlinks::Cache, tag: &crate::backlinks::Tag, muts: &mut Vec<Mutation>) {
+fn index_backlinks<'a>(
+    did: &str,
+    gen: u64,
+    records: impl Iterator<Item = (&'a str, &'a [u8])>,
+    cache: &mut crate::backlinks::Cache,
+    tag: &crate::backlinks::Tag,
+    muts: &mut Vec<Mutation>,
+) {
     let mut vals: BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = BTreeMap::new();
     for (path, bytes) in records {
         let coll = collection_of(path);
@@ -2700,7 +2887,11 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     };
     // a staged import's commit takes the rev it reserved: nothing else may
     // sign a commit first
-    if matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::SigningKey(KeyStep::Begin(_) | KeyStep::Finish { .. })) && importing(st) {
+    if matches!(
+        req.op,
+        AccountOp::ReplaceRepo { .. } | AccountOp::SigningKey(KeyStep::Begin(_) | KeyStep::Finish { .. })
+    ) && importing(st)
+    {
         return refuse(req.reply, import_in_progress());
     }
     match req.op {
@@ -2749,7 +2940,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         }
         AccountOp::ReplaceRepo { records, swap_commit, stale_keys, tree: prebuilt } => {
             if let Some(swap) = swap_commit.filter(|c| *c != st.head.commit) {
-                return refuse(req.reply, WriteError::InvalidSwap(format!("head commit is {}, not {swap}", st.head.commit)));
+                return refuse(
+                    req.reply,
+                    WriteError::InvalidSwap(format!("head commit is {}, not {swap}", st.head.commit)),
+                );
             }
             // first: a stale key the replace writes again ends up written
             muts.extend(stale_keys.into_iter().map(|key| Mutation { key, val: None }));
@@ -2779,7 +2973,14 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
                 index_mutations(st, rev.0, path, false, true, Some(blobs), &mut muts)?;
             }
             // after the clear's deletes: a link kept is written again
-            index_backlinks(&st.did, gen, records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])), &mut st.backlinks, &Some(done.clone()), &mut muts);
+            index_backlinks(
+                &st.did,
+                gen,
+                records.iter().map(|(p, _, b, _)| (p.as_str(), &b[..])),
+                &mut st.backlinks,
+                &Some(done.clone()),
+                &mut muts,
+            );
             let data = tree.root_cid()?;
             let counted = crate::repo_stats::count_tree(&tree)?;
             replace_nodes_mutations(&st.did, gen, old_nodes, &tree, &mut muts);
@@ -2861,7 +3062,14 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
 }
 
 /// Applies a [`KeyStep`] to the repo.
-fn key_step(st: &mut RepoState, step: KeyStep, clock_id: u64, time: &str, frames: &mut Vec<events::Frame>, muts: &mut Vec<Mutation>) -> anyhow::Result<KeyOutcome> {
+fn key_step(
+    st: &mut RepoState,
+    step: KeyStep,
+    clock_id: u64,
+    time: &str,
+    frames: &mut Vec<events::Frame>,
+    muts: &mut Vec<Mutation>,
+) -> anyhow::Result<KeyOutcome> {
     if st.account.status.as_deref() == Some("deleted") {
         return Ok(KeyOutcome::Refused(WriteError::RepoNotFound));
     }
@@ -2872,9 +3080,15 @@ fn key_step(st: &mut RepoState, step: KeyStep, clock_id: u64, time: &str, frames
         KeyStep::Begin(p) => {
             match &account.pending_signing_key {
                 Some(cur) if *cur == p => return Ok(KeyOutcome::Noop),
-                Some(_) => return Ok(KeyOutcome::Refused(WriteError::Invalid("a signing key rotation is already in progress".into()))),
+                Some(_) => {
+                    return Ok(KeyOutcome::Refused(WriteError::Invalid(
+                        "a signing key rotation is already in progress".into(),
+                    )))
+                }
                 None if p.pubkey == account.signing_pubkey => {
-                    return Ok(KeyOutcome::Refused(WriteError::Invalid("that is already the account's signing key".into())))
+                    return Ok(KeyOutcome::Refused(WriteError::Invalid(
+                        "that is already the account's signing key".into(),
+                    )))
                 }
                 None => {}
             }
@@ -2896,8 +3110,14 @@ fn key_step(st: &mut RepoState, step: KeyStep, clock_id: u64, time: &str, frames
                 // finished already
                 (None, true) if account.signing_pubkey == pubkey => return Ok(KeyOutcome::Noop),
                 (None, false) if account.signing_pubkey == pubkey => {}
-                (Some(_), _) => return Ok(KeyOutcome::Refused(WriteError::Invalid("a signing key rotation is in progress".into()))),
-                (None, _) => return Ok(KeyOutcome::Refused(WriteError::Invalid("not the account's signing key or its pending one".into()))),
+                (Some(_), _) => {
+                    return Ok(KeyOutcome::Refused(WriteError::Invalid("a signing key rotation is in progress".into())))
+                }
+                (None, _) => {
+                    return Ok(KeyOutcome::Refused(WriteError::Invalid(
+                        "not the account's signing key or its pending one".into(),
+                    )))
+                }
             }
             // the empty commit: same data root, new rev, signed with the new key
             let rev = tid::next_rev(Some(st.head.rev), clock_id);
@@ -2983,8 +3203,25 @@ mod tests {
     fn write(did: &Arc<str>, rkey: &str) -> (WorkerMsg, oneshot::Receiver<Result<CommitAck, WriteError>>) {
         let bytes = Bytes::from(format!("record {rkey}"));
         let (reply, rx) = oneshot::channel();
-        let w = Write::Create { collection: "app.test.thing".into(), rkey: rkey.into(), cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: false };
-        (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None }), rx)
+        let w = Write::Create {
+            collection: "app.test.thing".into(),
+            rkey: rkey.into(),
+            cid: Cid::dag_cbor(&bytes),
+            bytes,
+            blobs: Vec::new(),
+            prune_backlinks: false,
+        };
+        (
+            WorkerMsg::Write(WriteReq {
+                did: did.clone(),
+                writes: vec![w],
+                swap_commit: None,
+                reply,
+                claim: None,
+                permit: None,
+            }),
+            rx,
+        )
     }
 
     /// A commit that fails while an earlier one is still in flight must not
@@ -3052,7 +3289,15 @@ mod tests {
             "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
         });
         let (reply, created) = oneshot::channel();
-        w.send(WorkerMsg::CreateRepo(CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply })).unwrap();
+        w.send(WorkerMsg::CreateRepo(CreateRepoReq {
+            did: did.clone(),
+            handle: "t.test".into(),
+            key,
+            account_json: Bytes::from(serde_json::to_vec(&account).unwrap()),
+            records: Vec::new(),
+            reply,
+        }))
+        .unwrap();
         settle(rx.recv().await.unwrap());
         created.await.unwrap().unwrap();
         let with_claim = |rkey: &str, abandoned: bool| {
@@ -3072,12 +3317,19 @@ mod tests {
         settle(rx.recv().await.unwrap());
         assert!(r1.await.is_err(), "abandoned write answered");
         let ack = r2.await.unwrap().unwrap();
-        assert!(matches!(&ack.results[..], [WriteOutcome::Create { path, .. }] if path == "app.test.thing/b"), "{:?}", ack.results);
+        assert!(
+            matches!(&ack.results[..], [WriteOutcome::Create { path, .. }] if path == "app.test.thing/b"),
+            "{:?}",
+            ack.results
+        );
         assert!(!c2.abandon(), "taken by the worker");
         let (reply, info) = oneshot::channel();
         w.send(WorkerMsg::CacheInfo { did: did.clone(), reply }).unwrap();
         assert!(info.await.unwrap().unwrap().loaded_nodes >= 1);
-        assert!(part.recent.take_dirty().is_some_and(|b| b.as_ref() == b"did:plc:claims\n"), "written repo tracked as recent");
+        assert!(
+            part.recent.take_dirty().is_some_and(|b| b.as_ref() == b"did:plc:claims\n"),
+            "written repo tracked as recent"
+        );
     }
 
     /// Blob refs are loaded on a repo's first update, delete or create with
@@ -3098,7 +3350,17 @@ mod tests {
         let did: Arc<str> = "did:plc:blobrefs".into();
         let op = |w: Write| {
             let (reply, rx) = oneshot::channel();
-            (WorkerMsg::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None }), rx)
+            (
+                WorkerMsg::Write(WriteReq {
+                    did: did.clone(),
+                    writes: vec![w],
+                    swap_commit: None,
+                    reply,
+                    claim: None,
+                    permit: None,
+                }),
+                rx,
+            )
         };
         let blob = |i: u8| Cid::dag_cbor(&[i]);
         let rec = |rkey: &str, blobs: Vec<Cid>, update: bool| {
@@ -3122,7 +3384,15 @@ mod tests {
                 "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
             });
             let (reply, created) = oneshot::channel();
-            w.send(WorkerMsg::CreateRepo(CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply })).unwrap();
+            w.send(WorkerMsg::CreateRepo(CreateRepoReq {
+                did: did.clone(),
+                handle: "t.test".into(),
+                key,
+                account_json: Bytes::from(serde_json::to_vec(&account).unwrap()),
+                records: Vec::new(),
+                reply,
+            }))
+            .unwrap();
             apply(rx.recv().await.unwrap()).await;
             created.await.unwrap().unwrap();
             let (m, r) = op(rec("p1", vec![blob(1)], false));
@@ -3141,15 +3411,27 @@ mod tests {
         let (m, plain) = op(rec("p0", Vec::new(), false));
         w.send(m).unwrap();
         let e_plain = rx.recv().await.unwrap();
-        assert!(!cached().await.unwrap().unwrap().blob_refs_loaded, "a create without blobs opened the repo with its blob refs");
+        assert!(
+            !cached().await.unwrap().unwrap().blob_refs_loaded,
+            "a create without blobs opened the repo with its blob refs"
+        );
         let (m, created) = op(rec("p2", vec![blob(2), blob(1)], false));
         w.send(m).unwrap();
         let e_create = rx.recv().await.unwrap(); // in flight: its b/ row isn't applied
         assert!(cached().await.unwrap().unwrap().blob_refs_loaded, "a create with blobs ran without the refs");
-        let stats = |e: &LogEntry| e.muts.iter().find(|m| m.key[..] == state::repo_stats_key(&did)[..]).map(|m| state::RepoStats::decode(m.val.as_ref().unwrap()).unwrap());
+        let stats = |e: &LogEntry| {
+            e.muts
+                .iter()
+                .find(|m| m.key[..] == state::repo_stats_key(&did)[..])
+                .map(|m| state::RepoStats::decode(m.val.as_ref().unwrap()).unwrap())
+        };
         // blob(1) was p1's already
         assert_eq!(stats(&e_create).map(|s| (s.records, s.blobs)), Some((3, 2)));
-        let has = |e: &LogEntry, b: u8, path: &str, put: bool| e.muts.iter().any(|m| m.key[..] == state::blob_ref_key(&did, 0, &blob(b), path)[..] && m.val.is_some() == put);
+        let has = |e: &LogEntry, b: u8, path: &str, put: bool| {
+            e.muts
+                .iter()
+                .any(|m| m.key[..] == state::blob_ref_key(&did, 0, &blob(b), path)[..] && m.val.is_some() == put)
+        };
         let (m, deleted) = op(Write::Delete { collection: "app.test.thing".into(), rkey: "p2".into(), swap: None });
         w.send(m).unwrap();
         let e_delete = rx.recv().await.unwrap();
@@ -3158,7 +3440,10 @@ mod tests {
         let (m, updated) = op(rec("p1", vec![blob(3)], true));
         w.send(m).unwrap();
         let e_update = rx.recv().await.unwrap();
-        assert!(has(&e_update, 1, "app.test.thing/p1", false) && has(&e_update, 3, "app.test.thing/p1", true), "the durable ref isn't replaced");
+        assert!(
+            has(&e_update, 1, "app.test.thing/p1", false) && has(&e_update, 3, "app.test.thing/p1", true),
+            "the durable ref isn't replaced"
+        );
         assert_eq!(stats(&e_delete).map(|s| (s.records, s.blobs)), Some((2, 1)));
         // p1's blob(1) replaced: blob(3) only
         assert_eq!(stats(&e_update).map(|s| (s.records, s.blobs)), None, "unchanged counts aren't written");
@@ -3199,7 +3484,10 @@ mod tests {
                 "did": &*did, "handle": "t.test", "wrapped_signing_key": "", "signing_pubkey": key.public_multibase(), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            (did.clone(), finish_load(part.clone(), did, LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct).unwrap())
+            (
+                did.clone(),
+                finish_load(part.clone(), did, LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct).unwrap(),
+            )
         };
         // a repo's charge fully loaded, and with its root only
         let charges = |records: u32| {
@@ -3212,7 +3500,15 @@ mod tests {
         assert!(full > 3 * root, "{full} vs {root}");
         let limits = CacheLimits { entries: 100, bytes: full + root + root / 2, ..CacheLimits::from(0) };
         let (me, _me_rx) = crate::chan::unbounded();
-        let mut w = Worker::new(0, me, Arc::new(|_: &str| None), tokio::runtime::Handle::current(), limits, Secrets::dev(), Default::default());
+        let mut w = Worker::new(
+            0,
+            me,
+            Arc::new(|_: &str| None),
+            tokio::runtime::Handle::current(),
+            limits,
+            Secrets::dev(),
+            Default::default(),
+        );
         let put = |w: &mut Worker, (did, st): (Arc<str>, RepoState)| {
             w.cache_put(did.clone(), st);
             w.settle(&did);
@@ -3280,11 +3576,29 @@ mod tests {
         let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
         let log = NodeLog::start(
             store.clone(),
-            NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+            NodeLogConfig {
+                log_id: "t".into(),
+                writer: 1,
+                max_segment_bytes: 1 << 20,
+                hedge_after: Duration::from_secs(1),
+                lease_ok: None,
+            },
             merger_tx,
         );
         let (tx, rx) = tokio::sync::mpsc::channel::<LogEntry>(16);
-        (Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
+        (
+            Arc::new(Partition {
+                id: crate::slots::ShardId(0),
+                epoch: 1,
+                db,
+                apply_lock: Default::default(),
+                tx,
+                wm: log.wm.clone(),
+                log: log.clone(),
+                recent: Default::default(),
+            }),
+            rx,
+        )
     }
 
     async fn apply(db: &Arc<slatedb::Db>, e: LogEntry) {
@@ -3308,7 +3622,14 @@ mod tests {
             "password_hash": "", "created_at": "2026-01-01T00:00:00Z",
         });
         let (reply, rx) = oneshot::channel();
-        let req = CreateRepoReq { did: did.clone(), handle: "t.test".into(), key, account_json: Bytes::from(serde_json::to_vec(&account).unwrap()), records: Vec::new(), reply };
+        let req = CreateRepoReq {
+            did: did.clone(),
+            handle: "t.test".into(),
+            key,
+            account_json: Bytes::from(serde_json::to_vec(&account).unwrap()),
+            records: Vec::new(),
+            reply,
+        };
         (WorkerMsg::CreateRepo(req), rx)
     }
 
@@ -3352,7 +3673,14 @@ mod tests {
         created.await.unwrap().unwrap();
         let account = |mutate: AccountMutation| {
             let (reply, r) = oneshot::channel();
-            (WorkerMsg::Account(AccountReq { did: did.clone(), op: AccountOp::Update { mutate, identity_event: false, account_event: false }, reply }), r)
+            (
+                WorkerMsg::Account(AccountReq {
+                    did: did.clone(),
+                    op: AccountOp::Update { mutate, identity_event: false, account_event: false },
+                    reply,
+                }),
+                r,
+            )
         };
         // nothing in flight: acked at once, nothing logged
         let (m, mut r) = account(Box::new(|_| Ok(false)));
@@ -3395,12 +3723,30 @@ mod tests {
             let (merger_tx, _merger_rx) = tokio::sync::mpsc::unbounded_channel();
             let log = NodeLog::start(
                 store.clone(),
-                NodeLogConfig { log_id: "t".into(), writer: 1, max_segment_bytes: 1 << 20, hedge_after: Duration::from_secs(1), lease_ok: None },
+                NodeLogConfig {
+                    log_id: "t".into(),
+                    writer: 1,
+                    max_segment_bytes: 1 << 20,
+                    hedge_after: Duration::from_secs(1),
+                    lease_ok: None,
+                },
                 merger_tx,
             );
             std::mem::forget(_merger_rx);
             let (tx, rx) = tokio::sync::mpsc::channel::<LogEntry>(1 << 16);
-            (Arc::new(Partition { id: crate::slots::ShardId(0), epoch: 1, db, apply_lock: Default::default(), tx, wm: log.wm.clone(), log: log.clone(), recent: Default::default() }), rx)
+            (
+                Arc::new(Partition {
+                    id: crate::slots::ShardId(0),
+                    epoch: 1,
+                    db,
+                    apply_lock: Default::default(),
+                    tx,
+                    wm: log.wm.clone(),
+                    log: log.clone(),
+                    recent: Default::default(),
+                }),
+                rx,
+            )
         });
         let tid = |i: u64| Tid::from_parts(1_700_000_000_000_000 + i * 1_000_003, i % 1024).to_string();
         // likes and follows: createRecord's backlink check (one index
@@ -3410,7 +3756,11 @@ mod tests {
             let key = Keypair::generate();
             let mut tree = Tree::new();
             for i in 0..records {
-                tree.insert_no_proof(format!("app.bsky.feed.post/{}", tid(i)).as_bytes(), Cid::dag_cbor(&i.to_be_bytes())).unwrap();
+                tree.insert_no_proof(
+                    format!("app.bsky.feed.post/{}", tid(i)).as_bytes(),
+                    Cid::dag_cbor(&i.to_be_bytes()),
+                )
+                .unwrap();
             }
             let root = tree.root_cid().unwrap();
             let head = Head { commit: root, data: root, rev: Tid(1), commit_block: Bytes::new() };
@@ -3418,7 +3768,9 @@ mod tests {
                 "did": &*did, "handle": "t.test", "wrapped_signing_key": "", "signing_pubkey": key.public_multibase(), "password_hash": "", "created_at": "",
             }))
             .unwrap();
-            let mut st = finish_load(part.clone(), did.clone(), LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct).unwrap();
+            let mut st =
+                finish_load(part.clone(), did.clone(), LazyTree::loaded(tree, 1), head, Some(Arc::new(key)), acct)
+                    .unwrap();
             let mut next = records;
             let (mut state_bytes, mut seg_bytes, mut commits) = (0usize, 0usize, 0usize);
             let mut one = |st: &mut RepoState| {
@@ -3437,13 +3789,28 @@ mod tests {
                     }
                 };
                 let (reply, _rx) = oneshot::channel();
-                let w = Write::Create { collection: collection.into(), rkey, cid: Cid::dag_cbor(&bytes), bytes, blobs: Vec::new(), prune_backlinks: kind != "post" };
-                let reqs = vec![Queued::Write(WriteReq { did: did.clone(), writes: vec![w], swap_commit: None, reply, claim: None, permit: None })];
+                let w = Write::Create {
+                    collection: collection.into(),
+                    rkey,
+                    cid: Cid::dag_cbor(&bytes),
+                    bytes,
+                    blobs: Vec::new(),
+                    prune_backlinks: kind != "post",
+                };
+                let reqs = vec![Queued::Write(WriteReq {
+                    did: did.clone(),
+                    writes: vec![w],
+                    swap_commit: None,
+                    reply,
+                    claim: None,
+                    permit: None,
+                })];
                 let reqs = match lazy_needs(st, reqs) {
                     Ok(reqs) => reqs,
                     // the backlink read a fetch does off the worker thread
                     Err((reqs, Some(need))) => {
-                        if let Some(f) = rt.block_on(need.load_backlinks(&*st.partition.db, &st.did, st.gen())).unwrap() {
+                        if let Some(f) = rt.block_on(need.load_backlinks(&*st.partition.db, &st.did, st.gen())).unwrap()
+                        {
                             st.backlinks.install(f);
                         }
                         let Ok(reqs) = lazy_needs(st, reqs) else { panic!("paths not loaded") };
@@ -3454,9 +3821,14 @@ mod tests {
                 process(st, reqs, 7, rt.handle()).unwrap();
                 while let Ok(e) = rx.try_recv() {
                     commits += 1;
-                    state_bytes += e.muts.iter().map(|m| m.key.len() + m.val.as_ref().map_or(0, |v| v.len())).sum::<usize>();
+                    state_bytes +=
+                        e.muts.iter().map(|m| m.key.len() + m.val.as_ref().map_or(0, |v| v.len())).sum::<usize>();
                     let derived = e.frames.first().map_or(0, |f| f.derived_muts);
-                    seg_bytes += e.frames.iter().map(|f| f.len_hint()).sum::<usize>() + e.muts[derived..].iter().map(|m| 6 + m.key.len() + m.val.as_ref().map_or(0, |v| v.len())).sum::<usize>();
+                    seg_bytes += e.frames.iter().map(|f| f.len_hint()).sum::<usize>()
+                        + e.muts[derived..]
+                            .iter()
+                            .map(|m| 6 + m.key.len() + m.val.as_ref().map_or(0, |v| v.len()))
+                            .sum::<usize>();
                     settle(e);
                 }
             };

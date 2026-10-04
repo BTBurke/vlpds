@@ -85,9 +85,7 @@ pub fn commit_frame(c: &CommitFrame) -> Frame {
     write_text(&mut p, "rev");
     write_text(&mut p, c.rev);
 
-    let mut s = Vec::with_capacity(
-        c.blocks.len() + 192 + c.repo.len() + c.time.len() + c.since.map_or(0, str::len),
-    );
+    let mut s = Vec::with_capacity(c.blocks.len() + 192 + c.repo.len() + c.time.len() + c.since.map_or(0, str::len));
     write_text(&mut s, "repo");
     write_text(&mut s, c.repo);
     write_text(&mut s, "time");
@@ -111,12 +109,7 @@ pub fn commit_frame(c: &CommitFrame) -> Frame {
         write_text(&mut s, "prevData");
         write_cid(&mut s, pd);
     }
-    Frame {
-        prefix: p,
-        suffix: s,
-        derived_muts: 0,
-        derived_gen: 0,
-    }
+    Frame { prefix: p, suffix: s, derived_muts: 0, derived_gen: 0 }
 }
 
 /// `#sync`: did rev seq time blocks
@@ -133,12 +126,7 @@ pub fn sync_frame(did: &str, rev: &str, blocks: &[u8], time: &str) -> Frame {
     write_text(&mut s, time);
     write_text(&mut s, "blocks");
     write_bytes(&mut s, blocks);
-    Frame {
-        prefix: p,
-        suffix: s,
-        derived_muts: 0,
-        derived_gen: 0,
-    }
+    Frame { prefix: p, suffix: s, derived_muts: 0, derived_gen: 0 }
 }
 
 /// `#identity`: did seq time handle
@@ -154,12 +142,7 @@ pub fn identity_frame(did: &str, handle: &str, time: &str) -> Frame {
     write_text(&mut s, time);
     write_text(&mut s, "handle");
     write_text(&mut s, handle);
-    Frame {
-        prefix: p,
-        suffix: s,
-        derived_muts: 0,
-        derived_gen: 0,
-    }
+    Frame { prefix: p, suffix: s, derived_muts: 0, derived_gen: 0 }
 }
 
 /// `#account`: did seq time active [status]
@@ -179,12 +162,7 @@ pub fn account_frame(did: &str, active: bool, status: Option<&str>, time: &str) 
         write_text(&mut s, "status");
         write_text(&mut s, st);
     }
-    Frame {
-        prefix: p,
-        suffix: s,
-        derived_muts: 0,
-        derived_gen: 0,
-    }
+    Frame { prefix: p, suffix: s, derived_muts: 0, derived_gen: 0 }
 }
 
 /// Error frame header `{op: -1}` + body `{error, message}`.

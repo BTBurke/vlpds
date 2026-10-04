@@ -22,7 +22,10 @@ use crate::mst::{self, Entry, Node};
 pub enum Next {
     /// An MST node: decode it and pass it to [`Walk::enter`].
     Node(Cid),
-    Record { key: Arc<[u8]>, cid: Cid },
+    Record {
+        key: Arc<[u8]>,
+        cid: Cid,
+    },
     Done,
 }
 

@@ -14,8 +14,8 @@ use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::transport::smtp::PoolConfig;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use prometheus::{
-    exponential_buckets, register_histogram, register_int_counter, register_int_counter_vec,
-    register_int_gauge, Histogram, IntCounter, IntCounterVec, IntGauge,
+    exponential_buckets, register_histogram, register_int_counter, register_int_counter_vec, register_int_gauge,
+    Histogram, IntCounter, IntCounterVec, IntGauge,
 };
 use std::path::Path;
 use std::sync::{Arc, LazyLock};
@@ -29,11 +29,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_QUEUE: usize = 1024;
 const DEFAULT_CONCURRENCY: usize = 4;
 /// Waits before the 2nd, 3rd and 4th attempts.
-const DEFAULT_BACKOFF: [Duration; 3] = [
-    Duration::from_secs(2),
-    Duration::from_secs(10),
-    Duration::from_secs(60),
-];
+const DEFAULT_BACKOFF: [Duration; 3] = [Duration::from_secs(2), Duration::from_secs(10), Duration::from_secs(60)];
 
 macro_rules! lazy {
     ($name:ident: $t:ty = $e:expr) => {
@@ -118,7 +114,11 @@ impl SmtpConfig {
 
 /// None: log-only. Setting only one of the two is an error, as in the
 /// reference PDS. Must run inside the tokio runtime.
-pub fn from_flags(url: Option<String>, from: Option<String>, ca_file: Option<&Path>) -> anyhow::Result<Option<SharedMailer>> {
+pub fn from_flags(
+    url: Option<String>,
+    from: Option<String>,
+    ca_file: Option<&Path>,
+) -> anyhow::Result<Option<SharedMailer>> {
     let m = start_if_set(
         (url, "PDS_EMAIL_SMTP_URL"),
         (from, "PDS_EMAIL_FROM_ADDRESS"),
@@ -133,7 +133,11 @@ pub fn from_flags(url: Option<String>, from: Option<String>, ca_file: Option<&Pa
 
 /// The reference's ModerationMailer, for admin sendEmail. None: it falls
 /// back to the main mailer (DESIGN.md "Email").
-pub fn moderation_from_flags(url: Option<String>, from: Option<String>, ca_file: Option<&Path>) -> anyhow::Result<Option<SharedMailer>> {
+pub fn moderation_from_flags(
+    url: Option<String>,
+    from: Option<String>,
+    ca_file: Option<&Path>,
+) -> anyhow::Result<Option<SharedMailer>> {
     let m = start_if_set(
         (url, "PDS_MODERATION_EMAIL_SMTP_URL"),
         (from, "PDS_MODERATION_EMAIL_ADDRESS"),
@@ -157,7 +161,9 @@ fn start_if_set(
         (None, None) => Ok(None),
         (Some(url), Some(from)) => {
             let ca_pem = match ca_file {
-                Some(p) => Some(std::fs::read(p).map_err(|e| anyhow::anyhow!("--email-smtp-ca-file {}: {e}", p.display()))?),
+                Some(p) => {
+                    Some(std::fs::read(p).map_err(|e| anyhow::anyhow!("--email-smtp-ca-file {}: {e}", p.display()))?)
+                }
                 None => None,
             };
             Ok(Some(SharedMailer(Arc::new(SmtpMailer::start(SmtpConfig { ca_pem, ..SmtpConfig::new(url, from) })?))))
@@ -178,10 +184,8 @@ pub struct SmtpMailer {
 impl SmtpMailer {
     /// Needs a tokio runtime.
     pub fn start(cfg: SmtpConfig) -> anyhow::Result<SmtpMailer> {
-        let from: Mailbox = cfg
-            .from
-            .parse()
-            .map_err(|e| anyhow::anyhow!("--email-from-address {:?}: {e}", cfg.from))?;
+        let from: Mailbox =
+            cfg.from.parse().map_err(|e| anyhow::anyhow!("--email-from-address {:?}: {e}", cfg.from))?;
         let (transport, host) = transport(&cfg)?;
         tracing::info!(smtp_host = %host, from = %from, "email enabled (SMTP)");
         let (tx, rx) = mpsc::channel(cfg.queue.max(1));
@@ -242,10 +246,8 @@ fn transport(cfg: &SmtpConfig) -> anyhow::Result<(AsyncSmtpTransport<Tokio1Execu
     if let Some(pem) = &cfg.ca_pem {
         b = b.tls(with_ca(&url, pem)?);
     }
-    let t = b
-        .timeout(Some(CONNECT_TIMEOUT))
-        .pool_config(PoolConfig::new().max_size(cfg.concurrency.max(1) as u32))
-        .build();
+    let t =
+        b.timeout(Some(CONNECT_TIMEOUT)).pool_config(PoolConfig::new().max_size(cfg.concurrency.max(1) as u32)).build();
     Ok((t, host))
 }
 
@@ -358,7 +360,10 @@ mod tests {
 
     #[tokio::test]
     async fn partial_config_is_an_error() {
-        assert!(from_flags(Some("smtp://h".into()), Some(String::new()), None).is_err() || std::env::var("PDS_EMAIL_FROM_ADDRESS").is_ok());
+        assert!(
+            from_flags(Some("smtp://h".into()), Some(String::new()), None).is_err()
+                || std::env::var("PDS_EMAIL_FROM_ADDRESS").is_ok()
+        );
         assert!(SmtpMailer::start(SmtpConfig::new("smtp://h", "not an address")).is_err());
         let (_, host) = transport(&SmtpConfig::new("smtps://user:secret@mail.example.com:465/ehlo", "a@b.c")).unwrap();
         assert_eq!(host, "mail.example.com:465");

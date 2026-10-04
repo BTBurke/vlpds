@@ -118,15 +118,21 @@ async fn workload(s: &TestServer, accts: &[TestAccount]) {
         .await;
         for d in 0..2 {
             s.xrpc
-                .post("com.atproto.repo.putRecord",
-                      &json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self",
+                .post(
+                    "com.atproto.repo.putRecord",
+                    &json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self",
                               "record": {"$type": "app.bsky.actor.profile", "displayName": format!("name {d}")}}),
-                      &a.auth())
+                    &a.auth(),
+                )
                 .await
                 .ok();
         }
         s.xrpc
-            .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": POST, "rkey": posts[1].rkey()}), &a.auth())
+            .post(
+                "com.atproto.repo.deleteRecord",
+                &json!({"repo": a.did, "collection": POST, "rkey": posts[1].rkey()}),
+                &a.auth(),
+            )
             .await
             .ok();
     }
@@ -163,7 +169,11 @@ async fn sync_identity_account_events_on_creation() {
         assert_eq!(c.did, a.did);
         assert_eq!(c.rev, sy.rev);
         c.verify(&s.signing_key(&a.did).await).unwrap();
-        assert_eq!(c.data.to_string(), "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "new repo has an empty MST");
+        assert_eq!(
+            c.data.to_string(),
+            "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm",
+            "new repo has an empty MST"
+        );
 
         // the first #commit chains from the #sync
         let first = evts.iter().find_map(|f| f.commit()).expect("a #commit");
@@ -213,7 +223,8 @@ async fn commit_ops_match_rpc_results() {
     assert_eq!(Some(c.rev.as_str()), r["commit"]["rev"].as_str());
     let results = r["results"].as_array().unwrap();
     assert_eq!(c.ops.len(), results.len());
-    let mut from_stream: Vec<(String, String)> = c.ops.iter().map(|o| (o.path.clone(), o.cid.unwrap().to_string())).collect();
+    let mut from_stream: Vec<(String, String)> =
+        c.ops.iter().map(|o| (o.path.clone(), o.cid.unwrap().to_string())).collect();
     let mut from_rpc: Vec<(String, String)> = results
         .iter()
         .map(|x| {
@@ -393,7 +404,11 @@ async fn account_deletion_events() {
     s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &b1.auth()).await.ok();
     let token = s.mail_token(&b1.email).await.expect("dev-mode delete token for baddie1");
     s.xrpc
-        .post("com.atproto.server.deleteAccount", &json!({"did": b1.did, "password": b1.password, "token": token}), &Auth::None)
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": b1.did, "password": b1.password, "token": token}),
+            &Auth::None,
+        )
         .await
         .ok();
     // admin deletion
@@ -417,7 +432,12 @@ async fn errors_on_future_cursor() {
     let future = s.settled_now().await * 2 + 1_000_000_000;
     let mut sub = s.subscribe(Some(future)).await;
     let frames = sub.drain(Duration::from_secs(2)).await;
-    assert_eq!(frames.len(), 1, "exactly one (error) frame: {:?}", frames.iter().map(|f| f.body.clone()).collect::<Vec<_>>());
+    assert_eq!(
+        frames.len(),
+        1,
+        "exactly one (error) frame: {:?}",
+        frames.iter().map(|f| f.body.clone()).collect::<Vec<_>>()
+    );
     assert_eq!(frames[0].op, -1);
     assert_eq!(frames[0].str("error"), Some("FutureCursor"));
     assert!(sub.closed, "connection closed after the error frame");

@@ -47,10 +47,18 @@ fn owned(n: &TestServer) -> Vec<vlpds::slots::ShardId> {
 type Gaps = Vec<(vlpds::slots::ShardId, Duration, Duration)>;
 
 /// Polls until `joiner` serves `want` shards.
-async fn watch_handback(nodes: &[&TestServer], joiner: &TestServer, raw: &object_store::memory::InMemory, want: usize) -> Gaps {
+async fn watch_handback(
+    nodes: &[&TestServer],
+    joiner: &TestServer,
+    raw: &object_store::memory::InMemory,
+    want: usize,
+) -> Gaps {
     let j = nodes.iter().position(|n| std::ptr::eq(*n, joiner)).unwrap();
     let jid = joiner.app.cluster.as_ref().unwrap().cfg.node_id.clone();
-    let (mut dropped, mut released): (HashMap<vlpds::slots::ShardId, Instant>, HashMap<vlpds::slots::ShardId, Instant>) = Default::default();
+    let (mut dropped, mut released): (
+        HashMap<vlpds::slots::ShardId, Instant>,
+        HashMap<vlpds::slots::ShardId, Instant>,
+    ) = Default::default();
     let mut gaps = HashMap::new();
     let mut prev: Vec<Option<usize>> = vec![None; SHARDS as usize];
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -105,7 +113,13 @@ fn store_with_latency(ms: u64) -> (Arc<dyn object_store::ObjectStore>, Arc<objec
         return (mem.clone(), mem);
     }
     let d = Duration::from_millis(ms);
-    let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
+    let cfg = ThrottleConfig {
+        wait_get_per_call: d,
+        wait_put_per_call: d,
+        wait_list_per_call: d,
+        wait_delete_per_call: d,
+        ..Default::default()
+    };
     (Arc::new(ThrottledStore::new(mem.clone(), cfg)), mem)
 }
 

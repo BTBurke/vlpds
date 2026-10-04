@@ -134,7 +134,14 @@ pub struct Fetched {
 
 /// Reads `links`' index values, the links of the records at `paths` (and
 /// those links' values), or with `all` the repo's whole index.
-pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, links: &[Vec<u8>], paths: &[String], all: bool) -> anyhow::Result<Fetched> {
+pub async fn fetch<R: slatedb::DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    links: &[Vec<u8>],
+    paths: &[String],
+    all: bool,
+) -> anyhow::Result<Fetched> {
     let mut out = Fetched { all, ..Default::default() };
     let mut want: Vec<Vec<u8>> = Vec::new();
     if all {
@@ -180,11 +187,15 @@ mod tests {
     fn links_as_the_reference() {
         let did = "did:plc:abcdefghijklmnopqrstuvwx";
         let post = format!("at://{did}/app.bsky.feed.post/3jzfcijpj2z2a");
-        let like = rec(serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": post, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}, "createdAt": "2026-10-01T00:00:00.000Z"}));
+        let like = rec(
+            serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": post, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}, "createdAt": "2026-10-01T00:00:00.000Z"}),
+        );
         assert_eq!(link("app.bsky.feed.like", &like), Some([b"l", post.as_bytes()].concat()));
         // the record's $type must be its collection
         assert_eq!(link("app.bsky.feed.repost", &like), None);
-        let follow = rec(serde_json::json!({"$type": "app.bsky.graph.follow", "subject": did, "createdAt": "2026-10-01T00:00:00.000Z"}));
+        let follow = rec(
+            serde_json::json!({"$type": "app.bsky.graph.follow", "subject": did, "createdAt": "2026-10-01T00:00:00.000Z"}),
+        );
         assert_eq!(link("app.bsky.graph.follow", &follow), Some([b"f", did.as_bytes()].concat()));
         let bad = rec(serde_json::json!({"$type": "app.bsky.graph.block", "subject": "not a did"}));
         assert_eq!(link("app.bsky.graph.block", &bad), None);

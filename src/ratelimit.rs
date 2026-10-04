@@ -85,51 +85,237 @@ pub struct Limit {
 
 macro_rules! limit {
     ($id:ident, $idx:expr, $name:expr, $key:ident, $scope:expr, $window:expr, $points:expr) => {
-        pub const $id: Limit = Limit {
-            idx: $idx,
-            name: $name,
-            key: KeyKind::$key,
-            scope: $scope,
-            window_ms: $window,
-            points: $points,
-        };
+        pub const $id: Limit =
+            Limit { idx: $idx, name: $name, key: KeyKind::$key, scope: $scope, window_ms: $window, points: $points };
     };
 }
 
-limit!(GLOBAL_IP, 0, "global-ip", Ip, "every XRPC call except sync.getRepo and an account moving in sending blobs its repo references; OAuth sign-in", 5 * MINUTE, 3000);
+limit!(
+    GLOBAL_IP,
+    0,
+    "global-ip",
+    Ip,
+    "every XRPC call except sync.getRepo and an account moving in sending blobs its repo references; OAuth sign-in",
+    5 * MINUTE,
+    3000
+);
 limit!(GET_REPO, 1, "com.atproto.sync.getRepo-0", Ip, "sync.getRepo", 5 * MINUTE, 6000);
-limit!(CREATE_SESSION_DAY, 2, "com.atproto.server.createSession-0", IdentifierIp, "server.createSession; OAuth sign-in", DAY, 300);
-limit!(CREATE_SESSION_5MIN, 3, "com.atproto.server.createSession-1", IdentifierIp, "server.createSession; OAuth sign-in", 5 * MINUTE, 30);
-limit!(CREATE_ACCOUNT, 4, "com.atproto.server.createAccount-0", Ip, "server.createAccount; OAuth sign-up", 5 * MINUTE, 100);
+limit!(
+    CREATE_SESSION_DAY,
+    2,
+    "com.atproto.server.createSession-0",
+    IdentifierIp,
+    "server.createSession; OAuth sign-in",
+    DAY,
+    300
+);
+limit!(
+    CREATE_SESSION_5MIN,
+    3,
+    "com.atproto.server.createSession-1",
+    IdentifierIp,
+    "server.createSession; OAuth sign-in",
+    5 * MINUTE,
+    30
+);
+limit!(
+    CREATE_ACCOUNT,
+    4,
+    "com.atproto.server.createAccount-0",
+    Ip,
+    "server.createAccount; OAuth sign-up",
+    5 * MINUTE,
+    100
+);
 limit!(DELETE_ACCOUNT, 5, "com.atproto.server.deleteAccount-0", Ip, "server.deleteAccount", 5 * MINUTE, 50);
-limit!(REQUEST_PASSWORD_RESET_DAY, 6, "com.atproto.server.requestPasswordReset-0", Ip, "server.requestPasswordReset", DAY, 50);
-limit!(REQUEST_PASSWORD_RESET_HOUR, 7, "com.atproto.server.requestPasswordReset-1", Ip, "server.requestPasswordReset", HOUR, 15);
+limit!(
+    REQUEST_PASSWORD_RESET_DAY,
+    6,
+    "com.atproto.server.requestPasswordReset-0",
+    Ip,
+    "server.requestPasswordReset",
+    DAY,
+    50
+);
+limit!(
+    REQUEST_PASSWORD_RESET_HOUR,
+    7,
+    "com.atproto.server.requestPasswordReset-1",
+    Ip,
+    "server.requestPasswordReset",
+    HOUR,
+    15
+);
 limit!(RESET_PASSWORD, 8, "com.atproto.server.resetPassword-0", Ip, "server.resetPassword", 5 * MINUTE, 50);
-limit!(UPLOAD_BLOB, 9, "com.atproto.repo.uploadBlob-0", Ip, "repo.uploadBlob, except an account moving in sending blobs its repo references", DAY, 1000);
+limit!(
+    UPLOAD_BLOB,
+    9,
+    "com.atproto.repo.uploadBlob-0",
+    Ip,
+    "repo.uploadBlob, except an account moving in sending blobs its repo references",
+    DAY,
+    1000
+);
 limit!(UPDATE_HANDLE_5MIN, 10, "com.atproto.identity.updateHandle-0", Did, "identity.updateHandle", 5 * MINUTE, 10);
 limit!(UPDATE_HANDLE_DAY, 11, "com.atproto.identity.updateHandle-1", Did, "identity.updateHandle", DAY, 50);
-limit!(REQUEST_ACCOUNT_DELETE_DAY, 12, "com.atproto.server.requestAccountDelete-0", Did, "server.requestAccountDelete", DAY, 15);
-limit!(REQUEST_ACCOUNT_DELETE_HOUR, 13, "com.atproto.server.requestAccountDelete-1", Did, "server.requestAccountDelete", HOUR, 5);
-limit!(REQUEST_EMAIL_CONFIRMATION_DAY, 14, "com.atproto.server.requestEmailConfirmation-0", Did, "server.requestEmailConfirmation", DAY, 15);
-limit!(REQUEST_EMAIL_CONFIRMATION_HOUR, 15, "com.atproto.server.requestEmailConfirmation-1", Did, "server.requestEmailConfirmation", HOUR, 5);
-limit!(REQUEST_EMAIL_UPDATE_DAY, 16, "com.atproto.server.requestEmailUpdate-0", Did, "server.requestEmailUpdate", DAY, 15);
-limit!(REQUEST_EMAIL_UPDATE_HOUR, 17, "com.atproto.server.requestEmailUpdate-1", Did, "server.requestEmailUpdate", HOUR, 5);
-limit!(REPO_WRITE_HOUR, 18, "repo-write-hour", Did, "every repo write (create 3, update 2, delete 1 points)", HOUR, 5000);
+limit!(
+    REQUEST_ACCOUNT_DELETE_DAY,
+    12,
+    "com.atproto.server.requestAccountDelete-0",
+    Did,
+    "server.requestAccountDelete",
+    DAY,
+    15
+);
+limit!(
+    REQUEST_ACCOUNT_DELETE_HOUR,
+    13,
+    "com.atproto.server.requestAccountDelete-1",
+    Did,
+    "server.requestAccountDelete",
+    HOUR,
+    5
+);
+limit!(
+    REQUEST_EMAIL_CONFIRMATION_DAY,
+    14,
+    "com.atproto.server.requestEmailConfirmation-0",
+    Did,
+    "server.requestEmailConfirmation",
+    DAY,
+    15
+);
+limit!(
+    REQUEST_EMAIL_CONFIRMATION_HOUR,
+    15,
+    "com.atproto.server.requestEmailConfirmation-1",
+    Did,
+    "server.requestEmailConfirmation",
+    HOUR,
+    5
+);
+limit!(
+    REQUEST_EMAIL_UPDATE_DAY,
+    16,
+    "com.atproto.server.requestEmailUpdate-0",
+    Did,
+    "server.requestEmailUpdate",
+    DAY,
+    15
+);
+limit!(
+    REQUEST_EMAIL_UPDATE_HOUR,
+    17,
+    "com.atproto.server.requestEmailUpdate-1",
+    Did,
+    "server.requestEmailUpdate",
+    HOUR,
+    5
+);
+limit!(
+    REPO_WRITE_HOUR,
+    18,
+    "repo-write-hour",
+    Did,
+    "every repo write (create 3, update 2, delete 1 points)",
+    HOUR,
+    5000
+);
 limit!(REPO_WRITE_DAY, 19, "repo-write-day", Did, "every repo write (create 3, update 2, delete 1 points)", DAY, 35000);
 limit!(OAUTH_SIGN_IN_IP, 20, "oauth-sign-in-ip", Ip, "OAuth sign-in form posts", 5 * MINUTE, 100);
-limit!(SIGN_IN_ACCOUNT, 21, "sign-in-account", Did, "server.createSession; OAuth sign-in (both steps), from any IP", HOUR, 100);
+limit!(
+    SIGN_IN_ACCOUNT,
+    21,
+    "sign-in-account",
+    Did,
+    "server.createSession; OAuth sign-in (both steps), from any IP",
+    HOUR,
+    100
+);
 limit!(OAUTH_IP, 22, "oauth-ip", Ip, "OAuth /oauth/par, /oauth/token, /oauth/revoke", 5 * MINUTE, 3000);
 limit!(RESERVE_SIGNING_KEY_IP, 23, "com.atproto.server.reserveSigningKey-0", Ip, "server.reserveSigningKey", HOUR, 100);
-limit!(RESERVE_SIGNING_KEY_NODE, 24, "reserve-signing-key-node", Node, "server.reserveSigningKey calls that reserve a new key (one KMS wrap each)", DAY, 5000);
-limit!(REQUEST_PLC_OPERATION_SIGNATURE_DAY, 25, "com.atproto.identity.requestPlcOperationSignature-0", Did, "identity.requestPlcOperationSignature", DAY, 15);
-limit!(REQUEST_PLC_OPERATION_SIGNATURE_HOUR, 26, "com.atproto.identity.requestPlcOperationSignature-1", Did, "identity.requestPlcOperationSignature", HOUR, 5);
-limit!(PASSWORD_RESET_ACCOUNT_DAY, 27, "password-reset-account-day", Did, "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)", DAY, 15);
-limit!(PASSWORD_RESET_ACCOUNT_HOUR, 28, "password-reset-account-hour", Did, "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)", HOUR, 5);
-limit!(MAIL_RECIPIENT_DAY, 29, "mail-recipient-day", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", DAY, 30);
-limit!(MAIL_RECIPIENT_HOUR, 30, "mail-recipient-hour", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", HOUR, 10);
-limit!(MAIL_NODE_HOUR, 31, "mail-node-hour", Node, "every account mail this node sends; admin sendEmail exempt", HOUR, 200);
+limit!(
+    RESERVE_SIGNING_KEY_NODE,
+    24,
+    "reserve-signing-key-node",
+    Node,
+    "server.reserveSigningKey calls that reserve a new key (one KMS wrap each)",
+    DAY,
+    5000
+);
+limit!(
+    REQUEST_PLC_OPERATION_SIGNATURE_DAY,
+    25,
+    "com.atproto.identity.requestPlcOperationSignature-0",
+    Did,
+    "identity.requestPlcOperationSignature",
+    DAY,
+    15
+);
+limit!(
+    REQUEST_PLC_OPERATION_SIGNATURE_HOUR,
+    26,
+    "com.atproto.identity.requestPlcOperationSignature-1",
+    Did,
+    "identity.requestPlcOperationSignature",
+    HOUR,
+    5
+);
+limit!(
+    PASSWORD_RESET_ACCOUNT_DAY,
+    27,
+    "password-reset-account-day",
+    Did,
+    "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)",
+    DAY,
+    15
+);
+limit!(
+    PASSWORD_RESET_ACCOUNT_HOUR,
+    28,
+    "password-reset-account-hour",
+    Did,
+    "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)",
+    HOUR,
+    5
+);
+limit!(
+    MAIL_RECIPIENT_DAY,
+    29,
+    "mail-recipient-day",
+    Did,
+    "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt",
+    DAY,
+    30
+);
+limit!(
+    MAIL_RECIPIENT_HOUR,
+    30,
+    "mail-recipient-hour",
+    Did,
+    "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt",
+    HOUR,
+    10
+);
+limit!(
+    MAIL_NODE_HOUR,
+    31,
+    "mail-node-hour",
+    Node,
+    "every account mail this node sends; admin sendEmail exempt",
+    HOUR,
+    200
+);
 // Default points: --mail-daily-budget ([`Limiter::defaults`]).
-limit!(MAIL_CLUSTER_DAY, 32, "mail-cluster-day", Cluster, "every account mail the cluster sends (the mail provider's quota); admin sendEmail exempt", DAY, DEFAULT_MAIL_DAILY_BUDGET);
+limit!(
+    MAIL_CLUSTER_DAY,
+    32,
+    "mail-cluster-day",
+    Cluster,
+    "every account mail the cluster sends (the mail provider's quota); admin sendEmail exempt",
+    DAY,
+    DEFAULT_MAIL_DAILY_BUDGET
+);
 
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
@@ -185,9 +371,7 @@ fn ip_route_limits(path: &str) -> &'static [&'static Limit] {
         "/xrpc/com.atproto.sync.getRepo" => &[&GET_REPO],
         "/xrpc/com.atproto.server.createAccount" => &[&CREATE_ACCOUNT],
         "/xrpc/com.atproto.server.deleteAccount" => &[&DELETE_ACCOUNT],
-        "/xrpc/com.atproto.server.requestPasswordReset" => {
-            &[&REQUEST_PASSWORD_RESET_DAY, &REQUEST_PASSWORD_RESET_HOUR]
-        }
+        "/xrpc/com.atproto.server.requestPasswordReset" => &[&REQUEST_PASSWORD_RESET_DAY, &REQUEST_PASSWORD_RESET_HOUR],
         "/xrpc/com.atproto.server.resetPassword" => &[&RESET_PASSWORD],
         "/xrpc/com.atproto.server.reserveSigningKey" => &[&RESERVE_SIGNING_KEY_IP],
         _ => &[],
@@ -212,15 +396,7 @@ pub struct Spec {
 
 impl Spec {
     pub fn new(name: &str, key: KeyKind, scope: &str, window_ms: u64, points: u32, enabled: bool) -> Spec {
-        Spec {
-            name: name.into(),
-            key,
-            scope: scope.into(),
-            window_ms,
-            points,
-            enabled,
-            tag: name_tag(name),
-        }
+        Spec { name: name.into(), key, scope: scope.into(), window_ms, points, enabled, tag: name_tag(name) }
     }
 
     fn of(l: &Limit) -> Spec {
@@ -302,13 +478,9 @@ impl Policy {
 
     fn ip_matches(&self, ip: Option<IpAddr>) -> Vec<usize> {
         match ip {
-            Some(ip) if !self.ip_ov.is_empty() => self
-                .ip_ov
-                .iter()
-                .enumerate()
-                .filter(|(_, (c, _))| c.contains(&ip))
-                .map(|(i, _)| i)
-                .collect(),
+            Some(ip) if !self.ip_ov.is_empty() => {
+                self.ip_ov.iter().enumerate().filter(|(_, (c, _))| c.contains(&ip)).map(|(i, _)| i).collect()
+            }
             _ => Vec::new(),
         }
     }
@@ -399,13 +571,7 @@ impl Default for Counters {
     fn default() -> Self {
         Counters {
             shards: (0..SHARDS)
-                .map(|_| {
-                    Mutex::new(Shard {
-                        map: HashMap::new(),
-                        top: HashMap::new(),
-                        next_sweep_ms: 0,
-                    })
-                })
+                .map(|_| Mutex::new(Shard { map: HashMap::new(), top: HashMap::new(), next_sweep_ms: 0 }))
                 .collect(),
             hasher: Default::default(),
         }
@@ -449,15 +615,9 @@ impl Counters {
             });
             shard.next_sweep_ms = now_ms + SWEEP_EVERY_MS;
         }
-        let w = shard.map.entry(id).or_insert(Window {
-            reset_ms: now_ms + spec.window_ms,
-            used: 0,
-        });
+        let w = shard.map.entry(id).or_insert(Window { reset_ms: now_ms + spec.window_ms, used: 0 });
         if w.reset_ms <= now_ms {
-            *w = Window {
-                reset_ms: now_ms + spec.window_ms,
-                used: 0,
-            };
+            *w = Window { reset_ms: now_ms + spec.window_ms, used: 0 };
         }
         // As rate-limiter-flexible: points are counted even when rejected.
         w.used = w.used.saturating_add(points);
@@ -532,13 +692,7 @@ fn track(list: &mut Vec<Cand>, id: u64, window_ms: u64, key: &str, used: u32, re
         c.reset_ms = reset_ms;
         return;
     }
-    let cand = || Cand {
-        id,
-        window_ms,
-        key: truncate(key, TOP_KEY_MAX).into(),
-        used,
-        reset_ms,
-    };
+    let cand = || Cand { id, window_ms, key: truncate(key, TOP_KEY_MAX).into(), used, reset_ms };
     if list.len() < TOP_PER_SHARD {
         list.push(cand());
         return;
@@ -563,10 +717,7 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 static REJECTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -650,7 +801,9 @@ impl Rejections {
 
     pub fn snapshot(&self, now_ms: u64) -> Vec<RejectionCount> {
         let minute = now_ms / MINUTE;
-        let within = |r: &Ring, n: u64| -> u64 { r.mins.iter().filter(|(m, _)| *m + n > minute && *m <= minute).map(|(_, c)| c).sum() };
+        let within = |r: &Ring, n: u64| -> u64 {
+            r.mins.iter().filter(|(m, _)| *m + n > minute && *m <= minute).map(|(_, c)| c).sum()
+        };
         let mut v: Vec<RejectionCount> = self
             .map
             .lock()
@@ -694,8 +847,7 @@ impl Cidr {
     pub fn contains(&self, ip: &IpAddr) -> bool {
         fn prefix_eq(a: &[u8], b: &[u8], bits: u8) -> bool {
             let (full, rem) = ((bits / 8) as usize, bits % 8);
-            a[..full] == b[..full]
-                && (rem == 0 || (a[full] ^ b[full]) & (0xffu8 << (8 - rem)) == 0)
+            a[..full] == b[..full] && (rem == 0 || (a[full] ^ b[full]) & (0xffu8 << (8 - rem)) == 0)
         }
         match (self.net, ip.to_canonical()) {
             (IpAddr::V4(n), IpAddr::V4(i)) => prefix_eq(&n.octets(), &i.octets(), self.bits),
@@ -867,7 +1019,10 @@ impl Limiter {
         let spec = policy.builtin(&MAIL_CLUSTER_DAY);
         if let Some(used) = self.mail_budget.last().map(|s| s.used_in(spec.window_ms, now)).filter(|u| *u > 0) {
             let reset_ms = mail_budget::window_start(spec.window_ms, now) + spec.window_ms;
-            top.insert(spec.name.to_string(), vec![Consumer { key: CLUSTER_KEY.into(), used, limit: Some(spec.points), reset_ms }]);
+            top.insert(
+                spec.name.to_string(),
+                vec![Consumer { key: CLUSTER_KEY.into(), used, limit: Some(spec.points), reset_ms }],
+            );
         }
         NodeSnapshot {
             node: node.to_string(),
@@ -909,7 +1064,13 @@ impl Limiter {
     /// bucket. `report`: give the response these buckets' RateLimit-*
     /// headers (never where they would tell the caller whether an address
     /// has an account).
-    pub fn consume_unbypassable(&self, limits: &[&'static Limit], key: &str, route: &str, report: bool) -> Result<(), XrpcError> {
+    pub fn consume_unbypassable(
+        &self,
+        limits: &[&'static Limit],
+        key: &str,
+        route: &str,
+        report: bool,
+    ) -> Result<(), XrpcError> {
         let policy = self.policy();
         if !self.enabled_by_flag || !policy.enabled {
             return Ok(());
@@ -955,7 +1116,12 @@ impl Limiter {
     /// The cluster's `mail-cluster-day`, like [`Self::consume_unbypassable`]
     /// but counted in the bucket ([`mail_budget`]). Overrides don't apply:
     /// it stands for the mail provider's quota, which has none.
-    pub async fn consume_cluster_mail(&self, store: &crate::store::Store, route: &str, report: bool) -> Result<(), XrpcError> {
+    pub async fn consume_cluster_mail(
+        &self,
+        store: &crate::store::Store,
+        route: &str,
+        report: bool,
+    ) -> Result<(), XrpcError> {
         let policy = self.policy();
         let spec = policy.builtin(&MAIL_CLUSTER_DAY);
         if !self.enabled_by_flag || !policy.enabled || !spec.enabled {
@@ -1041,7 +1207,12 @@ impl Ctx {
         self.consume_specs(limits.iter().map(|l| policy.builtin(l)), key, points)
     }
 
-    fn consume_specs<'a>(&mut self, specs: impl Iterator<Item = &'a Spec>, key: &str, points: u32) -> Result<(), XrpcError> {
+    fn consume_specs<'a>(
+        &mut self,
+        specs: impl Iterator<Item = &'a Spec>,
+        key: &str,
+        points: u32,
+    ) -> Result<(), XrpcError> {
         if self.bypass || points == 0 || !self.policy.enabled {
             return Ok(());
         }
@@ -1188,7 +1359,9 @@ pub async fn layer(
             Ok(()) => next.run(req).await,
             Err(_) if oauth_endpoint => (
                 StatusCode::TOO_MANY_REQUESTS,
-                axum::Json(serde_json::json!({"error": "rate_limit_exceeded", "error_description": "Rate Limit Exceeded"})),
+                axum::Json(
+                    serde_json::json!({"error": "rate_limit_exceeded", "error_description": "Rate Limit Exceeded"}),
+                ),
             )
                 .into_response(),
             Err(e) => e.into_response(),
@@ -1208,14 +1381,7 @@ mod tests {
     #[test]
     fn fixed_window() {
         let c = Counters::default();
-        const L: Limit = Limit {
-            idx: 0,
-            name: "t",
-            key: KeyKind::Ip,
-            scope: "",
-            window_ms: 1000,
-            points: 5,
-        };
+        const L: Limit = Limit { idx: 0, name: "t", key: KeyKind::Ip, scope: "", window_ms: 1000, points: 5 };
         let spec = Spec::of(&L);
         let consume = |key: &str, points, now| c.consume_spec(&spec, L.points, key, points, now);
         for i in 0..5 {
@@ -1347,10 +1513,7 @@ mod tests {
         // untrusted peer: XFF ignored
         assert_eq!(client_ip(&h, Some(peer), &[]), Some(peer));
         // trusted peer: right-most untrusted hop
-        assert_eq!(
-            client_ip(&h, Some(peer), &[c]),
-            Some("1.2.3.4".parse().unwrap())
-        );
+        assert_eq!(client_ip(&h, Some(peer), &[c]), Some("1.2.3.4".parse().unwrap()));
     }
 
     #[test]
@@ -1406,7 +1569,10 @@ mod tests {
         assert!(spend(&l, "did:plc:a").is_err_and(|e| e.error == "RateLimitExceeded"));
         assert!(spend(&l, "did:plc:b").is_ok());
         let mut p = Policy::default();
-        p.did_ov.insert("did:plc:a".into(), vec![Ov { limiters: vec!["mail-recipient-hour".into()], action: Action::Exempt }]);
+        p.did_ov.insert(
+            "did:plc:a".into(),
+            vec![Ov { limiters: vec!["mail-recipient-hour".into()], action: Action::Exempt }],
+        );
         l.install(p);
         assert!(spend(&l, "did:plc:a").is_ok());
         l.install(Policy { enabled: false, ..Policy::default() });

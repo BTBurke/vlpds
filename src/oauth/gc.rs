@@ -9,8 +9,7 @@
 //! device session.
 
 use super::client::{
-    ClientAuth, REFRESH_LIFETIME, REFRESH_LIFETIME_EXTENDED, SESSION_LIFETIME,
-    SESSION_LIFETIME_EXTENDED,
+    ClientAuth, REFRESH_LIFETIME, REFRESH_LIFETIME_EXTENDED, SESSION_LIFETIME, SESSION_LIFETIME_EXTENDED,
 };
 use super::store::{self, Device, RequestData, Session};
 use super::{OAuthError, AUTHENTICATION_MAX_AGE, CODE_CHALLENGE_REPLAY_TIMEFRAME};
@@ -75,21 +74,15 @@ fn session_expired(s: &Session, now: i64) -> bool {
 fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool {
     match kind {
         Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
-        Kind::Revocation => {
-            crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false)
+        Kind::Revocation => crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false),
+        Kind::Request => serde_json::from_slice::<RequestData>(val).map(|r| request_expired(&r, now)).unwrap_or(true),
+        Kind::CodeChallenge => {
+            serde_json::from_slice::<i64>(val).map(|at| now - at >= CODE_CHALLENGE_REPLAY_TIMEFRAME).unwrap_or(true)
         }
-        Kind::Request => serde_json::from_slice::<RequestData>(val)
-            .map(|r| request_expired(&r, now))
-            .unwrap_or(true),
-        Kind::CodeChallenge => serde_json::from_slice::<i64>(val)
-            .map(|at| now - at >= CODE_CHALLENGE_REPLAY_TIMEFRAME)
-            .unwrap_or(true),
-        Kind::Device => serde_json::from_slice::<Device>(val)
-            .map(|d| now - d.last_seen_at > AUTHENTICATION_MAX_AGE)
-            .unwrap_or(true),
-        Kind::Session => serde_json::from_slice::<Session>(val)
-            .map(|s| session_expired(&s, now))
-            .unwrap_or(true),
+        Kind::Device => {
+            serde_json::from_slice::<Device>(val).map(|d| now - d.last_seen_at > AUTHENTICATION_MAX_AGE).unwrap_or(true)
+        }
+        Kind::Session => serde_json::from_slice::<Session>(val).map(|s| session_expired(&s, now)).unwrap_or(true),
     }
 }
 
@@ -106,13 +99,7 @@ fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     }
 }
 
-async fn delete_if_expired(
-    app: &App,
-    kind: Kind,
-    routing: &str,
-    name: &str,
-    now: i64,
-) -> Result<bool, OAuthError> {
+async fn delete_if_expired(app: &App, kind: Kind, routing: &str, name: &str, now: i64) -> Result<bool, OAuthError> {
     let _g = store::lock(app, &lock_key(kind, routing, name)).await;
     let Some(val) = app.get_private(routing, name).await? else {
         return Ok(false);
@@ -164,7 +151,9 @@ impl Sweeper {
         let fam = crate::state::PRIVATE_FAMILY;
         for p in app.partitions.owned() {
             let start = self.cursors.remove(&p.id);
-            let mut it = crate::state::FamilyScan::new(p.db.as_ref(), fam, start, &Default::default()).await.map_err(server_err)?;
+            let mut it = crate::state::FamilyScan::new(p.db.as_ref(), fam, start, &Default::default())
+                .await
+                .map_err(server_err)?;
             let mut examined = 0;
             let mut resume = None;
             while let Some(kv) = it.next().await.map_err(server_err)? {
@@ -223,19 +212,10 @@ mod tests {
 
     #[test]
     fn classifies_oauth_rows_only() {
-        assert_eq!(
-            classify("oauth:req:req-x", "oauth/req"),
-            Some(Kind::Request)
-        );
-        assert_eq!(
-            classify("oauth:cc:abc", "oauth/cc"),
-            Some(Kind::CodeChallenge)
-        );
+        assert_eq!(classify("oauth:req:req-x", "oauth/req"), Some(Kind::Request));
+        assert_eq!(classify("oauth:cc:abc", "oauth/cc"), Some(Kind::CodeChallenge));
         assert_eq!(classify("oauth:dev:dev-x", "oauth/dev"), Some(Kind::Device));
-        assert_eq!(
-            classify("did:plc:x", "oauth/ses/ses-1"),
-            Some(Kind::Session)
-        );
+        assert_eq!(classify("did:plc:x", "oauth/ses/ses-1"), Some(Kind::Session));
         assert_eq!(classify("did:plc:x", "oauth/authz/h"), None);
         assert_eq!(classify("oauth:lex:com.example.x", "oauth/lex"), None);
         assert_eq!(classify("_reserved:x", "key"), None);
@@ -244,14 +224,8 @@ mod tests {
         assert_eq!(classify("did:plc:x", "sec/rvk/d/0000000000000001"), Some(Kind::Revocation));
         assert_eq!(classify("did:plc:x", "sec/rvk/f/fam"), Some(Kind::Revocation));
         assert_eq!(classify("did:plc:x", "sec/td/rec/a/b"), None);
-        assert_eq!(
-            lock_key(Kind::Request, "oauth:req:req-1", "oauth/req"),
-            "req:req-1"
-        );
-        assert_eq!(
-            lock_key(Kind::Session, "did:plc:x", "oauth/ses/ses-1"),
-            "ses:ses-1"
-        );
+        assert_eq!(lock_key(Kind::Request, "oauth:req:req-1", "oauth/req"), "req:req-1");
+        assert_eq!(lock_key(Kind::Session, "did:plc:x", "oauth/ses/ses-1"), "ses:ses-1");
     }
 
     #[test]
@@ -259,12 +233,7 @@ mod tests {
         let now = 1_000_000_000;
         let x = |kind, val: &[u8]| expired(kind, "oauth:x", "n", val, now);
         assert!(!x(Kind::CodeChallenge, b"999999999"));
-        assert!(x(
-            Kind::CodeChallenge,
-            (now - CODE_CHALLENGE_REPLAY_TIMEFRAME)
-                .to_string()
-                .as_bytes(),
-        ));
+        assert!(x(Kind::CodeChallenge, (now - CODE_CHALLENGE_REPLAY_TIMEFRAME).to_string().as_bytes(),));
         assert!(x(Kind::Request, b"not json"));
         assert!(!x(Kind::Replay, (now + 1).to_string().as_bytes()));
         assert!(x(Kind::Replay, now.to_string().as_bytes()));
@@ -292,11 +261,7 @@ mod tests {
         assert!(!session_expired(&s, now));
         assert!(session_expired(&s, now + REFRESH_LIFETIME + 1));
         let conf = Session {
-            client_auth: ClientAuth::PrivateKeyJwt {
-                alg: "ES256".into(),
-                kid: "k".into(),
-                jkt: "j".into(),
-            },
+            client_auth: ClientAuth::PrivateKeyJwt { alg: "ES256".into(), kid: "k".into(), jkt: "j".into() },
             ..s
         };
         assert!(!session_expired(&conf, now + REFRESH_LIFETIME + 1));

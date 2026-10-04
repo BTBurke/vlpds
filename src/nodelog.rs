@@ -22,8 +22,8 @@
 use crate::events::Frame;
 use crate::metrics;
 use crate::segment::{self, LogObject, Mutation, SegmentBuilder};
-use crate::stats::STATS;
 use crate::slots::ShardId;
+use crate::stats::STATS;
 use crate::store::Store;
 use bytes::Bytes;
 use object_store::path::Path;
@@ -210,7 +210,11 @@ pub struct Watermark {
 
 impl Watermark {
     pub fn new(writer: u8, last: i64) -> Watermark {
-        Watermark { writer, inner: Mutex::new((own_seq_at_or_below(last, writer), last)), cap: std::sync::atomic::AtomicI64::new(i64::MAX) }
+        Watermark {
+            writer,
+            inner: Mutex::new((own_seq_at_or_below(last, writer), last)),
+            cap: std::sync::atomic::AtomicI64::new(i64::MAX),
+        }
     }
 
     /// Time-based, strictly increasing; the low byte is this node's writer id
@@ -288,7 +292,15 @@ impl ShardSink {
     /// every entry the log took for the shard is durable and applied, and
     /// the log takes no more for this sink.
     pub fn barrier_entry(&self, ack: AckFn) -> LogEntry {
-        LogEntry { shard: self.id, frames: Vec::new(), muts: Vec::new(), ack: Some(ack), pending: Some(self.barrier.token.clone()), enqueued: Instant::now(), totals: None }
+        LogEntry {
+            shard: self.id,
+            frames: Vec::new(),
+            muts: Vec::new(),
+            ack: Some(ack),
+            pending: Some(self.barrier.token.clone()),
+            enqueued: Instant::now(),
+            totals: None,
+        }
     }
 
     pub fn barrier_taken(&self) -> bool {
@@ -415,7 +427,12 @@ impl ShardSinks {
         }
         let mut r = self.retain.lock();
         r.retired.retain(|(_, at)| at.elapsed() < RETIRED_GRACE);
-        r.floors.values().map(|f| f.0).chain(r.closing.values().copied()).chain(r.retired.iter().map(|f| f.0)).fold(durable, u64::min)
+        r.floors
+            .values()
+            .map(|f| f.0)
+            .chain(r.closing.values().copied())
+            .chain(r.retired.iter().map(|f| f.0))
+            .fold(durable, u64::min)
     }
 
     /// shard -> highest epoch this log's owner opened it at.
@@ -460,7 +477,12 @@ pub enum Head {
 
 /// Errs unless a segment header names the log and ordinal it was read from.
 pub fn check_header(h: &segment::SegHeader, log_id: &str, ordinal: u64) -> anyhow::Result<()> {
-    anyhow::ensure!(h.log_id == log_id && h.ordinal == ordinal, "log object {log_id}/{ordinal} has header {}/{}", h.log_id, h.ordinal);
+    anyhow::ensure!(
+        h.log_id == log_id && h.ordinal == ordinal,
+        "log object {log_id}/{ordinal} has header {}/{}",
+        h.log_id,
+        h.ordinal
+    );
     Ok(())
 }
 
@@ -519,7 +541,9 @@ pub async fn first_free(store: &Store, log_id: &str) -> anyhow::Result<(u64, boo
     let mut listed = Vec::new();
     let mut list = store.raw.list(Some(&prefix));
     while let Some(meta) = list.next().await {
-        if let Some(ord) = meta?.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+        if let Some(ord) =
+            meta?.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok())
+        {
             listed.push(ord);
         }
     }
@@ -568,7 +592,12 @@ impl NodeLog {
         Self::start_with_inflight(store, cfg, DEFAULT_LOG_INFLIGHT, merger_tx)
     }
 
-    pub fn start_with_inflight(store: Store, cfg: NodeLogConfig, inflight: usize, merger_tx: mpsc::UnboundedSender<LogBatch>) -> Arc<NodeLog> {
+    pub fn start_with_inflight(
+        store: Store,
+        cfg: NodeLogConfig,
+        inflight: usize,
+        merger_tx: mpsc::UnboundedSender<LogBatch>,
+    ) -> Arc<NodeLog> {
         let wm = Arc::new(Watermark::new(cfg.writer, seq_floor(crate::tid::now_micros())));
         let (tx, rx) = mpsc::channel(64 * 1024);
         let (fin_tx, fin_rx) = mpsc::channel(4);
@@ -576,12 +605,29 @@ impl NodeLog {
         let durable_ordinal = Arc::new(AtomicU64::new(u64::MAX));
         let sinks = Arc::new(ShardSinks::new(durable_ordinal.clone()));
         let log_id: Arc<str> = cfg.log_id.clone().into();
-        let seq_cfg = SeqConfig { log_id: cfg.log_id.clone(), max_segment_bytes: cfg.max_segment_bytes, inflight: inflight.max(1), hedge_after: cfg.hedge_after };
+        let seq_cfg = SeqConfig {
+            log_id: cfg.log_id.clone(),
+            max_segment_bytes: cfg.max_segment_bytes,
+            inflight: inflight.max(1),
+            hedge_after: cfg.hedge_after,
+        };
         // critical: a panic in either fail-stops the node (lifecycle.rs)
-        tokio::spawn(crate::lifecycle::critical("log_sequencer", run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx)));
+        tokio::spawn(crate::lifecycle::critical(
+            "log_sequencer",
+            run_sequencer(store, seq_cfg, cfg.lease_ok.clone(), wm.clone(), sinks.clone(), rx, fin_tx),
+        ));
         tokio::spawn(crate::lifecycle::critical(
             "log_finalizer",
-            run_finalizer(log_id.clone(), sinks.clone(), wm.clone(), fin_rx, merger_tx, live.clone(), cfg.lease_ok, durable_ordinal.clone()),
+            run_finalizer(
+                log_id.clone(),
+                sinks.clone(),
+                wm.clone(),
+                fin_rx,
+                merger_tx,
+                live.clone(),
+                cfg.lease_ok,
+                durable_ordinal.clone(),
+            ),
         ));
         Arc::new(NodeLog { log_id, tx, wm, live, durable_ordinal, sinks, closed: Default::default() })
     }
@@ -643,7 +689,9 @@ impl NodeLog {
         }
         let written = s.db.write(wb).await.is_ok();
         drop(_g);
-        let flushed = s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await;
+        let flushed =
+            s.db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await;
         if written && flushed.is_ok() {
             self.sinks.checkpointed(s.id, ord);
         }
@@ -668,7 +716,11 @@ impl NodeLog {
                 drop(l);
                 shards.sort_by_key(|s| s.id);
                 // bench/ha kill9-mid-checkpoint keys off "checkpoint start"
-                tracing::info!(shards = shards.len(), every_ms = every.as_millis() as u64, "checkpoint start (staggered pass)");
+                tracing::info!(
+                    shards = shards.len(),
+                    every_ms = every.as_millis() as u64,
+                    "checkpoint start (staggered pass)"
+                );
                 let gap = every / shards.len().max(1) as u32;
                 if shards.is_empty() {
                     tokio::time::sleep(every).await;
@@ -749,7 +801,19 @@ impl Open {
             let seq = seqs[i];
             let (muts, derived): (&[Mutation], usize) = if i + 1 == n { (&e.muts, f.derived_muts) } else { (&[], 0) };
             let empty = f.prefix.is_empty() && f.suffix.is_empty();
-            let range = self.seg.push_derived(seq, e.shard, epoch, |out| if !empty { f.finish(seq, out) }, muts, derived, f.derived_gen);
+            let range = self.seg.push_derived(
+                seq,
+                e.shard,
+                epoch,
+                |out| {
+                    if !empty {
+                        f.finish(seq, out)
+                    }
+                },
+                muts,
+                derived,
+                f.derived_gen,
+            );
             self.frames.push((seq, range));
         }
         self.muts.entry(e.shard).or_default().append(&mut e.muts);
@@ -857,7 +921,9 @@ async fn run_sequencer(
             }
             let o = std::mem::replace(&mut open, Open::new(&log_id));
             metrics::SEGMENT_EVENTS.observe(o.frames.len() as f64);
-            metrics::COMMIT_STAGE.with_label_values(&["seal_wait"]).observe(o.acks.first().map_or(0.0, |a| a.3.elapsed().as_secs_f64()));
+            metrics::COMMIT_STAGE
+                .with_label_values(&["seal_wait"])
+                .observe(o.acks.first().map_or(0.0, |a| a.3.elapsed().as_secs_f64()));
             if inflight.is_empty() {
                 prefix_end = ordinal;
             }
@@ -885,21 +951,22 @@ async fn run_sequencer(
                 // compressed off the runtime; the finalizer keeps slicing
                 // frames out of the uncompressed `data`
                 let raw = sealed.data.clone();
-                let put = commit_pool().run(move || {
-                    let t = Instant::now();
-                    let z = segment::compress(&raw, segment::compression_level());
-                    metrics::SEGMENT_COMPRESS.observe(t.elapsed().as_secs_f64());
-                    match z {
-                        Ok(Some(z)) => Bytes::from(z),
-                        Ok(None) => raw,
-                        Err(e) => {
-                            tracing::error!("segment compression failed, storing it uncompressed: {e:#}");
-                            raw
+                let put = commit_pool()
+                    .run(move || {
+                        let t = Instant::now();
+                        let z = segment::compress(&raw, segment::compression_level());
+                        metrics::SEGMENT_COMPRESS.observe(t.elapsed().as_secs_f64());
+                        match z {
+                            Ok(Some(z)) => Bytes::from(z),
+                            Ok(None) => raw,
+                            Err(e) => {
+                                tracing::error!("segment compression failed, storing it uncompressed: {e:#}");
+                                raw
+                            }
                         }
-                    }
-                })
-                .await
-                .expect("segment compression task");
+                    })
+                    .await
+                    .expect("segment compression task");
                 sealed.stored_bytes = put.len();
                 let t = Instant::now();
                 upload(&store, &log_id, sealed.ordinal, put, hedge_after).await;
@@ -941,7 +1008,10 @@ impl BlockingPool {
     }
 
     /// Runs `f` on the pool; Err if it panicked.
-    pub async fn run<R: Send + 'static>(&self, f: impl FnOnce() -> R + Send + 'static) -> Result<R, tokio::sync::oneshot::error::RecvError> {
+    pub async fn run<R: Send + 'static>(
+        &self,
+        f: impl FnOnce() -> R + Send + 'static,
+    ) -> Result<R, tokio::sync::oneshot::error::RecvError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let job: Box<dyn FnOnce() + Send> = Box::new(move || {
             let _ = tx.send(f());
@@ -1121,7 +1191,11 @@ async fn run_finalizer(
                     // which nothing is taken for it: unreachable. If it ever
                     // happens, they may lie past the span end the close
                     // published, where nobody replays them: never ack them.
-                    tracing::error!(shard = shard.0, ordinal = s.ordinal, "durable entries for a shard we no longer hold: not applied, acked as failed");
+                    tracing::error!(
+                        shard = shard.0,
+                        ordinal = s.ordinal,
+                        "durable entries for a shard we no longer hold: not applied, acked as failed"
+                    );
                     unheld.push(shard);
                 }
             }
@@ -1247,7 +1321,9 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
         let mut v = Vec::new();
         for (i, span) in history.iter().enumerate().skip(first) {
             let (from, resume) = match &marker {
-                Some((log, ord)) if i == first && &span.log_id == log => ((ord + 1).max(span.start), ord + 1 > span.start),
+                Some((log, ord)) if i == first && &span.log_id == log => {
+                    ((ord + 1).max(span.start), ord + 1 > span.start)
+                }
                 _ => (span.start, false),
             };
             if span.end.is_none_or(|e| from < e) {
@@ -1277,7 +1353,9 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
             // past a resume point: the shard's next entries may be right
             // after its marker.
             let head = crate::backfill::first_ordinal(store, &log_id).await?;
-            if let Some((_, from, span)) = resumes.iter().find(|(l, from, _)| *l == log_id && head.is_none_or(|h| h > *from)) {
+            if let Some((_, from, span)) =
+                resumes.iter().find(|(l, from, _)| *l == log_id && head.is_none_or(|h| h > *from))
+            {
                 anyhow::bail!("log {log_id} is pruned to {head:?}, past ordinal {from} where replay of {span:?} resumes after its applied marker");
             }
             match head {
@@ -1288,7 +1366,11 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
                 None if members.iter().all(|m| m.1.end.is_some()) => continue,
                 None => {}
             }
-            let hi = if members.iter().any(|m| m.1.end.is_none()) { u64::MAX } else { members.iter().filter_map(|m| m.1.end).max().unwrap_or(0) };
+            let hi = if members.iter().any(|m| m.1.end.is_none()) {
+                u64::MAX
+            } else {
+                members.iter().filter_map(|m| m.1.end).max().unwrap_or(0)
+            };
             let fetch = |ord: u64| {
                 let (store, path) = (store.clone(), segment_path(store, &log_id, ord));
                 async move {
@@ -1320,7 +1402,9 @@ pub async fn replay_many(store: &Store, shards: &[(ShardId, &Db, &[Span])]) -> a
                     None => None,
                 };
                 let Some((h, entries)) = seg else {
-                    if let Some((_, span, _)) = members.iter().find(|(_, s, from)| ord >= *from && s.end.is_some_and(|e| ord < e)) {
+                    if let Some((_, span, _)) =
+                        members.iter().find(|(_, s, from)| ord >= *from && s.end.is_some_and(|e| ord < e))
+                    {
                         anyhow::bail!("log {log_id} ends at ordinal {ord} inside closed span {span:?}");
                     }
                     break;
@@ -1384,7 +1468,11 @@ mod tests {
     }
 
     async fn put_seg(store: &Store, log: &str, ord: u64, shard: ShardId, epoch: u64, key: &str) {
-        store.raw.put(&segment_path(store, log, ord), PutPayload::from(seg_bytes(log, ord, shard, epoch, key))).await.unwrap();
+        store
+            .raw
+            .put(&segment_path(store, log, ord), PutPayload::from(seg_bytes(log, ord, shard, epoch, key)))
+            .await
+            .unwrap();
     }
 
     fn span(log: &str, epoch: u64, start: u64, end: Option<u64>) -> Span {
@@ -1550,8 +1638,15 @@ mod tests {
 
     #[async_trait::async_trait]
     impl object_store::ObjectStore for FaultStore {
-        async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
-            if let Some(ord) = location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if let Some(ord) =
+                location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok())
+            {
                 if self.holds.lock().contains(&ord) {
                     futures::future::pending::<()>().await;
                 }
@@ -1567,22 +1662,41 @@ mod tests {
             }
             self.inner.put_opts(location, payload, opts).await
         }
-        async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
             self.inner.get_opts(location, options).await
         }
-        fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
             self.inner.delete_stream(locations)
         }
-        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
@@ -1595,19 +1709,46 @@ mod tests {
     /// A log on `store` with K = `k`, owning `shard` (epoch 1) into a DB
     /// under its own prefix. Segments hold one entry each (`entry` makes
     /// entries bigger than max_segment_bytes).
-    async fn test_log(store: &Store, k: usize, shard: ShardId, max_segment_bytes: usize) -> (Arc<NodeLog>, Arc<Db>, mpsc::UnboundedReceiver<LogBatch>) {
+    async fn test_log(
+        store: &Store,
+        k: usize,
+        shard: ShardId,
+        max_segment_bytes: usize,
+    ) -> (Arc<NodeLog>, Arc<Db>, mpsc::UnboundedReceiver<LogBatch>) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let cfg = NodeLogConfig { log_id: "L".into(), writer: 1, max_segment_bytes, hedge_after: Duration::from_secs(10), lease_ok: None };
+        let cfg = NodeLogConfig {
+            log_id: "L".into(),
+            writer: 1,
+            max_segment_bytes,
+            hedge_after: Duration::from_secs(10),
+            lease_ok: None,
+        };
         let log = NodeLog::start_with_inflight(store.clone(), cfg, k, tx);
-        let db = Arc::new(crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap());
-        log.sinks.insert(Arc::new(ShardSink { id: shard, epoch: 1, db: db.clone(), apply_lock: Default::default(), applied: Default::default(), recent: Default::default(), barrier: Default::default(), totals: Default::default() }));
+        let db = Arc::new(
+            crate::partition::open_db(&Store { prefix: "apply".into(), ..store.clone() }, shard, None).await.unwrap(),
+        );
+        log.sinks.insert(Arc::new(ShardSink {
+            id: shard,
+            epoch: 1,
+            db: db.clone(),
+            apply_lock: Default::default(),
+            applied: Default::default(),
+            recent: Default::default(),
+            barrier: Default::default(),
+            totals: Default::default(),
+        }));
         (log, db, rx)
     }
 
     fn entry(shard: ShardId, key: String, val_len: usize, ack: Option<AckFn>) -> LogEntry {
         LogEntry {
             shard,
-            frames: vec![Frame { prefix: key.clone().into_bytes(), suffix: Vec::new(), derived_muts: 0, derived_gen: 0 }],
+            frames: vec![Frame {
+                prefix: key.clone().into_bytes(),
+                suffix: Vec::new(),
+                derived_muts: 0,
+                derived_gen: 0,
+            }],
             muts: vec![Mutation { key: Bytes::from(key), val: Some(Bytes::from(vec![7u8; val_len])) }],
             ack,
             pending: None,
@@ -1688,7 +1829,11 @@ mod tests {
         let t = Instant::now();
         let acked = send_n(&log, shard, 3).await;
         while acked.lock().len() < 3 {
-            assert!(t.elapsed() < Duration::from_millis(1000), "commits stalled behind the checkpoint ({} acked)", acked.lock().len());
+            assert!(
+                t.elapsed() < Duration::from_millis(1000),
+                "commits stalled behind the checkpoint ({} acked)",
+                acked.lock().len()
+            );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(!ckpt.is_finished(), "the checkpoint was still flushing");
@@ -1813,7 +1958,11 @@ mod tests {
             all.notified().await;
             let secs = t.elapsed().as_secs_f64();
             let segs = log.durable_ordinal.load(Ordering::Acquire) + 1;
-            println!("K={k}: {N} entries in {secs:.2} s = {:.0}/s, {segs} segments ({:.1} segs/s)", N as f64 / secs, segs as f64 / secs);
+            println!(
+                "K={k}: {N} entries in {secs:.2} s = {:.0}/s, {segs} segments ({:.1} segs/s)",
+                N as f64 / secs,
+                segs as f64 / secs
+            );
         }
     }
 
@@ -1833,15 +1982,43 @@ mod tests {
         let sink = log.sinks.get(shard).unwrap();
         // an entry ahead of the barrier is taken and acked
         let (etx, erx) = tokio::sync::oneshot::channel();
-        log.tx.send(entry(shard, "early".into(), 10, Some(Box::new(move |r| { let _ = etx.send(r.is_ok()); })))).await.ok().unwrap();
+        log.tx
+            .send(entry(
+                shard,
+                "early".into(),
+                10,
+                Some(Box::new(move |r| {
+                    let _ = etx.send(r.is_ok());
+                })),
+            ))
+            .await
+            .ok()
+            .unwrap();
         let (btx, brx) = tokio::sync::oneshot::channel();
-        log.tx.send(sink.barrier_entry(Box::new(move |r| { let _ = btx.send(r.is_ok()); }))).await.ok().unwrap();
+        log.tx
+            .send(sink.barrier_entry(Box::new(move |r| {
+                let _ = btx.send(r.is_ok());
+            })))
+            .await
+            .ok()
+            .unwrap();
         assert!(erx.await.unwrap() && brx.await.unwrap(), "the barrier is durable");
         assert!(sink.barrier_taken());
         // the late write; its segment (ordinal 1) is slow to land
         fs.delays.lock().insert(1, Duration::from_millis(300));
         let (tx, rx) = tokio::sync::oneshot::channel();
-        log.tx.send(entry(shard, "late".into(), 10, Some(Box::new(move |r| { let _ = tx.send(r.is_ok()); })))).await.ok().unwrap();
+        log.tx
+            .send(entry(
+                shard,
+                "late".into(),
+                10,
+                Some(Box::new(move |r| {
+                    let _ = tx.send(r.is_ok());
+                })),
+            ))
+            .await
+            .ok()
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
         // the close completes: the sink goes, the span ends at the durable end
         log.sinks.remove(shard);

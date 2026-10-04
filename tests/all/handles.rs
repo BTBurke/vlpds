@@ -17,7 +17,12 @@ async fn current_handle(s: &TestServer, did: &str) -> String {
 
 async fn did_doc_handle(s: &TestServer, did: &str) -> Option<String> {
     let d = s.describe_repo(did).await.ok();
-    d["didDoc"]["alsoKnownAs"].as_array()?.iter().filter_map(|x| x.as_str()).find_map(|x| x.strip_prefix("at://")).map(String::from)
+    d["didDoc"]["alsoKnownAs"]
+        .as_array()?
+        .iter()
+        .filter_map(|x| x.as_str())
+        .find_map(|x| x.strip_prefix("at://"))
+        .map(String::from)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -85,7 +90,17 @@ async fn handle_updates_are_idempotent() {
 async fn validates_input_handle_syntax() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    for bad in ["did:john", "jo_hn.test", "jo!hn.test", "jo%hn.test", "jo&hn.test", "jo*hn.test", "jo|hn.test", "jo:hn.test", "jo/hn.test"] {
+    for bad in [
+        "did:john",
+        "jo_hn.test",
+        "jo!hn.test",
+        "jo%hn.test",
+        "jo&hn.test",
+        "jo*hn.test",
+        "jo|hn.test",
+        "jo:hn.test",
+        "jo/hn.test",
+    ] {
         let r = update_handle(&s, &a, bad).await;
         assert_eq!(r.status, 400, "{bad}: {}", r.text());
         assert!(matches!(r.error_name(), Some("InvalidRequest") | Some("InvalidHandle")), "{bad}: {}", r.text());
@@ -121,12 +136,18 @@ async fn admin_overrides_handles() {
     let s = TestServer::spawn().await;
     let b = s.create_account("bob").await;
     let alt = h(&unique_name("balt"));
-    s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": alt}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": alt}), &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(current_handle(&s, &b.did).await, alt);
     assert_eq!(s.resolve_handle(&alt).await.ok()["did"], json!(b.did));
     // admins may assign reserved names
     let reserved = h("dril");
-    s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": reserved}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.updateAccountHandle", &json!({"did": b.did, "handle": reserved}), &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(current_handle(&s, &b.did).await, reserved);
 }
 
@@ -137,7 +158,10 @@ async fn admin_update_requires_admin_auth() {
     let body = json!({"did": b.did, "handle": h(&unique_name("balt"))});
     s.xrpc.post("com.atproto.admin.updateAccountHandle", &body, &b.auth()).await.err_status(401);
     s.xrpc.post("com.atproto.admin.updateAccountHandle", &body, &Auth::None).await.err_status(401);
-    s.xrpc.post("com.atproto.admin.updateAccountHandle", &body, &Auth::Basic("admin".into(), "wrong".into())).await.err_status(401);
+    s.xrpc
+        .post("com.atproto.admin.updateAccountHandle", &body, &Auth::Basic("admin".into(), "wrong".into()))
+        .await
+        .err_status(401);
     assert_eq!(current_handle(&s, &b.did).await, b.handle);
 }
 
@@ -152,7 +176,12 @@ async fn disallows_slurs_in_handles() {
     let a = s.create_account("alice").await;
     // service-domain and custom-domain handles alike (the reference checks
     // before the domain split), separators squashed out first
-    for handle in [h(&rev("reggin")), h(&rev("ynnart")), format!("{}.example.com", rev("reg.gin")), format!("{}.com", rev("sekyk"))] {
+    for handle in [
+        h(&rev("reggin")),
+        h(&rev("ynnart")),
+        format!("{}.example.com", rev("reg.gin")),
+        format!("{}.com", rev("sekyk")),
+    ] {
         let r = update_handle(&s, &a, &handle).await;
         r.err(400, "InvalidHandle");
         assert!(r.text().contains("Inappropriate language in handle"), "{handle}: {}", r.text());
@@ -160,11 +189,17 @@ async fn disallows_slurs_in_handles() {
     assert_eq!(current_handle(&s, &a.did).await, a.handle);
     // admins bypass the filter (allowAnyValid)...
     let slur = h(&rev("reggin"));
-    s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": slur}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": slur}), &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(current_handle(&s, &a.did).await, slur);
     // ...but not the service-domain shape rules
     for bad in [h("ab"), h("a.bcd")] {
-        let r = s.xrpc.post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": bad}), &Auth::Admin).await;
+        let r = s
+            .xrpc
+            .post("com.atproto.admin.updateAccountHandle", &json!({"did": a.did, "handle": bad}), &Auth::Admin)
+            .await;
         r.err(400, "InvalidHandle");
     }
 }
@@ -179,7 +214,10 @@ async fn disallows_slurs_in_record_keys() {
     for (nsid, body) in [
         ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
         ("com.atproto.repo.putRecord", json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec})),
-        ("com.atproto.repo.applyWrites", json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rkey, "value": rec}]})),
+        (
+            "com.atproto.repo.applyWrites",
+            json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rkey, "value": rec}]}),
+        ),
     ] {
         let r = s.xrpc.post(nsid, &body, &a.auth()).await;
         r.err(400, "InvalidRequest");
@@ -187,7 +225,10 @@ async fn disallows_slurs_in_record_keys() {
     }
     // ordinary keys are fine (a collection without TID keys); deletes aren't checked
     s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "com.example.thing", "rkey": "self-intro", "record": {"$type": "com.example.thing", "x": 1}}), &a.auth()).await.ok();
-    let r = s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &a.auth()).await;
+    let r = s
+        .xrpc
+        .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &a.auth())
+        .await;
     assert!(!r.text().contains("slur"), "{}", r.text());
 }
 

@@ -19,8 +19,8 @@ use vlpds::mst::{decode_node, decode_node_reference, Entry, Node, Tree};
 
 fn rand_text(rng: &mut impl Rng) -> String {
     const PIECES: &[&str] = &[
-        "a", "b", "z", "$type", "$link", "text", "\"", "\\", "\n", "\u{0}", "\u{7f}", "é", "😀",
-        "e", "l", "k", "p", "t", "v",
+        "a", "b", "z", "$type", "$link", "text", "\"", "\\", "\n", "\u{0}", "\u{7f}", "é", "😀", "e", "l", "k", "p",
+        "t", "v",
     ];
     (0..rng.gen_range(0..5)).map(|_| PIECES[rng.gen_range(0..PIECES.len())]).collect()
 }
@@ -38,7 +38,9 @@ fn rand_value(rng: &mut impl Rng, depth: usize) -> Value {
         }),
         3 => Value::Bytes((0..rng.gen_range(0..40)).map(|_| rng.gen()).collect()),
         4 => Value::Text(rand_text(rng)),
-        5 => Value::Link(if rng.gen() { Cid::dag_cbor(&rng.gen::<[u8; 8]>()) } else { Cid::raw(&rng.gen::<[u8; 8]>()) }),
+        5 => {
+            Value::Link(if rng.gen() { Cid::dag_cbor(&rng.gen::<[u8; 8]>()) } else { Cid::raw(&rng.gen::<[u8; 8]>()) })
+        }
         6 => Value::Array((0..rng.gen_range(0..5)).map(|_| rand_value(rng, depth + 1)).collect()),
         _ => {
             let mut m: Vec<(String, Value)> = Vec::new();
@@ -75,7 +77,9 @@ fn cbor_corpus() -> Vec<Vec<u8>> {
         .collect();
     for car in ["shrike/greenground.repo.car", "shrike/repo_slice.car"] {
         let (_, blocks) = car_blocks(car);
-        out.extend(blocks.into_iter().filter(|(c, _)| c.codec == vlpds::cid::CODEC_DAG_CBOR).map(|(_, b)| b).take(1500));
+        out.extend(
+            blocks.into_iter().filter(|(c, _)| c.codec == vlpds::cid::CODEC_DAG_CBOR).map(|(_, b)| b).take(1500),
+        );
     }
     let mut rng = StdRng::seed_from_u64(42);
     for _ in 0..3000 {
@@ -212,11 +216,13 @@ fn json_strings_are_escaped_as_serde_json_does() {
         let s: String = if i < 256 {
             char::from_u32(i).map(String::from).unwrap_or_default()
         } else {
-            (0..rng.gen_range(0..12)).map(|_| match rng.gen_range(0..4) {
-                0 => rng.gen_range(0u8..0x80) as char,
-                1 => ['"', '\\', '\n', '\u{1f}', '\u{7f}', '\u{2028}', '/', 'é', '😀'][rng.gen_range(0..9)],
-                _ => rng.gen_range(b'a'..=b'z') as char,
-            }).collect()
+            (0..rng.gen_range(0..12))
+                .map(|_| match rng.gen_range(0..4) {
+                    0 => rng.gen_range(0u8..0x80) as char,
+                    1 => ['"', '\\', '\n', '\u{1f}', '\u{7f}', '\u{2028}', '/', 'é', '😀'][rng.gen_range(0..9)],
+                    _ => rng.gen_range(b'a'..=b'z') as char,
+                })
+                .collect()
         };
         let cbor = Value::Map(vec![(s.clone(), Value::Text(s.clone()))]).to_cbor();
         let mut out = Vec::new();
@@ -349,7 +355,13 @@ fn old_height_for_key(key: &[u8]) -> i32 {
             height += 4;
             continue;
         }
-        height += if b & 0xFC == 0 { 3 } else if b & 0xF0 == 0 { 2 } else { 1 };
+        height += if b & 0xFC == 0 {
+            3
+        } else if b & 0xF0 == 0 {
+            2
+        } else {
+            1
+        };
         break;
     }
     height
@@ -441,7 +453,8 @@ fn mst_node_decoder_matches_reference() {
         if rng.gen_bool(0.3) {
             // structural edits a byte flip rarely makes: a prefix length,
             // a key suffix byte, t/l swapped between link and null
-            let pos: Vec<usize> = (0..b.len().saturating_sub(2)).filter(|&j| b[j] == 0x61 && b[j + 1] == b'p').collect();
+            let pos: Vec<usize> =
+                (0..b.len().saturating_sub(2)).filter(|&j| b[j] == 0x61 && b[j + 1] == b'p').collect();
             if let Some(&j) = pos.get(rng.gen_range(0..pos.len().max(1))) {
                 if j + 2 < b.len() {
                     b[j + 2] = rng.gen_range(0..24);

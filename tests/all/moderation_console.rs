@@ -19,11 +19,17 @@ fn cid_of(blob: &J) -> String {
 }
 
 async fn audit(s: &TestServer, did: &str) -> Vec<J> {
-    s.xrpc.get("vlpds.admin.getAuditLog", &[("did", did)], &Auth::Admin).await.ok()["entries"].as_array().unwrap().clone()
+    s.xrpc.get("vlpds.admin.getAuditLog", &[("did", did)], &Auth::Admin).await.ok()["entries"]
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 async fn takedowns(s: &TestServer, kind: &str) -> Vec<J> {
-    s.xrpc.get("vlpds.admin.listTakedowns", &[("kind", kind)], &Auth::Admin).await.ok()["takedowns"].as_array().unwrap().clone()
+    s.xrpc.get("vlpds.admin.listTakedowns", &[("kind", kind)], &Auth::Admin).await.ok()["takedowns"]
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 async fn quota(s: &TestServer, did: &str) -> J {
@@ -37,15 +43,30 @@ async fn record_takedown_with_a_case_and_audit() {
     let p = s.post(&a, "infringing text").await;
     let keep = s.post(&a, "fine").await;
 
-    let case = s.xrpc.post("vlpds.admin.createCase", &json!({"source": "DMCA notice from Example Studios (email)", "note": "received 2026-10-03"}), &Auth::Admin).await.ok();
+    let case = s
+        .xrpc
+        .post(
+            "vlpds.admin.createCase",
+            &json!({"source": "DMCA notice from Example Studios (email)", "note": "received 2026-10-03"}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
     let id = case["id"].as_str().unwrap().to_string();
     assert_eq!(case["status"], json!("open"));
     assert_eq!(case["notes"].as_array().unwrap().len(), 1);
 
     // a reason is required
-    moderate(&s, json!({"did": a.did, "kind": "record", "uri": p.uri, "action": "takedown", "reason": "  "})).await.err(400, "InvalidRequest");
+    moderate(&s, json!({"did": a.did, "kind": "record", "uri": p.uri, "action": "takedown", "reason": "  "}))
+        .await
+        .err(400, "InvalidRequest");
     // an unknown case is refused before anything changes
-    moderate(&s, json!({"did": a.did, "kind": "record", "uri": p.uri, "action": "takedown", "reason": "x", "caseId": "nope"})).await.err(400, "CaseNotFound");
+    moderate(
+        &s,
+        json!({"did": a.did, "kind": "record", "uri": p.uri, "action": "takedown", "reason": "x", "caseId": "nope"}),
+    )
+    .await
+    .err(400, "CaseNotFound");
     s.get_record(&a.did, p.collection(), p.rkey()).await.ok();
 
     let r = moderate(&s, json!({"did": a.did, "kind": "record", "uri": p.uri, "action": "takedown", "reason": "copyright: notice 42", "caseId": id})).await.ok();
@@ -93,8 +114,14 @@ async fn record_takedown_with_a_case_and_audit() {
 
     // case edits: notes, status, subjects; bad status refused
     let c = s.xrpc.post("vlpds.admin.updateCase", &json!({"id": id, "note": "closed", "status": "dismissed", "addSubject": {"kind": "account", "did": a.did}}), &Auth::Admin).await.ok();
-    assert_eq!((c["status"].clone(), c["notes"].as_array().unwrap().len(), c["subjects"].as_array().unwrap().len()), (json!("dismissed"), 2, 2));
-    s.xrpc.post("vlpds.admin.updateCase", &json!({"id": id, "status": "bogus"}), &Auth::Admin).await.err(400, "InvalidRequest");
+    assert_eq!(
+        (c["status"].clone(), c["notes"].as_array().unwrap().len(), c["subjects"].as_array().unwrap().len()),
+        (json!("dismissed"), 2, 2)
+    );
+    s.xrpc
+        .post("vlpds.admin.updateCase", &json!({"id": id, "status": "bogus"}), &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
     let open = s.xrpc.get("vlpds.admin.listCases", &[("status", "open")], &Auth::Admin).await.ok();
     assert!(open["cases"].as_array().unwrap().is_empty());
     let all = s.xrpc.get("vlpds.admin.listCases", &[], &Auth::Admin).await.ok();
@@ -138,13 +165,18 @@ async fn blob_takedown_quarantines_and_restores() {
     assert_eq!(quota(&s, &a.did).await["bytes"].as_u64().unwrap(), before);
 
     let subj = s.xrpc.get("vlpds.admin.getSubject", &[("did", &a.did), ("cid", &cid)], &Auth::Admin).await.ok();
-    assert_eq!((subj["blob"]["takendown"].clone(), subj["blob"]["quarantined"].clone(), subj["blob"]["stored"].clone()), (json!(true), json!(true), json!(false)));
+    assert_eq!(
+        (subj["blob"]["takendown"].clone(), subj["blob"]["quarantined"].clone(), subj["blob"]["stored"].clone()),
+        (json!(true), json!(true), json!(false))
+    );
     assert_eq!(subj["blob"]["mimeType"], json!("image/png"));
     assert!(subj["blob"]["purgeAfterMs"].as_u64().unwrap() > 0);
     let td = takedowns(&s, "blob").await;
     assert_eq!(td[0]["quarantined"], json!(true));
 
-    moderate(&s, json!({"did": a.did, "kind": "blob", "cid": cid, "action": "restore", "reason": "false report"})).await.ok();
+    moderate(&s, json!({"did": a.did, "kind": "blob", "cid": cid, "action": "restore", "reason": "false report"}))
+        .await
+        .ok();
     assert!(object_exists(&s, "blob", &a.did, &cid).await);
     assert!(!object_exists(&s, "blob-quarantine", &a.did, &cid).await);
     let r = s.get_blob(&a.did, &cid).await;
@@ -164,24 +196,40 @@ async fn quarantine_expires() {
     let before = quota(&s, &a.did).await["bytes"].as_u64().unwrap();
     // takedowns through the reference endpoint quarantine too (and are audited)
     let subject = json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": a.did, "cid": cid});
-    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": {"applied": true, "ref": "ozone-1"}}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post(
+            "com.atproto.admin.updateSubjectStatus",
+            &json!({"subject": subject, "takedown": {"applied": true, "ref": "ozone-1"}}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
     assert!(object_exists(&s, "blob-quarantine", &a.did, &cid).await);
     assert_eq!(audit(&s, &a.did).await[0]["action"], json!("takedown"));
 
-    assert_eq!(vlpds::xrpc::moderation::sweep_quarantine(&s.app, Duration::from_secs(3600)).await.unwrap(), 0, "not old enough");
+    assert_eq!(
+        vlpds::xrpc::moderation::sweep_quarantine(&s.app, Duration::from_secs(3600)).await.unwrap(),
+        0,
+        "not old enough"
+    );
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(vlpds::xrpc::moderation::sweep_quarantine(&s.app, Duration::from_millis(10)).await.unwrap(), 1);
     assert!(!object_exists(&s, "blob-quarantine", &a.did, &cid).await, "purged");
     assert!(!object_exists(&s, "blob", &a.did, &cid).await);
     assert_eq!(quota(&s, &a.did).await["bytes"].as_u64().unwrap(), before - bytes.len() as u64);
     // still taken down: no re-upload
-    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &a.auth()).await.err(400, "InvalidRequest");
+    s.xrpc
+        .post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &a.auth())
+        .await
+        .err(400, "InvalidRequest");
     let log = audit(&s, &a.did).await;
     assert_eq!(log[0]["action"], json!("blob.purge"));
     assert_eq!(log[0]["actor"], json!("system"));
 
     // a restore after the purge only lifts the takedown; the user may upload again
-    let r = moderate(&s, json!({"did": a.did, "kind": "blob", "cid": cid, "action": "restore", "reason": "appeal"})).await.ok();
+    let r = moderate(&s, json!({"did": a.did, "kind": "blob", "cid": cid, "action": "restore", "reason": "appeal"}))
+        .await
+        .ok();
     assert_eq!(r["result"]["bytesRestored"], json!(false));
     s.upload_blob(&a, &bytes, "image/png").await;
     assert_eq!(s.get_blob(&a.did, &cid).await.status, 200);
@@ -215,7 +263,12 @@ async fn account_takedown_and_lookup() {
     resolve("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into()).await.err(400, "NotHostedHere");
     resolve("not a thing".into()).await.err(400, "InvalidRequest");
 
-    moderate(&s, json!({"did": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "kind": "account", "action": "takedown", "reason": "x"})).await.err(400, "NotHostedHere");
+    moderate(
+        &s,
+        json!({"did": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", "kind": "account", "action": "takedown", "reason": "x"}),
+    )
+    .await
+    .err(400, "NotHostedHere");
     moderate(&s, json!({"did": a.did, "kind": "account", "action": "takedown", "reason": "spam network"})).await.ok();
     s.create_session(&a.handle, PASSWORD).await.err(401, "AccountTakedown");
     let subj = s.xrpc.get("vlpds.admin.getSubject", &[("did", &a.did)], &Auth::Admin).await.ok();
@@ -239,12 +292,23 @@ async fn upload_quotas() {
     r.err(429, "RateLimitExceeded");
     let q = quota(&s, &a.did).await;
     let used: u64 = pngs[..3].iter().map(|p| p.len() as u64).sum();
-    assert_eq!((q["bytes"].as_u64(), q["uploadsToday"].as_u64(), q["limitUploadsPerDay"].as_u64()), (Some(used), Some(3), Some(3)));
+    assert_eq!(
+        (q["bytes"].as_u64(), q["uploadsToday"].as_u64(), q["limitUploadsPerDay"].as_u64()),
+        (Some(used), Some(3), Some(3))
+    );
 
     // per-account override: unlimited uploads, a byte quota just above usage
     // (one byte of room: a quota exactly full refuses before reading the body)
     let limit = used + pngs[3].len() as u64 + 1;
-    let q = s.xrpc.post("vlpds.admin.setBlobQuota", &json!({"did": a.did, "bytes": limit, "uploadsPerDay": 0, "reason": "trial"}), &Auth::Admin).await.ok();
+    let q = s
+        .xrpc
+        .post(
+            "vlpds.admin.setBlobQuota",
+            &json!({"did": a.did, "bytes": limit, "uploadsPerDay": 0, "reason": "trial"}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
     assert_eq!(q["limitBytes"].as_u64(), Some(limit));
     s.upload_blob(&a, &pngs[3], "image/png").await;
     let r = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", pngs[4].clone(), "image/png", &a.auth()).await;
@@ -294,7 +358,10 @@ async fn migrating_accounts_are_not_blocked() {
     let over = s.xrpc.get("vlpds.admin.listOverQuota", &[], &Auth::Admin).await.ok();
     assert_eq!(over["accounts"][0]["did"], json!(a.did));
     // an unreferenced blob is held to the quota (daily count lifted to see the byte check)
-    s.xrpc.post("vlpds.admin.setBlobQuota", &json!({"did": a.did, "bytes": 10, "uploadsPerDay": 0}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("vlpds.admin.setBlobQuota", &json!({"did": a.did, "bytes": 10, "uploadsPerDay": 0}), &Auth::Admin)
+        .await
+        .ok();
     let r = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", pngs[1].clone(), "image/png", &a.auth()).await;
     r.err(413, "BlobQuotaExceeded");
     // raising the quota clears the flag

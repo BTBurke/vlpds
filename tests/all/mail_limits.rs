@@ -15,7 +15,8 @@ async fn limited() -> TestServer {
 }
 
 /// Lifts the shared mail budgets so a test sees one endpoint's own buckets.
-const ROOMY_MAIL: &str = r#"{"limiters": {"mail-recipient-hour": {"points": 1000}, "mail-recipient-day": {"points": 1000}}}"#;
+const ROOMY_MAIL: &str =
+    r#"{"limiters": {"mail-recipient-hour": {"points": 1000}, "mail-recipient-day": {"points": 1000}}}"#;
 
 fn mail_limited(r: &Resp) {
     r.err(429, "RateLimitExceeded");
@@ -23,7 +24,8 @@ fn mail_limited(r: &Resp) {
 }
 
 async fn confirm(s: &TestServer, a: &TestAccount) {
-    let (tok, _, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (tok, _, _) =
+        mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     s.xrpc.post("com.atproto.server.confirmEmail", &json!({"email": a.email, "token": tok}), &a.auth()).await.ok();
 }
 
@@ -33,7 +35,11 @@ async fn confirm(s: &TestServer, a: &TestAccount) {
 async fn each_account_mail_endpoint_has_its_limit() {
     let s = limited().await;
     set_limits(&s, serde_json::from_str(ROOMY_MAIL).unwrap());
-    for nsid in ["com.atproto.server.requestEmailConfirmation", "com.atproto.server.requestEmailUpdate", "com.atproto.server.requestAccountDelete"] {
+    for nsid in [
+        "com.atproto.server.requestEmailConfirmation",
+        "com.atproto.server.requestEmailUpdate",
+        "com.atproto.server.requestAccountDelete",
+    ] {
         let a = s.create_account("mle").await;
         if nsid.ends_with("requestEmailUpdate") {
             // only a confirmed address is mailed an update token
@@ -57,7 +63,10 @@ async fn email_factor_disable_shares_the_email_update_limit() {
     set_limits(&s, serde_json::from_str(ROOMY_MAIL).unwrap());
     let a = s.create_account("mld").await;
     confirm(&s, &a).await;
-    s.xrpc.post("com.atproto.server.updateEmail", &json!({"email": a.email, "emailAuthFactor": true}), &a.auth()).await.ok();
+    s.xrpc
+        .post("com.atproto.server.updateEmail", &json!({"email": a.email, "emailAuthFactor": true}), &a.auth())
+        .await
+        .ok();
     let off = json!({"email": a.email, "emailAuthFactor": false});
     for _ in 0..5 {
         let (r, _) = mailed_n(&s, &a.email, 1, s.xrpc.post("com.atproto.server.updateEmail", &off, &a.auth())).await;
@@ -85,10 +94,18 @@ async fn plc_operation_signature_requests_are_limited() {
     set_limits(&s, serde_json::from_str(ROOMY_MAIL).unwrap());
     let a = s.create_account("mlp").await;
     for _ in 0..5 {
-        let (r, _) = mailed_n(&s, &a.email, 1, s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth())).await;
+        let (r, _) = mailed_n(
+            &s,
+            &a.email,
+            1,
+            s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()),
+        )
+        .await;
         r.ok();
     }
-    let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth())).await;
+    let (r, _) =
+        mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()))
+            .await;
     r.err(429, "RateLimitExceeded");
     let top = s.app.ratelimit.snapshot("single", 10).top;
     assert!(top["com.atproto.identity.requestPlcOperationSignature-1"].iter().any(|c| c.key == a.did));
@@ -123,16 +140,24 @@ async fn recipient_budget_spans_mail_kinds() {
         mail_limited(&r);
     }
     // the bypass key lifts endpoint buckets, not the recipient's budget
-    let rb = s.xrpc.http.post(format!("{}/xrpc/com.atproto.server.requestEmailConfirmation", s.url)).bearer_auth(&a.access).header("x-ratelimit-bypass", "bypass-key");
+    let rb = s
+        .xrpc
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.requestEmailConfirmation", s.url))
+        .bearer_auth(&a.access)
+        .header("x-ratelimit-bypass", "bypass-key");
     let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.send(rb)).await;
     mail_limited(&r);
     // another recipient has its own budget
     mailed(&s, &b.email, post("com.atproto.server.requestEmailConfirmation", &b)).await.1.ok();
     // an operator can lift one recipient's
-    set_limits(&s, json!({
-        "limiters": {"mail-recipient-hour": {"points": 4}},
-        "overrides": [{"did": a.did, "limiters": ["mail-recipient-hour"], "exempt": true}],
-    }));
+    set_limits(
+        &s,
+        json!({
+            "limiters": {"mail-recipient-hour": {"points": 4}},
+            "overrides": [{"did": a.did, "limiters": ["mail-recipient-hour"], "exempt": true}],
+        }),
+    );
     mailed(&s, &a.email, post("com.atproto.server.requestAccountDelete", &a)).await.1.ok();
     // the update token mailed before the refusals still works
     let body = json!({"email": format!("new-{}", a.email), "token": update_tok});
@@ -151,7 +176,12 @@ async fn password_reset_over_budget_answers_like_a_mailed_one() {
         async move { s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": email}), &Auth::None).await }
     };
     let shape = |r: &Resp| {
-        let mut names: Vec<String> = r.headers.keys().map(|k| k.to_string()).filter(|k| k.starts_with("ratelimit") || k == "retry-after").collect();
+        let mut names: Vec<String> = r
+            .headers
+            .keys()
+            .map(|k| k.to_string())
+            .filter(|k| k.starts_with("ratelimit") || k == "retry-after")
+            .collect();
         names.sort();
         (r.status, r.text(), names, r.header("ratelimit-limit"), r.header("ratelimit-policy"))
     };
@@ -166,13 +196,17 @@ async fn password_reset_over_budget_answers_like_a_mailed_one() {
     let (r, _) = mailed_n(&s, &a.email, 0, reset(a.email.clone())).await;
     assert_eq!(shape(&r), mailed_shape);
     // with per-account room again, the recipient budget (5 spent) stops it
-    set_limits(&s, json!({"limiters": {"password-reset-account-hour": {"points": 100}, "mail-recipient-hour": {"points": 6}}}));
+    set_limits(
+        &s,
+        json!({"limiters": {"password-reset-account-hour": {"points": 100}, "mail-recipient-hour": {"points": 6}}}),
+    );
     let (r, _) = mailed_n(&s, &a.email, 1, reset(a.email.clone())).await;
     assert_eq!(shape(&r), mailed_shape);
     let (r, _) = mailed_n(&s, &a.email, 0, reset(a.email.clone())).await;
     assert_eq!(shape(&r), mailed_shape);
     // the account's own requests over the budget get a clear 429
-    let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (r, _) =
+        mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     mail_limited(&r);
     // unknown addresses answer like known ones (the reference errors instead)
     reset("nobody-mlw@example.com".into()).await.ok();
@@ -188,7 +222,8 @@ fn scraped(text: &str, series: &str) -> f64 {
 async fn node_budget_caps_all_account_mail() {
     let s = limited().await;
     let series = r#"vlpds_mail_suppressed_total{purpose="confirm_email",reason="node_limit"}"#;
-    let metric = || async { scraped(&reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap(), series) };
+    let metric =
+        || async { scraped(&reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap(), series) };
     let before = metric().await;
     let mut accts = Vec::new();
     for _ in 0..4 {
@@ -199,11 +234,18 @@ async fn node_budget_caps_all_account_mail() {
         mailed(&s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await.1.ok();
     }
     let a = &accts[3];
-    let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (r, _) =
+        mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     mail_limited(&r);
     assert!(metric().await > before, "{series} moved");
     // reset requests over it are answered as mailed
-    let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None)).await;
+    let (r, _) = mailed_n(
+        &s,
+        &a.email,
+        0,
+        s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None),
+    )
+    .await;
     r.ok();
     // moderation mail still goes out
     let body = json!({"recipientDid": a.did, "content": "<p>hello</p>", "senderDid": "did:example:mod"});
@@ -219,7 +261,10 @@ async fn email_sign_in_code_over_budget() {
     let s = limited().await;
     let a = s.create_account("mls").await;
     confirm(&s, &a).await;
-    s.xrpc.post("com.atproto.server.updateEmail", &json!({"email": a.email, "emailAuthFactor": true}), &a.auth()).await.ok();
+    s.xrpc
+        .post("com.atproto.server.updateEmail", &json!({"email": a.email, "emailAuthFactor": true}), &a.auth())
+        .await
+        .ok();
     // one mail (the confirmation) spent; one more allowed
     set_limits(&s, json!({"limiters": {"mail-recipient-hour": {"points": 2}}}));
     let (code, r, _) = mailed(&s, &a.email, s.login(&a.handle, &a.password, None)).await;

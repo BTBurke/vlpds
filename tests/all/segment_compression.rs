@@ -37,6 +37,8 @@ async fn segments_stored_compressed() {
     assert!(zstd > 0 && stored < raw, "{zstd} compressed segments, {stored} B stored for {raw} B");
     let head = Cid::parse(last.unwrap().commit_cid.as_deref().unwrap()).unwrap();
     let mut sub = s.subscribe(Some(0)).await;
-    let frames = sub.until(Duration::from_secs(10), |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.commit == head)).await;
+    let frames = sub
+        .until(Duration::from_secs(10), |fs| fs.last().and_then(|f| f.commit()).is_some_and(|c| c.commit == head))
+        .await;
     assert_eq!(frames.iter().filter(|f| f.did() == Some(a.did.as_str()) && f.kind() == "#commit").count(), 20);
 }

@@ -7,7 +7,12 @@ use std::collections::BTreeMap;
 const POST: &str = "app.bsky.feed.post";
 
 /// Posts `n` records and returns path -> (cid, value) as reported by getRecord.
-async fn make_posts(s: &TestServer, a: &TestAccount, n: usize, model: &mut BTreeMap<String, (String, J)>) -> Vec<RecordRef> {
+async fn make_posts(
+    s: &TestServer,
+    a: &TestAccount,
+    n: usize,
+    model: &mut BTreeMap<String, (String, J)>,
+) -> Vec<RecordRef> {
     let mut out = Vec::new();
     for i in 0..n {
         let r = s.post(a, &format!("post {i} {}", unique_name("t"))).await;
@@ -58,7 +63,14 @@ async fn creates_and_syncs_records_then_deletes() {
     refs.extend(make_posts(&s, &a, 10, &mut model).await);
     for i in 0..4 {
         let r = &refs[i * 5];
-        s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": POST, "rkey": r.rkey()}), &a.auth()).await.ok();
+        s.xrpc
+            .post(
+                "com.atproto.repo.deleteRecord",
+                &json!({"repo": a.did, "collection": POST, "rkey": r.rkey()}),
+                &a.auth(),
+            )
+            .await
+            .ok();
         model.remove(&format!("{POST}/{}", r.rkey()));
     }
     let repo = check_full_export(&s, &a, &model).await;
@@ -102,10 +114,22 @@ async fn repo_status_and_latest_commit() {
 async fn unknown_repo_errors() {
     let s = TestServer::spawn().await;
     let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-    for nsid in ["com.atproto.sync.getRepo", "com.atproto.sync.getLatestCommit", "com.atproto.sync.getRepoStatus", "com.atproto.sync.listBlobs"] {
+    for nsid in [
+        "com.atproto.sync.getRepo",
+        "com.atproto.sync.getLatestCommit",
+        "com.atproto.sync.getRepoStatus",
+        "com.atproto.sync.listBlobs",
+    ] {
         s.xrpc.get(nsid, &[("did", did)], &Auth::None).await.err(400, "RepoNotFound");
     }
-    s.xrpc.get("com.atproto.sync.getRecord", &[("did", did), ("collection", POST), ("rkey", "3jzfcijpj2z2a")], &Auth::None).await.err(400, "RepoNotFound");
+    s.xrpc
+        .get(
+            "com.atproto.sync.getRecord",
+            &[("did", did), ("collection", POST), ("rkey", "3jzfcijpj2z2a")],
+            &Auth::None,
+        )
+        .await
+        .err(400, "RepoNotFound");
     let r = s
         .xrpc
         .get_multi(
@@ -145,7 +169,8 @@ async fn get_repo_since_returns_diff() {
             continue;
         }
         let v = Value::decode(bytes).expect("cbor block");
-        let is_mst_node = matches!(&v, Value::Map(m) if m.iter().any(|(k, _)| k == "e") && m.iter().any(|(k, _)| k == "l"));
+        let is_mst_node =
+            matches!(&v, Value::Map(m) if m.iter().any(|(k, _)| k == "e") && m.iter().any(|(k, _)| k == "l"));
         assert!(is_mst_node, "diff block {cid} is neither the commit, the new record nor an MST node: {v:?}");
     }
     assert!(diff.blocks.len() < full.blocks.len());
@@ -153,7 +178,8 @@ async fn get_repo_since_returns_diff() {
     // Applying the diff on top of the old block set yields the full new repo.
     let mut merged = full.blocks.clone();
     merged.extend(diff.blocks.clone());
-    let tree = vlpds::mst::Tree::load_from_blocks(&merged, diff.commit().data).expect("diff + old blocks = complete tree");
+    let tree =
+        vlpds::mst::Tree::load_from_blocks(&merged, diff.commit().data).expect("diff + old blocks = complete tree");
     let mut n = 0;
     tree.walk(&mut |_, _| n += 1);
     assert_eq!(n, 21);
@@ -168,7 +194,14 @@ async fn record_inclusion_proof() {
     let refs = make_posts(&s, &a, 30, &mut model).await;
     let key = s.signing_key(&a.did).await;
     for r in [&refs[0], &refs[13], &refs[29]] {
-        let resp = s.xrpc.get("com.atproto.sync.getRecord", &[("did", &a.did), ("collection", POST), ("rkey", r.rkey())], &Auth::None).await;
+        let resp = s
+            .xrpc
+            .get(
+                "com.atproto.sync.getRecord",
+                &[("did", &a.did), ("collection", POST), ("rkey", r.rkey())],
+                &Auth::None,
+            )
+            .await;
         assert_eq!(resp.status, 200, "{}", resp.text());
         assert_eq!(resp.header("content-type").as_deref(), Some("application/vnd.ipld.car"));
         let path = format!("{POST}/{}", r.rkey());
@@ -190,11 +223,22 @@ async fn record_non_inclusion_proof() {
     let key = s.signing_key(&a.did).await;
     // a fresh TID rkey that doesn't exist, and a deleted one
     let missing = vlpds::tid::TidClock::new().next().to_string();
-    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": POST, "rkey": refs[7].rkey()}), &a.auth()).await.ok();
+    s.xrpc
+        .post(
+            "com.atproto.repo.deleteRecord",
+            &json!({"repo": a.did, "collection": POST, "rkey": refs[7].rkey()}),
+            &a.auth(),
+        )
+        .await
+        .ok();
     for rkey in [missing.as_str(), refs[7].rkey()] {
-        let resp = s.xrpc.get("com.atproto.sync.getRecord", &[("did", &a.did), ("collection", POST), ("rkey", rkey)], &Auth::None).await;
+        let resp = s
+            .xrpc
+            .get("com.atproto.sync.getRecord", &[("did", &a.did), ("collection", POST), ("rkey", rkey)], &Auth::None)
+            .await;
         assert_eq!(resp.status, 200, "non-existence proof should be served: {}", resp.text());
-        let got = verify_record_proof(&resp.body, &a.did, &format!("{POST}/{rkey}"), Some(&key)).expect("proof verifies");
+        let got =
+            verify_record_proof(&resp.body, &a.did, &format!("{POST}/{rkey}"), Some(&key)).expect("proof verifies");
         assert_eq!(got, None, "proof shows {rkey} is absent");
     }
 }
@@ -226,7 +270,8 @@ async fn get_blocks() {
 
     // a CID that isn't in the repo -> BlockNotFound
     let bogus = Cid::dag_cbor(b"not a block").to_string();
-    let resp = s.xrpc.get_multi("com.atproto.sync.getBlocks", &[("did", a.did.clone()), ("cids", bogus)], &Auth::None).await;
+    let resp =
+        s.xrpc.get_multi("com.atproto.sync.getBlocks", &[("did", a.did.clone()), ("cids", bogus)], &Auth::None).await;
     resp.err(400, "BlockNotFound");
 }
 
@@ -253,7 +298,11 @@ async fn list_blobs() {
     let lb = s.xrpc.get("com.atproto.sync.listBlobs", &[("did", &a.did), ("since", &rev)], &Auth::None).await.ok();
     assert_eq!(lb["cids"].as_array().map(|a| a.len()), Some(0), "{lb}");
     // since a rev before it -> the blob
-    let lb = s.xrpc.get("com.atproto.sync.listBlobs", &[("did", &a.did), ("since", before.rev.as_deref().unwrap())], &Auth::None).await.ok();
+    let lb = s
+        .xrpc
+        .get("com.atproto.sync.listBlobs", &[("did", &a.did), ("since", before.rev.as_deref().unwrap())], &Auth::None)
+        .await
+        .ok();
     assert_eq!(lb["cids"], json!([blob_cid]));
 }
 
@@ -277,7 +326,10 @@ async fn repo_takedown_visibility() {
     // unauthenticated reads are refused
     s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await.err(400, "RepoTakendown");
     s.xrpc.get("com.atproto.sync.getLatestCommit", &[("did", &a.did)], &Auth::None).await.err(400, "RepoTakendown");
-    s.xrpc.get("com.atproto.sync.getRecord", &[("did", &a.did), ("collection", POST), ("rkey", r.rkey())], &Auth::None).await.err(400, "RepoTakendown");
+    s.xrpc
+        .get("com.atproto.sync.getRecord", &[("did", &a.did), ("collection", POST), ("rkey", r.rkey())], &Auth::None)
+        .await
+        .err(400, "RepoTakendown");
 
     // the owner and admins can still sync
     let owner = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &a.auth()).await;

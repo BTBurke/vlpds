@@ -10,8 +10,7 @@ use crate::oauth::scopes::{is_atproto_did, is_atproto_oauth_scope};
 use crate::oauth::store::{self, AuthParams, Device, DeviceAccount, RequestData, Session};
 use crate::oauth::util::{self as ou, now_secs};
 use crate::oauth::{
-    lexicon, ui, OAuthError, ACCESS_TOKEN_TTL, AUTHENTICATION_MAX_AGE,
-    AUTHORIZATION_INACTIVITY_TIMEOUT, PAR_EXPIRES_IN,
+    lexicon, ui, OAuthError, ACCESS_TOKEN_TTL, AUTHENTICATION_MAX_AGE, AUTHORIZATION_INACTIVITY_TIMEOUT, PAR_EXPIRES_IN,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderName, HeaderValue};
@@ -39,8 +38,7 @@ struct Keys {
 static FIRST_KEYS: std::sync::OnceLock<(Box<str>, Keys)> = std::sync::OnceLock::new();
 /// In-process tests run servers with several secrets; their keys are leaked
 /// once each.
-static OTHER_KEYS: LazyLock<parking_lot::Mutex<HashMap<Box<str>, &'static Keys>>> =
-    LazyLock::new(Default::default);
+static OTHER_KEYS: LazyLock<parking_lot::Mutex<HashMap<Box<str>, &'static Keys>>> = LazyLock::new(Default::default);
 
 fn derive_keys(secret: &str) -> Keys {
     Keys {
@@ -76,14 +74,8 @@ fn is_https(app: &App) -> bool {
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(protected_resource_metadata).options(preflight),
-        )
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(authorization_server_metadata).options(preflight),
-        )
+        .route("/.well-known/oauth-protected-resource", get(protected_resource_metadata).options(preflight))
+        .route("/.well-known/oauth-authorization-server", get(authorization_server_metadata).options(preflight))
         .route("/oauth/jwks", get(jwks).options(preflight))
         .route("/oauth/par", post(par).options(preflight))
         .route("/oauth/token", post(token).options(preflight))
@@ -117,17 +109,9 @@ pub async fn resolve_identifier(app: &App, ident: &str) -> Option<String> {
 }
 
 /// For `crate::forward`; None: any node.
-pub async fn route_key(
-    app: &App,
-    path: &str,
-    query: Option<&str>,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Option<String> {
+pub async fn route_key(app: &App, path: &str, query: Option<&str>, headers: &HeaderMap, body: &[u8]) -> Option<String> {
     let params = || parse_params(headers, body).ok().unwrap_or_default();
-    let request = |uri: Option<&String>| {
-        store::request_id_from_uri(uri?).map(store::req_routing)
-    };
+    let request = |uri: Option<&String>| store::request_id_from_uri(uri?).map(store::req_routing);
     match path {
         // the account owner, so the whole flow tends to stay there (the
         // request id is minted local to whichever node runs PAR)
@@ -136,8 +120,7 @@ pub async fn route_key(
             resolve_identifier(app, &hint).await
         }
         "/oauth/authorize" => {
-            let q: HashMap<String, String> =
-                ou::parse_form(query.unwrap_or("")).into_iter().collect();
+            let q: HashMap<String, String> = ou::parse_form(query.unwrap_or("")).into_iter().collect();
             request(q.get("request_uri"))
         }
         // sign-up mints the DID on the node that runs it; the request row's
@@ -166,12 +149,8 @@ pub async fn route_key(
         "/oauth/token" => {
             let p = params();
             match p.get("grant_type").map(String::as_str) {
-                Some("authorization_code") => {
-                    store::code_request_id(p.get("code")?).map(|id| store::req_routing(&id))
-                }
-                Some("refresh_token") => {
-                    store::parse_refresh_token(p.get("refresh_token")?).map(|r| r.did)
-                }
+                Some("authorization_code") => store::code_request_id(p.get("code")?).map(|id| store::req_routing(&id)),
+                Some("refresh_token") => store::parse_refresh_token(p.get("refresh_token")?).map(|r| r.did),
                 _ => None,
             }
         }
@@ -197,32 +176,17 @@ pub async fn route_key(
 }
 
 fn cors(h: &mut HeaderMap) {
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        HeaderValue::from_static("DPoP-Nonce, WWW-Authenticate"),
-    );
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+    h.insert(header::ACCESS_CONTROL_EXPOSE_HEADERS, HeaderValue::from_static("DPoP-Nonce, WWW-Authenticate"));
 }
 
 async fn preflight() -> Response {
     let mut r = StatusCode::NO_CONTENT.into_response();
     let h = r.headers_mut();
     cors(h);
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Content-Type, DPoP, Authorization"),
-    );
-    h.insert(
-        header::ACCESS_CONTROL_MAX_AGE,
-        HeaderValue::from_static("86400"),
-    );
+    h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static("GET, POST, OPTIONS"));
+    h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, HeaderValue::from_static("Content-Type, DPoP, Authorization"));
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
     r
 }
 
@@ -307,41 +271,27 @@ async fn jwks(State(app): AppState) -> Response {
 
 /// Urlencoded or JSON. Repeated parameters are an error (RFC 6749 §3.1).
 fn parse_params(headers: &HeaderMap, body: &[u8]) -> Result<HashMap<String, String>, OAuthError> {
-    let ct = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
     let mut out = HashMap::new();
     if ct.starts_with("application/json") {
-        let j: J = serde_json::from_slice(body)
-            .map_err(|_| OAuthError::invalid_request("Invalid JSON body"))?;
-        let obj = j
-            .as_object()
-            .ok_or_else(|| OAuthError::invalid_request("Invalid JSON body"))?;
+        let j: J = serde_json::from_slice(body).map_err(|_| OAuthError::invalid_request("Invalid JSON body"))?;
+        let obj = j.as_object().ok_or_else(|| OAuthError::invalid_request("Invalid JSON body"))?;
         for (k, v) in obj {
             let s = match v {
                 J::String(s) => s.clone(),
                 J::Number(n) => n.to_string(),
                 J::Bool(b) => b.to_string(),
                 J::Null => continue,
-                _ => {
-                    return Err(OAuthError::invalid_request(&format!(
-                        "Invalid \"{k}\" parameter"
-                    )))
-                }
+                _ => return Err(OAuthError::invalid_request(&format!("Invalid \"{k}\" parameter"))),
             };
             out.insert(k.clone(), s);
         }
         return Ok(out);
     }
-    let s = std::str::from_utf8(body)
-        .map_err(|_| OAuthError::invalid_request("Invalid request body"))?;
+    let s = std::str::from_utf8(body).map_err(|_| OAuthError::invalid_request("Invalid request body"))?;
     for (k, v) in ou::parse_form(s) {
         if out.insert(k.clone(), v).is_some() {
-            return Err(OAuthError::invalid_request(&format!(
-                "Duplicate \"{k}\" parameter"
-            )));
+            return Err(OAuthError::invalid_request(&format!("Duplicate \"{k}\" parameter")));
         }
     }
     Ok(out)
@@ -432,9 +382,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
         claim(app, r, OAuthError::invalid_client("client assertion replayed")).await?;
     }
     if p.contains_key("request_uri") {
-        return Err(OAuthError::invalid_request(
-            "\"request_uri\" is not supported in pushed authorization requests",
-        ));
+        return Err(OAuthError::invalid_request("\"request_uri\" is not supported in pushed authorization requests"));
     }
     // JAR (RFC 9101): only the request object's parameters are used
     let p = match p.get("request") {
@@ -447,9 +395,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     };
     let params = validate_authorization_request(app, &client, &p, &proof).await?;
     if !store::claim_code_challenge(app, &params.code_challenge).await? {
-        return Err(OAuthError::invalid_request(
-            "code_challenge was already used",
-        ));
+        return Err(OAuthError::invalid_request("code_challenge was already used"));
     }
     let id = store::new_local_request_id(app);
     let now = now_secs();
@@ -472,18 +418,11 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
 /// The reference's `oauthAuthorizationRequestParametersSchema`: scalars
 /// stringified, registered JWT claims dropped.
 fn request_object_params(payload: &J) -> Result<HashMap<String, String>, OAuthError> {
-    let bad = |k: &str| {
-        OAuthError::invalid_request(&format!("Invalid parameters in JAR: invalid \"{k}\""))
-    };
-    let obj = payload
-        .as_object()
-        .ok_or_else(|| OAuthError::invalid_request("Invalid parameters in JAR"))?;
+    let bad = |k: &str| OAuthError::invalid_request(&format!("Invalid parameters in JAR: invalid \"{k}\""));
+    let obj = payload.as_object().ok_or_else(|| OAuthError::invalid_request("Invalid parameters in JAR"))?;
     let mut out = HashMap::new();
     for (k, v) in obj {
-        if matches!(
-            k.as_str(),
-            "iss" | "aud" | "sub" | "iat" | "exp" | "nbf" | "jti"
-        ) {
+        if matches!(k.as_str(), "iss" | "aud" | "sub" | "iat" | "exp" | "nbf" | "jti") {
             continue;
         }
         let s = match v {
@@ -525,9 +464,7 @@ async fn validate_authorization_request(
     }
     for k in ["claims", "id_token_hint", "nonce"] {
         if p.contains_key(k) {
-            return Err(OAuthError::invalid_request(&format!(
-                "Unsupported \"{k}\" parameter"
-            )));
+            return Err(OAuthError::invalid_request(&format!("Unsupported \"{k}\" parameter")));
         }
     }
     if p.contains_key("authorization_details") {
@@ -537,8 +474,7 @@ async fn validate_authorization_request(
             "Unsupported \"authorization_details\"",
         ));
     }
-    let response_type = g("response_type")
-        .ok_or_else(|| OAuthError::invalid_request("Missing \"response_type\""))?;
+    let response_type = g("response_type").ok_or_else(|| OAuthError::invalid_request("Missing \"response_type\""))?;
     if response_type != "code" {
         return Err(OAuthError::new(
             StatusCode::BAD_REQUEST,
@@ -559,9 +495,7 @@ async fn validate_authorization_request(
     let redirect_uri = match g("redirect_uri") {
         Some(r) => {
             if !client.allows_redirect_uri(&r) {
-                return Err(OAuthError::invalid_request(&format!(
-                    "Invalid redirect_uri {r}"
-                )));
+                return Err(OAuthError::invalid_request(&format!("Invalid redirect_uri {r}")));
             }
             r
         }
@@ -575,25 +509,12 @@ async fn validate_authorization_request(
     let response_mode = g("response_mode");
     match response_mode.as_deref() {
         None | Some("query") | Some("fragment") | Some("form_post") => {}
-        Some(m) => {
-            return Err(OAuthError::invalid_request(&format!(
-                "Unsupported response_mode \"{m}\""
-            )))
-        }
+        Some(m) => return Err(OAuthError::invalid_request(&format!("Unsupported response_mode \"{m}\""))),
     }
     let mut prompt = g("prompt");
     match prompt.as_deref() {
-        None
-        | Some("none")
-        | Some("login")
-        | Some("consent")
-        | Some("select_account")
-        | Some("create") => {}
-        Some(v) => {
-            return Err(OAuthError::invalid_request(&format!(
-                "Unsupported prompt \"{v}\""
-            )))
-        }
+        None | Some("none") | Some("login") | Some("consent") | Some("select_account") | Some("create") => {}
+        Some(v) => return Err(OAuthError::invalid_request(&format!("Unsupported prompt \"{v}\""))),
     }
     // atproto: public clients may not sign in silently and always get the
     // consent screen (prompt=create keeps its prompt; consent_required
@@ -615,9 +536,7 @@ async fn validate_authorization_request(
             let h = h.to_lowercase();
             let h = h.strip_prefix('@').unwrap_or(&h).to_string();
             if !is_atproto_did(&h) && !super::syntax::valid_handle(&h) {
-                return Err(OAuthError::invalid_request(&format!(
-                    "Invalid login_hint \"{h}\""
-                )));
+                return Err(OAuthError::invalid_request(&format!("Invalid login_hint \"{h}\"")));
             }
             Some(h)
         }
@@ -625,15 +544,11 @@ async fn validate_authorization_request(
     };
     if let Some(jkt) = g("dpop_jkt") {
         if jkt != proof.jkt {
-            return Err(OAuthError::invalid_dpop_proof(
-                "DPoP proof does not match the dpop_jkt parameter",
-            ));
+            return Err(OAuthError::invalid_dpop_proof("DPoP proof does not match the dpop_jkt parameter"));
         }
     }
     // every include: scope must resolve to a permission set
-    lexicon::permission_sets_for_scope(app, &scope)
-        .await
-        .map_err(|e| OAuthError::invalid_scope(&e))?;
+    lexicon::permission_sets_for_scope(app, &scope).await.map_err(|e| OAuthError::invalid_scope(&e))?;
     Ok(AuthParams {
         client_id: client.id.clone(),
         response_type,
@@ -656,25 +571,19 @@ fn requested_scope(client: &Client, requested: &str) -> Result<String, OAuthErro
     let mut scopes: Vec<&str> = Vec::new();
     for s in requested.split(' ').filter(|s| !s.is_empty()) {
         if !client.scopes.iter().any(|c| c == s) {
-            return Err(OAuthError::invalid_scope(&format!(
-                "Scope \"{s}\" is not declared in the client metadata"
-            )));
+            return Err(OAuthError::invalid_scope(&format!("Scope \"{s}\" is not declared in the client metadata")));
         }
     }
     for s in requested.split(' ').filter(|s| !s.is_empty()) {
         if s == "openid" {
-            return Err(OAuthError::invalid_scope(
-                "OpenID Connect is not compatible with atproto",
-            ));
+            return Err(OAuthError::invalid_scope("OpenID Connect is not compatible with atproto"));
         }
         if is_atproto_oauth_scope(s) && !scopes.contains(&s) {
             scopes.push(s);
         }
     }
     if !scopes.contains(&"atproto") {
-        return Err(OAuthError::invalid_scope(
-            "The \"atproto\" scope is required",
-        ));
+        return Err(OAuthError::invalid_scope("The \"atproto\" scope is required"));
     }
     Ok(scopes.join(" "))
 }
@@ -684,18 +593,14 @@ fn pkce_challenge(p: &HashMap<String, String>) -> Result<(String, String), OAuth
     let g = |k: &str| p.get(k).filter(|v| !v.is_empty()).cloned();
     let code_challenge = g("code_challenge").ok_or_else(|| {
         if p.contains_key("code_challenge_method") {
-            OAuthError::invalid_request(
-                "code_challenge is required when code_challenge_method is provided",
-            )
+            OAuthError::invalid_request("code_challenge is required when code_challenge_method is provided")
         } else {
             OAuthError::invalid_request("Use of PKCE is required")
         }
     })?;
     let method = g("code_challenge_method").unwrap_or_else(|| "plain".into());
     if method != "S256" {
-        return Err(OAuthError::invalid_request(
-            "atproto requires use of \"S256\" code_challenge_method",
-        ));
+        return Err(OAuthError::invalid_request("atproto requires use of \"S256\" code_challenge_method"));
     }
     if code_challenge.len() != 43 || ou::b64u_decode(&code_challenge).map(|b| b.len()) != Some(32) {
         return Err(OAuthError::invalid_request("Invalid code_challenge"));
@@ -718,10 +623,8 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Loads or starts the browser device session; true: a cookie must be set.
 async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OAuthError> {
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.chars().take(256).collect::<String>());
+    let ua =
+        headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(256).collect::<String>());
     if let Some(id) = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i)) {
         if let Some(mut d) = store::get_device(app, &id).await? {
             let now = now_secs();
@@ -757,21 +660,12 @@ fn device_cookie(app: &App, d: &Device) -> HeaderValue {
 }
 
 fn csrf_token(app: &App, device_id: &str, scope: &str) -> String {
-    ou::b64u(ou::hmac_sha256(
-        &keys(app).csrf,
-        &[device_id.as_bytes(), scope.as_bytes()],
-    ))
+    ou::b64u(ou::hmac_sha256(&keys(app).csrf, &[device_id.as_bytes(), scope.as_bytes()]))
 }
 
 /// A token bound to the device cookie and the request, plus Fetch-Metadata
 /// and Origin checks when the browser sends them.
-fn check_csrf(
-    app: &App,
-    headers: &HeaderMap,
-    device: &Device,
-    scope: &str,
-    token: Option<&String>,
-) -> bool {
+fn check_csrf(app: &App, headers: &HeaderMap, device: &Device, scope: &str, token: Option<&String>) -> bool {
     if let Some(site) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         if site != "same-origin" && site != "none" {
             return false;
@@ -779,10 +673,7 @@ fn check_csrf(
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if origin != "null"
-            && reqwest::Url::parse(&issuer(app))
-                .map(|u| u.origin().ascii_serialization())
-                .ok()
-                .as_deref()
+            && reqwest::Url::parse(&issuer(app)).map(|u| u.origin().ascii_serialization()).ok().as_deref()
                 != Some(origin)
         {
             return false;
@@ -803,37 +694,16 @@ fn redirect_source(redirect_uri: &str) -> Option<String> {
     }
 }
 
-fn html(
-    app: &App,
-    status: StatusCode,
-    body: String,
-    form_action: &[String],
-    set_cookie: Option<&Device>,
-) -> Response {
+fn html(app: &App, status: StatusCode, body: String, form_action: &[String], set_cookie: Option<&Device>) -> Response {
     let mut r = (status, body).into_response();
     let h = r.headers_mut();
-    h.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_str(&ui::csp(form_action)).unwrap(),
-    );
+    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp(form_action)).unwrap());
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(
-        HeaderName::from_static("cross-origin-resource-policy"),
-        HeaderValue::from_static("same-origin"),
-    );
+    h.insert(HeaderName::from_static("cross-origin-resource-policy"), HeaderValue::from_static("same-origin"));
     if let Some(d) = set_cookie {
         h.insert(header::SET_COOKIE, device_cookie(app, d));
     }
@@ -864,32 +734,17 @@ fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, Strin
     pairs.push(("iss".into(), issuer(app)));
     if params.response_mode.as_deref() == Some("form_post") {
         let form_action: Vec<String> = redirect_source(&params.redirect_uri).into_iter().collect();
-        let mut r = html(
-            app,
-            StatusCode::OK,
-            ui::form_post(&params.redirect_uri, &pairs),
-            &form_action,
-            None,
-        );
+        let mut r = html(app, StatusCode::OK, ui::form_post(&params.redirect_uri, &pairs), &form_action, None);
         let h = r.headers_mut();
-        h.insert(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_str(&ui::csp_form_post(&form_action)).unwrap(),
-        );
+        h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp_form_post(&form_action)).unwrap());
         // out of the back/forward cache, so going "back" never re-posts the
         // response (as the reference does)
-        h.append(
-            header::SET_COOKIE,
-            HeaderValue::from_static("bfCacheBypass=1; Path=/; Max-Age=1; SameSite=Lax"),
-        );
+        h.append(header::SET_COOKIE, HeaderValue::from_static("bfCacheBypass=1; Path=/; Max-Age=1; SameSite=Lax"));
         return r;
     }
     let enc = ou::form_encode(&pairs);
     let url = if params.response_mode.as_deref() == Some("fragment") {
-        format!(
-            "{}#{enc}",
-            params.redirect_uri.split('#').next().unwrap_or("")
-        )
+        format!("{}#{enc}", params.redirect_uri.split('#').next().unwrap_or(""))
     } else if params.redirect_uri.contains('?') {
         format!("{}&{enc}", params.redirect_uri)
     } else {
@@ -897,27 +752,14 @@ fn client_redirect(app: &App, params: &AuthParams, mut pairs: Vec<(String, Strin
     };
     let mut r = StatusCode::SEE_OTHER.into_response();
     let h = r.headers_mut();
-    h.insert(
-        header::LOCATION,
-        HeaderValue::from_str(&url).unwrap_or(HeaderValue::from_static("/")),
-    );
+    h.insert(header::LOCATION, HeaderValue::from_str(&url).unwrap_or(HeaderValue::from_static("/")));
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    h.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
+    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     r
 }
 
 fn redirect_error(app: &App, params: &AuthParams, error: &str, desc: &str) -> Response {
-    client_redirect(
-        app,
-        params,
-        vec![
-            ("error".into(), error.into()),
-            ("error_description".into(), desc.into()),
-        ],
-    )
+    client_redirect(app, params, vec![("error".into(), error.into()), ("error_description".into(), desc.into())])
 }
 
 struct Flow {
@@ -970,8 +812,7 @@ async fn load_flow(
     let mut req = store::get_request(app, &id)
         .await?
         .ok_or_else(|| FlowError::Page(StatusCode::BAD_REQUEST, "Unknown request_uri".into()))?;
-    let fail =
-        |m: &str| FlowError::Redirect(Box::new(req.params.clone()), "access_denied", m.to_string());
+    let fail = |m: &str| FlowError::Redirect(Box::new(req.params.clone()), "access_denied", m.to_string());
     let now = now_secs();
     let authorized = req.did.is_some() || req.code_hash.is_some() || req.consumed.is_some();
     let err = if authorized {
@@ -1000,21 +841,8 @@ async fn load_flow(
     store::put_request(app, &id, Some(&req)).await?;
     let client = client::get_client(&req.client_id, app.config.dev_mode)
         .await
-        .map_err(|e| {
-            FlowError::Redirect(
-                Box::new(req.params.clone()),
-                "invalid_client",
-                e.description,
-            )
-        })?;
-    Ok(Flow {
-        id,
-        uri: uri.to_string(),
-        req,
-        client,
-        device,
-        new_cookie,
-    })
+        .map_err(|e| FlowError::Redirect(Box::new(req.params.clone()), "invalid_client", e.description))?;
+    Ok(Flow { id, uri: uri.to_string(), req, client, device, new_cookie })
 }
 
 impl Flow {
@@ -1023,19 +851,11 @@ impl Flow {
     }
 
     fn form_action(&self) -> Vec<String> {
-        redirect_source(&self.req.params.redirect_uri)
-            .into_iter()
-            .collect()
+        redirect_source(&self.req.params.redirect_uri).into_iter().collect()
     }
 
     fn page(&self, app: &App, body: String) -> Response {
-        html(
-            app,
-            StatusCode::OK,
-            body,
-            &self.form_action(),
-            self.new_cookie.then_some(&self.device),
-        )
+        html(app, StatusCode::OK, body, &self.form_action(), self.new_cookie.then_some(&self.device))
     }
 
     fn ctx<'a>(&'a self, csrf: &'a str, server_name: &'a str) -> ui::Ctx<'a> {
@@ -1084,12 +904,7 @@ async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAu
     let Some(a) = store::get_authorization(app, did, &flow.client.id).await? else {
         return Ok(true);
     };
-    Ok(!flow
-        .req
-        .params
-        .scope
-        .split(' ')
-        .all(|s| a.scopes.iter().any(|x| x == s)))
+    Ok(!flow.req.params.scope.split(' ').all(|s| a.scopes.iter().any(|x| x == s)))
 }
 
 fn login_page(
@@ -1104,13 +919,7 @@ fn login_page(
     let name = server_name(app);
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm {
-            action: "/oauth/authorize/sign-in",
-            identifier,
-            error,
-            totp,
-            email_hint: None,
-        },
+        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, totp, email_hint: None },
         "",
     );
     let mut r = flow.page(app, body);
@@ -1123,36 +932,19 @@ fn login_page(
 async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     let acct = match account_any(app, did).await {
         Ok(a) => a,
-        Err(_) => {
-            return login_page(
-                app,
-                &flow,
-                "",
-                Some("Account not found"),
-                false,
-                StatusCode::OK,
-            )
-        }
+        Err(_) => return login_page(app, &flow, "", Some("Account not found"), false, StatusCode::OK),
     };
     match consent_required(app, &flow, did).await {
         Ok(false) => return issue_code(app, flow, did).await,
         Ok(true) => {}
         Err(e) => return server_error_page(app, "Authorization failed", &e.description),
     }
-    let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope)
-        .await
-        .unwrap_or_default();
+    let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
     let perms = ui::describe_scopes(&flow.req.params.scope, &sets);
     let csrf = flow.csrf(app);
     let name = server_name(app);
     let email_choice = can_withhold_email(&flow.req.params.scope);
-    let body = ui::consent(
-        &flow.ctx(&csrf, &name),
-        did,
-        &acct.handle,
-        &perms,
-        email_choice,
-    );
+    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &perms, email_choice);
     flow.page(app, body)
 }
 
@@ -1160,12 +952,7 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
 async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     if let Err(e) = ensure_active_any(app, did).await {
         let _ = store::put_request(app, &flow.id, None).await;
-        return redirect_error(
-            app,
-            &flow.req.params,
-            "access_denied",
-            &format!("Account unavailable: {}", e.message),
-        );
+        return redirect_error(app, &flow.req.params, "access_denied", &format!("Account unavailable: {}", e.message));
     }
     // the code's session is created only while this login's credential
     // epoch is current (code_grant)
@@ -1192,33 +979,19 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     let _ = store::put_authorization(
         app,
         did,
-        &store::Authorization {
-            client_id: flow.client.id.clone(),
-            scopes,
-            updated_at: now_secs(),
-        },
+        &store::Authorization { client_id: flow.client.id.clone(), scopes, updated_at: now_secs() },
     )
     .await;
     let mut r = client_redirect(app, &flow.req.params, vec![("code".into(), code)]);
     if flow.new_cookie {
-        r.headers_mut()
-            .append(header::SET_COOKIE, device_cookie(app, &flow.device));
+        r.headers_mut().append(header::SET_COOKIE, device_cookie(app, &flow.device));
     }
     r
 }
 
-async fn authorize(
-    State(app): AppState,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
+async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     if !q.contains_key("client_id") {
-        return error_page(
-            &app,
-            StatusCode::BAD_REQUEST,
-            "Authorization failed",
-            "Missing client_id",
-        );
+        return error_page(&app, StatusCode::BAD_REQUEST, "Authorization failed", "Missing client_id");
     }
     let flow = match load_flow(
         &app,
@@ -1234,10 +1007,7 @@ async fn authorize(
     let accounts = device_accounts(&app, &flow.device).await;
     let params = flow.req.params.clone();
     let hint = params.login_hint.clone().unwrap_or_default();
-    let hinted = accounts
-        .iter()
-        .find(|(d, h)| !hint.is_empty() && (hint == *d || hint == *h))
-        .cloned();
+    let hinted = accounts.iter().find(|(d, h)| !hint.is_empty() && (hint == *d || hint == *h)).cloned();
     // the sign-in <-> sign-up links between the two pages
     match q.get("screen").map(String::as_str) {
         Some("sign-up") => return signup_page(&app, &flow, &SignupValues::default(), None, StatusCode::OK),
@@ -1253,19 +1023,12 @@ async fn authorize(
                     return redirect_error(&app, &params, "login_required", "Login is required")
                 }
                 (None, _) => {
-                    return redirect_error(
-                        &app,
-                        &params,
-                        "account_selection_required",
-                        "Account selection is required",
-                    )
+                    return redirect_error(&app, &params, "account_selection_required", "Account selection is required")
                 }
             };
             match consent_required(&app, &flow, &chosen.0).await {
                 Ok(false) => issue_code(&app, flow, &chosen.0).await,
-                Ok(true) => {
-                    redirect_error(&app, &params, "consent_required", "Consent is required")
-                }
+                Ok(true) => redirect_error(&app, &params, "consent_required", "Consent is required"),
                 Err(e) => redirect_error(&app, &params, "server_error", &e.description),
             }
         }
@@ -1297,11 +1060,7 @@ fn form_fields(body: &[u8]) -> HashMap<String, String> {
 
 /// Also checks CSRF.
 #[allow(clippy::result_large_err)]
-async fn form_flow(
-    app: &App,
-    headers: &HeaderMap,
-    body: &[u8],
-) -> Result<(Flow, HashMap<String, String>), Response> {
+async fn form_flow(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(Flow, HashMap<String, String>), Response> {
     let f = form_fields(body);
     let flow = load_flow(app, headers, f.get("request_uri").map(String::as_str), None)
         .await
@@ -1371,9 +1130,7 @@ impl LoginError {
             LoginError::Invalid => "Invalid handle or password",
             LoginError::Timeout => "Your sign-in timed out. Please enter your password again.",
             LoginError::BadCode => "Invalid authenticator code",
-            LoginError::TooManyCodes => {
-                "Too many invalid authenticator codes. Please sign in again later."
-            }
+            LoginError::TooManyCodes => "Too many invalid authenticator codes. Please sign in again later.",
             LoginError::RateLimited => "Too many sign-in attempts. Please try again later.",
             LoginError::Inactive => "This account is deactivated or suspended",
         }
@@ -1390,16 +1147,14 @@ impl LoginError {
 /// Records the login on the device. Wrong codes count against the account's
 /// TOTP lockout and, past [`PENDING_2FA_MAX_FAILURES`], drop the pending
 /// sign-in.
-async fn sign_in(
-    app: &App,
-    device: &mut Device,
-    f: &HashMap<String, String>,
-) -> Result<SignIn, OAuthError> {
+async fn sign_in(app: &App, device: &mut Device, f: &HashMap<String, String>) -> Result<SignIn, OAuthError> {
     let r = sign_in_inner(app, device, f).await;
     let result = match &r {
         Ok(SignIn::Ok(_)) => "success",
         Ok(SignIn::NeedTotp(..)) => "second_factor_required",
-        Ok(SignIn::NeedTotpErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => "second_factor_failed",
+        Ok(SignIn::NeedTotpErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => {
+            "second_factor_failed"
+        }
         Ok(SignIn::Failed(_, LoginError::RateLimited)) => "rate_limited",
         Ok(SignIn::Failed(_, LoginError::Inactive)) => "blocked",
         Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout)) => "failed",
@@ -1409,18 +1164,11 @@ async fn sign_in(
     r
 }
 
-async fn sign_in_inner(
-    app: &App,
-    device: &mut Device,
-    f: &HashMap<String, String>,
-) -> Result<SignIn, OAuthError> {
+async fn sign_in_inner(app: &App, device: &mut Device, f: &HashMap<String, String>) -> Result<SignIn, OAuthError> {
     use crate::ratelimit as rl;
     let now = now_secs();
     let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
-    let ident = f
-        .get("identifier")
-        .map(|s| s.trim().trim_start_matches('@').to_lowercase())
-        .unwrap_or_default();
+    let ident = f.get("identifier").map(|s| s.trim().trim_start_matches('@').to_lowercase()).unwrap_or_default();
     let limited = |ident: String| Ok(SignIn::Failed(ident, LoginError::RateLimited));
     if rl::check_ip(&[&rl::GLOBAL_IP, &rl::OAUTH_SIGN_IN_IP], 1).is_err() {
         return limited(ident);
@@ -1428,19 +1176,10 @@ async fn sign_in_inner(
     let password_step = f.get("step").map(String::as_str) != Some("totp");
     let (acct, ident, epoch) = if !password_step {
         // password already verified for the pending account
-        let Some((did, _)) = device
-            .pending_2fa
-            .clone()
-            .filter(|(_, at)| now - at < PENDING_2FA_TTL)
-        else {
+        let Some((did, _)) = device.pending_2fa.clone().filter(|(_, at)| now - at < PENDING_2FA_TTL) else {
             return Ok(SignIn::Failed(String::new(), LoginError::Timeout));
         };
-        if rl::check_with_ip(
-            &[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN],
-            &did,
-            1,
-        )
-        .is_err()
+        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1).is_err()
             || rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err()
         {
             return limited(String::new());
@@ -1453,13 +1192,7 @@ async fn sign_in_inner(
             return invalid();
         }
         // createSession's buckets (shared with it), before any Argon2 work
-        if rl::check_with_ip(
-            &[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN],
-            &ident,
-            1,
-        )
-        .is_err()
-        {
+        if rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &ident, 1).is_err() {
             return limited(ident);
         }
         let Some(did) = resolve_identifier(app, &ident).await else {
@@ -1504,7 +1237,9 @@ async fn sign_in_inner(
         }
         Err(fe) if fe.err.status.is_server_error() => return Err(fe.err.into()),
         // no code could be mailed: not a wrong code
-        Err(fe) if super::server::is_mail_limited(&fe.err) => return Ok(SignIn::Failed(ident, LoginError::RateLimited)),
+        Err(fe) if super::server::is_mail_limited(&fe.err) => {
+            return Ok(SignIn::Failed(ident, LoginError::RateLimited))
+        }
         Err(fe) => {
             let (e, hint) = (fe.err, email_hint(fe.factor));
             // a password step starts a new pending sign-in
@@ -1514,9 +1249,7 @@ async fn sign_in_inner(
                 device.pending_2fa_failures = 0;
             }
             device.pending_2fa_failures += 1;
-            if crate::totp::is_lockout(&e)
-                || device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES
-            {
+            if crate::totp::is_lockout(&e) || device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
                 device.pending_2fa = None;
                 device.pending_2fa_failures = 0;
                 store::put_device(app, device).await?;
@@ -1530,11 +1263,7 @@ async fn sign_in_inner(
     device.pending_2fa = None;
     device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
-    device.accounts.push(DeviceAccount {
-        did: did.clone(),
-        authenticated_at: now,
-        auth_epoch: epoch,
-    });
+    device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch });
     device.last_seen_at = now;
     store::put_device(app, device).await?;
     Ok(SignIn::Ok(did))
@@ -1557,13 +1286,7 @@ fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad
     });
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm {
-            action: "/oauth/authorize/sign-in",
-            identifier: handle,
-            error,
-            totp: true,
-            email_hint,
-        },
+        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier: handle, error, totp: true, email_hint },
         "",
     );
     let mut r = flow.page(app, body);
@@ -1586,9 +1309,7 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
         Ok(SignIn::Ok(did)) => consent_step(&app, flow, &did).await,
         Ok(SignIn::NeedTotp(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), false),
         Ok(SignIn::NeedTotpErr(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), true),
-        Ok(SignIn::Failed(ident, e)) => {
-            login_page(&app, &flow, &ident, Some(e.message()), false, e.status())
-        }
+        Ok(SignIn::Failed(ident, e)) => login_page(&app, &flow, &ident, Some(e.message()), false, e.status()),
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
             let ident = f.get("identifier").map(|s| s.trim().to_string()).unwrap_or_default();
             with_retry_after(login_page(&app, &flow, &ident, Some(BUSY_MESSAGE), false, e.status))
@@ -1689,21 +1410,12 @@ async fn authorize_select(State(app): AppState, headers: HeaderMap, body: AxByte
     }
     let accounts = device_accounts(&app, &flow.device).await;
     match accounts.iter().find(|(d, _)| *d == did) {
-        Some(_) if flow.req.params.prompt.as_deref() != Some("login") => {
-            consent_step(&app, flow, &did).await
-        }
+        Some(_) if flow.req.params.prompt.as_deref() != Some("login") => consent_step(&app, flow, &did).await,
         Some((_, handle)) => {
             let h = handle.clone();
             login_page(&app, &flow, &h, None, false, StatusCode::OK)
         }
-        None => login_page(
-            &app,
-            &flow,
-            "",
-            Some("Please sign in again"),
-            false,
-            StatusCode::OK,
-        ),
+        None => login_page(&app, &flow, "", Some("Please sign in again"), false, StatusCode::OK),
     }
 }
 
@@ -1719,26 +1431,14 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
     let did = f.get("did").cloned().unwrap_or_default();
     let accounts = device_accounts(&app, &flow.device).await;
     if !accounts.iter().any(|(d, _)| *d == did) {
-        return login_page(
-            &app,
-            &flow,
-            "",
-            Some("Please sign in again"),
-            false,
-            StatusCode::UNAUTHORIZED,
-        );
+        return login_page(&app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
     }
     let mut flow = flow;
     match granted_scope(&flow.req.params.scope, &f) {
         Some(scope) => flow.req.params.scope = scope,
         None => {
             let _ = store::put_request(&app, &flow.id, None).await;
-            return redirect_error(
-                &app,
-                &flow.req.params,
-                "access_denied",
-                "The \"atproto\" scope is required",
-            );
+            return redirect_error(&app, &flow.req.params, "access_denied", "The \"atproto\" scope is required");
         }
     }
     issue_code(&app, flow, &did).await
@@ -1751,17 +1451,15 @@ fn is_email_read_scope(s: &str) -> bool {
 /// Only a granular `account:email` scope can be withheld: transition scopes
 /// cannot be narrowed.
 fn can_withhold_email(scope: &str) -> bool {
-    !scope.split(' ').any(|s| s.starts_with("transition:"))
-        && scope.split(' ').any(is_email_read_scope)
+    !scope.split(' ').any(|s| s.starts_with("transition:")) && scope.split(' ').any(is_email_read_scope)
 }
 
 /// The reference's `setAuthorized` scope override: the form can only remove
 /// scopes, never add them. None if the result lacks `atproto`.
 fn granted_scope(requested: &str, f: &HashMap<String, String>) -> Option<String> {
     let allowed: Option<Vec<&str>> = f.get("scope").map(|s| s.split(' ').collect());
-    let withhold_email = f.contains_key("email_choice")
-        && !f.contains_key("allow_email")
-        && can_withhold_email(requested);
+    let withhold_email =
+        f.contains_key("email_choice") && !f.contains_key("allow_email") && can_withhold_email(requested);
     let granted: Vec<&str> = requested
         .split(' ')
         .filter(|s| !s.is_empty())
@@ -1799,9 +1497,7 @@ async fn token_inner(app: &Arc<App>, headers: &HeaderMap, body: &[u8]) -> Result
         "authorization_code" => code_grant(app, &client, client_auth, &p, &proof).await,
         "refresh_token" => refresh_grant(app, &client, client_auth, &p, &proof).await,
         "" => Err(OAuthError::invalid_request("Missing \"grant_type\"")),
-        g => Err(OAuthError::unsupported_grant_type(&format!(
-            "Unsupported grant_type \"{g}\""
-        ))),
+        g => Err(OAuthError::unsupported_grant_type(&format!("Unsupported grant_type \"{g}\""))),
     }
 }
 
@@ -1810,9 +1506,7 @@ fn code_matches(req: &RequestData, code: &str) -> bool {
 }
 
 fn verify_pkce(verifier: &str, challenge: &str) -> bool {
-    let ok_chars = verifier
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
+    let ok_chars = verifier.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~".contains(&b));
     (43..=128).contains(&verifier.len())
         && ok_chars
         && crate::auth::ct_eq(ou::sha256_b64u(verifier).as_bytes(), challenge.as_bytes())
@@ -1825,17 +1519,12 @@ async fn code_grant(
     p: &HashMap<String, String>,
     proof: &DpopProof,
 ) -> Result<J, OAuthError> {
-    let code = p
-        .get("code")
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| OAuthError::invalid_request("Missing \"code\""))?;
-    let rid =
-        store::code_request_id(code).ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let code =
+        p.get("code").filter(|c| !c.is_empty()).ok_or_else(|| OAuthError::invalid_request("Missing \"code\""))?;
+    let rid = store::code_request_id(code).ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
     require_owner(app, &store::req_routing(&rid))?;
     let _g = store::lock(app, &format!("req:{rid}")).await;
-    let mut req = store::get_request(app, &rid)
-        .await?
-        .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let mut req = store::get_request(app, &rid).await?.ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
     if !code_matches(&req, code) {
         return Err(OAuthError::invalid_grant("Invalid code"));
     }
@@ -1844,10 +1533,7 @@ async fn code_grant(
         store::delete_session(app, did, sid).await?;
         return Err(OAuthError::invalid_grant("Code replayed"));
     }
-    let did = req
-        .did
-        .clone()
-        .ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
+    let did = req.did.clone().ok_or_else(|| OAuthError::invalid_grant("Invalid code"))?;
     let params = req.params.clone();
     let fail = |m: &str| OAuthError::invalid_grant(m);
     if req.expires_at < now_secs() {
@@ -1863,23 +1549,16 @@ async fn code_grant(
     if p.get("redirect_uri").map(String::as_str) != Some(params.redirect_uri.as_str()) {
         return Err(fail("Invalid redirect_uri"));
     }
-    let verifier = p
-        .get("code_verifier")
-        .ok_or_else(|| OAuthError::invalid_grant("Missing code_verifier"))?;
+    let verifier = p.get("code_verifier").ok_or_else(|| OAuthError::invalid_grant("Missing code_verifier"))?;
     if !verify_pkce(verifier, &params.code_challenge) {
         return Err(fail("Invalid code_verifier"));
     }
     if proof.jkt != params.dpop_jkt {
-        return Err(OAuthError::invalid_dpop_proof(
-            "DPoP proof does not match the expected JKT",
-        ));
+        return Err(OAuthError::invalid_dpop_proof("DPoP proof does not match the expected JKT"));
     }
-    ensure_active_any(app, &did)
-        .await
-        .map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    let token_scope = lexicon::build_token_scope_cached(app, &params.scope)
-        .await
-        .map_err(|e| OAuthError::invalid_request(&e))?;
+    ensure_active_any(app, &did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
+    let token_scope =
+        lexicon::build_token_scope_cached(app, &params.scope).await.map_err(|e| OAuthError::invalid_request(&e))?;
     let now = now_secs();
     let mut s = Session {
         id: ou::random_id("ses-", 16),
@@ -1907,7 +1586,12 @@ async fn code_grant(
 }
 
 /// A session revoked meanwhile is not brought back (`guard`).
-async fn issue_tokens(app: &App, client: &Client, s: &mut Session, guard: store::SessionGuard) -> Result<J, OAuthError> {
+async fn issue_tokens(
+    app: &App,
+    client: &Client,
+    s: &mut Session,
+    guard: store::SessionGuard,
+) -> Result<J, OAuthError> {
     let now = now_secs();
     let lifetime = ACCESS_TOKEN_TTL.min(s.created_at + client.session_lifetime() - now);
     if lifetime <= 1 {
@@ -1964,9 +1648,7 @@ async fn refresh_grant(
     let parsed = store::parse_refresh_token(tok).ok_or_else(invalid)?;
     require_owner(app, &parsed.did)?;
     let _g = store::lock(app, &format!("ses:{}", parsed.session_id)).await;
-    let (mut s, raw) = store::get_session_raw(app, &parsed.did, &parsed.session_id)
-        .await?
-        .ok_or_else(invalid)?;
+    let (mut s, raw) = store::get_session_raw(app, &parsed.did, &parsed.session_id).await?.ok_or_else(invalid)?;
     let k = keys(app);
     if !parsed.authentic(&k.refresh, &s) || parsed.generation > s.refresh_gen {
         return Err(invalid());
@@ -1977,23 +1659,17 @@ async fn refresh_grant(
         return Err(OAuthError::invalid_grant("Refresh token replayed"));
     }
     if s.client_id != client.id {
-        return Err(OAuthError::invalid_grant(
-            "Refresh token was issued to another client",
-        ));
+        return Err(OAuthError::invalid_grant("Refresh token was issued to another client"));
     }
     if !client.has_key(&s.client_auth) {
         store::delete_session(app, &s.did, &s.id).await?;
-        return Err(OAuthError::invalid_grant(
-            "Client authentication key no longer available",
-        ));
+        return Err(OAuthError::invalid_grant("Client authentication key no longer available"));
     }
     if s.client_auth != client_auth {
         return Err(OAuthError::invalid_grant("Client authentication mismatch"));
     }
     if proof.jkt != s.dpop_jkt {
-        return Err(OAuthError::invalid_dpop_proof(
-            "DPoP proof does not match the expected JKT",
-        ));
+        return Err(OAuthError::invalid_dpop_proof("DPoP proof does not match the expected JKT"));
     }
     let now = now_secs();
     if now - s.created_at > client.session_lifetime() {
@@ -2004,12 +1680,8 @@ async fn refresh_grant(
         store::delete_session(app, &s.did, &s.id).await?;
         return Err(OAuthError::invalid_grant("Refresh token expired"));
     }
-    ensure_active_any(app, &s.did)
-        .await
-        .map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope)
-        .await
-        .map_err(|e| OAuthError::server_error(&e))?;
+    ensure_active_any(app, &s.did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
+    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope).await.map_err(|e| OAuthError::server_error(&e))?;
     s.refresh_gen += 1;
     super::cas::pause_point("oauth_refresh", &s.did).await;
     // only if the row is still the one read: a revocation since is not undone
@@ -2026,10 +1698,8 @@ async fn revoke(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Resp
 
 async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(), OAuthError> {
     let p = parse_params(headers, body)?;
-    let tok = p
-        .get("token")
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| OAuthError::invalid_request("Missing \"token\""))?;
+    let tok =
+        p.get("token").filter(|t| !t.is_empty()).ok_or_else(|| OAuthError::invalid_request("Missing \"token\""))?;
     let creds = ClientCredentials::from_params(&p)?;
     let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
     if let (_, Some(r)) = client.authenticate(&creds, &issuer(app))? {
@@ -2080,16 +1750,9 @@ tokio::task_local! {
 }
 
 fn dpop_fail(error: &str, desc: &str) -> XrpcError {
-    let challenge = format!(
-        "DPoP algs=\"ES256\", error=\"{error}\", error_description=\"{}\"",
-        desc.replace('"', "'")
-    );
+    let challenge = format!("DPoP algs=\"ES256\", error=\"{error}\", error_description=\"{}\"", desc.replace('"', "'"));
     let _ = DPOP_CTX.try_with(|c| c.borrow_mut().challenge = Some(challenge));
-    XrpcError {
-        status: StatusCode::UNAUTHORIZED,
-        error: error.into(),
-        message: desc.into(),
-    }
+    XrpcError { status: StatusCode::UNAUTHORIZED, error: error.into(), message: desc.into() }
 }
 
 /// Adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
@@ -2135,8 +1798,7 @@ async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: ax
                 }
             }
             if let Ok(v) = HeaderValue::from_str(&expose) {
-                r.headers_mut()
-                    .append(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
+                r.headers_mut().append(header::ACCESS_CONTROL_EXPOSE_HEADERS, v);
             }
             r
         })
@@ -2159,26 +1821,19 @@ pub fn access_token_sub(app: &App, token: &str) -> Option<String> {
 
 pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
     let k = keys(app);
-    let jwt = super::authn::verify_access_token(&k.server, token)
-        .map_err(|e| dpop_fail("invalid_token", &e))?;
+    let jwt = super::authn::verify_access_token(&k.server, token).map_err(|e| dpop_fail("invalid_token", &e))?;
     let now = now_secs();
     let claims_ok = jwt.claim_str("iss") == Some(issuer(app).as_str())
         && jwt.claim_str("aud") == Some(app.jwt.service_did.as_str());
     if !claims_ok {
-        return Err(dpop_fail(
-            "invalid_token",
-            "Invalid token audience or issuer",
-        ));
+        return Err(dpop_fail("invalid_token", "Invalid token audience or issuer"));
     }
     if jwt.claim_i64("exp").is_none_or(|e| e <= now) {
         return Err(dpop_fail("invalid_token", "Token expired"));
     }
-    let (Some(did), Some(sid), Some(jti), Some(client_id)) = (
-        jwt.claim_str("sub"),
-        jwt.claim_str("sid"),
-        jwt.claim_str("jti"),
-        jwt.claim_str("client_id"),
-    ) else {
+    let (Some(did), Some(sid), Some(jti), Some(client_id)) =
+        (jwt.claim_str("sub"), jwt.claim_str("sid"), jwt.claim_str("jti"), jwt.claim_str("client_id"))
+    else {
         return Err(dpop_fail("invalid_token", "Malformed token"));
     };
     let jkt = jwt
@@ -2192,16 +1847,13 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
         .ok_or_else(|| dpop_fail("invalid_dpop_proof", "DPoP proof required"))?;
     let htu = jose::normalize_htu(&format!("{}{}", issuer(app), parts.uri.path()))
         .ok_or_else(|| XrpcError::internal("bad public_url"))?;
-    let checked = jose::check_proof(&proof, parts.method.as_str(), &htu, Some(token), &k.nonces)
-        .map_err(|e| match e {
+    let checked =
+        jose::check_proof(&proof, parts.method.as_str(), &htu, Some(token), &k.nonces).map_err(|e| match e {
             DpopError::UseNonce(m) => dpop_fail("use_dpop_nonce", &m),
             DpopError::Invalid(m) => dpop_fail("invalid_dpop_proof", &m),
         })?;
     if checked.jkt != jkt {
-        return Err(dpop_fail(
-            "invalid_token",
-            "Access token is bound to another DPoP key",
-        ));
+        return Err(dpop_fail("invalid_token", "Access token is bound to another DPoP key"));
     }
     // claimed at the token DID's owner (normally this node: the request was
     // routed by that DID), in memory only (crate::oauth: residual risk)
@@ -2226,22 +1878,14 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
     }
     let scopes = ScopeSet::new(jwt.claim_str("scope").unwrap_or(""));
     if !scopes.has("atproto") {
-        return Err(dpop_fail(
-            "invalid_token",
-            "OAuth token does not have \"atproto\" scope",
-        ));
+        return Err(dpop_fail("invalid_token", "OAuth token does not have \"atproto\" scope"));
     }
-    Ok(Credentials::OAuth {
-        did: did.to_string(),
-        client_id: client_id.to_string(),
-        scopes,
-    })
+    Ok(Credentials::OAuth { did: did.to_string(), client_id: client_id.to_string(), scopes })
 }
 
 fn redirect_to(path: &str) -> Response {
     let mut r = StatusCode::SEE_OTHER.into_response();
-    r.headers_mut()
-        .insert(header::LOCATION, HeaderValue::from_str(path).unwrap());
+    r.headers_mut().insert(header::LOCATION, HeaderValue::from_str(path).unwrap());
     r
 }
 
@@ -2252,16 +1896,10 @@ fn rfc3339(secs: i64) -> String {
 }
 
 fn fmt_time(secs: i64) -> String {
-    chrono::DateTime::from_timestamp(secs, 0)
-        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
-        .unwrap_or_default()
+    chrono::DateTime::from_timestamp(secs, 0).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default()
 }
 
-async fn account_page(
-    State(app): AppState,
-    headers: HeaderMap,
-    Query(q): Query<HashMap<String, String>>,
-) -> Response {
+async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<HashMap<String, String>>) -> Response {
     let (device, new_cookie) = match device_for(&app, &headers).await {
         Ok(d) => d,
         Err(e) => return server_error_page(&app, "Error", &e.description),
@@ -2270,11 +1908,7 @@ async fn account_page(
     let accounts = device_accounts(&app, &device).await;
     let cookie = new_cookie.then_some(&device);
     if accounts.is_empty() || q.contains_key("add") {
-        let pending = device
-            .pending_2fa
-            .as_ref()
-            .filter(|(_, at)| now_secs() - at < PENDING_2FA_TTL)
-            .is_some()
+        let pending = device.pending_2fa.as_ref().filter(|(_, at)| now_secs() - at < PENDING_2FA_TTL).is_some()
             && q.contains_key("totp");
         let body = ui::login(
             None,
@@ -2282,10 +1916,7 @@ async fn account_page(
                 action: "/oauth/account/sign-in",
                 identifier: "",
                 // never echo the query text
-                error: q
-                    .get("error")
-                    .and_then(|c| LoginError::from_code(c))
-                    .map(LoginError::message),
+                error: q.get("error").and_then(|c| LoginError::from_code(c)).map(LoginError::message),
                 totp: pending,
                 // the address isn't put in the URL; the page says "your email"
                 email_hint: (pending && q.contains_key("email")).then_some("your email address"),
@@ -2310,13 +1941,7 @@ async fn account_page(
             .collect();
         rows.push((did, handle, list));
     }
-    html(
-        &app,
-        StatusCode::OK,
-        ui::account_page(&csrf, &rows),
-        &[],
-        cookie,
-    )
+    html(&app, StatusCode::OK, ui::account_page(&csrf, &rows), &[], cookie)
 }
 
 #[allow(clippy::result_large_err)]
@@ -2326,14 +1951,10 @@ async fn account_form(
     body: &[u8],
 ) -> Result<(Device, HashMap<String, String>), Response> {
     let f = form_fields(body);
-    let (device, new_cookie) = device_for(app, headers).await.map_err(|e| server_error_page(app, "Error", &e.description))?;
+    let (device, new_cookie) =
+        device_for(app, headers).await.map_err(|e| server_error_page(app, "Error", &e.description))?;
     if new_cookie || !check_csrf(app, headers, &device, "account", f.get("csrf")) {
-        return Err(error_page(
-            app,
-            StatusCode::FORBIDDEN,
-            "Request failed",
-            "Invalid or missing CSRF token.",
-        ));
+        return Err(error_page(app, StatusCode::FORBIDDEN, "Request failed", "Invalid or missing CSRF token."));
     }
     Ok((device, f))
 }
@@ -2353,9 +1974,7 @@ async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes
             if hint.is_some() { "&email=1" } else { "" },
             LoginError::BadCode.code()
         )),
-        Ok(SignIn::Failed(_, e)) => {
-            redirect_to(&format!("/oauth/account?add=1&error={}", e.code()))
-        }
+        Ok(SignIn::Failed(_, e)) => redirect_to(&format!("/oauth/account?add=1&error={}", e.code())),
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
             with_retry_after(error_page(&app, e.status, "Sign-in failed", BUSY_MESSAGE))
         }
@@ -2383,10 +2002,7 @@ async fn account_revoke(State(app): AppState, headers: HeaderMap, body: AxBytes)
     };
     let did = f.get("did").cloned().unwrap_or_default();
     let sid = f.get("session").cloned().unwrap_or_default();
-    let signed_in = device_accounts(&app, &device)
-        .await
-        .iter()
-        .any(|(d, _)| *d == did);
+    let signed_in = device_accounts(&app, &device).await.iter().any(|(d, _)| *d == did);
     if !signed_in {
         return error_page(
             &app,
@@ -2415,9 +2031,7 @@ fn full_session(creds: &Credentials) -> XResult<String> {
 
 async fn xrpc_list_sessions(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = full_session(&creds)?;
-    let mut sessions = store::list_sessions(&app, &did)
-        .await
-        .map_err(|e| XrpcError::internal(e.description))?;
+    let mut sessions = store::list_sessions(&app, &did).await.map_err(|e| XrpcError::internal(e.description))?;
     sessions.sort_by_key(|s| -s.updated_at);
     let out: Vec<J> = sessions
         .iter()
@@ -2446,15 +2060,9 @@ async fn xrpc_revoke_session(
     Json(inp): Json<RevokeSessionIn>,
 ) -> XResult<Json<J>> {
     let did = full_session(&creds)?;
-    if store::get_session(&app, &did, &inp.id)
-        .await
-        .map_err(|e| XrpcError::internal(e.description))?
-        .is_none()
-    {
+    if store::get_session(&app, &did, &inp.id).await.map_err(|e| XrpcError::internal(e.description))?.is_none() {
         return Err(XrpcError::bad("SessionNotFound", "no such OAuth session"));
     }
-    store::delete_session(&app, &did, &inp.id)
-        .await
-        .map_err(|e| XrpcError::internal(e.description))?;
+    store::delete_session(&app, &did, &inp.id).await.map_err(|e| XrpcError::internal(e.description))?;
     Ok(Json(json!({})))
 }

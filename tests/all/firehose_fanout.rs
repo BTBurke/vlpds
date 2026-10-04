@@ -6,8 +6,8 @@ use crate::common::*;
 use futures::{SinkExt, StreamExt};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::Message;
 
 /// A websocket client that does the handshake and then reads nothing: its
 /// receive window fills and the server's writes to it block.
@@ -71,7 +71,9 @@ async fn stalled_subscriber_is_cut_off_without_delaying_writes_or_others() {
     let mut last = None;
     for i in 0..200 {
         let t = Instant::now();
-        last = Some(s.create_record(&a, "com.example.big", json!({"$type": "com.example.big", "i": i, "data": big})).await);
+        last = Some(
+            s.create_record(&a, "com.example.big", json!({"$type": "com.example.big", "i": i, "data": big})).await,
+        );
         lat.push(t.elapsed());
     }
     lat.sort();

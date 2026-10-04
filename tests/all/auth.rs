@@ -175,12 +175,20 @@ async fn invalid_and_expired_access_tokens_are_rejected() {
     let s = TestServer::spawn().await;
     let a = s.create_account("ivan").await;
     let t = now_secs();
-    let expired = forge(&json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1}), "at+jwt", JWT_SECRET);
+    let expired = forge(
+        &json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t - 100, "exp": t - 1}),
+        "at+jwt",
+        JWT_SECRET,
+    );
     let r = get_session(&s, &expired).await;
     assert!(matches!(r.status, 400 | 401), "{}", r.text());
     assert!(matches!(r.error_name(), Some("ExpiredToken" | "InvalidToken" | "AuthenticationRequired")), "{}", r.text());
 
-    let wrong_key = forge(&json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600}), "at+jwt", "not-the-secret");
+    let wrong_key = forge(
+        &json!({"scope": "com.atproto.access", "sub": a.did, "aud": SERVICE_DID, "iat": t, "exp": t + 600}),
+        "at+jwt",
+        "not-the-secret",
+    );
     for tok in [wrong_key.as_str(), "garbage", "a.b.c", ""] {
         let r = get_session(&s, tok).await;
         assert!(matches!(r.status, 400 | 401), "token {tok:?}: {}", r.text());
@@ -218,7 +226,8 @@ async fn actor_takedown_disallows_refresh_session() {
 // ---- email sign-in second factor ----
 
 async fn enable_email_auth_factor(s: &TestServer, a: &TestAccount) {
-    let (tok, _, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (tok, _, _) =
+        mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     s.xrpc.post("com.atproto.server.confirmEmail", &json!({"email": a.email, "token": tok}), &a.auth()).await.ok();
     let (tok, r, _) = mailed(s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &a.auth())).await;
     assert_eq!(r.ok()["tokenRequired"], json!(true));

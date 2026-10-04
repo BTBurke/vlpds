@@ -34,7 +34,11 @@ struct PublishIdentityIn {
 /// re-signed (an empty commit, `#identity` + `#sync`) so relays that saw
 /// commits fail against the old document resynchronize; a PLC failure emits
 /// nothing.
-async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Json<PublishIdentityIn>) -> XResult<Json<J>> {
+async fn publish_identity(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<PublishIdentityIn>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let did = inp.did;
     let acct = app.account(&did).await.map_err(|_| not_found(&did))?;
@@ -53,7 +57,8 @@ async fn publish_identity(State(app): AppState, Auth(creds): Auth, Json(inp): Js
         plc_updated = json!(plc.update_signing_key(&did, &format!("did:key:{}", acct.signing_pubkey)).await?);
     }
     let key = app.secrets.account_signing_key(&acct).await?;
-    let head = app.account_op(&did, crate::worker::AccountOp::SigningKey(crate::worker::KeyStep::Resign { key })).await?;
+    let head =
+        app.account_op(&did, crate::worker::AccountOp::SigningKey(crate::worker::KeyStep::Resign { key })).await?;
     app.did_resolver.invalidate(&did);
     Ok(Json(json!({"did": did, "handle": acct.handle, "plcUpdated": plc_updated, "rev": head.rev.to_string()})))
 }
@@ -101,7 +106,9 @@ fn check_commit(did: &str, head: &Head, pubkey: &str) -> J {
         };
         data_ok = matches!(c.get("data"), Some(Value::Link(d)) if *d == head.data);
         did_ok = text("did").as_deref() == Some(did);
-        if let (Some(cdid), Some(rev), Some(Value::Link(data)), Some(Value::Bytes(sig))) = (text("did"), text("rev"), c.get("data"), c.get("sig")) {
+        if let (Some(cdid), Some(rev), Some(Value::Link(data)), Some(Value::Bytes(sig))) =
+            (text("did"), text("rev"), c.get("data"), c.get("sig"))
+        {
             let unsigned = crate::events::encode_commit(&cdid, &rev, data, None);
             let sec1 = pubkey
                 .strip_prefix('z')
@@ -114,7 +121,11 @@ fn check_commit(did: &str, head: &Head, pubkey: &str) -> J {
 }
 
 /// (records, paths of records that don't decode or hash to their CID).
-async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> XResult<(Vec<StoredRecord>, Vec<String>)> {
+async fn read_records<R: slatedb::DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+) -> XResult<(Vec<StoredRecord>, Vec<String>)> {
     let rprefix = state::record_prefix(did, gen);
     let (mut records, mut bad) = (Vec::new(), Vec::new());
     for (k, v) in scan_keys(db, &rprefix).await? {
@@ -194,7 +205,8 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         k[..k.len() - 8].to_vec()
     };
     let cid_index: HashSet<Bytes> = scan_keys(snap.as_ref(), &cprefix).await?.into_iter().map(|(k, _)| k).collect();
-    let blob_index: HashSet<Bytes> = scan_keys(snap.as_ref(), &state::blob_ref_prefix(did, gen)).await?.into_iter().map(|(k, _)| k).collect();
+    let blob_index: HashSet<Bytes> =
+        scan_keys(snap.as_ref(), &state::blob_ref_prefix(did, gen)).await?.into_iter().map(|(k, _)| k).collect();
     let mut colls = BTreeSet::new();
     for (path, ..) in &records {
         colls.insert(crate::worker::collection_of(path).to_string());
@@ -206,11 +218,16 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
         }
     }
 
-    let recs: Vec<(crate::mst_lazy::Key, Cid)> = records.iter().map(|(p, c, ..)| (Arc::from(p.as_bytes()), *c)).collect();
+    let recs: Vec<(crate::mst_lazy::Key, Cid)> =
+        records.iter().map(|(p, c, ..)| (Arc::from(p.as_bytes()), *c)).collect();
     let (rebuilt, want, tree_nodes) = tokio::task::spawn_blocking(move || -> XResult<(Cid, NodeBlocks, u64)> {
         let mut tree = crate::mst_lazy::build_tree(&recs).map_err(XrpcError::from_err)?;
         let root = tree.root_cid().map_err(XrpcError::from_err)?;
-        Ok((root, crate::mst_lazy::persisted_nodes(&tree, 1), crate::repo_stats::count_tree(&tree).map_err(XrpcError::from_err)?.1))
+        Ok((
+            root,
+            crate::mst_lazy::persisted_nodes(&tree, 1),
+            crate::repo_stats::count_tree(&tree).map_err(XrpcError::from_err)?.1,
+        ))
     })
     .await
     .map_err(XrpcError::from_err)??;
@@ -235,7 +252,8 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     }
     let missing: Vec<&Cid> = want.keys().filter(|c| !have.contains(*c)).collect();
 
-    let want_cids: HashSet<Bytes> = records.iter().map(|(p, c, ..)| Bytes::from(state::record_cid_key(did, gen, c, p))).collect();
+    let want_cids: HashSet<Bytes> =
+        records.iter().map(|(p, c, ..)| Bytes::from(state::record_cid_key(did, gen, c, p))).collect();
     let want_blobs: HashSet<Bytes> = records
         .iter()
         .flat_map(|(p, _, _, bs)| bs.iter().map(move |b| Bytes::from(state::blob_ref_key(did, gen, b, p))))
@@ -368,11 +386,12 @@ async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<R
     }
     let (records, stale_keys) = (ins.records, ins.stale_keys);
     let swap = Some(ins.head.commit);
-    let head = app.account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: swap, stale_keys, tree: None }).await?;
+    let head = app
+        .account_op(&did, crate::worker::AccountOp::ReplaceRepo { records, swap_commit: swap, stale_keys, tree: None })
+        .await?;
     tracing::warn!(%did, commit = %head.commit, rev = %head.rev, "repo rebuilt from its records (admin rebuildRepo)");
     out["commit"] = json!(head.commit.to_string());
     out["rev"] = json!(head.rev.to_string());
     out["after"] = inspect(&app, &did).await?.report;
     Ok(Json(out))
 }
-

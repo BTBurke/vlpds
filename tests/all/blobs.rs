@@ -56,7 +56,8 @@ async fn upload_get_list_and_gc() {
     let gone = up(bytes(10, 9), "image/png").await.ok();
     let missing_cid = gone["blob"]["ref"]["$link"].as_str().unwrap().to_string();
     let missing = missing_cid.as_str();
-    let blob = |cid: &str, size: usize| json!({"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/png", "size": size});
+    let blob =
+        |cid: &str, size: usize| json!({"$type": "blob", "ref": {"$link": cid}, "mimeType": "image/png", "size": size});
     let rec = json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2026-01-01T00:00:00Z", "a": blob(&small_cid, 3000), "b": blob(missing, 10)});
     s.create_record(&a, "app.bsky.feed.post", rec).await;
     use object_store::ObjectStoreExt;

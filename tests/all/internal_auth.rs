@@ -14,7 +14,10 @@ async fn cluster_status(s: &TestServer, token: &str) -> u16 {
 
 async fn private_put(s: &TestServer, routing: &str, key: &[u8]) -> Resp {
     let body = json!({"routing": routing, "muts": [[B64.encode(key), B64.encode(b"x")]]});
-    let rb = peer_client().post(format!("{}/internal/v1/private/put", s.peer_url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN).json(&body);
+    let rb = peer_client()
+        .post(format!("{}/internal/v1/private/put", s.peer_url))
+        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
+        .json(&body);
     s.xrpc.send(rb).await
 }
 
@@ -33,10 +36,14 @@ async fn internal_token_and_private_put_scope() {
     let r = private_put(&s, &a.did, &vlpds::state::private_key(&a.did, "scratch")).await;
     assert_eq!(r.status, 200, "{}", r.text());
     private_put(&s, &a.did, &vlpds::state::head_key(&a.did)).await.err(400, "InvalidRequest");
-    private_put(&s, &a.did, &vlpds::state::record_key(&a.did, 0, "app.bsky.feed.post/x")).await.err(400, "InvalidRequest");
+    private_put(&s, &a.did, &vlpds::state::record_key(&a.did, 0, "app.bsky.feed.post/x"))
+        .await
+        .err(400, "InvalidRequest");
     private_put(&s, &a.did, &vlpds::state::private_key(&b.did, "totp")).await.err(400, "InvalidRequest");
     // a DID that is a prefix of another's can't reach into it
-    private_put(&s, &a.did[..a.did.len() - 1], &vlpds::state::private_key(&a.did, "totp")).await.err(400, "InvalidRequest");
+    private_put(&s, &a.did[..a.did.len() - 1], &vlpds::state::private_key(&a.did, "totp"))
+        .await
+        .err(400, "InvalidRequest");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -63,7 +63,8 @@ pub(super) fn effective(app: &App, l: &Limits) -> (u64, u32) {
     (l.bytes.unwrap_or(app.config.blob_quota_bytes), l.uploads_per_day.unwrap_or(app.config.blob_uploads_per_day))
 }
 
-static LOCKS: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> = std::sync::LazyLock::new(|| (0..256).map(|_| tokio::sync::Mutex::new(())).collect());
+static LOCKS: std::sync::LazyLock<Vec<tokio::sync::Mutex<()>>> =
+    std::sync::LazyLock::new(|| (0..256).map(|_| tokio::sync::Mutex::new(())).collect());
 
 pub(super) async fn lock(did: &str) -> tokio::sync::MutexGuard<'static, ()> {
     LOCKS[(state::did_hash(did) % LOCKS.len() as u64) as usize].lock().await
@@ -268,7 +269,15 @@ pub(super) async fn set_limits(app: &App, did: &str, l: Limits) -> XResult<()> {
 /// Accounts flagged over their byte quota.
 pub(super) async fn over_quota(app: &App) -> XResult<Vec<J>> {
     let root = object_store::path::Path::from(format!("{}/moderation/over-quota", app.store.prefix));
-    let metas: Vec<object_store::ObjectMeta> = app.store.raw.list(Some(&root)).collect::<Vec<_>>().await.into_iter().collect::<Result<_, _>>().map_err(XrpcError::from_err)?;
+    let metas: Vec<object_store::ObjectMeta> = app
+        .store
+        .raw
+        .list(Some(&root))
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()
+        .map_err(XrpcError::from_err)?;
     let mut out = Vec::new();
     for m in metas {
         if let Ok(r) = app.store.raw.get(&m.location).await {

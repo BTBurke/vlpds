@@ -60,8 +60,15 @@ fn record(h: u64, i: usize) -> (&'static str, Vec<u8>) {
         ("app.bsky.graph.follow", vec![("subject".to_string(), Value::Text(did(h)))])
     } else if r < 88.0 {
         let len = 20 + (h % 260) as usize;
-        let text: String = (0..len).map(|k| if k % 6 == 5 { ' ' } else { (b'a' + ((h >> (k % 50)) % 26) as u8) as char }).collect();
-        ("app.bsky.feed.post", vec![("text".to_string(), Value::Text(text)), ("langs".to_string(), Value::Array(vec![Value::Text("en".into())]))])
+        let text: String =
+            (0..len).map(|k| if k % 6 == 5 { ' ' } else { (b'a' + ((h >> (k % 50)) % 26) as u8) as char }).collect();
+        (
+            "app.bsky.feed.post",
+            vec![
+                ("text".to_string(), Value::Text(text)),
+                ("langs".to_string(), Value::Array(vec![Value::Text("en".into())])),
+            ],
+        )
     } else if r < 97.0 {
         ("app.bsky.feed.repost", vec![("subject".to_string(), strong(h))])
     } else {
@@ -129,8 +136,11 @@ async fn import_burst() {
     let cap: u32 = env_or("IMPORT_BURST_CAP", 100_000);
     let big: usize = env_or("IMPORT_BURST_BIG", 1);
     let latency: f64 = env_or("IMPORT_BURST_LATENCY_MS", 25.0);
-    let budget: Option<u64> = std::env::var("IMPORT_BURST_BUDGET_MB").ok().and_then(|v| v.parse().ok()).map(|m: u64| m << 20);
-    let mut sizes: Vec<usize> = (0..n as u64).map(|i| vlpds::real_dist::draw(unit(mix(seed ^ (i << 1))), unit(mix(seed ^ (i << 1 | 1)))).min(cap) as usize).collect();
+    let budget: Option<u64> =
+        std::env::var("IMPORT_BURST_BUDGET_MB").ok().and_then(|v| v.parse().ok()).map(|m: u64| m << 20);
+    let mut sizes: Vec<usize> = (0..n as u64)
+        .map(|i| vlpds::real_dist::draw(unit(mix(seed ^ (i << 1))), unit(mix(seed ^ (i << 1 | 1)))).min(cap) as usize)
+        .collect();
     sizes.extend(std::iter::repeat_n(62_685, big));
     let total = sizes.len();
     let t = Instant::now();
@@ -138,7 +148,14 @@ async fn import_burst() {
         let idx: Vec<(usize, usize)> = sizes.iter().copied().enumerate().collect();
         let chunks: Vec<Vec<(usize, usize)>> = idx.chunks(total.div_ceil(8).max(1)).map(|c| c.to_vec()).collect();
         let mut out: Vec<(usize, Vec<u8>)> = std::thread::scope(|s| {
-            let hs: Vec<_> = chunks.into_iter().map(|c| s.spawn(move || c.into_iter().map(|(i, k)| (i, repo_car(seed ^ (i as u64) << 20, k))).collect::<Vec<_>>())).collect();
+            let hs: Vec<_> = chunks
+                .into_iter()
+                .map(|c| {
+                    s.spawn(move || {
+                        c.into_iter().map(|(i, k)| (i, repo_car(seed ^ (i as u64) << 20, k))).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         out.sort_by_key(|(i, _)| *i);
@@ -166,7 +183,14 @@ async fn import_burst() {
     })
     .await;
     let start = 9_000_000u64;
-    let r = s.xrpc.post("vlpds.admin.bulkCreate", &json!({"start": start, "count": total, "records": 0}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
+    let r = s
+        .xrpc
+        .post(
+            "vlpds.admin.bulkCreate",
+            &json!({"start": start, "count": total, "records": 0}),
+            &Auth::Bearer(ADMIN_TOKEN.into()),
+        )
+        .await;
     assert_eq!(r.status, 200, "{}", r.text());
     let tokens: Vec<String> = (0..total as u64).map(|i| s.app.jwt.access(&vlpds::state::bulk_did(start + i))).collect();
 
@@ -199,7 +223,14 @@ async fn import_burst() {
         .map(|(car, tok)| {
             let (http, url) = (http.clone(), url.clone());
             tokio::spawn(async move {
-                match http.post(url).header("content-type", "application/vnd.ipld.car").bearer_auth(tok).body(car).send().await {
+                match http
+                    .post(url)
+                    .header("content-type", "application/vnd.ipld.car")
+                    .bearer_auth(tok)
+                    .body(car)
+                    .send()
+                    .await
+                {
                     Ok(r) => {
                         let status = r.status().as_u16();
                         let text = r.text().await.unwrap_or_default();

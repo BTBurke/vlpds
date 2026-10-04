@@ -67,7 +67,9 @@ pub fn init(path: Option<PathBuf>) {
         Ok(()) => {
             let _ = FILE.set(path);
         }
-        Err(e) => tracing::warn!(path = %path.display(), "exit-state file not writable (fail-stop reasons will not be kept): {e}"),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "exit-state file not writable (fail-stop reasons will not be kept): {e}")
+        }
     }
 }
 
@@ -88,7 +90,11 @@ pub fn fail_stop(code: i32, reason: &str) -> ! {
     // Straight to fd 2, not eprintln!: libtest captures eprintln! and loses
     // it when exit kills the binary, leaving a bare "exit status: N".
     use std::io::Write;
-    let _ = writeln!(std::io::stderr(), "vlpds fail-stop: exit {code} ({reason}) on thread {}", std::thread::current().name().unwrap_or("?"));
+    let _ = writeln!(
+        std::io::stderr(),
+        "vlpds fail-stop: exit {code} ({reason}) on thread {}",
+        std::thread::current().name().unwrap_or("?")
+    );
     std::process::exit(code)
 }
 
@@ -174,7 +180,8 @@ mod tests {
 
     #[test]
     fn previous_exit_from_the_file() {
-        let dir = std::env::temp_dir().join(format!("vlpds-lifecycle-{}-{}", std::process::id(), crate::tid::now_micros()));
+        let dir =
+            std::env::temp_dir().join(format!("vlpds-lifecycle-{}-{}", std::process::id(), crate::tid::now_micros()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("exit.json");
         assert_eq!(previous(read(&path)).0, "none");
@@ -190,7 +197,11 @@ mod tests {
     /// The only test that calls `init` (it sets the process-wide file).
     #[test]
     fn init_exports_the_previous_exit_and_marks_running() {
-        let dir = std::env::temp_dir().join(format!("vlpds-lifecycle-init-{}-{}", std::process::id(), crate::tid::now_micros()));
+        let dir = std::env::temp_dir().join(format!(
+            "vlpds-lifecycle-init-{}-{}",
+            std::process::id(),
+            crate::tid::now_micros()
+        ));
         let path = dir.join("sub").join("exit.json");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         write(&path, &ExitRecord { reason: "lease_lost".into(), code: Some(5), at: 7.0, pid: 1 }).unwrap();

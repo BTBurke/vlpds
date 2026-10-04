@@ -15,7 +15,10 @@
 
 use crate::common::*;
 use object_store::path::Path;
-use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,18 +47,30 @@ impl StatePuts {
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for StatePuts {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
         self.count(location);
         self.inner.put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.count(location);
         self.inner.put_multipart_opts(location, opts).await
     }
     async fn get_opts(&self, location: &Path, options: GetOptions) -> object_store::Result<GetResult> {
         self.inner.get_opts(location, options).await
     }
-    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         self.inner.delete_stream(locations)
     }
     fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
@@ -116,8 +131,16 @@ async fn own_writes_visible_with_slow_manifest_poll() {
     // compaction ran and the writer saw it well before a 10 s poll could
     // matter: L0 back under the deep mark, with sorted runs
     let t = Instant::now();
-    let seen = eventually(Duration::from_secs(30), || async { (db.manifest().l0().len() < 8 && !db.manifest().compacted().is_empty()).then_some(()) }).await;
-    assert!(seen.is_some(), "writer never saw compaction: L0 {}, {} sorted runs", db.manifest().l0().len(), db.manifest().compacted().len());
+    let seen = eventually(Duration::from_secs(30), || async {
+        (db.manifest().l0().len() < 8 && !db.manifest().compacted().is_empty()).then_some(())
+    })
+    .await;
+    assert!(
+        seen.is_some(),
+        "writer never saw compaction: L0 {}, {} sorted runs",
+        db.manifest().l0().len(),
+        db.manifest().compacted().len()
+    );
     eprintln!("writer saw compaction after {:?}", t.elapsed());
     check(&db, 11, 500).await;
     db.close().await.unwrap();
@@ -127,7 +150,10 @@ async fn own_writes_visible_with_slow_manifest_poll() {
 async fn markers(s: &TestServer) -> Vec<(vlpds::slots::ShardId, Option<(String, u64)>)> {
     let mut v = Vec::new();
     for p in s.app.partitions.owned() {
-        v.push((p.id, p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().map(|b| vlpds::nodelog::decode_marker(&b).unwrap())));
+        v.push((
+            p.id,
+            p.db.get(vlpds::nodelog::META_APPLIED).await.unwrap().map(|b| vlpds::nodelog::decode_marker(&b).unwrap()),
+        ));
     }
     v
 }
@@ -146,7 +172,8 @@ async fn settle(s: &TestServer) -> u64 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn idle_checkpoint_writes_nothing() {
-    let counting = Arc::new(StatePuts { inner: Arc::new(object_store::memory::InMemory::new()), puts: AtomicU64::new(0) });
+    let counting =
+        Arc::new(StatePuts { inner: Arc::new(object_store::memory::InMemory::new()), puts: AtomicU64::new(0) });
     let store: Arc<dyn object_store::ObjectStore> = counting.clone();
     let s = TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -204,9 +231,13 @@ async fn deep_l0_ingest_keeps_up() {
     if let Some(ms) = std::env::var("COMPACTION_POLL_MS").ok().and_then(|v| v.parse().ok()) {
         vlpds::partition::set_compaction_poll_interval(Duration::from_millis(ms));
     }
-    let store = vlpds::store::Store { raw: Arc::new(throttled_store(env_or("INGEST_LATENCY_MS", 10))), ..vlpds::store::Store::memory(None) };
+    let store = vlpds::store::Store {
+        raw: Arc::new(throttled_store(env_or("INGEST_LATENCY_MS", 10))),
+        ..vlpds::store::Store::memory(None)
+    };
     let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(0), None).await.unwrap();
-    let crate::compaction_polling::Ingest { secs, worst, slow, stalled, max_l0 } = crate::compaction_polling::unpaced_ingest(&db, records).await;
+    let crate::compaction_polling::Ingest { secs, worst, slow, stalled, max_l0 } =
+        crate::compaction_polling::unpaced_ingest(&db, records).await;
     eprintln!(
         "ingest: {records} records in {secs:.1} s ({:.0}/s), worst write {worst:?}, {slow} writes > 250 ms ({stalled:?} total), max L0 {max_l0}",
         records as f64 / secs

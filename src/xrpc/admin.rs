@@ -4,8 +4,8 @@
 use super::authn::Credentials;
 use super::server::{
     ctl, delete_account_fully, ext, get_json, invalid_request, normalize_handle, pmut, put_sec, recompute_status,
-    scan_private_routing, set_deactivated, set_email, set_extra, to_json_bytes, update_account, NEW_PASSWORD_MAX_LENGTH,
-    TAKEDOWN,
+    scan_private_routing, set_deactivated, set_email, set_extra, to_json_bytes, update_account,
+    NEW_PASSWORD_MAX_LENGTH, TAKEDOWN,
 };
 use super::*;
 
@@ -93,7 +93,11 @@ async fn reshard(app: &Arc<App>, plan: crate::reshard::Plan, wait: bool) -> XRes
                 break;
             }
             if std::time::Instant::now() > deadline {
-                return Err(XrpcError { status: StatusCode::GATEWAY_TIMEOUT, error: "Timeout".into(), message: format!("op {} still in progress", op.id) });
+                return Err(XrpcError {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    error: "Timeout".into(),
+                    message: format!("op {} still in progress", op.id),
+                });
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -186,7 +190,10 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         for_account: did.into(),
         created_by: "admin".into(),
         created_at: "2026-10-01T00:00:00.000Z".into(),
-        uses: vec![InviteUse { used_by: "did:plc:invitee000000000000000".into(), used_at: "2026-10-01T00:01:00.000Z".into() }],
+        uses: vec![InviteUse {
+            used_by: "did:plc:invitee000000000000000".into(),
+            used_at: "2026-10-01T00:01:00.000Z".into(),
+        }],
     };
     vec![
         (invite_routing(code), "c".into(), super::private_rows::enc(&inv)),
@@ -199,7 +206,11 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
         return Some(super::private_rows::typed_row::<InviteCode>("invite code", val));
     }
     if name.starts_with("invite/") {
-        return Some(if val.is_empty() { Ok("invite code index") } else { Err(anyhow::anyhow!("invite index row with a value")) });
+        return Some(if val.is_empty() {
+            Ok("invite code index")
+        } else {
+            Err(anyhow::anyhow!("invite index row with a value"))
+        });
     }
     None
 }
@@ -310,8 +321,9 @@ pub(super) async fn record_invite_use(app: &App, claim: &InviteClaim, did: &str)
     let code = claim.code.as_str();
     let e = ext(app);
     let _g = e.lock(&invite_routing(code)).await;
-    let mut inv =
-        get_invite(app, code).await?.ok_or_else(|| XrpcError::bad("InvalidInviteCode", "Provided invite code not available"))?;
+    let mut inv = get_invite(app, code)
+        .await?
+        .ok_or_else(|| XrpcError::bad("InvalidInviteCode", "Provided invite code not available"))?;
     inv.uses.push(InviteUse { used_by: did.to_string(), used_at: crate::events::now_rfc3339() });
     put_invite(app, &inv).await?;
     crate::metrics::INVITE_CODES.with_label_values(&["used"]).inc();
@@ -376,7 +388,8 @@ pub(super) fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
 }
 
 async fn account_view(app: &App, a: &Account) -> XResult<J> {
-    let invites: Vec<J> = account_invites(app, &a.did).await?.into_iter().map(|c| serde_json::to_value(c).unwrap()).collect();
+    let invites: Vec<J> =
+        account_invites(app, &a.did).await?.into_iter().map(|c| serde_json::to_value(c).unwrap()).collect();
     let mut v = json!({
         "did": a.did,
         "handle": a.handle,
@@ -472,7 +485,10 @@ impl SearchQ {
 
 /// The local half of searchAccounts: (hits in (slot, did) order after the
 /// cursor, the shards scanned).
-pub(super) async fn search_accounts_local(app: &App, q: &SearchQ) -> XResult<(Vec<AccountHit>, Vec<crate::slots::ShardId>)> {
+pub(super) async fn search_accounts_local(
+    app: &App,
+    q: &SearchQ,
+) -> XResult<(Vec<AccountHit>, Vec<crate::slots::ShardId>)> {
     let (limit, email, after) = q.parsed()?;
     let layout = app.partitions.layout();
     let mut owned = app.partitions.owned();
@@ -547,8 +563,14 @@ fn partial_fields(
     covered: &std::collections::HashSet<crate::slots::ShardId>,
     from: u32,
 ) {
-    let missing: Vec<crate::slots::ShardId> =
-        app.partitions.layout().shards.iter().filter(|r| r.hi > from && !covered.contains(&r.id)).map(|r| r.id).collect();
+    let missing: Vec<crate::slots::ShardId> = app
+        .partitions
+        .layout()
+        .shards
+        .iter()
+        .filter(|r| r.hi > from && !covered.contains(&r.id))
+        .map(|r| r.id)
+        .collect();
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
     }
@@ -566,7 +588,11 @@ struct UpdateHandleIn {
     handle: String,
 }
 
-async fn update_account_handle(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateHandleIn>) -> XResult<StatusCode> {
+async fn update_account_handle(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<UpdateHandleIn>,
+) -> XResult<StatusCode> {
     require_admin(&creds)?;
     let handle = normalize_handle(&inp.handle)?;
     // reference allowAnyValid: no slur or reserved-name checks, but a
@@ -585,7 +611,11 @@ struct UpdateEmailIn {
     email: String,
 }
 
-async fn update_account_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateEmailIn>) -> XResult<StatusCode> {
+async fn update_account_email(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<UpdateEmailIn>,
+) -> XResult<StatusCode> {
     require_admin(&creds)?;
     let missing = || invalid_request(format!("Account does not exist: {}", inp.account));
     let did = app.resolve_repo(&inp.account).await.map_err(|_| missing())?;
@@ -600,7 +630,11 @@ struct UpdatePasswordIn {
     password: String,
 }
 
-async fn update_account_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdatePasswordIn>) -> XResult<StatusCode> {
+async fn update_account_password(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<UpdatePasswordIn>,
+) -> XResult<StatusCode> {
     require_admin(&creds)?;
     if inp.password.len() > NEW_PASSWORD_MAX_LENGTH {
         return Err(invalid_request("Invalid password length."));
@@ -621,7 +655,11 @@ struct UpdateSigningKeyIn {
 /// a did:key reserved with server.reserveSigningKey, or omitted/"generate"
 /// for a fresh key (src/xrpc/key_rotation.rs). With a rotation pending (an
 /// earlier call failed midway), the call finishes that one instead.
-async fn update_account_signing_key(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateSigningKeyIn>) -> XResult<Json<J>> {
+async fn update_account_signing_key(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<UpdateSigningKeyIn>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let acct = app.account(&inp.did).await.map_err(|_| invalid_request(format!("Account not found: {}", inp.did)))?;
     let requested = inp.signing_key.as_deref().filter(|k| !k.is_empty() && *k != "generate");
@@ -634,9 +672,11 @@ async fn update_account_signing_key(State(app): AppState, Auth(creds): Auth, Jso
             if !dk.starts_with("did:key:") {
                 return Err(invalid_request("signingKey must be a did:key"));
             }
-            super::server::take_reserved_key(&app, dk)
-                .await?
-                .ok_or_else(|| invalid_request("signingKey is not a key reserved on this PDS (use com.atproto.server.reserveSigningKey)"))?
+            super::server::take_reserved_key(&app, dk).await?.ok_or_else(|| {
+                invalid_request(
+                    "signingKey is not a key reserved on this PDS (use com.atproto.server.reserveSigningKey)",
+                )
+            })?
         }
         None => Keypair::generate(),
     };
@@ -665,7 +705,8 @@ enum Subject {
 }
 
 fn parse_subject(s: &J) -> XResult<Subject> {
-    let field = |k: &str| s[k].as_str().map(str::to_string).ok_or_else(|| invalid_request(format!("subject.{k} required")));
+    let field =
+        |k: &str| s[k].as_str().map(str::to_string).ok_or_else(|| invalid_request(format!("subject.{k} required")));
     let t = s["$type"].as_str().unwrap_or("");
     match t {
         "com.atproto.admin.defs#repoRef" => Ok(Subject::Repo(field("did")?)),
@@ -709,7 +750,9 @@ async fn update_subject_status(
         use super::moderation::SubjectRef;
         let s = match &subject {
             Subject::Repo(did) => SubjectRef::account(did),
-            Subject::Record { uri, did, cid } => SubjectRef { kind: "record".into(), did: did.clone(), uri: Some(uri.clone()), cid: cid.clone() },
+            Subject::Record { uri, did, cid } => {
+                SubjectRef { kind: "record".into(), did: did.clone(), uri: Some(uri.clone()), cid: cid.clone() }
+            }
             Subject::Blob { did, cid } => SubjectRef::blob(did, cid),
         };
         let actor = match &creds {
@@ -717,7 +760,8 @@ async fn update_subject_status(
             _ => "admin".into(),
         };
         let who = super::moderation::Who { actor, ip: peer.map(|ip| ip.to_string()) };
-        let act = super::moderation::Action { applied: td.applied, reason: None, r#ref: td.r#ref.clone(), case_id: None };
+        let act =
+            super::moderation::Action { applied: td.applied, reason: None, r#ref: td.r#ref.clone(), case_id: None };
         super::moderation::apply(&app, &s, &act, &who).await?;
     }
     if let (Some(d), Subject::Repo(did)) = (&inp.deactivated, &subject) {
@@ -746,7 +790,11 @@ struct SubjectStatusQ {
     blob: Option<String>,
 }
 
-async fn get_subject_status(State(app): AppState, Auth(creds): Auth, Query(q): Query<SubjectStatusQ>) -> XResult<Json<J>> {
+async fn get_subject_status(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Query(q): Query<SubjectStatusQ>,
+) -> XResult<Json<J>> {
     require_moderator(&creds)?;
     let body = if let Some(blob) = &q.blob {
         let did = q.did.as_deref().ok_or_else(|| invalid_request("Must provide a did to request blob state"))?;
@@ -806,7 +854,11 @@ struct DeleteAccountIn {
     did: String,
 }
 
-async fn delete_account(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DeleteAccountIn>) -> XResult<StatusCode> {
+async fn delete_account(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<DeleteAccountIn>,
+) -> XResult<StatusCode> {
     require_admin(&creds)?;
     delete_account_fully(&app, &inp.did).await.map_err(|e| match e.error.as_str() {
         "AccountNotFound" => invalid_request(format!("Account not found: {}", inp.did)),
@@ -833,13 +885,21 @@ async fn set_account_invites_disabled(app: &App, account: &str, disabled: bool) 
     set_invites_disabled(app, &codes, disabled).await
 }
 
-async fn disable_account_invites(State(app): AppState, Auth(creds): Auth, Json(inp): Json<AccountIn>) -> XResult<StatusCode> {
+async fn disable_account_invites(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<AccountIn>,
+) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, true).await?;
     Ok(StatusCode::OK)
 }
 
-async fn enable_account_invites(State(app): AppState, Auth(creds): Auth, Json(inp): Json<AccountIn>) -> XResult<StatusCode> {
+async fn enable_account_invites(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<AccountIn>,
+) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     set_account_invites_disabled(&app, &inp.account, false).await?;
     Ok(StatusCode::OK)
@@ -853,7 +913,11 @@ struct DisableCodesIn {
     accounts: Vec<String>,
 }
 
-async fn disable_invite_codes(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DisableCodesIn>) -> XResult<StatusCode> {
+async fn disable_invite_codes(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<DisableCodesIn>,
+) -> XResult<StatusCode> {
     require_moderator(&creds)?;
     if inp.accounts.iter().any(|a| a == "admin") {
         return Err(invalid_request("cannot disable admin invite codes"));
@@ -924,7 +988,10 @@ impl InviteCodesQ {
 
 /// The local half of getInviteCodes: (at most `limit + 1` codes after the
 /// cursor, so the merger knows whether more exist; the shards scanned).
-pub(super) async fn invite_codes_local(app: &App, q: &InviteCodesQ) -> XResult<(Vec<InviteCode>, Vec<crate::slots::ShardId>)> {
+pub(super) async fn invite_codes_local(
+    app: &App,
+    q: &InviteCodesQ,
+) -> XResult<(Vec<InviteCode>, Vec<crate::slots::ShardId>)> {
     let (usage, limit, after) = q.parsed()?;
     let owned: Vec<crate::slots::ShardId> = app.partitions.owned().iter().map(|p| p.id).collect();
     let mut all: Vec<(InviteKey, InviteCode)> = scan_private_routing(app, "_invite:")
@@ -1042,10 +1109,7 @@ const BULK_EXISTS_CONCURRENCY: usize = 64;
 /// one). Idempotent, so a resumed range is safe.
 async fn bulk_create(State(app): AppState, headers: HeaderMap, Json(inp): Json<BulkCreateIn>) -> XResult<Json<J>> {
     use futures::StreamExt;
-    let tok = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+    let tok = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     if !tok.is_some_and(|t| crate::auth::token_eq(&app.admin_token, t)) {
         return Err(XrpcError::auth("admin token required"));
     }
@@ -1172,9 +1236,8 @@ async fn bulk_password_hash(password: Option<String>) -> XResult<String> {
         }
     }
     let p = pw.clone();
-    let h = tokio::task::spawn_blocking(move || state::hash_password_blocking(&p))
-        .await
-        .map_err(XrpcError::from_err)?;
+    let h =
+        tokio::task::spawn_blocking(move || state::hash_password_blocking(&p)).await.map_err(XrpcError::from_err)?;
     *LAST.lock() = Some((pw, h.clone()));
     Ok(h)
 }
@@ -1232,7 +1295,8 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     let dry = inp.dry_run;
     let (parts, coverage) = scan_set(&app, &inp.shards);
-    let dids: Vec<String> = accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
+    let dids: Vec<String> =
+        accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
     let accounts = dids.len();
     let results: Vec<(String, Result<crate::plc::KeyRotation, crate::plc::PlcError>)> = futures::stream::iter(dids)
         .map(|did| {
@@ -1257,19 +1321,31 @@ async fn rotate_plc_keys(State(app): AppState, Auth(creds): Auth, body: Option<J
             Err(e) => errors.push(format!("{did}: {e}")),
         }
     }
-    tracing::info!(accounts, current, rotated, foreign, errors = errors.len(), dry_run = dry, rotation_key = plc.rotation_did_key(), "rotate PLC keys");
+    tracing::info!(
+        accounts,
+        current,
+        rotated,
+        foreign,
+        errors = errors.len(),
+        dry_run = dry,
+        rotation_key = plc.rotation_did_key(),
+        "rotate PLC keys"
+    );
     let failed = errors.len();
     errors.truncate(20);
-    Ok(Json(with_coverage(coverage, json!({
-        "rotationKey": plc.rotation_did_key(),
-        "dryRun": dry,
-        "accounts": accounts,
-        "current": current,
-        "rotated": rotated,
-        "foreign": foreign,
-        "failed": failed,
-        "errors": errors,
-    }))))
+    Ok(Json(with_coverage(
+        coverage,
+        json!({
+            "rotationKey": plc.rotation_did_key(),
+            "dryRun": dry,
+            "accounts": accounts,
+            "current": current,
+            "rotated": rotated,
+            "foreign": foreign,
+            "failed": failed,
+            "errors": errors,
+        }),
+    )))
 }
 
 #[derive(Deserialize, Default)]
@@ -1290,7 +1366,11 @@ const ENSURE_RECOVERY_CHANGES_SHOWN: usize = 50;
 /// did:plc accounts that lack it (accounts made before it was set, or that
 /// arrived with other keys), just ahead of the server key so keys the user
 /// added stay first. Idempotent.
-async fn ensure_recovery_key(State(app): AppState, Auth(creds): Auth, body: Option<Json<EnsureRecoveryIn>>) -> XResult<Json<J>> {
+async fn ensure_recovery_key(
+    State(app): AppState,
+    Auth(creds): Auth,
+    body: Option<Json<EnsureRecoveryIn>>,
+) -> XResult<Json<J>> {
     use crate::plc::RecoveryKeyOutcome as O;
     use futures::StreamExt;
     require_admin(&creds)?;
@@ -1308,26 +1388,28 @@ async fn ensure_recovery_key(State(app): AppState, Auth(creds): Auth, body: Opti
     let period = std::time::Duration::from_secs_f64(1.0 / per_second);
     let next = Arc::new(tokio::sync::Mutex::new(tokio::time::Instant::now()));
     let (parts, coverage) = scan_set(&app, &inp.shards);
-    let dids: Vec<String> = accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
+    let dids: Vec<String> =
+        accounts_of(&parts).await?.into_iter().map(|a| a.did).filter(|d| crate::plc::valid_plc_did(d)).collect();
     let accounts = dids.len();
-    let results: Vec<(String, Result<crate::plc::RecoveryKeyChange, crate::plc::PlcError>)> = futures::stream::iter(dids)
-        .map(|did| {
-            let (plc, next) = (plc.clone(), next.clone());
-            async move {
-                let at = {
-                    let mut n = next.lock().await;
-                    let at = (*n).max(tokio::time::Instant::now());
-                    *n = at + period;
-                    at
-                };
-                tokio::time::sleep_until(at).await;
-                let r = plc.ensure_recovery_key(&did, dry).await;
-                (did, r)
-            }
-        })
-        .buffer_unordered(ROTATE_PLC_CONCURRENCY)
-        .collect()
-        .await;
+    let results: Vec<(String, Result<crate::plc::RecoveryKeyChange, crate::plc::PlcError>)> =
+        futures::stream::iter(dids)
+            .map(|did| {
+                let (plc, next) = (plc.clone(), next.clone());
+                async move {
+                    let at = {
+                        let mut n = next.lock().await;
+                        let at = (*n).max(tokio::time::Instant::now());
+                        *n = at + period;
+                        at
+                    };
+                    tokio::time::sleep_until(at).await;
+                    let r = plc.ensure_recovery_key(&did, dry).await;
+                    (did, r)
+                }
+            })
+            .buffer_unordered(ROTATE_PLC_CONCURRENCY)
+            .collect()
+            .await;
     let (mut present, mut added, mut foreign, mut full) = (0u64, 0u64, 0u64, 0u64);
     let (mut errors, mut changes) = (Vec::new(), Vec::new());
     for (did, r) in results {
@@ -1353,18 +1435,21 @@ async fn ensure_recovery_key(State(app): AppState, Auth(creds): Auth, body: Opti
     let failed = errors.len() as u64 - full;
     tracing::info!(accounts, present, added, foreign, full, failed, dry_run = dry, recovery_key = %recovery, "ensure PLC recovery key");
     errors.truncate(20);
-    Ok(Json(with_coverage(coverage, json!({
-        "recoveryKey": recovery,
-        "dryRun": dry,
-        "accounts": accounts,
-        "present": present,
-        "added": added,
-        "foreign": foreign,
-        "full": full,
-        "failed": failed,
-        "errors": errors,
-        "changes": changes,
-    }))))
+    Ok(Json(with_coverage(
+        coverage,
+        json!({
+            "recoveryKey": recovery,
+            "dryRun": dry,
+            "accounts": accounts,
+            "present": present,
+            "added": added,
+            "foreign": foreign,
+            "full": full,
+            "failed": failed,
+            "errors": errors,
+            "changes": changes,
+        }),
+    )))
 }
 
 fn with_coverage(coverage: J, mut res: J) -> J {
@@ -1395,7 +1480,8 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     let started = std::time::Instant::now();
     let (parts, coverage) = scan_set(&app, &inp.shards);
-    let dids: Vec<(String, String)> = accounts_of(&parts).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
+    let dids: Vec<(String, String)> =
+        accounts_of(&parts).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
     let (accounts, check, dry) = (dids.len(), inp.check_versions, inp.dry_run);
     let app2 = app.clone();
     // (stale signing key, stale TOTP, error)
@@ -1447,7 +1533,8 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     // the did:key-indexed rows carry the wrapped key
     let mut reserved = 0u64;
     for (routing, name, val) in super::server::scan_private_routing_in(&parts, "_reserved:").await? {
-        let Some(did_key) = routing.strip_prefix("_reserved:").filter(|r| r.starts_with("did:key:") && name == "k") else {
+        let Some(did_key) = routing.strip_prefix("_reserved:").filter(|r| r.starts_with("did:key:") && name == "k")
+        else {
             continue;
         };
         let Ok(mut rec) = serde_json::from_slice::<J>(&val) else { continue };
@@ -1472,19 +1559,32 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
         }
     }
     let stale = keys + totp + reserved;
-    tracing::info!(accounts, signing_keys = keys, totp, reserved, errors = errors.len(), dry_run = dry, kek = app.secrets.current_kid(), elapsed_ms = started.elapsed().as_millis() as u64, "rewrap secrets");
+    tracing::info!(
+        accounts,
+        signing_keys = keys,
+        totp,
+        reserved,
+        errors = errors.len(),
+        dry_run = dry,
+        kek = app.secrets.current_kid(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "rewrap secrets"
+    );
     let failed = errors.len();
     errors.truncate(20);
-    Ok(Json(with_coverage(coverage, json!({
-        "kek": app.secrets.current_kid(),
-        "dryRun": dry,
-        "accounts": accounts,
-        // stale secrets found (dry run) or rewrapped
-        "stale": stale,
-        "signingKeys": keys,
-        "totpSecrets": totp,
-        "reservedKeys": reserved,
-        "failed": failed,
-        "errors": errors,
-    }))))
+    Ok(Json(with_coverage(
+        coverage,
+        json!({
+            "kek": app.secrets.current_kid(),
+            "dryRun": dry,
+            "accounts": accounts,
+            // stale secrets found (dry run) or rewrapped
+            "stale": stale,
+            "signingKeys": keys,
+            "totpSecrets": totp,
+            "reservedKeys": reserved,
+            "failed": failed,
+            "errors": errors,
+        }),
+    )))
 }

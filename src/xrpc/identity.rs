@@ -2,39 +2,15 @@ use super::*;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
-        .route(
-            "/xrpc/com.atproto.identity.resolveHandle",
-            get(resolve_handle),
-        )
+        .route("/xrpc/com.atproto.identity.resolveHandle", get(resolve_handle))
         .route("/xrpc/com.atproto.identity.resolveDid", get(resolve_did))
-        .route(
-            "/xrpc/com.atproto.identity.resolveIdentity",
-            get(resolve_identity),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.refreshIdentity",
-            post(refresh_identity),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.updateHandle",
-            post(update_handle),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
-            get(get_recommended_did_credentials),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.requestPlcOperationSignature",
-            post(request_plc_operation_signature),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.signPlcOperation",
-            post(sign_plc_operation),
-        )
-        .route(
-            "/xrpc/com.atproto.identity.submitPlcOperation",
-            post(submit_plc_operation),
-        )
+        .route("/xrpc/com.atproto.identity.resolveIdentity", get(resolve_identity))
+        .route("/xrpc/com.atproto.identity.refreshIdentity", post(refresh_identity))
+        .route("/xrpc/com.atproto.identity.updateHandle", post(update_handle))
+        .route("/xrpc/com.atproto.identity.getRecommendedDidCredentials", get(get_recommended_did_credentials))
+        .route("/xrpc/com.atproto.identity.requestPlcOperationSignature", post(request_plc_operation_signature))
+        .route("/xrpc/com.atproto.identity.signPlcOperation", post(sign_plc_operation))
+        .route("/xrpc/com.atproto.identity.submitPlcOperation", post(submit_plc_operation))
         .route("/xrpc/vlpds.identity.getPlcData", get(get_plc_data))
         .route("/xrpc/vlpds.identity.getPlcAuditLog", get(get_plc_audit_log))
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
@@ -71,7 +47,9 @@ struct TlsCheckQ {
 /// Caddy's on-demand TLS `ask` endpoint, as the reference PDS
 /// distribution's: Caddy issues a certificate only on 2xx.
 async fn tls_check(State(app): AppState, Query(q): Query<TlsCheckQ>) -> Response {
-    let err = |status: StatusCode, error: &str, message: &str| (status, Json(json!({"error": error, "message": message}))).into_response();
+    let err = |status: StatusCode, error: &str, message: &str| {
+        (status, Json(json!({"error": error, "message": message}))).into_response()
+    };
     let domain = match q.domain.as_deref().map(|d| d.trim_end_matches('.').to_ascii_lowercase()) {
         Some(d) if !d.is_empty() => d,
         _ => return err(StatusCode::BAD_REQUEST, "InvalidRequest", "bad or missing domain query param"),
@@ -112,10 +90,7 @@ pub(crate) fn service_did_doc(did: &str, public_url: &str) -> J {
 /// HTTPS handle verification (reference well-known.ts): the Host is the
 /// handle.
 async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Response {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     let handle = match host.rsplit_once(':') {
         Some((h, port)) if port.bytes().all(|b| b.is_ascii_digit()) => h,
         _ => host,
@@ -168,7 +143,9 @@ pub(crate) async fn account_did_doc(app: &App, acct: &Account) -> Result<Arc<J>,
         return Ok(Arc::new(did_doc(app, acct)));
     }
     match app.did_resolver.resolve(&acct.did).await {
-        Err(crate::did_resolver::ResolveError::Failed(..)) if acct.status.is_none() && !acct.signing_pubkey.is_empty() => {
+        Err(crate::did_resolver::ResolveError::Failed(..))
+            if acct.status.is_none() && !acct.signing_pubkey.is_empty() =>
+        {
             Ok(Arc::new(did_doc(app, acct)))
         }
         r => r,
@@ -179,7 +156,9 @@ fn resolve_error(e: crate::did_resolver::ResolveError) -> XrpcError {
     use crate::did_resolver::ResolveError as E;
     match e {
         E::NotFound(did) | E::BadDid(did) => XrpcError::bad("DidNotFound", format!("DID not found: {did}")),
-        E::Failed(..) => XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message: e.to_string() },
+        E::Failed(..) => {
+            XrpcError { status: StatusCode::BAD_GATEWAY, error: "UpstreamFailure".into(), message: e.to_string() }
+        }
     }
 }
 
@@ -290,7 +269,6 @@ async fn handle_resolves_to(app: &App, handle: &str, did: &str) -> XResult<bool>
     Ok(resolve_external_handle(app, handle).await.as_deref() == Some(did))
 }
 
-
 #[derive(Deserialize)]
 struct DidQ {
     did: String,
@@ -395,10 +373,7 @@ async fn refresh_identity(
     if may_emit {
         // writes nothing: the worker re-announces its current account (a
         // snapshot sent from here could undo a concurrent takedown)
-        app.mutate_account(&acct.did, true, false, false, |a| {
-            Ok(a.status.as_deref() != Some("takendown"))
-        })
-        .await?;
+        app.mutate_account(&acct.did, true, false, false, |a| Ok(a.status.as_deref() != Some("takendown"))).await?;
     }
     Ok(Json(info))
 }
@@ -450,9 +425,7 @@ async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> 
         let body = String::from_utf8_lossy(&buf);
         Ok(body.lines().next().unwrap_or("").trim().to_string())
     };
-    tokio::time::timeout(crate::handle_resolver::TIMEOUT, fetch)
-        .await
-        .map_err(|_| "timed out".to_string())?
+    tokio::time::timeout(crate::handle_resolver::TIMEOUT, fetch).await.map_err(|_| "timed out".to_string())?
 }
 
 async fn update_handle(
@@ -588,7 +561,8 @@ async fn update_did_doc_handle(app: &App, did: &str, handle: &str) -> XResult<()
     } else {
         app.did_resolver.invalidate(did);
         let doc = app.did_resolver.resolve(did).await.map_err(|e| XrpcError::bad("InvalidRequest", e.to_string()))?;
-        let at = doc["alsoKnownAs"].as_array().and_then(|a| a.iter().filter_map(J::as_str).find(|h| h.starts_with("at://")));
+        let at =
+            doc["alsoKnownAs"].as_array().and_then(|a| a.iter().filter_map(J::as_str).find(|h| h.starts_with("at://")));
         if at != Some(format!("at://{handle}").as_str()) {
             return Err(XrpcError::bad("InvalidRequest", "DID is not properly configured for handle"));
         }
@@ -597,10 +571,7 @@ async fn update_did_doc_handle(app: &App, did: &str, handle: &str) -> XResult<()
     Ok(())
 }
 
-async fn get_recommended_did_credentials(
-    State(app): AppState,
-    Auth(creds): Auth,
-) -> XResult<Json<J>> {
+async fn get_recommended_did_credentials(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let acct = app.account(creds.user_did()?).await?;
     Ok(Json(json!({
         "alsoKnownAs": [format!("at://{}", acct.handle)],
@@ -616,7 +587,9 @@ fn plc_service(app: &App) -> XResult<&Arc<crate::plc::Plc>> {
     app.plc.as_ref().ok_or_else(|| XrpcError {
         status: StatusCode::NOT_IMPLEMENTED,
         error: "MethodNotImplemented".into(),
-        message: "PLC operations are not supported: PLC registration is off on this PDS (--plc-mode unregistered, dev only)".into(),
+        message:
+            "PLC operations are not supported: PLC registration is off on this PDS (--plc-mode unregistered, dev only)"
+                .into(),
     })
 }
 
@@ -677,7 +650,9 @@ async fn get_plc_audit_log(State(app): AppState, Query(q): Query<DidQ>) -> XResu
         None => crate::plc::PlcClient::new(&app.config.plc_url),
     };
     let log = client.audit_log(&q.did).await.map_err(|e| match e {
-        crate::plc::PlcError::NotFound(_) => XrpcError::bad("DidNotFound", format!("{} is not in the PLC directory", q.did)),
+        crate::plc::PlcError::NotFound(_) => {
+            XrpcError::bad("DidNotFound", format!("{} is not in the PLC directory", q.did))
+        }
         e => e.into(),
     })?;
     Ok(Json(json!({"did": q.did, "log": log})))
@@ -692,7 +667,8 @@ async fn request_plc_operation_signature(State(app): AppState, Auth(creds): Auth
         check(&[&REQUEST_PLC_OPERATION_SIGNATURE_DAY, &REQUEST_PLC_OPERATION_SIGNATURE_HOUR], &did, 1)?;
     }
     let acct = app.account(&did).await.map_err(|_| XrpcError::bad("InvalidRequest", "account not found"))?;
-    let email = acct.email.clone().ok_or_else(|| XrpcError::bad("InvalidRequest", "account does not have an email address"))?;
+    let email =
+        acct.email.clone().ok_or_else(|| XrpcError::bad("InvalidRequest", "account does not have an email address"))?;
     let permit = super::server::mail_permit(&app, Some(&did), &email, "plc_operation", true).await?;
     let token = super::server::create_email_token(&app, &did, "plc_operation").await?;
     super::server::deliver(&app, permit, &email, crate::mail::Email::PlcOperation { token: &token });
@@ -714,11 +690,10 @@ struct SignPlcIn {
 async fn sign_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SignPlcIn>) -> XResult<Json<J>> {
     let plc = plc_service(&app)?.clone();
     let did = plc_signer(&creds)?;
-    let token = inp
-        .token
-        .as_deref()
-        .filter(|t| !t.is_empty())
-        .ok_or_else(|| XrpcError::bad("InvalidRequest", "email confirmation token required to sign PLC operations"))?;
+    let token =
+        inp.token.as_deref().filter(|t| !t.is_empty()).ok_or_else(|| {
+            XrpcError::bad("InvalidRequest", "email confirmation token required to sign PLC operations")
+        })?;
     super::server::assert_email_token(&app, &did, "plc_operation", token).await?;
     if !did.starts_with("did:plc:") {
         return Err(XrpcError::bad("InvalidRequest", format!("not a did:plc: {did}")));
@@ -774,7 +749,11 @@ struct SubmitPlcIn {
 }
 
 /// The reference's submitPlcOperation checks, then #identity.
-async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp): Json<SubmitPlcIn>) -> XResult<StatusCode> {
+async fn submit_plc_operation(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<SubmitPlcIn>,
+) -> XResult<StatusCode> {
     creds.need_identity("*")?;
     let did = creds.user_did()?.to_string();
     let plc = plc_service(&app)?.clone();
@@ -811,7 +790,8 @@ async fn submit_plc_operation(State(app): AppState, Auth(creds): Auth, Json(inp)
     }
     plc.client.send(&did, &op, "submit").await?;
     app.did_resolver.invalidate(&did);
-    let foreign_keys = op["rotationKeys"].as_array().is_some_and(|a| a.iter().filter_map(J::as_str).any(|k| !plc.is_operator_key(k)));
+    let foreign_keys =
+        op["rotationKeys"].as_array().is_some_and(|a| a.iter().filter_map(J::as_str).any(|k| !plc.is_operator_key(k)));
     if foreign_keys {
         mark_plc_external(&app, &did).await?;
     }

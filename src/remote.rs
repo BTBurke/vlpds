@@ -183,7 +183,21 @@ pub fn follow_log(
         while !stop.load(Ordering::Acquire) {
             match addr() {
                 Some(base) => {
-                    if let Err(e) = stream_live(&log_id, &store, floor, &base, &token, &merger_tx, &wm, &mut next, &stop, &*addr, tls.clone()).await {
+                    if let Err(e) = stream_live(
+                        &log_id,
+                        &store,
+                        floor,
+                        &base,
+                        &token,
+                        &merger_tx,
+                        &wm,
+                        &mut next,
+                        &stop,
+                        &*addr,
+                        tls.clone(),
+                    )
+                    .await
+                    {
                         tracing::debug!(%log_id, "log stream from {base} ended: {e:#}");
                     }
                 }
@@ -228,7 +242,11 @@ async fn catch_up(
             },
             Some(LogObject::Fence { .. }) => return Ok(true),
             Some(LogObject::Segment(h, entries)) => {
-                let _ = merger_tx.send(LogBatch { log_id: log_id.clone(), ordinal: *next, events: segment::events(entries) });
+                let _ = merger_tx.send(LogBatch {
+                    log_id: log_id.clone(),
+                    ordinal: *next,
+                    events: segment::events(entries),
+                });
                 wm.fetch_max(h.last_seq, Ordering::AcqRel);
                 *next += 1;
             }
@@ -250,7 +268,8 @@ async fn stream_live(
     addr: &(dyn Fn() -> Option<String> + Send + Sync),
     tls: Option<tokio_tungstenite::Connector>,
 ) -> anyhow::Result<()> {
-    let tls = tls.ok_or_else(|| anyhow::anyhow!("no peer TLS on this node (a lone node): can't stream {base}'s log"))?;
+    let tls =
+        tls.ok_or_else(|| anyhow::anyhow!("no peer TLS on this node (a lone node): can't stream {base}'s log"))?;
     let Some(rest) = base.strip_prefix("https://") else {
         anyhow::bail!("peer address {base:?} isn't https:// (peers talk mTLS only)");
     };
@@ -355,7 +374,11 @@ mod tests {
         m.extend_from_slice(&u32::MAX.to_be_bytes());
         m.extend_from_slice(&[0u8; 12]);
         assert!(decode(&log, Bytes::from(m)).is_err());
-        let b = LogBatch { log_id: log.clone(), ordinal: 3, events: vec![(5, Bytes::from_static(b"xy")), (9, Bytes::new())] };
+        let b = LogBatch {
+            log_id: log.clone(),
+            ordinal: 3,
+            events: vec![(5, Bytes::from_static(b"xy")), (9, Bytes::new())],
+        };
         match decode(&log, encode_batch(&b)).unwrap() {
             StreamMsg::Batch(got) => assert_eq!((got.ordinal, got.events), (3, b.events)),
             _ => panic!("not a batch"),

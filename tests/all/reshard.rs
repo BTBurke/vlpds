@@ -44,17 +44,29 @@ impl Killable {
 }
 
 use object_store::path::Path;
-use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
+};
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for Killable {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
         self.gate().await;
         let r = self.inner.put_opts(location, payload, opts).await;
         self.gate().await;
         r
     }
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.gate().await;
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -64,7 +76,10 @@ impl object_store::ObjectStore for Killable {
         self.gate().await;
         r
     }
-    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         use futures::StreamExt;
         if self.dead.load(Ordering::SeqCst) {
             return futures::stream::pending().boxed();
@@ -107,7 +122,11 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> Node {
     node_with(id, store, |_| {}).await
 }
 
-async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, f: impl FnOnce(&mut vlpds::server::Config)) -> Node {
+async fn node_with(
+    id: &str,
+    store: &Arc<object_store::memory::InMemory>,
+    f: impl FnOnce(&mut vlpds::server::Config),
+) -> Node {
     let k = Arc::new(Killable { inner: store.clone(), dead: AtomicBool::new(false) });
     let (id, raw) = (id.to_string(), k.clone() as Arc<dyn object_store::ObjectStore>);
     let s = cluster_node(&id, raw, SHARDS, f).await;
@@ -205,7 +224,8 @@ impl Load {
         let urls = Arc::new(parking_lot::Mutex::new(urls));
         let mut handles = Vec::new();
         for (i, acct) in accounts.iter().cloned().enumerate() {
-            let (stop, acked, failed, gaps, urls, statuses) = (stop.clone(), acked.clone(), failed.clone(), gaps.clone(), urls.clone(), statuses.clone());
+            let (stop, acked, failed, gaps, urls, statuses) =
+                (stop.clone(), acked.clone(), failed.clone(), gaps.clone(), urls.clone(), statuses.clone());
             handles.push(tokio::spawn(async move {
                 // one client per node, reused (a client per attempt ran the
                 // box out of ephemeral ports)
@@ -256,7 +276,12 @@ impl Load {
         let want = self.acked() + n;
         let deadline = Instant::now() + Duration::from_secs(30);
         while self.acked() < want {
-            assert!(Instant::now() < deadline, "writes stalled at {} acked ({} failed)", self.acked(), self.failed.load(Ordering::Relaxed));
+            assert!(
+                Instant::now() < deadline,
+                "writes stalled at {} acked ({} failed)",
+                self.acked(),
+                self.failed.load(Ordering::Relaxed)
+            );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -313,14 +338,27 @@ async fn diagnose(n: &TestServer, a: &Acked) {
     let path = a.uri.splitn(4, '/').nth(3).unwrap().to_string();
     let rk = vlpds::state::record_key(&a.did, 0, &path);
     let l = n.app.partitions.layout();
-    eprintln!("DIAG {} slot {} rev {} layout v{} routes to shard {} of {:?}", a.uri, vlpds::slots::slot_of(&a.did), a.rev, l.version, l.shard_of(&a.did), l.ids());
+    eprintln!(
+        "DIAG {} slot {} rev {} layout v{} routes to shard {} of {:?}",
+        a.uri,
+        vlpds::slots::slot_of(&a.did),
+        a.rev,
+        l.version,
+        l.shard_of(&a.did),
+        l.ids()
+    );
     for p in n.app.partitions.owned() {
         let rec = p.db.get(&rk).await.map(|v| v.is_some());
         let head = p.db.get(vlpds::state::head_key(&a.did)).await.map(|v| v.is_some());
         let m = p.db.manifest();
         let ids: Vec<_> = m.l0().iter().map(|v| v.id).collect();
         let repeats = ids.len() - ids.iter().collect::<HashSet<_>>().len();
-        eprintln!("DIAG open shard {}: record {rec:?} head {head:?}; L0 {} ({repeats} repeated view ids), {} sorted runs", p.id, ids.len(), m.compacted().len());
+        eprintln!(
+            "DIAG open shard {}: record {rec:?} head {head:?}; L0 {} ({repeats} repeated view ids), {} sorted runs",
+            p.id,
+            ids.len(),
+            m.compacted().len()
+        );
     }
     for id in (0..l.next_id.0).map(ShardId) {
         let path = vlpds::partition::db_path(&n.app.store, id);
@@ -345,7 +383,11 @@ async fn verify_firehose(sub: &mut Sub, acked: &[Acked]) {
         let left = deadline.saturating_duration_since(Instant::now());
         let Some(f) = sub.next(left).await else {
             let missing: Vec<_> = want.difference(&seen).take(5).collect();
-            panic!("firehose ended or timed out: {} of {} acked commits seen; missing e.g. {missing:?}", want.intersection(&seen).count(), want.len());
+            panic!(
+                "firehose ended or timed out: {} of {} acked commits seen; missing e.g. {missing:?}",
+                want.intersection(&seen).count(),
+                want.len()
+            );
         };
         let Some(c) = f.commit() else { continue };
         assert!(c.seq > last_seq, "seqs out of order: {} after {last_seq}", c.seq);
@@ -583,7 +625,10 @@ async fn abort_before_flip() {
     let stuck = Arc::new(AtomicUsize::new(0));
     {
         let stuck = stuck.clone();
-        vlpds::reshard::set_crash_hook(&b.id(), Some(Arc::new(move |p: &str| p == "cloned" && stuck.fetch_add(1, Ordering::SeqCst) < 1_000_000)));
+        vlpds::reshard::set_crash_hook(
+            &b.id(),
+            Some(Arc::new(move |p: &str| p == "cloned" && stuck.fetch_add(1, Ordering::SeqCst) < 1_000_000)),
+        );
     }
     admin(&a.s, "vlpds.admin.splitShard", json!({"shard": target})).await;
     let t = Instant::now();
@@ -695,7 +740,10 @@ async fn list_repos_across_layout_changes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn policy_splits_a_hot_shard() {
     let store = Arc::new(object_store::memory::InMemory::new());
-    let n = node_with("rspol", &store, |c| c.reshard_policy = vlpds::reshard::Policy { split_bytes: None, split_writes_per_sec: Some(20.0) }).await;
+    let n = node_with("rspol", &store, |c| {
+        c.reshard_policy = vlpds::reshard::Policy { split_bytes: None, split_writes_per_sec: Some(20.0) }
+    })
+    .await;
     let s = &n.s;
     let acct = s.create_account("pol").await;
     let hot = s.app.partitions.shard_of(&acct.did);
@@ -791,7 +839,13 @@ async fn shard_ids_past_u16_end_to_end() {
     use vlpds::slots::{Layout, ShardId};
     let store = Arc::new(object_store::memory::InMemory::new());
     let seeded = Layout { next_id: ShardId(65_534), ..Layout::uniform(SHARDS) };
-    object_store::ObjectStoreExt::put(&*store, &Path::from("vlpds/assign/layout"), serde_json::to_vec(&seeded).unwrap().into()).await.unwrap();
+    object_store::ObjectStoreExt::put(
+        &*store,
+        &Path::from("vlpds/assign/layout"),
+        serde_json::to_vec(&seeded).unwrap().into(),
+    )
+    .await
+    .unwrap();
     let a = node("rsw-a", &store).await;
     let mut accts = accounts(&a.s, 9).await;
     let b = node("rsw-b", &store).await;
@@ -816,7 +870,11 @@ async fn shard_ids_past_u16_end_to_end() {
     // them so both wide shards get accounts and writes
     let child = l2.range_of(l2.shard_of(&probe)).unwrap();
     let slots_in = |accts: &[TestAccount]| -> std::collections::BTreeSet<u32> {
-        accts.iter().map(|x| vlpds::slots::slot_of(&x.did) as u32).filter(|s| (child.lo..child.hi).contains(s)).collect()
+        accts
+            .iter()
+            .map(|x| vlpds::slots::slot_of(&x.did) as u32)
+            .filter(|s| (child.lo..child.hi).contains(s))
+            .collect()
     };
     // (a node mints DIDs in shards it owns: create through the child's owner)
     let minter = *nodes.iter().find(|n| owned(n).contains(&child.id)).expect("the child is owned");
@@ -859,28 +917,48 @@ async fn shard_ids_past_u16_end_to_end() {
     assert!(fenced > 0, "the dead owner's log was fenced");
     // object keys: 10-digit ids under assign/ and state/, every one below next_id
     let keys = keys(&store).await;
-    let assigned: HashSet<ShardId> = keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/")).filter_map(ShardId::from_key).collect();
+    let assigned: HashSet<ShardId> =
+        keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/")).filter_map(ShardId::from_key).collect();
     for w in [65_536u32, 65_537, 65_538] {
         assert!(assigned.contains(&ShardId(w)), "assign/{} missing", ShardId(w).key());
-        assert!(keys.iter().any(|k| k.starts_with(&format!("vlpds/state/{}/", ShardId(w).key()))), "state/{} missing", ShardId(w).key());
+        assert!(
+            keys.iter().any(|k| k.starts_with(&format!("vlpds/state/{}/", ShardId(w).key()))),
+            "state/{} missing",
+            ShardId(w).key()
+        );
     }
     assert!(assigned.iter().all(|s| *s < l5.next_id), "{assigned:?} vs next_id {}", l5.next_id);
-    assert!(keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/")).all(|k| k == "layout" || ShardId::from_key(k).is_some()), "{keys:?}");
+    assert!(
+        keys.iter()
+            .filter_map(|k| k.strip_prefix("vlpds/assign/"))
+            .all(|k| k == "layout" || ShardId::from_key(k).is_some()),
+        "{keys:?}"
+    );
 }
 
 async fn keys(store: &Arc<object_store::memory::InMemory>) -> Vec<String> {
     use futures::TryStreamExt;
-    object_store::ObjectStore::list(&**store, Some(&Path::from("vlpds"))).map_ok(|m| m.location.to_string()).try_collect().await.unwrap()
+    object_store::ObjectStore::list(&**store, Some(&Path::from("vlpds")))
+        .map_ok(|m| m.location.to_string())
+        .try_collect()
+        .await
+        .unwrap()
 }
 
 /// Object keys under the prefix: shard ids with a state dir, shard ids with
 /// an assignment, and log ids under log/.
 async fn bucket(store: &Arc<object_store::memory::InMemory>) -> (Vec<u32>, Vec<u32>, Vec<String>) {
     let keys = keys(store).await;
-    let mut dirs: Vec<u32> = keys.iter().filter_map(|k| k.strip_prefix("vlpds/state/")?.split('/').next().and_then(ShardId::from_key)).map(|s| s.0).collect();
+    let mut dirs: Vec<u32> = keys
+        .iter()
+        .filter_map(|k| k.strip_prefix("vlpds/state/")?.split('/').next().and_then(ShardId::from_key))
+        .map(|s| s.0)
+        .collect();
     dirs.dedup();
-    let assigns: Vec<u32> = keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/").and_then(ShardId::from_key)).map(|s| s.0).collect();
-    let mut logs: Vec<String> = keys.iter().filter_map(|k| Some(k.strip_prefix("vlpds/log/")?.split('/').next()?.to_string())).collect();
+    let assigns: Vec<u32> =
+        keys.iter().filter_map(|k| k.strip_prefix("vlpds/assign/").and_then(ShardId::from_key)).map(|s| s.0).collect();
+    let mut logs: Vec<String> =
+        keys.iter().filter_map(|k| Some(k.strip_prefix("vlpds/log/")?.split('/').next()?.to_string())).collect();
     logs.dedup();
     (dirs, assigns, logs)
 }
@@ -916,7 +994,12 @@ async fn retired_state_gc_over_history() {
             max_inflight: 2,
             full_every: None,
         });
-        c.log_retention = Some(vlpds::retention::Config { window: Duration::ZERO, interval: Duration::from_millis(50), max_deletes: 50, fence_retention: Some(Duration::ZERO) });
+        c.log_retention = Some(vlpds::retention::Config {
+            window: Duration::ZERO,
+            interval: Duration::from_millis(50),
+            max_deletes: 50,
+            fence_retention: Some(Duration::ZERO),
+        });
     };
     let mut nodes = vec![node_with("rsgc-a", &store, gc).await];
     let accts = accounts(&nodes[0].s, 12).await;
@@ -982,15 +1065,34 @@ async fn retired_state_gc_over_history() {
             let mut why = Vec::new();
             for d in dirs.iter().filter(|d| !want.contains(d)) {
                 let path = format!("vlpds/state/{}", ShardId(*d).key());
-                let admin = slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>).build();
-                let cps = admin.list_checkpoints(None).await.map(|v| v.iter().map(|c| (c.id, c.create_time, c.expire_time, c.manifest_id)).collect::<Vec<_>>()); let ext = admin.read_manifest(None).await.ok().flatten().map(|m| m.external_dbs().iter().map(|e| (e.path.clone(), e.source_checkpoint_id, e.final_checkpoint_id, e.sst_ids.len())).collect::<Vec<_>>());
+                let admin =
+                    slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>)
+                        .build();
+                let cps = admin
+                    .list_checkpoints(None)
+                    .await
+                    .map(|v| v.iter().map(|c| (c.id, c.create_time, c.expire_time, c.manifest_id)).collect::<Vec<_>>());
+                let ext = admin.read_manifest(None).await.ok().flatten().map(|m| {
+                    m.external_dbs()
+                        .iter()
+                        .map(|e| (e.path.clone(), e.source_checkpoint_id, e.final_checkpoint_id, e.sst_ids.len()))
+                        .collect::<Vec<_>>()
+                });
                 why.push(format!("{d}: now {} checkpoints {cps:?} external {ext:?}", chrono::Utc::now()));
             }
             for d in &want {
                 let path = format!("vlpds/state/{}", ShardId(*d).key());
-                let admin = slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>).build();
+                let admin =
+                    slatedb::admin::AdminBuilder::new(path, store.clone() as Arc<dyn object_store::ObjectStore>)
+                        .build();
                 if let Ok(Some(m)) = admin.read_manifest(None).await {
-                    why.push(format!("live {d}: external {:?}", m.external_dbs().iter().map(|e| (e.path.clone(), e.sst_ids.len(), e.final_checkpoint_id.is_some())).collect::<Vec<_>>()));
+                    why.push(format!(
+                        "live {d}: external {:?}",
+                        m.external_dbs()
+                            .iter()
+                            .map(|e| (e.path.clone(), e.sst_ids.len(), e.final_checkpoint_id.is_some()))
+                            .collect::<Vec<_>>()
+                    ));
                 }
             }
             panic!(

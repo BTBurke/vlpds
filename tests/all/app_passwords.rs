@@ -100,7 +100,8 @@ async fn app_password_lifecycle() {
     let j = s.xrpc.get("com.atproto.server.listAppPasswords", &[], &app2.auth()).await.ok();
     let pws = j["passwords"].as_array().unwrap();
     assert_eq!(pws.len(), 2, "{j}");
-    let find = |n: &str| pws.iter().find(|p| p["name"] == json!(n)).cloned().unwrap_or_else(|| panic!("{n} not listed"));
+    let find =
+        |n: &str| pws.iter().find(|p| p["name"] == json!(n)).cloned().unwrap_or_else(|| panic!("{n} not listed"));
     assert_eq!(find("privi-pass")["privileged"], json!(true));
     assert_eq!(find("test-pass")["privileged"], json!(false));
     assert!(pws.iter().all(|p| p.get("password").is_none()), "listing must not reveal passwords");

@@ -312,18 +312,12 @@ struct Acct {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(args.threads)
-        .enable_all()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(args.threads).enable_all().build()?;
     rt.block_on(async move {
         match &args.cmd {
-            Cmd::Setup {
-                accounts,
-                records,
-                concurrency,
-                prefix,
-            } => setup(&args, *accounts, *records, *concurrency, prefix).await,
+            Cmd::Setup { accounts, records, concurrency, prefix } => {
+                setup(&args, *accounts, *records, *concurrency, prefix).await
+            }
             Cmd::Run {
                 rate,
                 hot_rate,
@@ -355,33 +349,51 @@ fn main() -> anyhow::Result<()> {
                 )
                 .await
             }
-            Cmd::Methods {
-                only,
-                concurrency,
-                seconds,
-                json_out,
-            } => methods(&args, only, *concurrency, *seconds, json_out).await,
-            Cmd::Fanout {
-                subscribers,
-                seconds,
-                cursor,
-                json_out,
-            } => fanout(&args, *subscribers, *seconds, *cursor, json_out).await,
+            Cmd::Methods { only, concurrency, seconds, json_out } => {
+                methods(&args, only, *concurrency, *seconds, json_out).await
+            }
+            Cmd::Fanout { subscribers, seconds, cursor, json_out } => {
+                fanout(&args, *subscribers, *seconds, *cursor, json_out).await
+            }
             Cmd::Verify { acked } => verify(&args, acked).await,
             Cmd::StubAppview { listen, body_bytes, content_encoding, repo_rev } => {
                 stub_appview(listen, *body_bytes, content_encoding, repo_rev).await
             }
-            Cmd::Proxy { active, concurrency, seconds, path, connections, jwt_secret, service_did, accept_encoding, json_out } => {
-                proxy_bench(&args, *active, *concurrency, *seconds, path, *connections, jwt_secret, service_did, accept_encoding, json_out)
-                    .await
+            Cmd::Proxy {
+                active,
+                concurrency,
+                seconds,
+                path,
+                connections,
+                jwt_secret,
+                service_did,
+                accept_encoding,
+                json_out,
+            } => {
+                proxy_bench(
+                    &args,
+                    *active,
+                    *concurrency,
+                    *seconds,
+                    path,
+                    *connections,
+                    jwt_secret,
+                    service_did,
+                    accept_encoding,
+                    json_out,
+                )
+                .await
             }
-            Cmd::CloneRepo { car, copies, concurrency, blobs_dir } => clone_repo(&args, car, *copies, *concurrency, blobs_dir).await,
+            Cmd::CloneRepo { car, copies, concurrency, blobs_dir } => {
+                clone_repo(&args, car, *copies, *concurrency, blobs_dir).await
+            }
             Cmd::Sweep { sizes, concurrency, seconds, fill_concurrency, json_out, reuse, fill_only } => {
                 sweep(&args, sizes, *concurrency, *seconds, *fill_concurrency, json_out, *reuse, *fill_only).await
             }
             Cmd::Bulk { start, count, batch, max_request_records, concurrency, admin_token, progress_file, dist } => {
                 let d = Dist::new(dist)?;
-                bulk(&args, *start, *count, &d, *batch, *max_request_records, *concurrency, admin_token, progress_file).await
+                bulk(&args, *start, *count, &d, *batch, *max_request_records, *concurrency, admin_token, progress_file)
+                    .await
             }
             Cmd::Dist { start, count, batch, max_request_records, bytes_per_repo, bytes_per_record, dist } => {
                 let d = Dist::new(dist)?;
@@ -425,13 +437,7 @@ fn post_record(i: u64) -> serde_json::Value {
     })
 }
 
-async fn setup(
-    args: &Args,
-    n: usize,
-    records: usize,
-    concurrency: usize,
-    prefix: &str,
-) -> anyhow::Result<()> {
+async fn setup(args: &Args, n: usize, records: usize, concurrency: usize, prefix: &str) -> anyhow::Result<()> {
     let c = client();
     let started = Instant::now();
     let done = Arc::new(AtomicU64::new(0));
@@ -512,7 +518,14 @@ struct Run {
 /// failed write, or the transport failure.
 fn err_kind(e: &anyhow::Error) -> String {
     if let Some(r) = e.downcast_ref::<reqwest::Error>() {
-        return if r.is_timeout() { "timeout" } else if r.is_connect() { "connect" } else { "transport" }.into();
+        return if r.is_timeout() {
+            "timeout"
+        } else if r.is_connect() {
+            "connect"
+        } else {
+            "transport"
+        }
+        .into();
     }
     let s = e.to_string();
     let mut it = s.splitn(2, ": ");
@@ -551,11 +564,8 @@ async fn run(
     sim: Sim,
 ) -> anyhow::Result<()> {
     let c = client();
-    let mut accts: Vec<Acct> = if sim.sim_total > 0 {
-        Vec::new()
-    } else {
-        serde_json::from_slice(&std::fs::read(&args.accounts_file)?)?
-    };
+    let mut accts: Vec<Acct> =
+        if sim.sim_total > 0 { Vec::new() } else { serde_json::from_slice(&std::fs::read(&args.accounts_file)?)? };
     if active > 0 {
         accts.truncate(active);
     }
@@ -571,10 +581,8 @@ async fn run(
                     .await?
                     .json()
                     .await?;
-                let token = r["accessJwt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("createSession failed: {r}"))?
-                    .to_string();
+                let token =
+                    r["accessJwt"].as_str().ok_or_else(|| anyhow::anyhow!("createSession failed: {r}"))?.to_string();
                 anyhow::Ok(Acct { token, ..a })
             }
         })
@@ -585,8 +593,7 @@ async fn run(
         .collect::<Result<_, _>>()?;
     let accts = Arc::new(accts);
     // rkeys created during this run, per account, for updates/deletes
-    let created: Arc<Vec<Mutex<Vec<String>>>> =
-        Arc::new((0..accts.len()).map(|_| Mutex::new(Vec::new())).collect());
+    let created: Arc<Vec<Mutex<Vec<String>>>> = Arc::new((0..accts.len()).map(|_| Mutex::new(Vec::new())).collect());
     let st = Arc::new(Run {
         lat: Mutex::new(hist()),
         window: Mutex::new(hist()),
@@ -604,10 +611,7 @@ async fn run(
 
     if firehose {
         let st = st.clone();
-        let url = format!(
-            "{}/xrpc/com.atproto.sync.subscribeRepos",
-            args.host.replacen("http", "ws", 1)
-        );
+        let url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", args.host.replacen("http", "ws", 1));
         tokio::spawn(async move {
             if let Err(e) = consume_firehose(url, st).await {
                 eprintln!("firehose consumer: {e}");
@@ -616,10 +620,7 @@ async fn run(
     }
 
     if sim.sim_total > 0 {
-        eprintln!(
-            "sim: {} total repos, {} active window, churn {}/s",
-            sim.sim_total, sim.sim_active, sim.sim_churn
-        );
+        eprintln!("sim: {} total repos, {} active window, churn {}/s", sim.sim_total, sim.sim_active, sim.sim_churn);
     }
     eprintln!(
         "run: {} accounts, fleet {rate}/s, hot {hot_rate}/s, {duration}s, mix create/update/delete = {}/{update_pct}/{delete_pct}",
@@ -648,7 +649,10 @@ async fn run(
                     w.reset();
                     r
                 };
-                let kinds: String = std::mem::take(&mut st.err_kinds.lock().0).into_iter().map(|(k, n)| format!(" [{k}]={n}")).collect();
+                let kinds: String = std::mem::take(&mut st.err_kinds.lock().0)
+                    .into_iter()
+                    .map(|(k, n)| format!(" [{k}]={n}"))
+                    .collect();
                 eprintln!(
                     "[{:>4.0}s] ok/s {:>7.0} err {} dropped {} inflight {} | p50 {:.1}ms p99 {:.1}ms max {:.0}ms | firehose ev/s {:.0}{}{kinds}",
                     start.elapsed().as_secs_f64(),
@@ -676,13 +680,7 @@ async fn run(
         if r <= 0.0 {
             continue;
         }
-        let (accts, created, st, host, c) = (
-            accts.clone(),
-            created.clone(),
-            st.clone(),
-            host.clone(),
-            clients.clone(),
-        );
+        let (accts, created, st, host, c) = (accts.clone(), created.clone(), st.clone(), host.clone(), clients.clone());
         let (sim, jwt) = (sim.clone(), jwt.clone());
         gens.push(tokio::spawn(async move {
             let interval = Duration::from_secs_f64(1.0 / r);
@@ -714,52 +712,22 @@ async fn run(
                         };
                         let did = vlpds::state::bulk_did(idx);
                         let token = jwt.access(&did);
-                        Acct {
-                            did,
-                            handle: String::new(),
-                            token,
-                        }
+                        Acct { did, handle: String::new(), token }
                     });
-                    let idx = if hot || sim_target.is_some() {
-                        0
-                    } else {
-                        rand::thread_rng().gen_range(0..accts.len())
-                    };
-                    let (accts, created, st, host, c) = (
-                        accts.clone(),
-                        created.clone(),
-                        st.clone(),
-                        host.clone(),
-                        c.clone(),
-                    );
+                    let idx =
+                        if hot || sim_target.is_some() { 0 } else { rand::thread_rng().gen_range(0..accts.len()) };
+                    let (accts, created, st, host, c) =
+                        (accts.clone(), created.clone(), st.clone(), host.clone(), c.clone());
                     st.inflight.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(async move {
                         let res = match &sim_target {
                             Some(a) => {
-                                one_write(
-                                    c.pick(),
-                                    &host,
-                                    a,
-                                    &Mutex::new(Vec::new()),
-                                    roll,
-                                    update_pct,
-                                    delete_pct,
-                                    i,
-                                )
-                                .await
+                                one_write(c.pick(), &host, a, &Mutex::new(Vec::new()), roll, update_pct, delete_pct, i)
+                                    .await
                             }
                             None => {
-                                one_write(
-                                    c.pick(),
-                                    &host,
-                                    &accts[idx],
-                                    &created[idx],
-                                    roll,
-                                    update_pct,
-                                    delete_pct,
-                                    i,
-                                )
-                                .await
+                                one_write(c.pick(), &host, &accts[idx], &created[idx], roll, update_pct, delete_pct, i)
+                                    .await
                             }
                         };
                         let us = scheduled.elapsed().as_micros() as u64;
@@ -827,10 +795,7 @@ async fn run(
     report("all", &st.lat.lock());
     report("hot-repo", &st.hot_lat.lock());
     if firehose {
-        println!(
-            "firehose events received: {}",
-            st.fh_events.load(Ordering::Relaxed)
-        );
+        println!("firehose events received: {}", st.fh_events.load(Ordering::Relaxed));
         report("fh-lag", &st.fh_lag.lock());
     }
     if let Some(e) = st.first_err.lock().as_ref() {
@@ -876,21 +841,11 @@ async fn one_write(
             "putRecord",
             json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rkey, "record": post_record(i)}),
         ),
-        Some(rkey) => (
-            "deleteRecord",
-            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rkey}),
-        ),
-        None => (
-            "createRecord",
-            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(i)}),
-        ),
+        Some(rkey) => ("deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rkey})),
+        None => ("createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(i)})),
     };
-    let resp = c
-        .post(format!("{host}/xrpc/com.atproto.repo.{method}"))
-        .bearer_auth(&a.token)
-        .json(&body)
-        .send()
-        .await?;
+    let resp =
+        c.post(format!("{host}/xrpc/com.atproto.repo.{method}")).bearer_auth(&a.token).json(&body).send().await?;
     let status = resp.status();
     let bytes = resp.bytes().await?;
     if !status.is_success() {
@@ -922,18 +877,13 @@ async fn consume_firehose(url: String, st: Arc<Run>) -> anyhow::Result<()> {
         }
         if let Some(t) = body.get("time").and_then(|t| t.as_str()) {
             if let Ok(t) = chrono::DateTime::parse_from_rfc3339(t) {
-                let lag = chrono::Utc::now()
-                    .signed_duration_since(t)
-                    .num_microseconds()
-                    .unwrap_or(0)
-                    .max(1);
+                let lag = chrono::Utc::now().signed_duration_since(t).num_microseconds().unwrap_or(0).max(1);
                 let _ = st.fh_lag.lock().record(lag as u64);
             }
         }
     }
     Ok(())
 }
-
 
 use vlpds::real_dist::REAL_DIST;
 
@@ -968,8 +918,22 @@ impl Dist {
         };
         anyhow::ensure!(a.dist_scale >= 1.0, "--dist-scale must be >= 1");
         let mut acc = 0;
-        let cum = REAL_DIST.iter().map(|&(_, _, n)| { acc += n; acc }).collect();
-        Ok(Dist { fixed, cum, scale: a.dist_scale, group: a.dist_group.max(1), seed: a.dist_seed, cap: a.dist_cap, knee: a.dist_knee })
+        let cum = REAL_DIST
+            .iter()
+            .map(|&(_, _, n)| {
+                acc += n;
+                acc
+            })
+            .collect();
+        Ok(Dist {
+            fixed,
+            cum,
+            scale: a.dist_scale,
+            group: a.dist_group.max(1),
+            seed: a.dist_seed,
+            cap: a.dist_cap,
+            knee: a.dist_knee,
+        })
     }
 
     /// Unscaled draw for account `i` (same for its whole group).
@@ -1014,7 +978,8 @@ async fn owned_slots(c: &reqwest::Client, host: &str, admin_token: &str) -> anyh
         .json()
         .await?;
     let Some(shards) = v["layout"]["shards"].as_array() else { return Ok(None) };
-    let owned: std::collections::HashSet<u64> = v["owned"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).collect();
+    let owned: std::collections::HashSet<u64> =
+        v["owned"].as_array().into_iter().flatten().filter_map(|x| x.as_u64()).collect();
     let mut r: Vec<(u32, u32)> = shards
         .iter()
         .filter(|s| s["id"].as_u64().is_some_and(|id| owned.contains(&id)))
@@ -1092,7 +1057,12 @@ async fn bulk(
     let owned = owned_slots(&c, &args.host, admin_token).await?;
     if let Some(o) = &owned {
         let slots: u32 = o.iter().map(|r| r.1 - r.0).sum();
-        eprintln!("bulk: {} serves {} shards ({:.1}% of slots): sending only its DIDs", args.host, o.len(), slots as f64 / 655.36);
+        eprintln!(
+            "bulk: {} serves {} shards ({:.1}% of slots): sending only its DIDs",
+            args.host,
+            o.len(),
+            slots as f64 / 655.36
+        );
         anyhow::ensure!(!o.is_empty(), "{} serves no shards (cluster not converged?)", args.host);
     }
     let t = Instant::now();
@@ -1104,7 +1074,8 @@ async fn bulk(
     // completed ranges past the watermark (requests finish out of order)
     let wm = Arc::new(Mutex::new((start, std::collections::BTreeMap::<u64, u64>::new())));
     let write_progress = {
-        let (done, recs, created, existing, reqs, wm) = (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
+        let (done, recs, created, existing, reqs, wm) =
+            (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
         let path = progress_file.to_string();
         move |fin: bool| {
             let secs = t.elapsed().as_secs_f64();
@@ -1132,18 +1103,31 @@ async fn bulk(
                 let v = wp(false);
                 n += 1;
                 if n.is_multiple_of(5) {
-                    eprintln!("bulk: {}/{count} accounts, {} records ({:.0} accounts/s, {:.0} records/s)",
-                        v["accounts"], v["records"], v["accounts_s"].as_f64().unwrap_or(0.0), v["records_s"].as_f64().unwrap_or(0.0));
+                    eprintln!(
+                        "bulk: {}/{count} accounts, {} records ({:.0} accounts/s, {:.0} records/s)",
+                        v["accounts"],
+                        v["records"],
+                        v["accounts_s"].as_f64().unwrap_or(0.0),
+                        v["records_s"].as_f64().unwrap_or(0.0)
+                    );
                 }
             }
         })
     };
-    let plan = BulkPlan { d, next: start, end: start + count, batch: batch.max(1), max_records: max_records.max(1), owned: owned.as_deref() };
+    let plan = BulkPlan {
+        d,
+        next: start,
+        end: start + count,
+        batch: batch.max(1),
+        max_records: max_records.max(1),
+        owned: owned.as_deref(),
+    };
     let mut results = futures::stream::iter(plan)
         .map(|q| {
             let c = c.clone();
             let host = args.host.clone();
-            let (done, recs, created, existing, reqs, wm) = (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
+            let (done, recs, created, existing, reqs, wm) =
+                (done.clone(), recs.clone(), created.clone(), existing.clone(), reqs.clone(), wm.clone());
             async move {
                 let (lo, hi) = (q.lo, q.hi);
                 if !q.records.is_empty() {
@@ -1151,12 +1135,24 @@ async fn bulk(
                         Some(idx) => json!({"indices": idx, "records": q.records, "password": "hunter2"}),
                         None => json!({"start": lo, "count": hi - lo, "records": q.records, "password": "hunter2"}),
                     };
-                    let resp = c.post(format!("{host}/xrpc/vlpds.admin.bulkCreate")).bearer_auth(admin_token).json(&body).send().await?;
+                    let resp = c
+                        .post(format!("{host}/xrpc/vlpds.admin.bulkCreate"))
+                        .bearer_auth(admin_token)
+                        .json(&body)
+                        .send()
+                        .await?;
                     let status = resp.status();
                     let text = resp.text().await?;
                     let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({"raw": text}));
-                    anyhow::ensure!(status.is_success() && v["failed"].as_u64() == Some(0), "bulk {lo}..{hi} failed: {status} {v}");
-                    anyhow::ensure!(v["notOwned"].as_u64() == Some(0), "bulk {lo}..{hi}: {host} no longer serves {} of its DIDs (layout moved): re-run", v["notOwned"]);
+                    anyhow::ensure!(
+                        status.is_success() && v["failed"].as_u64() == Some(0),
+                        "bulk {lo}..{hi} failed: {status} {v}"
+                    );
+                    anyhow::ensure!(
+                        v["notOwned"].as_u64() == Some(0),
+                        "bulk {lo}..{hi}: {host} no longer serves {} of its DIDs (layout moved): re-run",
+                        v["notOwned"]
+                    );
                     reqs.fetch_add(1, Ordering::Relaxed);
                     created.fetch_add(v["created"].as_u64().unwrap_or(0), Ordering::Relaxed);
                     existing.fetch_add(v["existing"].as_u64().unwrap_or(0), Ordering::Relaxed);
@@ -1197,7 +1193,15 @@ async fn bulk(
     Ok(())
 }
 
-fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, per_repo: f64, per_record: f64) -> anyhow::Result<()> {
+fn dist_report(
+    start: u64,
+    count: u64,
+    d: &Dist,
+    batch: u64,
+    max_records: u64,
+    per_repo: f64,
+    per_record: f64,
+) -> anyhow::Result<()> {
     let t = Instant::now();
     let mut total = 0u64;
     let mut max = 0u32;
@@ -1220,7 +1224,8 @@ fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, p
         i = ge;
     }
     // requests over all nodes (each sends only its own DIDs), as if one node
-    let requests = BulkPlan { d, next: start, end, batch: batch.max(1), max_records: max_records.max(1), owned: None }.count();
+    let requests =
+        BulkPlan { d, next: start, end, batch: batch.max(1), max_records: max_records.max(1), owned: None }.count();
     let q = |p: f64| h.value_at_quantile(p).saturating_sub(1);
     let bytes = per_repo * count as f64 + per_record * total as f64;
     println!(
@@ -1237,7 +1242,6 @@ fn dist_report(start: u64, count: u64, d: &Dist, batch: u64, max_records: u64, p
     );
     Ok(())
 }
-
 
 fn method_keys() -> Vec<&'static str> {
     vec![
@@ -1275,13 +1279,7 @@ struct Ctx {
     seq: AtomicU64,
 }
 
-async fn methods(
-    args: &Args,
-    only: &str,
-    concurrency: usize,
-    seconds: u64,
-    json_out: &str,
-) -> anyhow::Result<()> {
+async fn methods(args: &Args, only: &str, concurrency: usize, seconds: u64, json_out: &str) -> anyhow::Result<()> {
     let c = client();
     let mut accts: Vec<Acct> = serde_json::from_slice(&std::fs::read(&args.accounts_file)?)?;
     accts.truncate(2000);
@@ -1297,10 +1295,7 @@ async fn methods(
                     .await?
                     .json()
                     .await?;
-                let token = r["accessJwt"]
-                    .as_str()
-                    .ok_or_else(|| anyhow::anyhow!("createSession: {r}"))?
-                    .to_string();
+                let token = r["accessJwt"].as_str().ok_or_else(|| anyhow::anyhow!("createSession: {r}"))?.to_string();
                 let refresh = r["refreshJwt"].as_str().unwrap_or_default().to_string();
                 anyhow::Ok((Acct { token, ..a }, refresh))
             }
@@ -1318,7 +1313,10 @@ async fn methods(
             let host = args.host.clone();
             async move {
                 let r: serde_json::Value = c
-                    .get(format!("{host}/xrpc/com.atproto.repo.listRecords?repo={}&collection=app.bsky.feed.post&limit=20", a.did))
+                    .get(format!(
+                        "{host}/xrpc/com.atproto.repo.listRecords?repo={}&collection=app.bsky.feed.post&limit=20",
+                        a.did
+                    ))
                     .send()
                     .await?
                     .json()
@@ -1326,7 +1324,9 @@ async fn methods(
                 anyhow::Ok(
                     r["records"]
                         .as_array()
-                        .map(|a| a.iter().filter_map(|r| r["uri"].as_str()?.rsplit('/').next().map(String::from)).collect())
+                        .map(|a| {
+                            a.iter().filter_map(|r| r["uri"].as_str()?.rsplit('/').next().map(String::from)).collect()
+                        })
                         .unwrap_or_default(),
                 )
             }
@@ -1361,11 +1361,7 @@ async fn methods(
         refresh: Mutex::new(refresh),
         seq: AtomicU64::new(0),
     });
-    let keys: Vec<&str> = if only.is_empty() {
-        method_keys()
-    } else {
-        only.split(',').collect()
-    };
+    let keys: Vec<&str> = if only.is_empty() { method_keys() } else { only.split(',').collect() };
     let mut out = String::new();
     println!(
         "{:<18} {:>10} {:>9} {:>9} {:>9} {:>9} {:>7}",
@@ -1413,14 +1409,8 @@ async fn bench_one(
     let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut tasks = Vec::new();
     for _ in 0..concurrency {
-        let (ctx, c, hist, n, errs, first_err) = (
-            ctx.clone(),
-            c.clone(),
-            hist.clone(),
-            n.clone(),
-            errs.clone(),
-            first_err.clone(),
-        );
+        let (ctx, c, hist, n, errs, first_err) =
+            (ctx.clone(), c.clone(), hist.clone(), n.clone(), errs.clone(), first_err.clone());
         let key = key.to_string();
         tasks.push(tokio::spawn(async move {
             while Instant::now() < deadline {
@@ -1443,12 +1433,7 @@ async fn bench_one(
     }
     let h = hist.lock().clone();
     let fe = first_err.lock().clone();
-    (
-        n.load(Ordering::Relaxed),
-        errs.load(Ordering::Relaxed),
-        h,
-        fe,
-    )
+    (n.load(Ordering::Relaxed), errs.load(Ordering::Relaxed), h, fe)
 }
 
 async fn call(ctx: &Ctx, c: &reqwest::Client, key: &str) -> anyhow::Result<()> {
@@ -1525,14 +1510,9 @@ async fn call(ctx: &Ctx, c: &reqwest::Client, key: &str) -> anyhow::Result<()> {
     let r = req.send().await?;
     let status = r.status();
     let body = r.bytes().await?;
-    anyhow::ensure!(
-        status.is_success(),
-        "{key} {status}: {}",
-        String::from_utf8_lossy(&body)
-    );
+    anyhow::ensure!(status.is_success(), "{key} {status}: {}", String::from_utf8_lossy(&body));
     Ok(())
 }
-
 
 async fn fanout(
     args: &Args,
@@ -1542,10 +1522,7 @@ async fn fanout(
     json_out: &str,
 ) -> anyhow::Result<()> {
     use tokio_tungstenite::tungstenite::Message;
-    let mut url = format!(
-        "{}/xrpc/com.atproto.sync.subscribeRepos",
-        args.host.replacen("http", "ws", 1)
-    );
+    let mut url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", args.host.replacen("http", "ws", 1));
     if let Some(c) = cursor {
         url.push_str(&format!("?cursor={c}"));
     }
@@ -1583,11 +1560,8 @@ async fn fanout(
                                 .and_then(|t| t.as_str())
                                 .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
                             {
-                                let l = chrono::Utc::now()
-                                    .signed_duration_since(t)
-                                    .num_microseconds()
-                                    .unwrap_or(0)
-                                    .max(1);
+                                let l =
+                                    chrono::Utc::now().signed_duration_since(t).num_microseconds().unwrap_or(0).max(1);
                                 let _ = lag.record(l as u64);
                             }
                         }
@@ -1691,10 +1665,13 @@ async fn verify(args: &Args, acked: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 /// A sweep repo an earlier `sweep --reuse` filled: (did, its blobs' CIDs),
 /// or None if `sw<size>.vlpds.test` doesn't exist.
-async fn sweep_reuse(c: &reqwest::Client, h: &str, size: usize) -> anyhow::Result<Option<(String, Vec<(String, u64)>)>> {
+async fn sweep_reuse(
+    c: &reqwest::Client,
+    h: &str,
+    size: usize,
+) -> anyhow::Result<Option<(String, Vec<(String, u64)>)>> {
     let r = c
         .post(format!("{h}/xrpc/com.atproto.server.createSession"))
         .json(&json!({"identifier": format!("sw{size}.vlpds.test"), "password": "hunter2"}))
@@ -1724,7 +1701,16 @@ async fn sweep_reuse(c: &reqwest::Client, h: &str, size: usize) -> anyhow::Resul
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, fill_concurrency: usize, json_out: &str, reuse: bool, fill_only: bool) -> anyhow::Result<()> {
+async fn sweep(
+    args: &Args,
+    sizes: &[usize],
+    concurrency: usize,
+    seconds: u64,
+    fill_concurrency: usize,
+    json_out: &str,
+    reuse: bool,
+    fill_only: bool,
+) -> anyhow::Result<()> {
     let c = client();
     let h = args.host.clone();
     let mut out = String::new();
@@ -1737,7 +1723,11 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
             eprintln!("== repo of {size} records reused ({did}, {} blobs)", blobs.len());
             (did, Arc::new(blobs), None)
         } else {
-            let handle = if reuse { format!("sw{size}.vlpds.test") } else { format!("sw{size}x{}.vlpds.test", rand::random::<u16>()) };
+            let handle = if reuse {
+                format!("sw{size}.vlpds.test")
+            } else {
+                format!("sw{size}x{}.vlpds.test", rand::random::<u16>())
+            };
             let r: serde_json::Value = c
                 .post(format!("{h}/xrpc/com.atproto.server.createAccount"))
                 .json(&json!({"handle": handle, "password": "hunter2", "email": format!("{}@example.com", handle.replace('.', "-"))}))
@@ -1766,7 +1756,10 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
                             .await?
                             .json()
                             .await?;
-                        let cid = v["blob"]["ref"]["$link"].as_str().ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?.to_string();
+                        let cid = v["blob"]["ref"]["$link"]
+                            .as_str()
+                            .ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?
+                            .to_string();
                         anyhow::Ok((cid, size))
                     }
                 })
@@ -1863,7 +1856,18 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
             b.sort();
             b.get(b.len() / 2).copied().unwrap_or_default().into()
         };
-        let methods = ["getRecord", "listRecords", "listRecordsDeep", "describeRepo", "getLatestCommit", "getRepoStatus", "sync.getRecord", "getBlocks10", "listBlobs", "listBlobsDeep"];
+        let methods = [
+            "getRecord",
+            "listRecords",
+            "listRecordsDeep",
+            "describeRepo",
+            "getLatestCommit",
+            "getRepoStatus",
+            "sync.getRecord",
+            "getBlocks10",
+            "listBlobs",
+            "listBlobsDeep",
+        ];
         match fill_secs {
             Some(f) => println!("\n### repo size {size}  (fill {:.0} rec/s)", size as f64 / f),
             None => println!("\n### repo size {size}  (reused)"),
@@ -1876,8 +1880,18 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
             let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             let mut tasks = Vec::new();
             for _ in 0..concurrency {
-                let (c, h, did, rkeys, cids, mid_blob, hist_all, n, errs, first_err) =
-                    (c.clone(), h.clone(), did.clone(), rkeys.clone(), cids.clone(), mid_blob.clone(), hist_all.clone(), n.clone(), errs.clone(), first_err.clone());
+                let (c, h, did, rkeys, cids, mid_blob, hist_all, n, errs, first_err) = (
+                    c.clone(),
+                    h.clone(),
+                    did.clone(),
+                    rkeys.clone(),
+                    cids.clone(),
+                    mid_blob.clone(),
+                    hist_all.clone(),
+                    n.clone(),
+                    errs.clone(),
+                    first_err.clone(),
+                );
                 tasks.push(tokio::spawn(async move {
                     while Instant::now() < deadline {
                         let rk = rkeys.get(rand::thread_rng().gen_range(0..rkeys.len().max(1))).cloned().unwrap_or_default();
@@ -1947,7 +1961,12 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
                 bytes += chunk.len();
             }
             let secs = t.elapsed().as_secs_f64();
-            println!("getRepo run {i}: {:.1} MB in {secs:.2}s ({:.0} MB/s), ttfb {:.0} ms", bytes as f64 / 1e6, bytes as f64 / 1e6 / secs, ttfb * 1000.0);
+            println!(
+                "getRepo run {i}: {:.1} MB in {secs:.2}s ({:.0} MB/s), ttfb {:.0} ms",
+                bytes as f64 / 1e6,
+                bytes as f64 / 1e6 / secs,
+                ttfb * 1000.0
+            );
             out.push_str(&serde_json::to_string(&json!({"size": size, "method": "getRepo", "run": i, "bytes": bytes, "secs": secs, "ttfb_ms": ttfb * 1000.0}))?);
             out.push('\n');
         }
@@ -1963,12 +1982,14 @@ async fn sweep(args: &Args, sizes: &[usize], concurrency: usize, seconds: u64, f
     Ok(())
 }
 
-
 fn collect_blob_links(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
     match v {
         serde_json::Value::Object(m) => {
             if m.get("$type").and_then(|t| t.as_str()) == Some("blob") {
-                if let (Some(link), mime) = (m.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()), m.get("mimeType").and_then(|t| t.as_str())) {
+                if let (Some(link), mime) = (
+                    m.get("ref").and_then(|r| r.get("$link")).and_then(|l| l.as_str()),
+                    m.get("mimeType").and_then(|t| t.as_str()),
+                ) {
                     out.push((link.to_string(), mime.unwrap_or("application/octet-stream").to_string()));
                 }
             }
@@ -1996,10 +2017,17 @@ fn rewrite_blob_links(v: &mut serde_json::Value, map: &std::collections::HashMap
     }
 }
 
-async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usize, blobs_dir: &str) -> anyhow::Result<()> {
+async fn clone_repo(
+    args: &Args,
+    car_path: &str,
+    copies: usize,
+    concurrency: usize,
+    blobs_dir: &str,
+) -> anyhow::Result<()> {
     let data = std::fs::read(car_path)?;
     let (roots, blocks) = vlpds::car::read_car(&data)?;
-    let map: std::collections::HashMap<vlpds::cid::Cid, Vec<u8>> = blocks.iter().map(|(c, b)| (*c, b.to_vec())).collect();
+    let map: std::collections::HashMap<vlpds::cid::Cid, Vec<u8>> =
+        blocks.iter().map(|(c, b)| (*c, b.to_vec())).collect();
     let commit = vlpds::cbor::Value::decode(&map[&roots[0]])?;
     let Some(vlpds::cbor::Value::Link(data_root)) = commit.get("data") else { anyhow::bail!("no data root in commit") };
     let tree = vlpds::mst::Tree::load_from_blocks(&map, *data_root)?;
@@ -2024,7 +2052,12 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
         eprintln!("warning: {e}");
     }
     let total_bytes: usize = by_coll.values().map(|v| v.1).sum();
-    eprintln!("source repo: {} records, {:.1} MB of record blocks, {} MST+record blocks", records.len(), total_bytes as f64 / 1e6, map.len());
+    eprintln!(
+        "source repo: {} records, {:.1} MB of record blocks, {} MST+record blocks",
+        records.len(),
+        total_bytes as f64 / 1e6,
+        map.len()
+    );
     for (c, (n, b)) in &by_coll {
         eprintln!("  {c:<40} {n:>7} records {:>8.1} KB", *b as f64 / 1e3);
     }
@@ -2038,7 +2071,8 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
 
     let c = client();
     let h = args.host.clone();
-    let mut accts: Vec<Acct> = std::fs::read(&args.accounts_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut accts: Vec<Acct> =
+        std::fs::read(&args.accounts_file).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     for copy in 0..copies {
         let t = Instant::now();
         let handle = format!("c{copy}x{}.vlpds.test", rand::random::<u32>());
@@ -2055,7 +2089,8 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
             .map(|(old, mime)| {
                 let (c, h, token) = (c.clone(), h.clone(), token.clone());
                 async move {
-                    let real = (!blobs_dir.is_empty()).then(|| std::fs::read(format!("{blobs_dir}/{old}")).ok()).flatten();
+                    let real =
+                        (!blobs_dir.is_empty()).then(|| std::fs::read(format!("{blobs_dir}/{old}")).ok()).flatten();
                     let body = real.unwrap_or_else(|| format!("stand-in for {old}").into_bytes());
                     let size = body.len() as u64;
                     let v: serde_json::Value = c
@@ -2067,7 +2102,10 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
                         .await?
                         .json()
                         .await?;
-                    let new = v["blob"]["ref"]["$link"].as_str().ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?.to_string();
+                    let new = v["blob"]["ref"]["$link"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("uploadBlob: {v}"))?
+                        .to_string();
                     anyhow::Ok((old, (new, size)))
                 }
             })
@@ -2136,14 +2174,17 @@ async fn clone_repo(args: &Args, car_path: &str, copies: usize, concurrency: usi
             "copy {copy}: {did} ({handle}) {} records in {:.1}s, {f} failed{}",
             records.len() - f as usize,
             t.elapsed().as_secs_f64(),
-            first_err.lock().as_ref().map(|e| format!(" (first error: {})", e.chars().take(200).collect::<String>())).unwrap_or_default()
+            first_err
+                .lock()
+                .as_ref()
+                .map(|e| format!(" (first error: {})", e.chars().take(200).collect::<String>()))
+                .unwrap_or_default()
         );
         accts.push(Acct { did, handle, token });
     }
     std::fs::write(&args.accounts_file, serde_json::to_vec(&accts)?)?;
     Ok(())
 }
-
 
 async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str, repo_rev: &str) -> anyhow::Result<()> {
     let body = if content_encoding.is_empty() {
@@ -2157,7 +2198,10 @@ async fn stub_appview(listen: &str, body_bytes: usize, content_encoding: &str, r
     let app = axum::Router::new().fallback(move || {
         let (body, ce, rev) = (body.clone(), ce.clone(), rev.clone());
         async move {
-            let mut r = axum::response::IntoResponse::into_response(([(axum::http::header::CONTENT_TYPE, "application/json")], body));
+            let mut r = axum::response::IntoResponse::into_response((
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                body,
+            ));
             if let Some(ce) = ce {
                 r.headers_mut().insert(axum::http::header::CONTENT_ENCODING, ce);
             }
@@ -2238,7 +2282,8 @@ async fn proxy_bench(
                                     err += 1;
                                     let st = r.status();
                                     let b = r.text().await.unwrap_or_default();
-                                    first_err.get_or_insert(format!("{st} {}", b.chars().take(160).collect::<String>()));
+                                    first_err
+                                        .get_or_insert(format!("{st} {}", b.chars().take(160).collect::<String>()));
                                 }
                                 Err(e) => {
                                     err += 1;
@@ -2286,9 +2331,11 @@ async fn proxy_bench(
     if !json_out.is_empty() {
         std::fs::write(
             json_out,
-            serde_json::to_string(&json!({"active": active, "concurrency": concurrency, "connections": connections, "path": path,
+            serde_json::to_string(
+                &json!({"active": active, "concurrency": concurrency, "connections": connections, "path": path,
                 "req_per_s": ok as f64 / secs, "errors": err, "mb_per_s": bytes as f64 / secs / 1e6,
-                "p50_ms": q(0.5), "p90_ms": q(0.9), "p99_ms": q(0.99), "p999_ms": q(0.999), "max_ms": h.max() as f64 / 1000.0, "first_error": fe}))?,
+                "p50_ms": q(0.5), "p90_ms": q(0.9), "p99_ms": q(0.99), "p999_ms": q(0.999), "max_ms": h.max() as f64 / 1000.0, "first_error": fe}),
+            )?,
         )?;
     }
     Ok(())

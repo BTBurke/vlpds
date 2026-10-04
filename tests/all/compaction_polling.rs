@@ -7,12 +7,14 @@
 
 use crate::common::{env_or, throttled_store};
 use object_store::path::Path;
-use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult,
+};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use vlpds::partition::CompactionPolling;
-
 
 /// Counts requests (GET, PUT, LIST, DELETE) on top of another store.
 #[derive(Debug)]
@@ -41,11 +43,20 @@ impl Counting {
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for Counting {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
         self.hit(1);
         self.inner.put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.hit(1);
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -53,7 +64,10 @@ impl object_store::ObjectStore for Counting {
         self.hit(0);
         self.inner.get_opts(location, options).await
     }
-    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         self.hit(3);
         self.inner.delete_stream(locations)
     }
@@ -117,7 +131,8 @@ pub(crate) async fn unpaced_ingest(db: &slatedb::Db, records: u64) -> Ingest {
     out
 }
 
-const MODES: [(&str, CompactionPolling); 3] = [("slow", CompactionPolling::Slow), ("adaptive", CompactionPolling::Adaptive), ("fast", CompactionPolling::Fast)];
+const MODES: [(&str, CompactionPolling); 3] =
+    [("slow", CompactionPolling::Slow), ("adaptive", CompactionPolling::Adaptive), ("fast", CompactionPolling::Fast)];
 
 /// Idle shards: requests per shard per second by mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -133,7 +148,9 @@ async fn idle_requests_per_mode() {
         for s in 0..shards {
             let db = vlpds::partition::open_db(&store, vlpds::slots::ShardId(s), None).await.unwrap();
             db.put(b"k", b"v").await.unwrap();
-            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
             dbs.push(db);
         }
         tokio::time::sleep(Duration::from_secs(6)).await;
@@ -141,7 +158,14 @@ async fn idle_requests_per_mode() {
         tokio::time::sleep(Duration::from_secs(secs)).await;
         let [g, p, l, d] = counting.take();
         let per = |n: u64| n as f64 / secs as f64 / shards as f64;
-        eprintln!("idle {name}: per shard per second: {:.2} GET, {:.2} PUT, {:.2} LIST, {:.2} DELETE ({:.2} total)", per(g), per(p), per(l), per(d), per(g + p + l + d));
+        eprintln!(
+            "idle {name}: per shard per second: {:.2} GET, {:.2} PUT, {:.2} LIST, {:.2} DELETE ({:.2} total)",
+            per(g),
+            per(p),
+            per(l),
+            per(d),
+            per(g + p + l + d)
+        );
         for db in dbs {
             db.close().await.unwrap();
         }

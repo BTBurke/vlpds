@@ -26,7 +26,9 @@ impl ShardId {
     }
 
     pub fn from_key(s: &str) -> Option<ShardId> {
-        (s.len() == Self::KEY_WIDTH && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok().map(ShardId)).flatten()
+        (s.len() == Self::KEY_WIDTH && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse().ok().map(ShardId))
+            .flatten()
     }
 
     pub fn next(self) -> Option<ShardId> {
@@ -146,7 +148,11 @@ impl Layout {
     /// The next `n` unused ids. `with_op` advances `next_id` past them; the
     /// layout's CAS makes that stick exactly once.
     pub fn alloc(&self, n: u32) -> anyhow::Result<Vec<ShardId>> {
-        let end = self.next_id.0.checked_add(n).ok_or_else(|| anyhow::anyhow!("shard ids exhausted (next_id {})", self.next_id))?;
+        let end = self
+            .next_id
+            .0
+            .checked_add(n)
+            .ok_or_else(|| anyhow::anyhow!("shard ids exhausted (next_id {})", self.next_id))?;
         Ok((self.next_id.0..end).map(ShardId).collect())
     }
 
@@ -156,7 +162,10 @@ impl Layout {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(!self.shards.is_empty(), "empty layout");
-        anyhow::ensure!(self.shards[0].lo == 0 && self.shards.last().unwrap().hi == SLOTS, "layout must cover [0, 65536)");
+        anyhow::ensure!(
+            self.shards[0].lo == 0 && self.shards.last().unwrap().hi == SLOTS,
+            "layout must cover [0, 65536)"
+        );
         for c in self.op.iter().flat_map(|o| &o.children) {
             anyhow::ensure!(c.id < self.next_id, "op child id {} >= next_id {}", c.id, self.next_id);
         }
@@ -218,8 +227,16 @@ impl Layout {
     /// `left` and `right` must be adjacent, in slot order.
     pub fn plan_merge(&self, left: ShardId, right: ShardId, driver: &str) -> anyhow::Result<Reshard> {
         anyhow::ensure!(self.op.is_none(), "a reshard is already in progress");
-        let i = self.shards.iter().position(|r| r.id == left).ok_or_else(|| anyhow::anyhow!("no shard {left} in layout v{}", self.version))?;
-        let r = self.shards.get(i + 1).filter(|r| r.id == right).ok_or_else(|| anyhow::anyhow!("shard {right} does not follow {left}"))?;
+        let i = self
+            .shards
+            .iter()
+            .position(|r| r.id == left)
+            .ok_or_else(|| anyhow::anyhow!("no shard {left} in layout v{}", self.version))?;
+        let r = self
+            .shards
+            .get(i + 1)
+            .filter(|r| r.id == right)
+            .ok_or_else(|| anyhow::anyhow!("shard {right} does not follow {left}"))?;
         let id = self.alloc(1)?[0];
         Ok(Reshard {
             id: self.op_seq + 1,
@@ -239,14 +256,25 @@ impl Layout {
     }
 
     pub fn flipped(&self, op: &Reshard) -> anyhow::Result<Layout> {
-        let first = self.shards.iter().position(|r| r.id == op.parents[0]).ok_or_else(|| anyhow::anyhow!("parent {} not in layout", op.parents[0]))?;
+        let first = self
+            .shards
+            .iter()
+            .position(|r| r.id == op.parents[0])
+            .ok_or_else(|| anyhow::anyhow!("parent {} not in layout", op.parents[0]))?;
         for (k, p) in op.parents.iter().enumerate() {
             anyhow::ensure!(self.shards.get(first + k).is_some_and(|r| r.id == *p), "parents not adjacent in layout");
         }
         let mut shards = self.shards.clone();
         shards.splice(first..first + op.parents.len(), op.children.iter().copied());
         let next_id = self.next_id_after(op);
-        let l = Layout { version: self.version + 1, shards, next_id, op_seq: self.op_seq, op: None, extra: self.extra.clone() };
+        let l = Layout {
+            version: self.version + 1,
+            shards,
+            next_id,
+            op_seq: self.op_seq,
+            op: None,
+            extra: self.extra.clone(),
+        };
         l.validate()?;
         Ok(l)
     }
@@ -341,7 +369,10 @@ mod tests {
     fn split_and_merge_regroup_slots() {
         let l = Layout::uniform(4);
         let op = l.plan_split(s(1), None, "n").unwrap();
-        assert_eq!(op.children, vec![ShardRange { id: s(4), lo: 16384, hi: 24576 }, ShardRange { id: s(5), lo: 24576, hi: 32768 }]);
+        assert_eq!(
+            op.children,
+            vec![ShardRange { id: s(4), lo: 16384, hi: 24576 }, ShardRange { id: s(5), lo: 24576, hi: 32768 }]
+        );
         let l2 = l.with_op(op.clone());
         assert!(l2.plan_split(s(0), None, "n").is_err(), "one op at a time");
         let l2 = l2.flipped(&op).unwrap();
@@ -359,7 +390,11 @@ mod tests {
         assert_eq!(aborted.plan_split(s(0), None, "n").unwrap().children[0].id, s(9));
         assert!(l.plan_split(s(9), None, "n").is_err());
         assert!(l.plan_split(s(0), Some(0), "n").is_err());
-        let one = Layout { shards: vec![ShardRange { id: s(0), lo: 0, hi: 1 }, ShardRange { id: s(1), lo: 1, hi: SLOTS }], next_id: s(2), ..Layout::uniform(1) };
+        let one = Layout {
+            shards: vec![ShardRange { id: s(0), lo: 0, hi: 1 }, ShardRange { id: s(1), lo: 1, hi: SLOTS }],
+            next_id: s(2),
+            ..Layout::uniform(1)
+        };
         one.validate().unwrap();
         assert!(one.plan_split(s(0), None, "n").is_err(), "a single slot can't split");
     }
@@ -372,7 +407,8 @@ mod tests {
             assert_eq!(ShardId::from_key(&k), Some(ShardId(v)));
         }
         assert_eq!(ShardId(65_536).key(), "0000065536");
-        let mut keys: Vec<String> = [70_000u32, 3, 65_535, 1000, 4_000_000_000, 12].iter().map(|v| ShardId(*v).key()).collect();
+        let mut keys: Vec<String> =
+            [70_000u32, 3, 65_535, 1000, 4_000_000_000, 12].iter().map(|v| ShardId(*v).key()).collect();
         keys.sort();
         let back: Vec<u32> = keys.iter().map(|k| ShardId::from_key(k).unwrap().0).collect();
         assert_eq!(back, vec![3, 12, 1000, 65_535, 70_000, 4_000_000_000], "keys sort like the ids");
@@ -468,7 +504,10 @@ mod tests {
         let planned: Layout = serde_json::from_value(planned).unwrap();
         let op = planned.op.clone().unwrap();
         let again = serde_json::to_value(&planned).unwrap();
-        assert_eq!((again["op"]["weight"].as_u64(), &again["placement"]["zones"][0]), (Some(3), &serde_json::json!("a")));
+        assert_eq!(
+            (again["op"]["weight"].as_u64(), &again["placement"]["zones"][0]),
+            (Some(3), &serde_json::json!("a"))
+        );
         let flipped = serde_json::to_value(planned.flipped(&op).unwrap()).unwrap();
         assert_eq!(flipped["placement"]["zones"][0], "a");
         let aborted = serde_json::to_value(Layout { op: None, ..planned }).unwrap();

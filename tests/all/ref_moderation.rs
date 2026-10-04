@@ -12,7 +12,9 @@ async fn takendown_account_blobs_are_served_to_owner_and_admin_only() {
     let bob = s.create_account("bob").await;
     let mut bytes = PNG_1X1.to_vec();
     bytes.extend_from_slice(unique_name("blob").as_bytes());
-    let blob = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth()).await.ok()["blob"].clone();
+    let blob = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth()).await.ok()
+        ["blob"]
+        .clone();
     s.create_record(
         &carol,
         "app.bsky.feed.post",

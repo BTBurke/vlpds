@@ -48,7 +48,9 @@ impl Driver {
         let mut g = DRIVING.lock();
         let m = g.get_or_insert_with(HashMap::new);
         if m.contains_key(did) {
-            return Err(XrpcError::from(WriteError::Invalid("a repo import is in progress; retry once it is done".into())));
+            return Err(XrpcError::from(WriteError::Invalid(
+                "a repo import is in progress; retry once it is done".into(),
+            )));
         }
         m.insert(did.to_string(), nonce);
         Ok(Driver { did: did.to_string(), nonce })
@@ -100,7 +102,8 @@ pub fn set_crash_hook(did: &str, h: Option<crate::lifecycle::CrashHook>) {
 fn crash_at(did: &str, phase: &str) -> XResult<()> {
     // a test's hook may block (to pause the import there): off the worker,
     // so the tasks queued behind it run meanwhile
-    let multi = tokio::runtime::Handle::try_current().is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let multi = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     let fires = match multi {
         true => tokio::task::block_in_place(|| CRASH_HOOKS.fires(did, phase)),
         false => CRASH_HOOKS.fires(did, phase),
@@ -140,10 +143,8 @@ async fn step(app: &App, did: &str, step: ImportStep) -> XResult<Head> {
 /// admits it (`import_budget`).
 pub(super) async fn import(app: &Arc<App>, did: &str, body: Body, headers: &HeaderMap) -> XResult<()> {
     let max = app.config.max_import_bytes;
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+    let declared =
+        headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > max as u64) {
         return Err(import_stream::too_large(max));
     }
@@ -178,7 +179,12 @@ struct Stage {
 }
 
 impl Stage {
-    async fn run(&mut self, app: &Arc<App>, items: &mut tokio::sync::mpsc::Receiver<XResult<Item>>, res: &Reservation) -> XResult<()> {
+    async fn run(
+        &mut self,
+        app: &Arc<App>,
+        items: &mut tokio::sync::mpsc::Receiver<XResult<Item>>,
+        res: &Reservation,
+    ) -> XResult<()> {
         loop {
             let item = items.recv().await.ok_or_else(|| XrpcError::internal("import parse ended early"))??;
             match item {
@@ -190,7 +196,12 @@ impl Stage {
                     if self.ticket.is_some() {
                         self.begin(app).await?;
                     }
-                    *self = Stage { did: std::mem::take(&mut self.did), nonce: self.nonce, ticket: self.ticket, ..Default::default() };
+                    *self = Stage {
+                        did: std::mem::take(&mut self.did),
+                        nonce: self.nonce,
+                        ticket: self.ticket,
+                        ..Default::default()
+                    };
                 }
                 Item::Done { root, records, nodes, path } => {
                     metrics::IMPORT_REPO_PARSES.with_label_values(&[path]).inc();
@@ -219,10 +230,17 @@ impl Stage {
         }
     }
 
-    async fn stage(&mut self, app: &Arc<App>, records: Vec<ImportedRecord>, nodes: Vec<(Cid, Arc<[u8]>)>, bloom_words: usize) -> XResult<()> {
+    async fn stage(
+        &mut self,
+        app: &Arc<App>,
+        records: Vec<ImportedRecord>,
+        nodes: Vec<(Cid, Arc<[u8]>)>,
+        bloom_words: usize,
+    ) -> XResult<()> {
         let t = self.ticket(app).await?;
         let did = self.did.clone();
-        let (mut muts, links, colls) = tokio::task::spawn_blocking(move || rows(&did, t, records, nodes)).await.map_err(XrpcError::from_err)?;
+        let (mut muts, links, colls) =
+            tokio::task::spawn_blocking(move || rows(&did, t, records, nodes)).await.map_err(XrpcError::from_err)?;
         self.colls.extend(colls);
         while self.inflight.len() >= IN_FLIGHT {
             self.ack_oldest().await?;
@@ -251,7 +269,14 @@ impl Stage {
     /// The `bl/` values of a batch's links: its rkeys added to what earlier
     /// batches wrote (records come in key order, so a collection's rkeys
     /// only ever append).
-    async fn backlinks(&mut self, app: &App, gen: u64, links: Vec<(Vec<u8>, Box<str>)>, muts: &mut Vec<crate::segment::Mutation>, bloom_words: usize) -> XResult<()> {
+    async fn backlinks(
+        &mut self,
+        app: &App,
+        gen: u64,
+        links: Vec<(Vec<u8>, Box<str>)>,
+        muts: &mut Vec<crate::segment::Mutation>,
+        bloom_words: usize,
+    ) -> XResult<()> {
         let mut by_link: std::collections::BTreeMap<Vec<u8>, crate::backlinks::Rkeys> = Default::default();
         for (l, rkey) in links {
             by_link.entry(l).or_default().push(rkey);
@@ -271,7 +296,10 @@ impl Stage {
             v.sort();
             v.dedup();
             self.seen.insert(&l, bloom_words);
-            muts.push(crate::segment::Mutation { key: state::backlink_key(&self.did, gen, &l).into(), val: Some(crate::backlinks::encode(&v)) });
+            muts.push(crate::segment::Mutation {
+                key: state::backlink_key(&self.did, gen, &l).into(),
+                val: Some(crate::backlinks::encode(&v)),
+            });
             self.recent.insert(l, (self.batch, v));
         }
         Ok(())
@@ -282,12 +310,18 @@ impl Stage {
         self.drain().await?;
         let p = app.partition(&self.did)?;
         let blobs = distinct_blobs(&*p.db, &self.did, t.gen).await.map_err(XrpcError::from_err)?;
-        let old: BTreeSet<String> = collections(&*p.db, &self.did, t.old_gen).await.map_err(XrpcError::from_err)?.into_iter().collect();
+        let old: BTreeSet<String> =
+            collections(&*p.db, &self.did, t.old_gen).await.map_err(XrpcError::from_err)?.into_iter().collect();
         let colls_add = self.colls.difference(&old).cloned().collect();
         let colls_del = old.difference(&self.colls).cloned().collect();
         let root = (!root.is_empty()).then_some(root);
         let stats = state::RepoStats { records, nodes, blobs };
-        step(app, &self.did, ImportStep::Commit { nonce: self.nonce, epoch: t.epoch, root, stats, colls_add, colls_del }).await?;
+        step(
+            app,
+            &self.did,
+            ImportStep::Commit { nonce: self.nonce, epoch: t.epoch, root, stats, colls_add, colls_del },
+        )
+        .await?;
         self.ticket = None;
         crash_at(&self.did, "committed")?;
         spawn_sweep(app.clone(), self.did.clone(), t.old_gen);
@@ -307,7 +341,12 @@ impl Stage {
 /// A batch's rows under the staged generation, its links (for `bl/`) and
 /// its collections.
 #[allow(clippy::type_complexity)]
-fn rows(did: &str, t: ImportTicket, records: Vec<ImportedRecord>, nodes: Vec<(Cid, Arc<[u8]>)>) -> (Vec<crate::segment::Mutation>, Vec<(Vec<u8>, Box<str>)>, Vec<String>) {
+fn rows(
+    did: &str,
+    t: ImportTicket,
+    records: Vec<ImportedRecord>,
+    nodes: Vec<(Cid, Arc<[u8]>)>,
+) -> (Vec<crate::segment::Mutation>, Vec<(Vec<u8>, Box<str>)>, Vec<String>) {
     use crate::segment::Mutation;
     let gen = t.gen;
     let rev = t.rev.0.to_be_bytes();
@@ -324,12 +363,18 @@ fn rows(did: &str, t: ImportTicket, records: Vec<ImportedRecord>, nodes: Vec<(Ci
                 links.push((l, path[coll.len() + 1..].into()));
             }
         }
-        muts.push(Mutation { key: state::record_key(did, gen, &path).into(), val: Some(state::record_value(&cid, t.rev.0, &bytes)) });
+        muts.push(Mutation {
+            key: state::record_key(did, gen, &path).into(),
+            val: Some(state::record_value(&cid, t.rev.0, &bytes)),
+        });
         muts.push(Mutation { key: state::record_cid_key(did, gen, &cid, &path).into(), val: Some(Bytes::new()) });
         blobs.sort();
         blobs.dedup();
         for b in &blobs {
-            muts.push(Mutation { key: state::blob_ref_key(did, gen, b, &path).into(), val: Some(Bytes::copy_from_slice(&rev)) });
+            muts.push(Mutation {
+                key: state::blob_ref_key(did, gen, b, &path).into(),
+                val: Some(Bytes::copy_from_slice(&rev)),
+            });
         }
     }
     for (c, b) in nodes {
@@ -354,7 +399,11 @@ async fn distinct_blobs<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str
 }
 
 /// A generation's collections: one seek per collection.
-async fn collections<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64) -> anyhow::Result<Vec<String>> {
+async fn collections<R: slatedb::DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+) -> anyhow::Result<Vec<String>> {
     let prefix = state::record_prefix(did, gen);
     let end = state::prefix_end(&prefix);
     let mut lo = prefix.clone();
@@ -392,7 +441,8 @@ impl BloomLayer {
     }
 
     fn full(&self) -> bool {
-        self.bits.len() < super::import_budget::MAX_BLOOM_WORDS && self.keys * super::import_budget::BLOOM_BITS_PER_LINK as usize >= self.bits.len() * 64
+        self.bits.len() < super::import_budget::MAX_BLOOM_WORDS
+            && self.keys * super::import_budget::BLOOM_BITS_PER_LINK as usize >= self.bits.len() * 64
     }
 }
 
@@ -450,7 +500,8 @@ pub async fn sweep_gen(app: &App, did: &str, gen: u64) -> XResult<()> {
         let end = state::prefix_end(&prefix);
         let mut lo = prefix.clone();
         loop {
-            let mut it = state::BatchedScan::new(p.db.scan(lo.clone()..end.clone()).await.map_err(XrpcError::from_err)?);
+            let mut it =
+                state::BatchedScan::new(p.db.scan(lo.clone()..end.clone()).await.map_err(XrpcError::from_err)?);
             let mut dels = Vec::new();
             while dels.len() < SWEEP_KEYS {
                 let Some(kv) = it.next().await.map_err(XrpcError::from_err)? else { break };

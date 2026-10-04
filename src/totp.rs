@@ -8,13 +8,13 @@
 //! ([`save_if`], src/xrpc/cas.rs) redone on conflict, so concurrent attempts
 //! on several nodes neither lose failures nor accept one code twice.
 
+use crate::auth::ct_eq;
 use crate::state::{self, Account};
 use crate::xrpc::{App, XrpcError};
 use axum::http::StatusCode;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use crate::auth::ct_eq;
 use sha2::Sha256;
 
 pub const STEP_SECS: u64 = 30;
@@ -74,7 +74,8 @@ async fn unseal(app: &App, did: &str, mut st: TotpState) -> Result<TotpState, Xr
     for f in [&mut st.secret, &mut st.pending] {
         if let Some(wrapped) = f.take() {
             let u = app.secrets.unwrap(crate::secrets::Purpose::Totp, did, &wrapped).await?;
-            let plain = String::from_utf8(u.plaintext.to_vec()).map_err(|_| XrpcError::internal("corrupt TOTP secret"))?;
+            let plain =
+                String::from_utf8(u.plaintext.to_vec()).map_err(|_| XrpcError::internal("corrupt TOTP secret"))?;
             *f = Some(plain.clone());
             // a stale blob (old KEK) isn't reused: the next save rewraps it
             if !u.stale {
@@ -97,10 +98,8 @@ fn hotp(secret: &[u8], counter: u64) -> u32 {
     mac.update(&counter.to_be_bytes());
     let h = mac.finalize().into_bytes();
     let off = (h[h.len() - 1] & 0x0f) as usize;
-    let bin = ((h[off] as u32 & 0x7f) << 24)
-        | ((h[off + 1] as u32) << 16)
-        | ((h[off + 2] as u32) << 8)
-        | h[off + 3] as u32;
+    let bin =
+        ((h[off] as u32 & 0x7f) << 24) | ((h[off + 1] as u32) << 16) | ((h[off + 2] as u32) << 8) | h[off + 3] as u32;
     bin % 10u32.pow(DIGITS)
 }
 
@@ -126,10 +125,7 @@ pub fn verify_code(secret: &[u8], code: &str, now: u64, after_step: u64) -> Opti
     let mut found = None;
     for step in now_step.saturating_sub(SKEW)..=now_step + SKEW {
         // compare every candidate (no early exit) in constant time
-        if ct_eq(code_for_step(secret, step).as_bytes(), code.as_bytes())
-            && step > after_step
-            && found.is_none()
-        {
+        if ct_eq(code_for_step(secret, step).as_bytes(), code.as_bytes()) && step > after_step && found.is_none() {
             found = Some(step);
         }
     }
@@ -146,11 +142,7 @@ pub fn base32_encode(b: &[u8]) -> String {
 }
 
 pub fn base32_decode(s: &str) -> Option<Vec<u8>> {
-    let norm: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != '=')
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let norm: String = s.chars().filter(|c| !c.is_whitespace() && *c != '=').collect::<String>().to_ascii_lowercase();
     crate::cid::base32_decode(&norm)
 }
 
@@ -190,11 +182,7 @@ pub fn generate_recovery_codes() -> Vec<String> {
 /// Keyed by the TOTP secret (KEK-wrapped at rest), so a leaked state row
 /// can't be brute-forced offline for its ~50-bit codes without the KEK.
 pub fn hash_recovery_code(secret: &[u8], code: &str) -> String {
-    let norm: String = code
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    let norm: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
     let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
     mac.update(b"vlpds-totp-recovery:");
     mac.update(norm.as_bytes());
@@ -220,9 +208,7 @@ pub async fn save_if(app: &App, did: &str, st: &TotpState, read: Option<Bytes>) 
     let val = if st.secret.is_none() && st.pending.is_none() {
         None
     } else {
-        Some(Bytes::from(
-            serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?,
-        ))
+        Some(Bytes::from(serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?))
     };
     let out = app.private_cas(did, vec![Cond::eq(PRIVATE_NAME, read)], vec![Op::put(PRIVATE_NAME, val)]).await?;
     Ok(out.applied)
@@ -264,9 +250,7 @@ pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -
 static LOCKS: [tokio::sync::Mutex<()>; 32] = [const { tokio::sync::Mutex::const_new(()) }; 32];
 
 pub async fn lock(did: &str) -> tokio::sync::MutexGuard<'static, ()> {
-    LOCKS[(state::did_hash(did) % LOCKS.len() as u64) as usize]
-        .lock()
-        .await
+    LOCKS[(state::did_hash(did) % LOCKS.len() as u64) as usize].lock().await
 }
 
 fn factor_required() -> XrpcError {
@@ -316,33 +300,22 @@ pub async fn enabled_for(app: &App, account: &Account) -> Result<bool, XrpcError
 
 /// `code` is a TOTP code or an unused recovery code. Caller persists.
 fn consume(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
-    let secret = st
-        .secret
-        .as_deref()
-        .and_then(base32_decode)
-        .ok_or_else(|| XrpcError::internal("corrupt TOTP secret"))?;
+    let secret =
+        st.secret.as_deref().and_then(base32_decode).ok_or_else(|| XrpcError::internal("corrupt TOTP secret"))?;
     let trimmed = code.trim();
     if trimmed.len() == DIGITS as usize && trimmed.bytes().all(|b| b.is_ascii_digit()) {
         st.last_step = verify_code(&secret, trimmed, now, st.last_step).ok_or_else(invalid_code)?;
         return Ok(());
     }
     let h = hash_recovery_code(&secret, trimmed);
-    let pos = st
-        .recovery
-        .iter()
-        .position(|r| ct_eq(r.as_bytes(), h.as_bytes()))
-        .ok_or_else(invalid_code)?;
+    let pos = st.recovery.iter().position(|r| ct_eq(r.as_bytes(), h.as_bytes())).ok_or_else(invalid_code)?;
     st.recovery.remove(pos);
     Ok(())
 }
 
 /// 401 AuthFactorTokenRequired when `code` is missing, 400 InvalidToken when
 /// wrong, 429 RateLimitExceeded while locked out.
-pub async fn check_second_factor(
-    app: &App,
-    account: &Account,
-    code: Option<&str>,
-) -> Result<(), XrpcError> {
+pub async fn check_second_factor(app: &App, account: &Account, code: Option<&str>) -> Result<(), XrpcError> {
     if flagged_off(account) {
         return Ok(());
     }
@@ -356,10 +329,7 @@ pub async fn check_second_factor(
         if now < st.locked_until {
             return Err(locked_out());
         }
-        let code = code
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .ok_or_else(factor_required)?;
+        let code = code.map(str::trim).filter(|c| !c.is_empty()).ok_or_else(factor_required)?;
         // saved even on failure: the count must survive restarts and be
         // shared by both login paths
         let r = attempt(&mut st, code, now);
@@ -409,14 +379,8 @@ mod tests {
         let now = 1111111109;
         let s = step_at(now);
         assert_eq!(verify_code(k, &code_for_step(k, s), now, 0), Some(s));
-        assert_eq!(
-            verify_code(k, &code_for_step(k, s - 1), now, 0),
-            Some(s - 1)
-        );
-        assert_eq!(
-            verify_code(k, &code_for_step(k, s + 1), now, 0),
-            Some(s + 1)
-        );
+        assert_eq!(verify_code(k, &code_for_step(k, s - 1), now, 0), Some(s - 1));
+        assert_eq!(verify_code(k, &code_for_step(k, s + 1), now, 0), Some(s + 1));
         assert_eq!(verify_code(k, &code_for_step(k, s + 2), now, 0), None);
         // replay: already accepted step s
         assert_eq!(verify_code(k, &code_for_step(k, s), now, s), None);

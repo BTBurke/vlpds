@@ -36,7 +36,15 @@ async fn headers_on_every_xrpc_response() {
     r3.client_err();
     assert_eq!(num(&r3, "ratelimit-remaining"), rem1 - 2);
     // browsers can read them (CORS)
-    let r = s.xrpc.send(s.xrpc.http.get(format!("{}/xrpc/com.atproto.server.describeServer", s.url)).header("origin", "https://example.com")).await;
+    let r = s
+        .xrpc
+        .send(
+            s.xrpc
+                .http
+                .get(format!("{}/xrpc/com.atproto.server.describeServer", s.url))
+                .header("origin", "https://example.com"),
+        )
+        .await;
     let expose = r.header("access-control-expose-headers").unwrap_or_default().to_ascii_lowercase();
     for h in ["ratelimit-limit", "ratelimit-remaining", "ratelimit-reset", "ratelimit-policy", "retry-after"] {
         assert!(expose.contains(h), "{h} not exposed: {expose}");
@@ -124,20 +132,35 @@ async fn repo_write_points_per_did() {
     // repo-write-hour: 5000 points; create=3, update=2, delete=1
     for batch in 0..8 {
         let writes: Vec<J> = (0..200).map(|i| create(coll, format!("b{batch}k{i}"))).collect();
-        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok(); // 600 points each -> 4800
+        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        // 600 points each -> 4800
     }
     s.xrpc
-        .post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k0", "record": {"$type": coll, "i": 2}}), &a.auth())
+        .post(
+            "com.atproto.repo.putRecord",
+            &json!({"repo": a.did, "collection": coll, "rkey": "b0k0", "record": {"$type": coll, "i": 2}}),
+            &a.auth(),
+        )
         .await
         .ok(); // 4802
-    s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k1"}), &a.auth()).await.ok(); // 4803
+    s.xrpc
+        .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": "b0k1"}), &a.auth())
+        .await
+        .ok(); // 4803
     let writes: Vec<J> = (0..65).map(|i| create(coll, format!("c{i}"))).collect();
     let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await;
     r.ok(); // 4998
     assert_eq!(num(&r, "ratelimit-remaining"), 2, "tightest bucket is repo-write-hour: {:?}", r.headers);
     assert_eq!(r.header("ratelimit-policy").as_deref(), Some("5000;w=3600"));
     let before = s.latest_commit(&a.did).await;
-    let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": coll, "record": {"$type": coll}}), &a.auth()).await; // 5001
+    let r = s
+        .xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": coll, "record": {"$type": coll}}),
+            &a.auth(),
+        )
+        .await; // 5001
     r.err(429, "RateLimitExceeded");
     assert!(r.header("retry-after").is_some());
     assert_eq!(s.latest_commit(&a.did).await, before, "a rate-limited write must not commit");
@@ -241,7 +264,10 @@ async fn forwarded_for_only_from_trusted_proxies() {
 async fn upload_blob_budget_spares_blobs_an_arriving_repo_references() {
     let s = limited().await;
     let cfg = json!({"limiters": {"com.atproto.repo.uploadBlob-0": {"points": 3}}});
-    s.xrpc.post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin)
+        .await
+        .ok();
     let up = |a: &TestAccount, bytes: Vec<u8>| {
         let (x, auth) = (s.xrpc.clone(), a.auth());
         async move { x.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &auth).await }
@@ -292,7 +318,10 @@ async fn global_ip_limit_spares_blobs_an_arriving_repo_references() {
     // a new window length starts this IP's global window afresh
     const POINTS: i64 = 8;
     let cfg = json!({"limiters": {"global-ip": {"points": POINTS, "windowSecs": 3600}}});
-    s.xrpc.post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin)
+        .await
+        .ok();
 
     for n in 0..3 * POINTS {
         let r = up(&b, img((n % 3) as u8)).await;

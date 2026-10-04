@@ -14,12 +14,7 @@ pub const REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 /// None deletes. Goes through the owner's conditional-write lock with no
 /// condition, so a blind write (a session revoked, a request consumed) never
 /// slips between the check and the write of a conditional one.
-pub(super) async fn put<T: Serialize>(
-    app: &App,
-    routing: &str,
-    name: &str,
-    v: Option<&T>,
-) -> Result<(), OAuthError> {
+pub(super) async fn put<T: Serialize>(app: &App, routing: &str, name: &str, v: Option<&T>) -> Result<(), OAuthError> {
     put_if(app, routing, name, v, Vec::new()).await.and_then(|applied| {
         applied.then_some(()).ok_or_else(|| OAuthError::server_error("unconditional write refused"))
     })
@@ -38,11 +33,7 @@ pub(super) async fn put_if<T: Serialize>(
     Ok(out.applied)
 }
 
-pub(super) async fn get<T: DeserializeOwned>(
-    app: &App,
-    routing: &str,
-    name: &str,
-) -> Result<Option<T>, OAuthError> {
+pub(super) async fn get<T: DeserializeOwned>(app: &App, routing: &str, name: &str) -> Result<Option<T>, OAuthError> {
     match app.get_private(routing, name).await? {
         None => Ok(None),
         Some(b) => serde_json::from_slice(&b)
@@ -251,10 +242,7 @@ pub async fn delete_session(app: &App, did: &str, id: &str) -> Result<(), OAuthE
 
 pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthError> {
     let rows = crate::xrpc::internal::scan_private_anywhere(app, did, "oauth/ses/").await?;
-    Ok(rows
-        .iter()
-        .filter_map(|(_, v)| serde_json::from_slice::<Session>(v).ok())
-        .collect())
+    Ok(rows.iter().filter_map(|(_, v)| serde_json::from_slice::<Session>(v).ok()).collect())
 }
 
 /// Also replaces the credential epoch in the same write, so neither a
@@ -272,13 +260,7 @@ pub async fn revoke_all_sessions(app: &App, did: &str) -> Result<usize, OAuthErr
 /// can't be minted from the server secret alone.
 pub fn refresh_token(key: &[u8; 32], s: &Session) -> String {
     let mac = refresh_mac(key, s, s.refresh_gen);
-    format!(
-        "ref-{}.{}.{}.{}",
-        b64u(s.did.as_bytes()),
-        s.id,
-        s.refresh_gen,
-        b64u(mac)
-    )
+    format!("ref-{}.{}.{}.{}", b64u(s.did.as_bytes()), s.id, s.refresh_gen, b64u(mac))
 }
 
 fn refresh_mac(key: &[u8; 32], s: &Session, generation: u64) -> [u8; 32] {
@@ -301,12 +283,7 @@ pub fn parse_refresh_token(t: &str) -> Option<ParsedRefresh> {
     if it.next().is_some() || !did.starts_with("did:") || !session_id.starts_with("ses-") {
         return None;
     }
-    Some(ParsedRefresh {
-        did,
-        session_id,
-        generation,
-        mac,
-    })
+    Some(ParsedRefresh { did, session_id, generation, mac })
 }
 
 impl ParsedRefresh {
@@ -372,11 +349,7 @@ fn authz_key(client_id: &str) -> String {
     format!("oauth/authz/{}", hash_secret(client_id))
 }
 
-pub async fn get_authorization(
-    app: &App,
-    did: &str,
-    client_id: &str,
-) -> Result<Option<Authorization>, OAuthError> {
+pub async fn get_authorization(app: &App, did: &str, client_id: &str) -> Result<Option<Authorization>, OAuthError> {
     get(app, did, &authz_key(client_id)).await
 }
 

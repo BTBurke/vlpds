@@ -6,8 +6,8 @@ use crate::firehose::Firehose;
 use crate::nodelog::{self, LogBatch, NodeLog, ShardSink, Span};
 use crate::partition::{self, Partition};
 use crate::partitions::PartitionTable;
-use crate::slots::ShardId;
 use crate::remote::{self, Follower};
+use crate::slots::ShardId;
 use crate::store::Store;
 use crate::worker::{WorkerMsg, Workers};
 use parking_lot::Mutex;
@@ -72,11 +72,20 @@ impl Node {
             let log_id = p.log_id.clone();
             let addr = Arc::new(move || cluster.peers().into_iter().find(|l| l.log_id == log_id).map(|l| l.addr));
             let tls = self.http.ws_connector(&p.node_id);
-            let fl = remote::follow_log(&p.log_id, &self.firehose, self.store.clone(), addr, self.internal_token.clone(), self.merger_tx.clone(), tls);
+            let fl = remote::follow_log(
+                &p.log_id,
+                &self.firehose,
+                self.store.clone(),
+                addr,
+                self.internal_token.clone(),
+                self.merger_tx.clone(),
+                tls,
+            );
             tracing::info!(log_id = %p.log_id, node = %p.node_id, "following peer log");
             f.insert(p.log_id.clone(), fl);
         }
-        let done: Vec<String> = f.iter().filter(|(_, fl)| fl.done.load(Ordering::Acquire)).map(|(k, _)| k.clone()).collect();
+        let done: Vec<String> =
+            f.iter().filter(|(_, fl)| fl.done.load(Ordering::Acquire)).map(|(k, _)| k.clone()).collect();
         for log_id in done {
             self.firehose.set_source(&log_id, None);
             f.remove(&log_id);
@@ -154,7 +163,13 @@ impl Node {
                 tracing::debug!("handoff prewarm: reader close: {e}");
             }
         }
-        tracing::info!(shards = opened.len(), recent = n, warmed, elapsed_ms = started.elapsed().as_millis() as u64, "handoff prewarmed");
+        tracing::info!(
+            shards = opened.len(),
+            recent = n,
+            warmed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "handoff prewarmed"
+        );
     }
 
     async fn purge_worker_caches(&self, shards: &[ShardId]) {
@@ -212,7 +227,8 @@ impl ShardHost for Node {
             let dbs: Vec<Arc<slatedb::Db>> = ready.iter().map(|r| r.3.clone()).collect();
             tokio::spawn(async move { partition::warm(&dbs).await })
         };
-        let plan: Vec<(ShardId, &slatedb::Db, &[Span])> = ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
+        let plan: Vec<(ShardId, &slatedb::Db, &[Span])> =
+            ready.iter().map(|(s, _, h, db)| (*s, db.as_ref(), h.as_slice())).collect();
         let replay_started = Instant::now();
         let replayed = match nodelog::replay_many(&self.store, &plan).await {
             Ok(r) => r,
@@ -230,7 +246,9 @@ impl ShardHost for Node {
             crate::metrics::REPLAY_SECONDS.observe(replay_started.elapsed().as_secs_f64());
         }
         let replayed_ms = started.elapsed().as_millis() as u64;
-        let phase = |name: &str, t: Instant| crate::metrics::SHARD_OPEN_PHASE_SECONDS.with_label_values(&[name]).observe(t.elapsed().as_secs_f64());
+        let phase = |name: &str, t: Instant| {
+            crate::metrics::SHARD_OPEN_PHASE_SECONDS.with_label_values(&[name]).observe(t.elapsed().as_secs_f64())
+        };
         crate::metrics::SHARD_OPEN_PHASE_SECONDS.with_label_values(&["open"]).observe(opened_ms as f64 / 1000.0);
         phase("replay", replay_started);
         // make replayed state durable before serving, and before the totals
@@ -239,7 +257,12 @@ impl ShardHost for Node {
         let flushed: Vec<(ShardId, u64, Arc<slatedb::Db>, anyhow::Result<()>)> = futures::stream::iter(ready)
             .map(|(s, e, _, db)| async move {
                 let r = match replayed > 0 {
-                    true => db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.map_err(Into::into),
+                    true => db
+                        .flush_with_options(slatedb::config::FlushOptions {
+                            flush_type: slatedb::config::FlushType::MemTable,
+                        })
+                        .await
+                        .map_err(Into::into),
                     false => Ok(()),
                 };
                 (s, e, db, r)
@@ -261,7 +284,16 @@ impl ShardHost for Node {
             let recent = Arc::new(partition::RecentRepos::new(self.recent_cap));
             preload.push((shard, db.clone(), recent.clone()));
             let apply_lock = Arc::new(tokio::sync::RwLock::new(()));
-            let sink = Arc::new(ShardSink { id: shard, epoch, db: db.clone(), apply_lock: apply_lock.clone(), applied: Default::default(), recent: recent.clone(), barrier: Default::default(), totals: Mutex::new(crate::totals::ShardTotals::unloaded()) });
+            let sink = Arc::new(ShardSink {
+                id: shard,
+                epoch,
+                db: db.clone(),
+                apply_lock: apply_lock.clone(),
+                applied: Default::default(),
+                recent: recent.clone(),
+                barrier: Default::default(),
+                totals: Mutex::new(crate::totals::ShardTotals::unloaded()),
+            });
             crate::totals::spawn_load(&sink, &self.cluster.cfg.node_id);
             self.log.sinks.insert(sink);
             self.table.set(
@@ -284,8 +316,17 @@ impl ShardHost for Node {
         let ok = results.iter().filter(|(_, r)| r.is_ok()).count() as u64;
         crate::metrics::SHARDS_OPENED.with_label_values(&["ok"]).inc_by(ok);
         crate::metrics::SHARDS_OPENED.with_label_values(&["error"]).inc_by(results.len() as u64 - ok);
-        crate::metrics::SHARD_OPEN_SECONDS.with_label_values(&[if replayed > 0 { "replay" } else { "clean" }]).observe(started.elapsed().as_secs_f64());
-        tracing::info!(shards = n, segments_replayed = replayed, opened_ms, replayed_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards opened");
+        crate::metrics::SHARD_OPEN_SECONDS
+            .with_label_values(&[if replayed > 0 { "replay" } else { "clean" }])
+            .observe(started.elapsed().as_secs_f64());
+        tracing::info!(
+            shards = n,
+            segments_replayed = replayed,
+            opened_ms,
+            replayed_ms,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "shards opened"
+        );
         crate::worker::spawn_preload(&self.workers, preload);
         results
     }
@@ -300,11 +341,17 @@ impl ShardHost for Node {
         // availability.
         let started = Instant::now();
         if !crate::cluster::wait_clock_past(seq, SEQ_FLOOR_MAX_WAIT).await {
-            tracing::error!(seq, "previous owner's clock is more than {SEQ_FLOOR_MAX_WAIT:?} ahead of ours: serving anyway");
+            tracing::error!(
+                seq,
+                "previous owner's clock is more than {SEQ_FLOOR_MAX_WAIT:?} ahead of ours: serving anyway"
+            );
             return;
         }
         if started.elapsed() > Duration::from_millis(1) {
-            tracing::warn!(waited_ms = started.elapsed().as_millis() as u64, "waited for our clock to pass the previous owner's last seq");
+            tracing::warn!(
+                waited_ms = started.elapsed().as_millis() as u64,
+                "waited for our clock to pass the previous owner's last seq"
+            );
         }
     }
 
@@ -352,7 +399,10 @@ impl ShardHost for Node {
         for (k, ack) in sinks.into_iter().zip(acks) {
             let r: anyhow::Result<()> = async {
                 let rx = ack.map_err(|_| anyhow::anyhow!("node log gone"))?;
-                tokio::time::timeout_at(deadline, rx).await.map_err(|_| anyhow::anyhow!("barrier not durable within 30 s"))??.map_err(|e| anyhow::anyhow!("{e}"))
+                tokio::time::timeout_at(deadline, rx)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("barrier not durable within 30 s"))??
+                    .map_err(|e| anyhow::anyhow!("{e}"))
             }
             .await;
             match r {
@@ -390,7 +440,12 @@ impl ShardHost for Node {
             .await;
         results.extend(closed);
         crate::metrics::OWNED_PARTITIONS.set(self.table.owned().len() as i64);
-        tracing::info!(shards = results.len(), drained_ms, elapsed_ms = started.elapsed().as_millis() as u64, "shards closed");
+        tracing::info!(
+            shards = results.len(),
+            drained_ms,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "shards closed"
+        );
         results
     }
 
@@ -428,7 +483,15 @@ impl ShardHost for Node {
             .map(|(addr, shards)| {
                 let shards = shards
                     .into_iter()
-                    .map(|s| (s, self.table.get(s).map(|p| p.recent.snapshot().iter().map(|d| d.to_string()).collect()).unwrap_or_default()))
+                    .map(|s| {
+                        (
+                            s,
+                            self.table
+                                .get(s)
+                                .map(|p| p.recent.snapshot().iter().map(|d| d.to_string()).collect())
+                                .unwrap_or_default(),
+                        )
+                    })
                     .collect();
                 (addr, crate::xrpc::internal::prewarm_request(shards))
             })
@@ -438,7 +501,14 @@ impl ShardHost for Node {
 
     async fn greet(&self, peers: Vec<crate::cluster::NodeLease>) -> Vec<Option<i64>> {
         let addrs = peers.into_iter().map(|l| l.addr).collect();
-        crate::xrpc::internal::hello_peers(&self.http, &self.internal_token, &self.cluster.cfg.node_id, self.cluster.cfg.levels, addrs).await
+        crate::xrpc::internal::hello_peers(
+            &self.http,
+            &self.internal_token,
+            &self.cluster.cfg.node_id,
+            self.cluster.cfg.levels,
+            addrs,
+        )
+        .await
     }
 
     fn leaving(&self) {
@@ -453,7 +523,10 @@ impl ShardHost for Node {
     }
 
     async fn refused(&self, addr: &str) -> bool {
-        let Some(authority) = reqwest::Url::parse(addr).ok().and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?))) else {
+        let Some(authority) = reqwest::Url::parse(addr)
+            .ok()
+            .and_then(|u| Some(format!("{}:{}", u.host_str()?, u.port_or_known_default()?)))
+        else {
             return false;
         };
         match tokio::time::timeout(Duration::from_millis(500), tokio::net::TcpStream::connect(&authority)).await {
@@ -478,10 +551,23 @@ impl ShardHost for Node {
         let plans: Vec<(ShardId, Vec<(ShardId, u32, u32)>)> = op
             .children
             .iter()
-            .map(|c| (c.id, parents.iter().filter(|p| p.lo < c.hi && c.lo < p.hi).map(|p| (p.id, p.lo.max(c.lo), p.hi.min(c.hi))).collect()))
+            .map(|c| {
+                (
+                    c.id,
+                    parents
+                        .iter()
+                        .filter(|p| p.lo < c.hi && c.lo < p.hi)
+                        .map(|p| (p.id, p.lo.max(c.lo), p.hi.min(c.hi)))
+                        .collect(),
+                )
+            })
             .collect();
         let results: Vec<anyhow::Result<()>> = futures::stream::iter(plans)
-            .map(|(c, srcs)| async move { partition::clone_db(&self.state_store, c, &srcs).await.map_err(|e| e.context(format!("cloning shard {c} from {srcs:?}"))) })
+            .map(|(c, srcs)| async move {
+                partition::clone_db(&self.state_store, c, &srcs)
+                    .await
+                    .map_err(|e| e.context(format!("cloning shard {c} from {srcs:?}")))
+            })
             .buffer_unordered(4)
             .collect()
             .await;
@@ -496,7 +582,8 @@ impl ShardHost for Node {
             .iter()
             .map(|p| {
                 let m = p.db.manifest();
-                let bytes: u64 = m.l0().iter().map(|t| t.estimate_size()).sum::<u64>() + m.compacted().iter().map(|r| r.estimate_size()).sum::<u64>();
+                let bytes: u64 = m.l0().iter().map(|t| t.estimate_size()).sum::<u64>()
+                    + m.compacted().iter().map(|r| r.estimate_size()).sum::<u64>();
                 (p.id, bytes, self.log.sinks.applied_entries(p.id))
             })
             .collect()

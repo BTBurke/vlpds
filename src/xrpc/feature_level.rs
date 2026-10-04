@@ -31,7 +31,9 @@ async fn set_feature_level(State(app): AppState, Auth(creds): Auth, Json(inp): J
     match r {
         Ok(v) => Ok(Json(json!({"active": v.active, "target": v.target, "history": v.history}))),
         Err(FinalizeError::Invalid(m)) => Err(XrpcError::bad("InvalidRequest", m)),
-        Err(e @ FinalizeError::Incompatible { .. }) => Err(XrpcError { status: StatusCode::CONFLICT, error: "IncompatibleNodes".into(), message: e.to_string() }),
+        Err(e @ FinalizeError::Incompatible { .. }) => {
+            Err(XrpcError { status: StatusCode::CONFLICT, error: "IncompatibleNodes".into(), message: e.to_string() })
+        }
         Err(e @ FinalizeError::Store(_)) => Err(XrpcError::unavailable("Unavailable", e.to_string())),
     }
 }

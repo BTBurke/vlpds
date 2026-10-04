@@ -32,30 +32,20 @@ type LexiconCache = parking_lot::Mutex<HashMap<String, (Instant, J)>>;
 /// Stale entries are the fallback while a publisher is unreachable.
 static CACHE: LazyLock<Arc<LexiconCache>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::PermissionSets, Default::default()));
-static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
-    LazyLock::new(Default::default);
+static OVERRIDES: LazyLock<parking_lot::Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
 /// Being re-resolved in the background.
-static IN_FLIGHT: LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-    LazyLock::new(Default::default);
+static IN_FLIGHT: LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> = LazyLock::new(Default::default);
 
 /// Tests: pins the authority DID of e.g. "example.com" for `com.example.*`,
 /// bypassing DNS.
 pub fn override_authority(authority: &str, did: &str) {
-    OVERRIDES
-        .lock()
-        .insert(authority.to_ascii_lowercase(), did.to_string());
+    OVERRIDES.lock().insert(authority.to_ascii_lowercase(), did.to_string());
 }
 
 /// All segments but the name, reversed.
 pub fn nsid_authority(nsid: &str) -> String {
     let segs: Vec<&str> = nsid.split('.').collect();
-    segs[..segs.len().saturating_sub(1)]
-        .iter()
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(".")
-        .to_ascii_lowercase()
+    segs[..segs.len().saturating_sub(1)].iter().rev().cloned().collect::<Vec<_>>().join(".").to_ascii_lowercase()
 }
 
 /// `defs.main`.
@@ -72,11 +62,7 @@ async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
         Ok((uri, doc)) => {
             main_def(nsid, &doc)?;
             cache_put(nsid, Instant::now(), doc.clone());
-            let stored = StoredLexicon {
-                uri,
-                doc: doc.clone(),
-                updated_at: now_secs(),
-            };
+            let stored = StoredLexicon { uri, doc: doc.clone(), updated_at: now_secs() };
             if let Err(e) = store::put_lexicon(app, nsid, &stored).await {
                 tracing::warn!(nsid, "persisting lexicon failed: {}", e.description);
             }
@@ -116,10 +102,8 @@ fn main_def(nsid: &str, doc: &J) -> Result<J, String> {
     if doc.get("id").and_then(|v| v.as_str()) != Some(nsid) {
         return Err(format!("Invalid document id for {nsid}"));
     }
-    let main = doc
-        .get("defs")
-        .and_then(|d| d.get("main"))
-        .ok_or_else(|| format!("Lexicon {nsid} has no main definition"))?;
+    let main =
+        doc.get("defs").and_then(|d| d.get("main")).ok_or_else(|| format!("Lexicon {nsid} has no main definition"))?;
     if main.get("type").and_then(|v| v.as_str()) != Some("permission-set") {
         return Err(format!("Lexicon document is not a permission set: {nsid}"));
     }
@@ -133,9 +117,7 @@ fn main_def(nsid: &str, doc: &J) -> Result<J, String> {
 pub(crate) async fn resolve(app: &App, nsid: &str) -> Result<(String, J), String> {
     let did = resolve_authority(nsid).await?;
     let uri = format!("at://{did}/{LEXICON_COLLECTION}/{nsid}");
-    let doc = fetch_record(app, &did, nsid)
-        .await
-        .map_err(|e| format!("Failed to fetch lexicon at {uri}: {e}"))?;
+    let doc = fetch_record(app, &did, nsid).await.map_err(|e| format!("Failed to fetch lexicon at {uri}: {e}"))?;
     Ok((uri, doc))
 }
 
@@ -163,20 +145,16 @@ async fn fetch_record(app: &App, did: &str, nsid: &str) -> Result<J, String> {
     let rpath = format!("{LEXICON_COLLECTION}/{nsid}");
     // hosted here: no proof needed
     if let Ok(a) = app.account(did).await {
-        let v = app.record_value(did, Some(a.repo_gen), &rpath).await.map_err(|e| e.message)?.ok_or("Record not found")?;
+        let v =
+            app.record_value(did, Some(a.repo_gen), &rpath).await.map_err(|e| e.message)?.ok_or("Record not found")?;
         let (_, bytes) = crate::state::decode_record_value(&v).map_err(|e| e.to_string())?;
         let rec = Value::decode(&bytes).map_err(|e| e.to_string())?;
         return check_record_type(rec.to_json());
     }
-    let doc = app
-        .did_resolver
-        .resolve(did)
-        .await
-        .map_err(|e| e.to_string())?;
+    let doc = app.did_resolver.resolve(did).await.map_err(|e| e.to_string())?;
     let pds = crate::did_resolver::service_endpoint(&doc, "atproto_pds")
         .ok_or("No atproto PDS service endpoint in DID document")?;
-    let key = crate::did_resolver::signing_key_multibase(&doc)
-        .ok_or("No atproto signing key in DID document")?;
+    let key = crate::did_resolver::signing_key_multibase(&doc).ok_or("No atproto signing key in DID document")?;
     let url = format!(
         "{}/xrpc/com.atproto.sync.getRecord?did={}&collection={}&rkey={}",
         pds.trim_end_matches('/'),
@@ -190,9 +168,7 @@ async fn fetch_record(app: &App, did: &str, nsid: &str) -> Result<J, String> {
 
 fn check_record_type(rec: J) -> Result<J, String> {
     if rec.get("$type").and_then(|v| v.as_str()) != Some(LEXICON_COLLECTION) {
-        return Err(format!(
-            "Invalid record type: expected {LEXICON_COLLECTION}"
-        ));
+        return Err(format!("Invalid record type: expected {LEXICON_COLLECTION}"));
     }
     Ok(rec)
 }
@@ -223,12 +199,7 @@ async fn fetch_bytes(url: &str, dev_mode: bool) -> Result<Vec<u8>, String> {
 
 /// Every block hashes to its CID, the root commit is `did`'s and signed by
 /// `key_multibase`, and its MST maps `rpath` to the included record.
-pub fn verify_record_proof(
-    car: &[u8],
-    did: &str,
-    key_multibase: &str,
-    rpath: &str,
-) -> Result<J, String> {
+pub fn verify_record_proof(car: &[u8], did: &str, key_multibase: &str, rpath: &str) -> Result<J, String> {
     let (roots, blocks) = crate::car::read_car(car).map_err(|e| e.to_string())?;
     let root = *roots.first().ok_or("CAR has no root")?;
     let mut map: HashMap<Cid, Vec<u8>> = HashMap::new();
@@ -238,8 +209,7 @@ pub fn verify_record_proof(
         }
         map.insert(c, data.to_vec());
     }
-    let commit =
-        Value::decode(map.get(&root).ok_or("missing commit block")?).map_err(|e| e.to_string())?;
+    let commit = Value::decode(map.get(&root).ok_or("missing commit block")?).map_err(|e| e.to_string())?;
     if commit.get("did").and_then(|v| v.as_str()) != Some(did) {
         return Err("Invalid repo did".into());
     }
@@ -258,14 +228,9 @@ pub fn verify_record_proof(
     };
     // only the nodes on rpath's path: the proof needs nothing else, and
     // the rest of an attacker's block set is never decoded
-    let tree = crate::mst::Tree::load_path_from_blocks(&map, *data, rpath.as_bytes())
-        .map_err(|e| format!("{e:?}"))?;
-    let rcid = tree
-        .get(rpath.as_bytes())
-        .map_err(|e| format!("{e:?}"))?
-        .ok_or("Record not found in proof")?;
-    let rec =
-        Value::decode(map.get(&rcid).ok_or("record block missing")?).map_err(|e| e.to_string())?;
+    let tree = crate::mst::Tree::load_path_from_blocks(&map, *data, rpath.as_bytes()).map_err(|e| format!("{e:?}"))?;
+    let rcid = tree.get(rpath.as_bytes()).map_err(|e| format!("{e:?}"))?.ok_or("Record not found in proof")?;
+    let rec = Value::decode(map.get(&rcid).ok_or("record block missing")?).map_err(|e| e.to_string())?;
     check_record_type(rec.to_json())
 }
 
@@ -377,10 +342,7 @@ pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<Str
     Ok(out.join(" "))
 }
 
-pub async fn permission_sets_for_scope(
-    app: &App,
-    scope: &str,
-) -> Result<Vec<(IncludeScope, J)>, String> {
+pub async fn permission_sets_for_scope(app: &App, scope: &str) -> Result<Vec<(IncludeScope, J)>, String> {
     let mut out = Vec::new();
     for s in scope.split(' ') {
         if let Some(inc) = IncludeScope::parse(s) {
@@ -407,17 +369,14 @@ mod tests {
         let low = sig.normalize_s().unwrap_or(sig);
         let high = p256::ecdsa::Signature::from_scalars(low.r(), -*low.s()).unwrap();
         assert!(high.normalize_s().is_some(), "high-S form");
-        for (key, low, high) in [
-            (p256_key, low.to_bytes().to_vec(), high.to_bytes().to_vec()),
-            {
-                // K-256
-                let kp = crate::crypto::Keypair::generate();
-                let low = kp.sign(msg);
-                let s = k256::ecdsa::Signature::from_slice(&low).unwrap();
-                let high = k256::ecdsa::Signature::from_scalars(s.r(), -*s.s()).unwrap();
-                (kp.public_multibase(), low.to_vec(), high.to_bytes().to_vec())
-            },
-        ] {
+        for (key, low, high) in [(p256_key, low.to_bytes().to_vec(), high.to_bytes().to_vec()), {
+            // K-256
+            let kp = crate::crypto::Keypair::generate();
+            let low = kp.sign(msg);
+            let s = k256::ecdsa::Signature::from_slice(&low).unwrap();
+            let high = k256::ecdsa::Signature::from_scalars(s.r(), -*s.s()).unwrap();
+            (kp.public_multibase(), low.to_vec(), high.to_bytes().to_vec())
+        }] {
             assert_eq!(super::verify_sig(&key, msg, &low), Ok(true));
             assert_eq!(super::verify_sig(&key, msg, &high), Ok(false), "record proofs reject high-S");
             assert_eq!(super::verify_sig_malleable(&key, msg, &low), Ok(true));
@@ -430,9 +389,6 @@ mod tests {
     #[test]
     fn authority() {
         assert_eq!(super::nsid_authority("app.bsky.feed.post"), "feed.bsky.app");
-        assert_eq!(
-            super::nsid_authority("com.example.authBasic"),
-            "example.com"
-        );
+        assert_eq!(super::nsid_authority("com.example.authBasic"), "example.com");
     }
 }

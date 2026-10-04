@@ -58,7 +58,11 @@ async fn streamed_and_buffered_imports_agree() {
     for i in 0..30 {
         let rec = json!({"$type": "app.bsky.graph.follow", "subject": format!("did:plc:{:024}", i), "createdAt": "2026-01-01T00:00:00Z"});
         old.xrpc
-            .post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.graph.follow", "record": rec}), &a.auth())
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": a.did, "collection": "app.bsky.graph.follow", "record": rec}),
+                &a.auth(),
+            )
             .await
             .ok();
     }
@@ -72,7 +76,8 @@ async fn streamed_and_buffered_imports_agree() {
     let exported = exported.body.to_vec();
     assert!(exported == stream_order(&exported), "getRepo writes the streamable order");
 
-    let cases: [(&str, Vec<u8>); 3] = [("export", exported.clone()), ("stream", stream_order(&exported)), ("shuffled", shuffled(&exported))];
+    let cases: [(&str, Vec<u8>); 3] =
+        [("export", exported.clone()), ("stream", stream_order(&exported)), ("shuffled", shuffled(&exported))];
     for (name, car) in cases {
         let b = new.create_account("dst").await;
         let streamed = parses("stream");

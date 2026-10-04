@@ -61,8 +61,7 @@ footer{margin-top:14px;text-align:center}
 label.check{display:flex;align-items:center;gap:8px;font-weight:500;margin:12px 0 4px}
 "#;
 
-static STYLE_HASH: LazyLock<String> =
-    LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(STYLE)));
+static STYLE_HASH: LazyLock<String> = LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(STYLE)));
 
 /// `form_action`: extra sources. Browsers apply form-action to the redirect
 /// that follows a form post, so the consent page must allow the client's
@@ -88,22 +87,14 @@ static AUTO_SUBMIT_HASH: LazyLock<String> =
     LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(AUTO_SUBMIT)));
 
 pub fn csp_form_post(form_action: &[String]) -> String {
-    format!(
-        "{}; script-src 'sha256-{}'",
-        csp(form_action),
-        *AUTO_SUBMIT_HASH
-    )
+    format!("{}; script-src 'sha256-{}'", csp(form_action), *AUTO_SUBMIT_HASH)
 }
 
 /// `response_mode=form_post`. The button is the no-script fallback.
 pub fn form_post(redirect_uri: &str, params: &[(String, String)]) -> String {
     let mut fields = String::new();
     for (k, v) in params {
-        fields.push_str(&format!(
-            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
-            e(k),
-            e(v)
-        ));
+        fields.push_str(&format!("<input type=\"hidden\" name=\"{}\" value=\"{}\">", e(k), e(v)));
     }
     let body = format!(
         "<h1>Returning to the app</h1><form method=\"post\" action=\"{}\">{fields}<div class=\"row\">\
@@ -178,23 +169,15 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
                 client_block(c)
             ));
         }
-        None => b.push_str(
-            "<h1>Sign in</h1><p class=\"muted\">Manage the apps connected to your account.</p>",
-        ),
+        None => b.push_str("<h1>Sign in</h1><p class=\"muted\">Manage the apps connected to your account.</p>"),
     }
     if let Some(err) = f.error {
         b.push_str(&format!("<p class=\"err\" role=\"alert\">{}</p>", e(err)));
     }
-    b.push_str(&format!(
-        "<form method=\"post\" action=\"{}\">",
-        e(f.action)
-    ));
+    b.push_str(&format!("<form method=\"post\" action=\"{}\">", e(f.action)));
     match ctx {
         Some(c) => b.push_str(&hidden(c)),
-        None => b.push_str(&format!(
-            "<input type=\"hidden\" name=\"csrf\" value=\"{}\">",
-            e(csrf_only)
-        )),
+        None => b.push_str(&format!("<input type=\"hidden\" name=\"csrf\" value=\"{}\">", e(csrf_only))),
     }
     if let (true, Some(hint)) = (f.totp, f.email_hint) {
         b.push_str(&format!(
@@ -230,11 +213,11 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     }
     b.push_str("<div class=\"row\">");
     if ctx.is_some() {
-        b.push_str(
-            "<button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>",
-        );
+        b.push_str("<button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>");
     }
-    b.push_str("<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></form>");
+    b.push_str(
+        "<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></form>",
+    );
     if let (Some(c), false) = (ctx, f.totp) {
         b.push_str(&format!(
             "<p class=\"alt\">New to {}? <a href=\"{}\">Create an account</a></p>",
@@ -305,10 +288,7 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
 }
 
 pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {
-    let mut b = format!(
-        "<h1>Choose an account</h1><p class=\"muted\">to continue to</p>{}",
-        client_block(ctx)
-    );
+    let mut b = format!("<h1>Choose an account</h1><p class=\"muted\">to continue to</p>{}", client_block(ctx));
     for (did, handle) in accounts {
         b.push_str(&format!(
             "<div class=\"acct\"><div class=\"who\"><b>@{}</b><div class=\"muted\">{}</div></div>\
@@ -389,28 +369,15 @@ pub fn describe_permission(p: &Permission) -> String {
                     _ => "delete",
                 })
                 .collect();
-            format!(
-                "{} records in {}",
-                capitalize(&verbs.join(", ")),
-                list(collection, "any collection")
-            )
+            format!("{} records in {}", capitalize(&verbs.join(", ")), list(collection, "any collection"))
         }
         Permission::Rpc { aud, lxm } => {
-            let svc = if aud == "*" {
-                "any service".to_string()
-            } else {
-                aud.clone()
-            };
-            format!(
-                "Make requests on your behalf to {} ({})",
-                svc,
-                list(lxm, "any method")
-            )
+            let svc = if aud == "*" { "any service".to_string() } else { aud.clone() };
+            format!("Make requests on your behalf to {} ({})", svc, list(lxm, "any method"))
         }
-        Permission::Blob { accept } => format!(
-            "Upload files ({})",
-            list(accept, "any type").replace("*/*", "any type")
-        ),
+        Permission::Blob { accept } => {
+            format!("Upload files ({})", list(accept, "any type").replace("*/*", "any type"))
+        }
         Permission::Account { attr, action } => {
             let manage = action.iter().any(|a| a == "manage");
             let what = match attr.as_str() {

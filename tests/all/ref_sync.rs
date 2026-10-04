@@ -27,7 +27,11 @@ async fn account_deletion_is_the_last_event_on_replay() {
     s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &a.auth()).await.ok();
     let token = s.mail_token(&a.email).await.expect("delete token");
     s.xrpc
-        .post("com.atproto.server.deleteAccount", &json!({"did": a.did, "password": a.password, "token": token}), &Auth::None)
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": a.did, "password": a.password, "token": token}),
+            &Auth::None,
+        )
         .await
         .ok();
     // later activity by someone else, so the replay runs past the deletion

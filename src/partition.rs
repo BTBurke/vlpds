@@ -2,8 +2,8 @@
 //! and clones for split/merge. All shards on a node share its commit log
 //! (nodelog.rs).
 
-pub use crate::nodelog::{seq_floor, AckFn, LogEntry, Watermark};
 use crate::nodelog::NodeLog;
+pub use crate::nodelog::{seq_floor, AckFn, LogEntry, Watermark};
 use crate::slots::ShardId;
 use crate::store::Store;
 use slatedb::Db;
@@ -103,7 +103,11 @@ impl RecentRepos {
     }
 
     pub fn decode(b: &[u8]) -> Vec<Arc<str>> {
-        b.split(|&c| c == b'\n').filter(|d| !d.is_empty()).filter_map(|d| std::str::from_utf8(d).ok()).map(Arc::from).collect()
+        b.split(|&c| c == b'\n')
+            .filter(|d| !d.is_empty())
+            .filter_map(|d| std::str::from_utf8(d).ok())
+            .map(Arc::from)
+            .collect()
     }
 }
 
@@ -160,7 +164,11 @@ pub struct CacheStats {
 /// The shared caches now (configured sizes before they exist).
 pub fn cache_stats() -> CacheStats {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut s = CacheStats { block_capacity: BLOCK_CACHE_BYTES.load(Relaxed), meta_capacity: META_CACHE_BYTES.load(Relaxed), ..Default::default() };
+    let mut s = CacheStats {
+        block_capacity: BLOCK_CACHE_BYTES.load(Relaxed),
+        meta_capacity: META_CACHE_BYTES.load(Relaxed),
+        ..Default::default()
+    };
     if let Some(b) = BLOCK.get() {
         (s.block_capacity, s.block_used) = (b.capacity(), b.0.usage() as u64);
     }
@@ -212,7 +220,10 @@ fn shared_meta_cache() -> &'static Arc<MetaCache> {
 /// The shared SST block cache: Foyer, as SlateDB's `FoyerCache`, which
 /// can't be resized. Foyer's `capacity()` keeps the size it was built
 /// with, so the current one is kept here.
-pub struct BlockCache(foyer::Cache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>, std::sync::atomic::AtomicU64);
+pub struct BlockCache(
+    foyer::Cache<slatedb::db_cache::CachedKey, slatedb::db_cache::CachedEntry>,
+    std::sync::atomic::AtomicU64,
+);
 
 impl BlockCache {
     pub fn new(bytes: u64) -> BlockCache {
@@ -239,7 +250,11 @@ impl BlockCache {
     }
 
     /// Single-flight per key (Foyer's `get_or_fetch`).
-    async fn fetch(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         use slatedb::db_cache::CacheFetch;
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let r = ran.clone();
@@ -278,16 +293,32 @@ impl slatedb::db_cache::DbCache for BlockCache {
     fn entry_count(&self) -> u64 {
         self.0.entries() as u64
     }
-    async fn fetch_block(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_block(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
-    async fn fetch_index(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_index(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
-    async fn fetch_filter(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_filter(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
-    async fn fetch_stats(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_stats(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader).await
     }
 }
@@ -317,7 +348,12 @@ impl MetaCache {
         self.0.bytes()
     }
 
-    async fn fetch(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader, kind: &'static str) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+        kind: &'static str,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         use slatedb::db_cache::CacheFetch;
         let (entry, how) = self.0.get_or_load(key, loader()).await?;
         Ok(match how {
@@ -358,13 +394,25 @@ impl slatedb::db_cache::DbCache for MetaCache {
     fn entry_count(&self) -> u64 {
         self.0.len() as u64
     }
-    async fn fetch_index(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_index(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader, "index").await
     }
-    async fn fetch_filter(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_filter(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader, "filter").await
     }
-    async fn fetch_stats(&self, key: MetaKey, loader: slatedb::db_cache::CacheLoader) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
+    async fn fetch_stats(
+        &self,
+        key: MetaKey,
+        loader: slatedb::db_cache::CacheLoader,
+    ) -> Result<slatedb::db_cache::CacheFetch, slatedb::Error> {
         self.fetch(key, loader, "stats").await
     }
 }
@@ -597,7 +645,11 @@ impl<K: std::hash::Hash + Eq + Clone, V: Clone + Weigh> ClockCache<K, V> {
 
     /// `load` runs only if no concurrent caller is loading `key`; a failed
     /// load leaves the next waiter to try its own.
-    pub async fn get_or_load<E>(&self, key: K, load: impl std::future::Future<Output = Result<V, E>>) -> Result<(V, Lookup), E> {
+    pub async fn get_or_load<E>(
+        &self,
+        key: K,
+        load: impl std::future::Future<Output = Result<V, E>>,
+    ) -> Result<(V, Lookup), E> {
         if let Some(v) = self.get(&key) {
             return Ok((v, Lookup::Hit));
         }
@@ -694,7 +746,8 @@ pub fn set_gc_min_age(d: Duration) {
 /// replaced SSTs for reads that started on it: a scan or snapshot (a big
 /// getRepo to a slow client) must finish within it. It also bounds how long
 /// replaced SSTs linger. Unit tests: 1 s, so forced detaches complete.
-static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(if cfg!(test) { 1 } else { 3600 });
+static CHECKPOINT_LIFETIME_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(if cfg!(test) { 1 } else { 3600 });
 
 pub fn set_checkpoint_lifetime(d: Duration) {
     CHECKPOINT_LIFETIME_SECS.store(d.as_secs().max(60), std::sync::atomic::Ordering::Relaxed);
@@ -755,7 +808,11 @@ fn slow_poll() -> Duration {
 fn gc_options() -> slatedb::config::GarbageCollectorOptions {
     use slatedb::config::{GarbageCollectorDirectoryOptions, GarbageCollectorOptions};
     let min_age = Duration::from_secs(GC_MIN_AGE_SECS.load(std::sync::atomic::Ordering::Relaxed));
-    let detach = Duration::from_millis(if cfg!(test) { 500 } else { DETACH_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed) });
+    let detach = Duration::from_millis(if cfg!(test) {
+        500
+    } else {
+        DETACH_INTERVAL_MS.load(std::sync::atomic::Ordering::Relaxed)
+    });
     GarbageCollectorOptions {
         compacted_options: Some(GarbageCollectorDirectoryOptions { min_age, ..Default::default() }),
         detach_options: Some(slatedb::config::GarbageCollectorScheduleOptions { interval: Some(detach) }),
@@ -796,7 +853,10 @@ pub struct DiskCacheConfig {
 
 impl DiskCacheConfig {
     pub fn for_shards(&self, shards: usize) -> DiskCache {
-        DiskCache { dir: self.dir.clone(), shard_bytes: disk_cache_shard_bytes(self.node_bytes, self.shard_bytes, shards) }
+        DiskCache {
+            dir: self.dir.clone(),
+            shard_bytes: disk_cache_shard_bytes(self.node_bytes, self.shard_bytes, shards),
+        }
     }
 }
 
@@ -833,11 +893,7 @@ fn shard_settings(partition: ShardId, cache: Option<&DiskCache>) -> slatedb::Set
     settings
 }
 
-pub async fn open_db(
-    store: &Store,
-    partition: ShardId,
-    cache: Option<&DiskCache>,
-) -> anyhow::Result<Db> {
+pub async fn open_db(store: &Store, partition: ShardId, cache: Option<&DiskCache>) -> anyhow::Result<Db> {
     let settings = shard_settings(partition, cache);
     let path = db_path(store, partition);
     let codec = settings.compression_codec;
@@ -882,7 +938,11 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
     for db in dbs {
         let m = db.manifest();
         let mut l0_bytes = 0;
-        let views = m.l0().iter().map(|v| (v, true)).chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| (v, false))));
+        let views = m
+            .l0()
+            .iter()
+            .map(|v| (v, true))
+            .chain(m.compacted().iter().flat_map(|r| r.sst_views().iter().map(|v| (v, false))));
         for (v, l0) in views {
             let need = v.sst.info.filter_len + v.sst.info.index_len;
             if need > meta_room {
@@ -899,7 +959,11 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
     let n = jobs.len();
     let failed = futures::stream::iter(jobs)
         .map(|(db, id, whole)| async move {
-            let targets: &[CacheTarget] = if whole { &[CacheTarget::Filters, CacheTarget::Data((std::ops::Bound::Unbounded, std::ops::Bound::Unbounded))] } else { &[CacheTarget::Filters, CacheTarget::Index] };
+            let targets: &[CacheTarget] = if whole {
+                &[CacheTarget::Filters, CacheTarget::Data((std::ops::Bound::Unbounded, std::ops::Bound::Unbounded))]
+            } else {
+                &[CacheTarget::Filters, CacheTarget::Index]
+            };
             db.warm_sst(id, targets).await.is_err()
         })
         .buffer_unordered(WARM_CONCURRENCY)
@@ -909,7 +973,14 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
     crate::metrics::SHARD_WARM_SECONDS.observe(started.elapsed().as_secs_f64());
     crate::metrics::SHARD_WARM_SSTS.with_label_values(&["ok"]).inc_by((n - failed) as u64);
     crate::metrics::SHARD_WARM_SSTS.with_label_values(&["error"]).inc_by(failed as u64);
-    tracing::info!(shards = dbs.len(), ssts = n, failed, skipped, elapsed_ms = started.elapsed().as_millis() as u64, "shards warmed");
+    tracing::info!(
+        shards = dbs.len(),
+        ssts = n,
+        failed,
+        skipped,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "shards warmed"
+    );
 }
 
 /// A read-only view of a shard another node still writes, sharing the
@@ -918,7 +989,11 @@ pub async fn warm<D: slatedb::DbCacheManagerOps + slatedb::DbMetadataOps + Send 
 /// (the writer never waits on it), and nothing to replay (no WAL).
 pub async fn open_reader(store: &Store, partition: ShardId) -> anyhow::Result<slatedb::DbReader> {
     let path = db_path(store, partition);
-    let opts = slatedb::config::DbReaderOptions { skip_wal_replay: true, manifest_poll_interval: Duration::from_secs(3600), ..Default::default() };
+    let opts = slatedb::config::DbReaderOptions {
+        skip_wal_replay: true,
+        manifest_poll_interval: Duration::from_secs(3600),
+        ..Default::default()
+    };
     Ok(slatedb::DbReader::builder(path.clone(), store.raw.clone())
         .with_reader_mode(slatedb::DbReaderMode::FollowLatest)
         .with_options(opts)
@@ -942,7 +1017,11 @@ fn cache_id(path: &str) -> u64 {
 /// standalone compactor and worker only know the DB's root, so they get a
 /// store that redirects those SST paths. The set only shrinks after the
 /// open.
-fn external_sst_redirect(db: &Db, path: &str, raw: Arc<dyn object_store::ObjectStore>) -> Arc<dyn object_store::ObjectStore> {
+fn external_sst_redirect(
+    db: &Db,
+    path: &str,
+    raw: Arc<dyn object_store::ObjectStore>,
+) -> Arc<dyn object_store::ObjectStore> {
     let m = db.manifest();
     let ext = m.external_dbs();
     if ext.is_empty() {
@@ -974,25 +1053,52 @@ impl std::fmt::Display for Redirect {
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for Redirect {
-    async fn put_opts(&self, location: &object_store::path::Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
         self.inner.put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &object_store::path::Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
-    async fn get_opts(&self, location: &object_store::path::Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
         self.inner.get_opts(self.map.get(location).unwrap_or(location), options).await
     }
-    fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         self.inner.delete_stream(locations)
     }
-    fn list(&self, prefix: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.inner.list(prefix)
     }
-    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy_opts(&self, from: &object_store::path::Path, to: &object_store::path::Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
 }
@@ -1025,13 +1131,28 @@ pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u
     for &(id, lo, hi) in sources {
         let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
         let now = chrono::Utc::now();
-        let existing = src.list_checkpoints(Some(&name)).await?.into_iter().find(|c| c.expire_time.is_none_or(|t| t > now + chrono::Duration::minutes(5)));
+        let existing = src
+            .list_checkpoints(Some(&name))
+            .await?
+            .into_iter()
+            .find(|c| c.expire_time.is_none_or(|t| t > now + chrono::Duration::minutes(5)));
         let cp = match existing {
             Some(c) => c.id,
-            None => src.create_detached_checkpoint(&slatedb::config::CheckpointOptions { lifetime: Some(CLONE_CHECKPOINT_LIFETIME), name: Some(name.clone()), ..Default::default() }).await?.id,
+            None => {
+                src.create_detached_checkpoint(&slatedb::config::CheckpointOptions {
+                    lifetime: Some(CLONE_CHECKPOINT_LIFETIME),
+                    name: Some(name.clone()),
+                    ..Default::default()
+                })
+                .await?
+                .id
+            }
         };
         let (a, b) = crate::state::slot_range_keys(lo, hi);
-        specs.push(slatedb::CloneSourceSpec::with_checkpoint(db_path(store, id), cp).with_projection_range((Bound::Included(a), Bound::Excluded(b))));
+        specs.push(
+            slatedb::CloneSourceSpec::with_checkpoint(db_path(store, id), cp)
+                .with_projection_range((Bound::Included(a), Bound::Excluded(b))),
+        );
     }
     let mut specs = specs.into_iter();
     let mut b = admin.create_clone_builder_from_source(specs.next().expect("a source"));
@@ -1078,7 +1199,13 @@ const MAX_SST_BYTES: usize = 64 << 20;
 /// closes. Started after the open instead of inside it: the embedded
 /// compactor's startup (~12 sequential store calls) delayed serving after a
 /// takeover or handback.
-fn spawn_compactor(db: &Db, path: String, raw: Arc<dyn object_store::ObjectStore>, codec: Option<slatedb::config::CompressionCodec>, cache_id: u64) {
+fn spawn_compactor(
+    db: &Db,
+    path: String,
+    raw: Arc<dyn object_store::ObjectStore>,
+    codec: Option<slatedb::config::CompressionCodec>,
+    cache_id: u64,
+) {
     spawn_deep_refresh(db);
     let mut status = db.subscribe();
     let watch = db.subscribe();
@@ -1178,7 +1305,8 @@ impl std::str::FromStr for CompactionPolling {
     }
 }
 
-static COMPACTION_POLLING: parking_lot::RwLock<CompactionPolling> = parking_lot::RwLock::new(CompactionPolling::Adaptive);
+static COMPACTION_POLLING: parking_lot::RwLock<CompactionPolling> =
+    parking_lot::RwLock::new(CompactionPolling::Adaptive);
 
 pub fn set_compaction_polling(p: CompactionPolling) {
     *COMPACTION_POLLING.write() = p;
@@ -1232,8 +1360,18 @@ async fn build_compactor(
     } else {
         slow_poll()
     };
-    let opts = CompactorOptions { worker: None, checkpoint_lifetime: checkpoint_lifetime(), poll_interval: poll, ..Default::default() };
-    let worker_opts = CompactionWorkerOptions { compression_codec: codec, compactions_poll_interval: poll, max_sst_size: MAX_SST_BYTES, ..Default::default() };
+    let opts = CompactorOptions {
+        worker: None,
+        checkpoint_lifetime: checkpoint_lifetime(),
+        poll_interval: poll,
+        ..Default::default()
+    };
+    let worker_opts = CompactionWorkerOptions {
+        compression_codec: codec,
+        compactions_poll_interval: poll,
+        max_sst_size: MAX_SST_BYTES,
+        ..Default::default()
+    };
     let compactor = slatedb::CompactorBuilder::new(path.to_string(), raw.clone()).with_options(opts);
     // the output's index and filters go straight into the DB's cache: every
     // read touching a new sorted run otherwise misses on them at once
@@ -1242,7 +1380,10 @@ async fn build_compactor(
         .with_sst_block_size(SST_BLOCK_SIZE)
         .with_db_cache(shared_db_cache(), cache_id);
     #[cfg(feature = "slatedb-metrics")]
-    let (compactor, worker) = (compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()), worker.with_metrics_recorder(crate::metrics::slatedb_recorder()));
+    let (compactor, worker) = (
+        compactor.with_metrics_recorder(crate::metrics::slatedb_recorder()),
+        worker.with_metrics_recorder(crate::metrics::slatedb_recorder()),
+    );
     Ok((compactor.build(), worker.build().await?))
 }
 
@@ -1298,7 +1439,11 @@ mod tests {
         let mut records = Vec::new();
         tree.walk(&mut |k, c| records.push((String::from_utf8(k.to_vec()).unwrap(), c)));
         let raw: usize = records.iter().map(|(_, c)| blocks[c].len()).sum();
-        println!("{} records x {copies} repos, {:.1} MiB of record bytes per repo", records.len(), raw as f64 / (1 << 20) as f64);
+        println!(
+            "{} records x {copies} repos, {:.1} MiB of record bytes per repo",
+            records.len(),
+            raw as f64 / (1 << 20) as f64
+        );
         for codec in [SstCompression::None, SstCompression::Lz4, SstCompression::Zstd] {
             set_sst_compression(codec);
             // two copies: one read by a scan, one by point gets, each cold
@@ -1384,7 +1529,9 @@ mod tests {
             for j in 0..200u32 {
                 db.put(format!("k{j:04}"), format!("value {i} {j} {}", "x".repeat(100))).await.unwrap();
             }
-            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
         }
         let t = std::time::Instant::now();
         loop {
@@ -1404,11 +1551,18 @@ mod tests {
         // writer's next manifest poll shows the compaction.
         let admin = slatedb::admin::AdminBuilder::new(db_path(&store, ShardId(0)), store.raw.clone()).build();
         let manifests = admin.list_manifests(..).await.unwrap();
-        let cp = manifests.iter().flat_map(|m| m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time))).max().expect("compactor checkpoint");
+        let cp = manifests
+            .iter()
+            .flat_map(|m| m.checkpoints().iter().filter_map(|c| Some(c.expire_time? - c.create_time)))
+            .max()
+            .expect("compactor checkpoint");
         assert_eq!(cp.num_seconds() as u64, checkpoint_lifetime().as_secs());
         db.close().await.unwrap();
         let db = open_db(&store, ShardId(0), None).await.unwrap();
-        assert_eq!(db.get(b"k0123").await.unwrap().as_deref(), Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes()));
+        assert_eq!(
+            db.get(b"k0123").await.unwrap().as_deref(),
+            Some(format!("value 7 123 {}", "x".repeat(100)).as_bytes())
+        );
         db.close().await.unwrap();
     }
 
@@ -1433,13 +1587,26 @@ mod tests {
 
     #[async_trait::async_trait]
     impl object_store::ObjectStore for SstGets {
-        async fn put_opts(&self, l: &object_store::path::Path, p: object_store::PutPayload, o: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+        async fn put_opts(
+            &self,
+            l: &object_store::path::Path,
+            p: object_store::PutPayload,
+            o: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
             self.inner.put_opts(l, p, o).await
         }
-        async fn put_multipart_opts(&self, l: &object_store::path::Path, o: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        async fn put_multipart_opts(
+            &self,
+            l: &object_store::path::Path,
+            o: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(l, o).await
         }
-        async fn get_opts(&self, l: &object_store::path::Path, o: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        async fn get_opts(
+            &self,
+            l: &object_store::path::Path,
+            o: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
             if l.as_ref().ends_with(".sst") {
                 self.n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // a store round trip, so concurrent readers overlap
@@ -1447,16 +1614,30 @@ mod tests {
             }
             self.inner.get_opts(l, o).await
         }
-        fn delete_stream(&self, l: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        fn delete_stream(
+            &self,
+            l: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
             self.inner.delete_stream(l)
         }
-        fn list(&self, p: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
             self.inner.list(p)
         }
-        async fn list_with_delimiter(&self, p: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+        async fn list_with_delimiter(
+            &self,
+            p: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
             self.inner.list_with_delimiter(p).await
         }
-        async fn copy_opts(&self, f: &object_store::path::Path, t: &object_store::path::Path, o: object_store::CopyOptions) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            f: &object_store::path::Path,
+            t: &object_store::path::Path,
+            o: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             self.inner.copy_opts(f, t, o).await
         }
     }
@@ -1470,7 +1651,9 @@ mod tests {
             for j in 0..200u32 {
                 db.put(format!("k{i:02}-{j:04}"), "v".repeat(64)).await.unwrap();
             }
-            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
         }
         db.close().await.unwrap();
         (store, gets)
@@ -1486,10 +1669,12 @@ mod tests {
         let ssts = (m.l0().len() + m.compacted().iter().map(|r| r.sst_views().len()).sum::<usize>()) as u64;
         gets.take();
         // absent keys: each get reads every L0's filter and nothing else
-        let reads: Vec<_> = (0..64).map(|i| {
-            let db = db.clone();
-            tokio::spawn(async move { db.get(format!("absent-{i}")).await.unwrap() })
-        }).collect();
+        let reads: Vec<_> = (0..64)
+            .map(|i| {
+                let db = db.clone();
+                tokio::spawn(async move { db.get(format!("absent-{i}")).await.unwrap() })
+            })
+            .collect();
         for r in reads {
             assert!(r.await.unwrap().is_none());
         }
@@ -1545,7 +1730,13 @@ mod tests {
         use object_store::throttle::{ThrottleConfig, ThrottledStore};
         let mem = Arc::new(object_store::memory::InMemory::new());
         let d = Duration::from_millis(20);
-        let cfg = ThrottleConfig { wait_get_per_call: d, wait_put_per_call: d, wait_list_per_call: d, wait_delete_per_call: d, ..Default::default() };
+        let cfg = ThrottleConfig {
+            wait_get_per_call: d,
+            wait_put_per_call: d,
+            wait_list_per_call: d,
+            wait_delete_per_call: d,
+            ..Default::default()
+        };
         let store = Store { raw: Arc::new(ThrottledStore::new(mem, cfg)), ..Store::memory(None) };
         for round in ["fresh", "reopen"] {
             let t = std::time::Instant::now();
@@ -1553,10 +1744,13 @@ mod tests {
             let open = t.elapsed();
             db.put(b"k", b"v").await.unwrap();
             db.close().await.unwrap();
-            println!("{round}: open {:.0} ms (~{:.0} calls at 20 ms)", open.as_secs_f64() * 1e3, open.as_secs_f64() / 0.02);
+            println!(
+                "{round}: open {:.0} ms (~{:.0} calls at 20 ms)",
+                open.as_secs_f64() * 1e3,
+                open.as_secs_f64() / 0.02
+            );
         }
     }
-
 }
 
 #[cfg(test)]
@@ -1613,7 +1807,9 @@ mod clone_tests {
                 c1.put(k(100, &format!("h/new{r}{i:03}")), "x").await.unwrap();
                 c1.delete(k(0, &format!("h/did{i:03}"))).await.unwrap();
             }
-            c1.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            c1.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
         }
         let t = std::time::Instant::now();
         loop {
@@ -1683,7 +1879,9 @@ mod clone_tests {
             }
             assert!(t.elapsed() < Duration::from_secs(60), "never compacted: {} L0s", m.l0().len());
             db.put(k(100, &format!("h/filler{i}")), "f").await.unwrap();
-            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = db.refresh_manifest().await;
         }
@@ -1759,7 +1957,11 @@ mod clone_tests {
                         model.insert(key, (slot, format!("v{n}"), *sid, step));
                         n += 1;
                     }
-                    db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+                    db.flush_with_options(slatedb::config::FlushOptions {
+                        flush_type: slatedb::config::FlushType::MemTable,
+                    })
+                    .await
+                    .unwrap();
                 }
             }
             if rng.gen_bool(0.5) {
@@ -1804,10 +2006,18 @@ mod clone_tests {
     }
 
     /// Every key of `model` reads back its value from the shard holding its slot.
-    async fn check(shards: &[(ShardId, u32, u32, Db)], model: &std::collections::BTreeMap<Vec<u8>, (u16, String, ShardId, usize)>, log: &[String], seed: u64, step: usize, when: &str) {
+    async fn check(
+        shards: &[(ShardId, u32, u32, Db)],
+        model: &std::collections::BTreeMap<Vec<u8>, (u16, String, ShardId, usize)>,
+        log: &[String],
+        seed: u64,
+        step: usize,
+        when: &str,
+    ) {
         let mut missing = Vec::new();
         for (key, (slot, v, wid, wstep)) in model {
-            let (id, _, _, db) = shards.iter().find(|(_, lo, hi, _)| (*slot as u32) >= *lo && (*slot as u32) < *hi).unwrap();
+            let (id, _, _, db) =
+                shards.iter().find(|(_, lo, hi, _)| (*slot as u32) >= *lo && (*slot as u32) < *hi).unwrap();
             match db.get(key).await.unwrap() {
                 Some(got) if got.as_ref() == v.as_bytes() => {}
                 other => missing.push((*id, *slot, v.clone(), other.is_some(), *wid, *wstep)),
@@ -1819,7 +2029,12 @@ mod clone_tests {
             }
             for (id, _, _, db) in shards {
                 let m = db.manifest();
-                eprintln!("shard {id}: l0 {} srs {} ext {:?}", m.l0().len(), m.compacted().len(), m.external_dbs().iter().map(|e| (e.path.clone(), e.sst_ids.len())).collect::<Vec<_>>());
+                eprintln!(
+                    "shard {id}: l0 {} srs {} ext {:?}",
+                    m.l0().len(),
+                    m.compacted().len(),
+                    m.external_dbs().iter().map(|e| (e.path.clone(), e.sst_ids.len())).collect::<Vec<_>>()
+                );
             }
             panic!("seed {seed} step {step} {when}: {} of {} keys missing, e.g. (shard, slot, v, present, written to, at step) {:?}", missing.len(), model.len(), &missing[..missing.len().min(8)]);
         }

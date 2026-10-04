@@ -38,7 +38,8 @@ fn export(app: &App) {
     metrics::REPOS_WRITTEN_WITHIN.with_label_values(&["all"]).set(t.repos());
     if let Some(cfg) = &app.node.disk_cache {
         let owned = app.partitions.owned().len().max(1) as u64;
-        let capacity = cfg.node_bytes.unwrap_or_else(|| app.node.shard_disk_cache().map_or(0, |c| c.shard_bytes) * owned);
+        let capacity =
+            cfg.node_bytes.unwrap_or_else(|| app.node.shard_disk_cache().map_or(0, |c| c.shard_bytes) * owned);
         metrics::DISK_CACHE_BYTES.with_label_values(&["capacity"]).set(capacity as i64);
         if let Some(used) = metrics::slatedb_gauge("slatedb.object_store_cache.cache_bytes") {
             metrics::DISK_CACHE_BYTES.with_label_values(&["used"]).set(used);
@@ -78,7 +79,13 @@ pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
         let snap = p.db.snapshot().await?;
         let lo = range.lo as u16;
         let in_range = |key: &[u8]| state::key_slot(key).is_some_and(|s| (s as u32) < range.hi);
-        let mut accts = state::FamilyScan::new(snap.as_ref(), state::ACCOUNT_FAMILY, Some(state::slot_family(lo, state::ACCOUNT_FAMILY)), &opts).await?;
+        let mut accts = state::FamilyScan::new(
+            snap.as_ref(),
+            state::ACCOUNT_FAMILY,
+            Some(state::slot_family(lo, state::ACCOUNT_FAMILY)),
+            &opts,
+        )
+        .await?;
         while let Some(kv) = accts.next().await? {
             if !in_range(&kv.key) {
                 break;
@@ -86,7 +93,13 @@ pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
             let status = serde_json::from_slice::<Status>(&kv.value).ok().and_then(|s| s.status);
             t.accounts[totals::status_index(status.as_deref()) as usize] += 1;
         }
-        let mut heads = state::FamilyScan::new(snap.as_ref(), state::HEAD_FAMILY, Some(state::slot_family(lo, state::HEAD_FAMILY)), &opts).await?;
+        let mut heads = state::FamilyScan::new(
+            snap.as_ref(),
+            state::HEAD_FAMILY,
+            Some(state::slot_family(lo, state::HEAD_FAMILY)),
+            &opts,
+        )
+        .await?;
         while let Some(kv) = heads.next().await? {
             if !in_range(&kv.key) {
                 break;

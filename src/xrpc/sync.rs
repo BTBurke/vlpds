@@ -3,10 +3,7 @@ use std::collections::{HashMap, HashSet};
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
-        .route(
-            "/xrpc/com.atproto.sync.getLatestCommit",
-            get(get_latest_commit),
-        )
+        .route("/xrpc/com.atproto.sync.getLatestCommit", get(get_latest_commit))
         .route("/xrpc/com.atproto.sync.getRepoStatus", get(get_repo_status))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
         .route("/xrpc/com.atproto.sync.getCheckout", get(get_checkout))
@@ -14,21 +11,12 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
         .route("/xrpc/com.atproto.sync.getRecord", get(sync_get_record))
         .route("/xrpc/com.atproto.sync.listRepos", get(list_repos))
-        .route(
-            "/xrpc/com.atproto.sync.listReposByCollection",
-            get(list_repos_by_collection),
-        )
-        .route(
-            "/xrpc/com.atproto.sync.subscribeRepos",
-            get(subscribe_repos),
-        )
+        .route("/xrpc/com.atproto.sync.listReposByCollection", get(list_repos_by_collection))
+        .route("/xrpc/com.atproto.sync.subscribeRepos", get(subscribe_repos))
         // relay-side methods
         .route("/xrpc/com.atproto.sync.getHostStatus", get(not_implemented))
         .route("/xrpc/com.atproto.sync.listHosts", get(not_implemented))
-        .route(
-            "/xrpc/com.atproto.sync.notifyOfUpdate",
-            post(not_implemented),
-        )
+        .route("/xrpc/com.atproto.sync.notifyOfUpdate", post(not_implemented))
         .route("/xrpc/com.atproto.sync.requestCrawl", post(not_implemented))
 }
 
@@ -42,11 +30,7 @@ pub(super) async fn not_implemented() -> XrpcError {
 
 /// Reference `assertRepoAvailability`: only the repo's own user or an admin
 /// may read an inactive repo.
-pub(super) async fn assert_available(
-    app: &App,
-    did: &str,
-    creds: Option<&Credentials>,
-) -> XResult<Account> {
+pub(super) async fn assert_available(app: &App, did: &str, creds: Option<&Credentials>) -> XResult<Account> {
     let acct = super::server::account_if_exists(app, did)
         .await?
         .ok_or_else(|| XrpcError::bad("RepoNotFound", format!("Could not find repo for DID: {did}")))?;
@@ -110,16 +94,10 @@ async fn get_latest_commit(
 ) -> XResult<Json<J>> {
     assert_available(&app, &q.did, creds.as_ref()).await?;
     let head = app.head(&q.did).await?;
-    Ok(Json(
-        json!({"cid": head.commit.to_string(), "rev": head.rev.to_string()}),
-    ))
+    Ok(Json(json!({"cid": head.commit.to_string(), "rev": head.rev.to_string()})))
 }
 
-async fn get_head(
-    State(app): AppState,
-    MaybeAuth(creds): MaybeAuth,
-    Query(q): Query<DidQ>,
-) -> XResult<Json<J>> {
+async fn get_head(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Query<DidQ>) -> XResult<Json<J>> {
     assert_available(&app, &q.did, creds.as_ref()).await?;
     let head = app.head(&q.did).await.map_err(|e| match e.error.as_str() {
         "RepoNotFound" => XrpcError::bad("HeadNotFound", format!("Could not find root for DID: {}", q.did)),
@@ -143,11 +121,7 @@ async fn get_repo_status(State(app): AppState, Query(q): Query<DidQ>) -> XResult
 }
 
 fn car_response(body: Vec<u8>) -> Response {
-    (
-        [(header::CONTENT_TYPE, "application/vnd.ipld.car")],
-        Body::from(body),
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "application/vnd.ipld.car")], Body::from(body)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -159,24 +133,18 @@ struct GetRepoQ {
 /// With `since`, only records written after that rev. MST nodes aren't
 /// stored per rev, so the whole current tree is included: a superset of the
 /// reference's block set that still applies cleanly for incremental sync.
-async fn get_repo(
-    State(app): AppState,
-    MaybeAuth(creds): MaybeAuth,
-    Query(q): Query<GetRepoQ>,
-) -> XResult<Response> {
+async fn get_repo(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Query<GetRepoQ>) -> XResult<Response> {
     let since = match &q.since {
-        Some(s) => Some(crate::tid::Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?.0),
+        Some(s) => {
+            Some(crate::tid::Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?.0)
+        }
         None => None,
     };
     assert_available(&app, &q.did, creds.as_ref()).await?;
     export_repo(&app, &q.did, since).await
 }
 
-async fn get_checkout(
-    State(app): AppState,
-    MaybeAuth(creds): MaybeAuth,
-    Query(q): Query<DidQ>,
-) -> XResult<Response> {
+async fn get_checkout(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Query<DidQ>) -> XResult<Response> {
     assert_available(&app, &q.did, creds.as_ref()).await?;
     export_repo(&app, &q.did, None).await
 }
@@ -243,7 +211,12 @@ async fn feed_records(
     tx: tokio::sync::mpsc::Sender<crate::mst_store::RecordBatch>,
 ) -> anyhow::Result<()> {
     let prefix = state::record_prefix(did, gen);
-    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
+    let opts = slatedb::config::ScanOptions {
+        read_ahead_bytes: 4 << 20,
+        max_fetch_tasks: 4,
+        cache_blocks: true,
+        ..Default::default()
+    };
     let mut iter = match snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await {
         Ok(it) => state::BatchedScan::new(it),
         Err(e) => {
@@ -271,7 +244,9 @@ async fn feed_records(
         };
         let carried = since.is_none_or(|s| state::record_value_rev(&kv.value) > s);
         batch.push(&kv.key[prefix.len()..], cid, carried.then_some(bytes));
-        if (batch.len() == EXPORT_BATCH || batch.bytes() >= EXPORT_BATCH_BYTES) && tx.send(Ok(std::mem::replace(&mut batch, new_batch()))).await.is_err() {
+        if (batch.len() == EXPORT_BATCH || batch.bytes() >= EXPORT_BATCH_BYTES)
+            && tx.send(Ok(std::mem::replace(&mut batch, new_batch()))).await.is_err()
+        {
             // the walk is gone: its result says why
             return Ok(());
         }
@@ -281,7 +256,6 @@ async fn feed_records(
     }
     Ok(())
 }
-
 
 struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
@@ -325,13 +299,22 @@ async fn export_slot(app: &App) -> XResult<ExportSlot> {
 
 /// A whole-tree walk's `M/` read-ahead, and its grants from
 /// [`EXPORT_PREFETCH_MB`]. Walk with its `persist_min()`.
-pub(crate) async fn prefetch_nodes(snap: &slatedb::DbSnapshot, did: &str, gen: u64) -> (crate::mst_store::Prefetched, Option<tokio::sync::SemaphorePermit<'static>>) {
+pub(crate) async fn prefetch_nodes(
+    snap: &slatedb::DbSnapshot,
+    did: &str,
+    gen: u64,
+) -> (crate::mst_store::Prefetched, Option<tokio::sync::SemaphorePermit<'static>>) {
     let (mut held, mut mb) = (None::<tokio::sync::SemaphorePermit<'static>>, 0usize);
     let max = EXPORT_PREFETCH_MAX.load(Ordering::Relaxed);
     if max == 0 {
         return (Default::default(), None);
     }
-    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, max_fetch_tasks: 4, cache_blocks: true, ..Default::default() };
+    let opts = slatedb::config::ScanOptions {
+        read_ahead_bytes: 4 << 20,
+        max_fetch_tasks: 4,
+        cache_blocks: true,
+        ..Default::default()
+    };
     let r = crate::mst_store::prefetch_tree(snap, did, gen, &opts, |bytes| {
         if bytes > max {
             return false;
@@ -413,11 +396,21 @@ impl<S: crate::mst_lazy::Source> crate::mst_lazy::Source for Stoppable<'_, S> {
         self.check()?;
         self.inner.node(cid)
     }
-    fn records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(crate::mst_lazy::Key, Cid)>) -> Result<(), crate::mst::MstError> {
+    fn records(
+        &self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        out: &mut Vec<(crate::mst_lazy::Key, Cid)>,
+    ) -> Result<(), crate::mst::MstError> {
         self.check()?;
         self.inner.records(lo, hi, out)
     }
-    fn leaf_records(&self, lo: Option<&[u8]>, hi: Option<&[u8]>, enc: &mut crate::mst::LeafEncoder) -> Result<(), crate::mst::MstError> {
+    fn leaf_records(
+        &self,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        enc: &mut crate::mst::LeafEncoder,
+    ) -> Result<(), crate::mst::MstError> {
         self.check()?;
         self.inner.leaf_records(lo, hi, enc)
     }
@@ -534,7 +527,6 @@ async fn stream_export(
     Ok(())
 }
 
-
 /// Only the current state's blocks: ones only reachable from older revisions
 /// aren't kept and report BlockNotFound.
 async fn get_blocks(
@@ -553,8 +545,7 @@ async fn get_blocks(
     let mut wanted = std::collections::HashSet::new();
     for (k, v) in &pairs {
         if k == "cids" || k == "cids[]" {
-            let c = Cid::parse(v)
-                .map_err(|_| XrpcError::bad("InvalidRequest", format!("invalid cid: {v}")))?;
+            let c = Cid::parse(v).map_err(|_| XrpcError::bad("InvalidRequest", format!("invalid cid: {v}")))?;
             if wanted.insert(c) {
                 want.push(c);
             }
@@ -611,10 +602,7 @@ async fn get_blocks(
 /// prefix), so the record at a path must match.
 async fn find_record(snap: &slatedb::DbSnapshot, did: &str, gen: u64, cid: &Cid) -> XResult<Option<Vec<u8>>> {
     let prefix = state::record_cid_prefix(did, gen, cid);
-    let mut iter = snap
-        .scan(prefix.clone()..state::prefix_end(&prefix))
-        .await
-        .map_err(XrpcError::from_err)?;
+    let mut iter = snap.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         let Ok(path) = std::str::from_utf8(&kv.key[prefix.len()..]) else {
             continue;
@@ -655,11 +643,7 @@ async fn sync_get_record(
     for (c, b) in proof.map_err(XrpcError::from_err)? {
         car::write_block(&mut out, &c, &b);
     }
-    if let Some(v) =
-        snap.get(state::record_key(&q.did, view.gen, &path))
-            .await
-            .map_err(XrpcError::from_err)?
-    {
+    if let Some(v) = snap.get(state::record_key(&q.did, view.gen, &path)).await.map_err(XrpcError::from_err)? {
         let (cid, bytes) = state::decode_record_value(&v).map_err(XrpcError::from_err)?;
         car::write_block(&mut out, &cid, &bytes);
     }
@@ -683,7 +667,9 @@ async fn lazy_nodes(
     let mut want: std::collections::HashSet<Cid> = cids.into_iter().collect();
     let mut out = Vec::new();
     let rev = view.head.rev.0;
-    let lookup = |ix: &NodeIndex, want: &HashSet<Cid>| -> Vec<(Cid, NodeRef)> { want.iter().filter_map(|c| ix.get(c).map(|r| (*c, r.clone()))).collect() };
+    let lookup = |ix: &NodeIndex, want: &HashSet<Cid>| -> Vec<(Cid, NodeRef)> {
+        want.iter().filter_map(|c| ix.get(c).map(|r| (*c, r.clone()))).collect()
+    };
     if !walk {
         crate::mst_lazy::loaded_blocks(&view.tree.root, &want, &mut out).map_err(XrpcError::from_err)?;
         for (c, _) in &out {
@@ -753,7 +739,9 @@ async fn lazy_nodes(
                 crate::mst_lazy::export_blocks(root, pre.persist_min(), &scan, &mut |c, b| {
                     // nodes with keys of their own (all leaves): where they sit
                     if let Ok(n) = crate::mst::decode_node(b, c) {
-                        if let Some(crate::mst::Entry::Value { key, .. }) = n.entries.iter().find(|e| matches!(e, crate::mst::Entry::Value { .. })) {
+                        if let Some(crate::mst::Entry::Value { key, .. }) =
+                            n.entries.iter().find(|e| matches!(e, crate::mst::Entry::Value { .. }))
+                        {
                             map.insert(c, (key.clone(), n.height));
                         }
                     }
@@ -797,7 +785,13 @@ fn index_build_gate(cell: &crate::mst::SharedNodeIndex) -> Arc<tokio::sync::Mute
 
 /// The block of node `c` if it ends `key`'s path in the view's tree (a node
 /// holding its own first key does).
-async fn path_end_block(view: &crate::worker::DurableView, snap: &slatedb::DbSnapshot, did: &str, key: &[u8], c: &Cid) -> XResult<Option<Vec<u8>>> {
+async fn path_end_block(
+    view: &crate::worker::DurableView,
+    snap: &slatedb::DbSnapshot,
+    did: &str,
+    key: &[u8],
+    c: &Cid,
+) -> XResult<Option<Vec<u8>>> {
     let n = crate::mst_store::path_end(&view.tree.root, snap, did, view.gen, key).await.map_err(XrpcError::from_err)?;
     if n.cid != Some(*c) {
         return Ok(None);
@@ -885,7 +879,11 @@ fn unowned(shard: crate::slots::ShardId) -> XrpcError {
 /// consecutively, and where the next page starts (None: past the last
 /// slot). 503 if `pos`'s shard isn't ours. Also served to peers by
 /// /internal/v1/sync/listRepos.
-pub(super) async fn list_repos_local(app: &App, pos: RepoPos, limit: usize) -> XResult<(Vec<RepoView>, Option<RepoPos>)> {
+pub(super) async fn list_repos_local(
+    app: &App,
+    pos: RepoPos,
+    limit: usize,
+) -> XResult<(Vec<RepoView>, Option<RepoPos>)> {
     let mut repos = Vec::with_capacity(limit.min(1000));
     match list_repos_into(app, pos, limit, &mut repos).await {
         Ok(next) => Ok((repos, next)),
@@ -925,12 +923,19 @@ async fn list_repos_into(app: &App, pos: RepoPos, limit: usize, repos: &mut Vec<
         first = false;
         let (h_lo, a_lo) = match &pos.after {
             Some(d) => ([state::head_key(d), vec![0]].concat(), [state::account_key(d), vec![0]].concat()),
-            None => (state::slot_family(pos.slot as u16, state::HEAD_FAMILY), state::slot_family(pos.slot as u16, state::ACCOUNT_FAMILY)),
+            None => (
+                state::slot_family(pos.slot as u16, state::HEAD_FAMILY),
+                state::slot_family(pos.slot as u16, state::ACCOUNT_FAMILY),
+            ),
         };
         let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
-        let mut heads = state::FamilyScan::new(snap.as_ref(), state::HEAD_FAMILY, Some(h_lo), &opts).await.map_err(XrpcError::from_err)?;
-        let mut accts = state::FamilyScan::new(snap.as_ref(), state::ACCOUNT_FAMILY, Some(a_lo), &opts).await.map_err(XrpcError::from_err)?;
+        let mut heads = state::FamilyScan::new(snap.as_ref(), state::HEAD_FAMILY, Some(h_lo), &opts)
+            .await
+            .map_err(XrpcError::from_err)?;
+        let mut accts = state::FamilyScan::new(snap.as_ref(), state::ACCOUNT_FAMILY, Some(a_lo), &opts)
+            .await
+            .map_err(XrpcError::from_err)?;
         let mut acct_peek: Option<slatedb::KeyValue> = None;
         let mut acct_done = false;
         while repos.len() < limit {
@@ -956,7 +961,9 @@ async fn list_repos_into(app: &App, pos: RepoPos, limit: usize, repos: &mut Vec<
                 match state::slot_did(&a.key, fam).cmp(&head_pos) {
                     std::cmp::Ordering::Less => acct_peek = None,
                     std::cmp::Ordering::Equal => {
-                        status = serde_json::from_slice::<Status>(&a.value).ok().and_then(|s| s.status.map(|s| s.into_owned()));
+                        status = serde_json::from_slice::<Status>(&a.value)
+                            .ok()
+                            .and_then(|s| s.status.map(|s| s.into_owned()));
                         acct_peek = None;
                         break;
                     }
@@ -1012,7 +1019,11 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
                 Err(e) if repos.is_empty() => return Err(e),
                 // what earlier owners listed stands: the cursor resumes here
                 Err(e) => {
-                    tracing::warn!(shard = shard.0, "listRepos: local shard failed, ending the page early: {}", e.message);
+                    tracing::warn!(
+                        shard = shard.0,
+                        "listRepos: local shard failed, ending the page early: {}",
+                        e.message
+                    );
                     break;
                 }
             }
@@ -1037,7 +1048,12 @@ async fn list_repos(State(app): AppState, Query(q): Query<ListReposQ>) -> XResul
     Ok(json_response(serde_json::to_vec(&page).map_err(XrpcError::from_err)?))
 }
 
-async fn owner_page(app: &App, shard: crate::slots::ShardId, pos: &RepoPos, limit: usize) -> XResult<(Bytes, ReposPage)> {
+async fn owner_page(
+    app: &App,
+    shard: crate::slots::ShardId,
+    pos: &RepoPos,
+    limit: usize,
+) -> XResult<(Bytes, ReposPage)> {
     let c = app.cluster.as_ref().ok_or_else(|| unowned(shard))?;
     let Some((owner, addr)) = c.owner_of(shard).filter(|(id, _)| *id != c.cfg.node_id) else {
         return Err(unowned(shard));
@@ -1078,7 +1094,9 @@ pub(super) async fn list_repos_by_collection_local(
     for p in owned {
         let (fam, start) = (fam.clone(), start.clone());
         scans.push(async move {
-            let mut iter = state::FamilyScan::new(p.db.as_ref(), &fam, start, &Default::default()).await.map_err(XrpcError::from_err)?;
+            let mut iter = state::FamilyScan::new(p.db.as_ref(), &fam, start, &Default::default())
+                .await
+                .map_err(XrpcError::from_err)?;
             let mut dids = Vec::new();
             while dids.len() < limit {
                 let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? else {
@@ -1105,10 +1123,7 @@ fn sort_slot_order(dids: &mut Vec<String>) {
 
 /// The (slot, DID) order spans every shard, so a shard with no answering
 /// owner fails the page with 503.
-async fn list_repos_by_collection(
-    State(app): AppState,
-    Query(q): Query<ByCollectionQ>,
-) -> XResult<Json<J>> {
+async fn list_repos_by_collection(State(app): AppState, Query(q): Query<ByCollectionQ>) -> XResult<Json<J>> {
     let limit = super::extract::limit_param(q.limit, 500, 1, 2000)?;
     let (mut all, owned) = list_repos_by_collection_local(&app, &q).await?;
     let mut query = vec![("collection", q.collection.clone()), ("limit", limit.to_string())];
@@ -1177,10 +1192,7 @@ mod tests {
 
     #[test]
     fn hostnames() {
-        assert_eq!(
-            public_hostname("https://pds.example.com/"),
-            "pds.example.com"
-        );
+        assert_eq!(public_hostname("https://pds.example.com/"), "pds.example.com");
         assert_eq!(public_hostname("http://localhost:2583"), "localhost:2583");
     }
 }

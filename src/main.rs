@@ -50,11 +50,7 @@ struct Args {
     /// the accept queue (0 = no cap).
     #[arg(long, env = "VLPDS_MAX_CONNECTIONS", default_value_t = vlpds::server::DEFAULT_MAX_CONNECTIONS)]
     max_connections: usize,
-    #[arg(
-        long,
-        env = "VLPDS_PUBLIC_URL",
-        default_value = "http://localhost:2583"
-    )]
+    #[arg(long, env = "VLPDS_PUBLIC_URL", default_value = "http://localhost:2583")]
     public_url: String,
     #[arg(long, env = "VLPDS_HANDLE_DOMAIN", default_value = "vlpds.test")]
     handle_domain: String,
@@ -84,11 +80,7 @@ struct Args {
     #[arg(long, env = "VLPDS_INTERNAL_TOKEN_FILE", conflicts_with = "internal_token")]
     internal_token_file: Option<std::path::PathBuf>,
 
-    #[arg(
-        long,
-        env = "VLPDS_S3_ENDPOINT",
-        default_value = "http://localhost:9000"
-    )]
+    #[arg(long, env = "VLPDS_S3_ENDPOINT", default_value = "http://localhost:9000")]
     s3_endpoint: String,
     #[arg(long, env = "VLPDS_S3_BUCKET", default_value = "vlpds")]
     s3_bucket: String,
@@ -663,9 +655,7 @@ struct Args {
 fn url_did(v: &Option<String>) -> anyhow::Result<Option<(String, String)>> {
     v.as_ref()
         .map(|s| {
-            let (u, d) = s
-                .split_once(',')
-                .ok_or_else(|| anyhow::anyhow!("expected <url>,<did>: {s}"))?;
+            let (u, d) = s.split_once(',').ok_or_else(|| anyhow::anyhow!("expected <url>,<did>: {s}"))?;
             Ok((u.to_string(), d.to_string()))
         })
         .transpose()
@@ -710,11 +700,19 @@ fn raise_nofile_limit() {
     #[cfg(target_os = "macos")]
     {
         extern "C" {
-            fn sysctlbyname(name: *const std::ffi::c_char, old: *mut std::ffi::c_void, oldlen: *mut usize, new: *mut std::ffi::c_void, newlen: usize) -> i32;
+            fn sysctlbyname(
+                name: *const std::ffi::c_char,
+                old: *mut std::ffi::c_void,
+                oldlen: *mut usize,
+                new: *mut std::ffi::c_void,
+                newlen: usize,
+            ) -> i32;
         }
         let (mut v, mut len) = (0i32, std::mem::size_of::<i32>());
         let name = c"kern.maxfilesperproc";
-        if unsafe { sysctlbyname(name.as_ptr(), &mut v as *mut i32 as *mut _, &mut len, std::ptr::null_mut(), 0) } == 0 && v > 0 {
+        if unsafe { sysctlbyname(name.as_ptr(), &mut v as *mut i32 as *mut _, &mut len, std::ptr::null_mut(), 0) } == 0
+            && v > 0
+        {
             want = want.min(v as u64);
         }
     }
@@ -735,7 +733,10 @@ fn raise_nofile_limit() {
 fn raise_nofile_limit() {}
 
 #[derive(Parser)]
-#[command(name = "vlpds admin", about = "Operator commands against a running vlpds node (pdsadmin equivalents, shard layout)")]
+#[command(
+    name = "vlpds admin",
+    about = "Operator commands against a running vlpds node (pdsadmin equivalents, shard layout)"
+)]
 struct AdminArgs {
     /// Any node of the cluster.
     #[arg(long, global = true, env = "VLPDS_URL", default_value = "http://127.0.0.1:2583")]
@@ -823,7 +824,9 @@ fn tls_main(cmd: TlsCmd) -> anyhow::Result<()> {
             println!("CA certificate: {}\nCA key (0600; keep it offline): {}", crt.display(), key.display());
         }
         TlsCmd::Issue { node_id, hosts, ca, ca_key, out, days, force } => {
-            let read = |p: &std::path::Path| std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()));
+            let read = |p: &std::path::Path| {
+                std::fs::read_to_string(p).map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display()))
+            };
             let n = peer_tls::issue_node(&read(&ca)?, &read(&ca_key)?, &node_id, &hosts, days)?;
             let (crt, key) = peer_tls::write_pair(&out, &node_id, &n, force)?;
             println!("node certificate: {}\nnode key (0600): {}", crt.display(), key.display());
@@ -839,7 +842,8 @@ fn tls_main(cmd: TlsCmd) -> anyhow::Result<()> {
             for der in rustls::pki_types::CertificateDer::pem_slice_iter(&pem) {
                 let i = peer_tls::cert_info(&der?)?;
                 let left = (i.not_after - chrono::Utc::now().timestamp()) / 86400;
-                let not_after = chrono::DateTime::from_timestamp(i.not_after, 0).map(|t| t.to_rfc3339()).unwrap_or_default();
+                let not_after =
+                    chrono::DateTime::from_timestamp(i.not_after, 0).map(|t| t.to_rfc3339()).unwrap_or_default();
                 println!(
                     "subject: {}\nca: {}\nnode: {}\nhosts: {}\nnot after: {not_after} ({left} days left)",
                     i.subject,
@@ -880,7 +884,11 @@ fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
     resolve("admin-token-file", &args.admin_token_file, &mut args.admin_token)?;
     resolve("internal-token-file", &args.internal_token_file, &mut args.internal_token)?;
     resolve("email-smtp-url-file", &args.email_smtp_url_file, &mut args.email_smtp_url)?;
-    resolve("moderation-email-smtp-url-file", &args.moderation_email_smtp_url_file, &mut args.moderation_email_smtp_url)?;
+    resolve(
+        "moderation-email-smtp-url-file",
+        &args.moderation_email_smtp_url_file,
+        &mut args.moderation_email_smtp_url,
+    )?;
     resolve("rate-limit-bypass-key-file", &args.rate_limit_bypass_key_file, &mut args.rate_limit_bypass_key)?;
     if let Some(p) = &args.s3_access_key_file {
         args.s3_access_key = read("s3-access-key-file", p)?;
@@ -924,10 +932,7 @@ fn main() -> anyhow::Result<()> {
     }
     let io_threads = args.io_threads.unwrap_or_else(cores).max(1);
     tracing::info!(io_threads, workers = args.workers.unwrap_or_else(default_workers), cores = cores(), "threads");
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(io_threads)
-        .enable_all()
-        .build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(io_threads).enable_all().build()?;
     let r = rt.block_on(run(args));
     match &r {
         Ok(()) => vlpds::lifecycle::record_exit(0, "clean"),
@@ -984,18 +989,24 @@ fn plc_config(args: &Args) -> anyhow::Result<vlpds::plc::PlcConfig> {
     use vlpds::plc::RotationKey;
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
     let hex = |h: &str| RotationKey::Hex(zeroize::Zeroizing::new(h.trim().to_string()));
-    let rotation_key = match (args.plc_rotation_key.as_deref().filter(|h| !h.trim().is_empty()), &args.plc_rotation_key_file) {
-        (Some(h), _) => Some(hex(h)),
-        (None, Some(p)) => Some(RotationKey::from_file(p)?),
-        (None, None) => env("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX").map(|h| hex(&zeroize::Zeroizing::new(h))),
-    };
-    let mut old_rotation_keys = args.plc_rotation_key_old_file.iter().map(|p| RotationKey::from_file(p)).collect::<anyhow::Result<Vec<_>>>()?;
+    let rotation_key =
+        match (args.plc_rotation_key.as_deref().filter(|h| !h.trim().is_empty()), &args.plc_rotation_key_file) {
+            (Some(h), _) => Some(hex(h)),
+            (None, Some(p)) => Some(RotationKey::from_file(p)?),
+            (None, None) => env("PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX").map(|h| hex(&zeroize::Zeroizing::new(h))),
+        };
+    let mut old_rotation_keys =
+        args.plc_rotation_key_old_file.iter().map(|p| RotationKey::from_file(p)).collect::<anyhow::Result<Vec<_>>>()?;
     old_rotation_keys.extend(args.plc_rotation_key_old.iter().filter(|h| !h.trim().is_empty()).map(|h| hex(h)));
     Ok(vlpds::plc::PlcConfig {
         mode: args.plc_mode.parse()?,
         rotation_key,
         old_rotation_keys,
-        recovery_did_key: args.plc_recovery_did_key.clone().filter(|k| !k.is_empty()).or_else(|| env("PDS_RECOVERY_DID_KEY")),
+        recovery_did_key: args
+            .plc_recovery_did_key
+            .clone()
+            .filter(|k| !k.is_empty())
+            .or_else(|| env("PDS_RECOVERY_DID_KEY")),
     })
 }
 
@@ -1050,7 +1061,11 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     })
 }
 
-fn peer_tls(args: &Args, node_id: &str, advertise_url: &str) -> anyhow::Result<Option<std::sync::Arc<vlpds::peer_tls::PeerTls>>> {
+fn peer_tls(
+    args: &Args,
+    node_id: &str,
+    advertise_url: &str,
+) -> anyhow::Result<Option<std::sync::Arc<vlpds::peer_tls::PeerTls>>> {
     let Some(dir) = &args.peer_tls_dir else {
         tracing::info!("lone node (no --peer-listen): no peer listener, no /internal/*, no peer calls");
         return Ok(None);
@@ -1065,7 +1080,8 @@ fn peer_tls(args: &Args, node_id: &str, advertise_url: &str) -> anyhow::Result<O
     } else {
         vlpds::peer_tls::Files::in_dir(dir, node_id)
     };
-    let t = vlpds::peer_tls::PeerTls::load(files).map_err(|e| e.context(format!("peer TLS (--peer-tls-dir {})", dir.display())))?;
+    let t = vlpds::peer_tls::PeerTls::load(files)
+        .map_err(|e| e.context(format!("peer TLS (--peer-tls-dir {})", dir.display())))?;
     anyhow::ensure!(t.node_id() == node_id, "{node_id}.crt names node {:?} but --node-id is {node_id:?}", t.node_id());
     let (cert_exp, ca_exp) = t.not_after();
     tracing::info!(node = %t.node_id(), cert_not_after = cert_exp, ca_not_after = ca_exp, "peer mTLS on");
@@ -1216,9 +1232,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         mod_service_did: flag_or_env(&args.mod_service_did, "PDS_MOD_SERVICE_DID"),
         txt_resolver: None,
         rate_limits_enabled: !args.no_rate_limits,
-        resolve_lexicons: args
-            .resolve_lexicons
-            .then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
+        resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         max_import_bytes: args.max_import_mb << 20,
         import_memory_bytes: args.import_memory_mb.map(|m| m << 20),
         import_wait: vlpds::xrpc::import_budget::ADMIT_WAIT,
@@ -1250,7 +1264,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         checkpoint_every: vlpds::retention::parse_duration(&args.checkpoint_every)?,
         checkpoint_stagger: args.checkpoint_stagger,
         preload_recent: args.preload_recent,
-        forwarded_write_start: (args.forwarded_write_start_ms > 0).then(|| Duration::from_millis(args.forwarded_write_start_ms)),
+        forwarded_write_start: (args.forwarded_write_start_ms > 0)
+            .then(|| Duration::from_millis(args.forwarded_write_start_ms)),
         retry_unapplied_writes: args.retry_unapplied_writes,
         ui_dir: args.ui_dir.clone().filter(|d| !d.as_os_str().is_empty()),
     };
@@ -1298,7 +1313,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     // (ShardMoved) they resend to the new owner.
     if let Some(l) = peer_listener {
         server::spawn_peer_listener(&app, l)?;
-        tracing::info!(peer_listen = args.peer_listen.as_deref().unwrap_or(""), "peer listener (mTLS, peer HTTP/2 settings)");
+        tracing::info!(
+            peer_listen = args.peer_listen.as_deref().unwrap_or(""),
+            "peer listener (mTLS, peer HTTP/2 settings)"
+        );
     }
     let router = server::public_router(&app);
     let opts = server::ServeOptions { h2: server::H2Profile::Public, max_connections: args.max_connections, tls: None };
@@ -1326,7 +1344,10 @@ async fn bind(addr: &str, backlog: u32) -> anyhow::Result<tokio::net::TcpListene
             Err(e) => last = Some(e),
         }
     }
-    Err(last.map_or_else(|| anyhow::anyhow!("{addr}: no address"), |e| anyhow::Error::from(e).context(format!("binding {addr}"))))
+    Err(last.map_or_else(
+        || anyhow::anyhow!("{addr}: no address"),
+        |e| anyhow::Error::from(e).context(format!("binding {addr}")),
+    ))
 }
 
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);

@@ -8,7 +8,10 @@
 
 use crate::common::*;
 use object_store::path::Path;
-use object_store::{GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult};
+use object_store::{
+    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult,
+};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -59,7 +62,10 @@ impl Pressure {
         self.total_peak.fetch_max(n, Ordering::SeqCst);
         if n > PORT_BUDGET {
             self.refused.fetch_add(1, Ordering::SeqCst);
-            return Err(object_store::Error::Generic { store: "pressure", source: "transport error of kind Connect: no ephemeral port".into() });
+            return Err(object_store::Error::Generic {
+                store: "pressure",
+                source: "transport error of kind Connect: no ephemeral port".into(),
+            });
         }
         tokio::time::sleep(LATENCY).await;
         Ok(Some(g))
@@ -74,11 +80,20 @@ impl std::fmt::Display for Pressure {
 
 #[async_trait::async_trait]
 impl ObjectStore for Pressure {
-    async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<PutResult> {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
         let _g = self.enter(location).await?;
         self.inner.put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &Path, opts: PutMultipartOptions) -> object_store::Result<Box<dyn MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
         let _g = self.enter(location).await?;
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -86,13 +101,20 @@ impl ObjectStore for Pressure {
         let _g = self.enter(location).await?;
         self.inner.get_opts(location, options).await
     }
-    fn delete_stream(&self, l: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+    fn delete_stream(
+        &self,
+        l: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
         self.inner.delete_stream(l)
     }
     fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
-    fn list_with_offset(&self, prefix: Option<&Path>, offset: &Path) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.inner.list_with_offset(prefix, offset)
     }
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<ListResult> {
@@ -114,7 +136,8 @@ async fn node(id: &str, store: &Arc<Pressure>) -> TestServer {
         c.log_store_inflight = 16;
         c.checkpoint_every = Duration::from_millis(200);
         let l = lease(c);
-        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(3), Duration::from_millis(200), Duration::from_millis(600));
+        (l.ttl, l.renew_every, l.skew) =
+            (Duration::from_secs(3), Duration::from_millis(200), Duration::from_millis(600));
     })
     .await
 }
@@ -124,13 +147,24 @@ async fn takeover_cold_loads_stay_bounded_and_the_lease_renews() {
     let store = Arc::new(Pressure::default());
     let a = node("a", &store).await;
     let b = node("b", &store).await;
-    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || {
+        owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize
+    })
+    .await;
 
     // accounts (a new account's DID lands on a shard of the node creating it)
     use futures::StreamExt;
-    let accounts: Vec<TestAccount> = futures::stream::iter(0..400).map(|_| b.create_account("press")).buffer_unordered(32).collect().await;
+    let accounts: Vec<TestAccount> =
+        futures::stream::iter(0..400).map(|_| b.create_account("press")).buffer_unordered(32).collect().await;
     let cold: Vec<&TestAccount> = accounts.iter().filter(|x| b.app.partitions.for_key(&x.did).is_some()).collect();
-    assert!(cold.len() > 100, "b holds {} of the {} accounts (owns {} shards, a {})", cold.len(), accounts.len(), owned(&b), owned(&a));
+    assert!(
+        cold.len() > 100,
+        "b holds {} of the {} accounts (owns {} shards, a {})",
+        cold.len(),
+        accounts.len(),
+        owned(&b),
+        owned(&a)
+    );
     // checkpoints flush b's writes to SSTs: a's loads read them from the store
     tokio::time::sleep(Duration::from_secs(1)).await;
     // and nothing b's loads cached in the process-wide block cache helps a
@@ -142,16 +176,30 @@ async fn takeover_cold_loads_stay_bounded_and_the_lease_renews() {
     wait_until("a takes b's shards over", Duration::from_secs(15), || owned(&a) == SHARDS as usize).await;
     // every cold repo written at once, right after the takeover
     let t = Instant::now();
-    let results = futures::future::join_all(cold.iter().map(|x| a.create_record(x, "app.bsky.feed.post", post_record("after the takeover")))).await;
+    let results = futures::future::join_all(
+        cold.iter().map(|x| a.create_record(x, "app.bsky.feed.post", post_record("after the takeover"))),
+    )
+    .await;
     let took = t.elapsed();
     assert_eq!(results.len(), cold.len());
-    let (state_peak, total_peak, refused) = (store.state_peak.load(Ordering::SeqCst), store.total_peak.load(Ordering::SeqCst), store.refused.load(Ordering::SeqCst));
-    eprintln!("{} cold writes in {took:?}: state requests in flight peak {state_peak}, total {total_peak}, refused {refused}", cold.len());
-    assert!(state_peak <= 2 * STATE_INFLIGHT, "state requests in flight peaked at {state_peak} (bound {STATE_INFLIGHT} per node)");
+    let (state_peak, total_peak, refused) = (
+        store.state_peak.load(Ordering::SeqCst),
+        store.total_peak.load(Ordering::SeqCst),
+        store.refused.load(Ordering::SeqCst),
+    );
+    eprintln!(
+        "{} cold writes in {took:?}: state requests in flight peak {state_peak}, total {total_peak}, refused {refused}",
+        cold.len()
+    );
+    assert!(
+        state_peak <= 2 * STATE_INFLIGHT,
+        "state requests in flight peaked at {state_peak} (bound {STATE_INFLIGHT} per node)"
+    );
     assert_eq!(refused, 0, "requests past the port budget ({PORT_BUDGET}); total in flight peaked at {total_peak}");
     assert!(ca.lease_valid() && !ca.halted(), "a kept its lease");
     // the renew loop kept going: validity ends TTL - skew (2.4 s) after a
     // renewal's send, so over 1 s left = renewed within the last 1.4 s
-    wait_until("a renews its lease", Duration::from_secs(3), || ca.lease_valid() && ca.lease_validity_secs() > 1.0).await;
+    wait_until("a renews its lease", Duration::from_secs(3), || ca.lease_valid() && ca.lease_validity_secs() > 1.0)
+        .await;
     assert_eq!(owned(&a), SHARDS as usize);
 }

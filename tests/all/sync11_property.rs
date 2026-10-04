@@ -31,14 +31,31 @@ type Model = BTreeMap<String, String>; // path -> record cid
 
 #[derive(Debug, Clone)]
 enum Op {
-    Create { coll: String, rkey: Option<String>, text: String },
-    Put { coll: String, rkey: String, text: String },
-    Delete { coll: String, rkey: String },
+    Create {
+        coll: String,
+        rkey: Option<String>,
+        text: String,
+    },
+    Put {
+        coll: String,
+        rkey: String,
+        text: String,
+    },
+    Delete {
+        coll: String,
+        rkey: String,
+    },
     Apply(Vec<ApplyW>),
     /// Must fail: create at an existing path.
-    DupCreate { coll: String, rkey: String },
+    DupCreate {
+        coll: String,
+        rkey: String,
+    },
     /// Must fail: delete with a wrong swapRecord.
-    BadSwapDelete { coll: String, rkey: String },
+    BadSwapDelete {
+        coll: String,
+        rkey: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -180,14 +197,22 @@ async fn exec(x: &Xrpc, a: &TestAccount, op: &Op) -> Result<Option<Ack>, String>
             Ok(Some(ack(&r.json, vec![(path, Some(r.json["cid"].as_str().unwrap().to_string()))])))
         }
         Op::Put { coll, rkey, text } => {
-            let r = x.post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec(coll, text)}), &auth).await;
+            let r = x
+                .post(
+                    "com.atproto.repo.putRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec(coll, text)}),
+                    &auth,
+                )
+                .await;
             if !r.is_ok() {
                 return Err(format!("putRecord {coll}/{rkey}: {}", r.text()));
             }
             Ok(Some(ack(&r.json, vec![(format!("{coll}/{rkey}"), Some(r.json["cid"].as_str().unwrap().to_string()))])))
         }
         Op::Delete { coll, rkey } => {
-            let r = x.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &auth).await;
+            let r = x
+                .post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &auth)
+                .await;
             if !r.is_ok() {
                 return Err(format!("deleteRecord {coll}/{rkey}: {}", r.text()));
             }
@@ -227,7 +252,13 @@ async fn exec(x: &Xrpc, a: &TestAccount, op: &Op) -> Result<Option<Ack>, String>
             Ok(Some(ack(&r.json, effects)))
         }
         Op::DupCreate { coll, rkey } => {
-            let r = x.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec(coll, "dup")}), &auth).await;
+            let r = x
+                .post(
+                    "com.atproto.repo.createRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec(coll, "dup")}),
+                    &auth,
+                )
+                .await;
             if r.is_ok() || r.status >= 500 {
                 return Err(format!("duplicate createRecord {coll}/{rkey} should fail with 4xx: {}", r.text()));
             }
@@ -235,9 +266,18 @@ async fn exec(x: &Xrpc, a: &TestAccount, op: &Op) -> Result<Option<Ack>, String>
         }
         Op::BadSwapDelete { coll, rkey } => {
             let wrong = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
-            let r = x.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey, "swapRecord": wrong}), &auth).await;
+            let r = x
+                .post(
+                    "com.atproto.repo.deleteRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey, "swapRecord": wrong}),
+                    &auth,
+                )
+                .await;
             if !(r.status == 400 && r.error_name() == Some("InvalidSwap")) {
-                return Err(format!("deleteRecord with wrong swapRecord {coll}/{rkey}: want 400 InvalidSwap, got {}", r.text()));
+                return Err(format!(
+                    "deleteRecord with wrong swapRecord {coll}/{rkey}: want 400 InvalidSwap, got {}",
+                    r.text()
+                ));
             }
             Ok(None)
         }
@@ -245,7 +285,11 @@ async fn exec(x: &Xrpc, a: &TestAccount, op: &Op) -> Result<Option<Ack>, String>
 }
 
 /// Runs `ops` (account index, op) concurrently; results in the same order.
-async fn concurrently(x: &Xrpc, accts: &[TestAccount], ops: Vec<(usize, Op)>) -> Vec<(usize, Result<Option<Ack>, String>)> {
+async fn concurrently(
+    x: &Xrpc,
+    accts: &[TestAccount],
+    ops: Vec<(usize, Op)>,
+) -> Vec<(usize, Result<Option<Ack>, String>)> {
     let hs: Vec<_> = ops
         .into_iter()
         .map(|(i, op)| {
@@ -284,7 +328,12 @@ impl Run {
     }
 
     fn assert_no_errors(&self) {
-        assert!(self.errors.is_empty(), "{} write errors:\n  {}", self.errors.len(), self.errors.iter().take(30).cloned().collect::<Vec<_>>().join("\n  "));
+        assert!(
+            self.errors.is_empty(),
+            "{} write errors:\n  {}",
+            self.errors.len(),
+            self.errors.iter().take(30).cloned().collect::<Vec<_>>().join("\n  ")
+        );
     }
 }
 
@@ -306,7 +355,10 @@ struct Chain {
 
 /// Validates the whole event stream; returns (failures, per-DID repo state
 /// from ops, per-DID commits).
-fn validate_stream(frames: &[Frame], keys: &HashMap<String, k256::ecdsa::VerifyingKey>) -> (Vec<String>, HashMap<String, Model>, HashMap<String, Vec<CommitEvt>>) {
+fn validate_stream(
+    frames: &[Frame],
+    keys: &HashMap<String, k256::ecdsa::VerifyingKey>,
+) -> (Vec<String>, HashMap<String, Model>, HashMap<String, Vec<CommitEvt>>) {
     let mut fails = Vec::new();
     let mut chains: HashMap<String, Chain> = HashMap::new();
     let mut state: HashMap<String, Model> = HashMap::new();
@@ -414,7 +466,10 @@ fn validate_stream(frames: &[Frame], keys: &HashMap<String, k256::ecdsa::Verifyi
                 match ev.invert() {
                     Ok(root) => {
                         if Some(root) != ev.prev_data {
-                            fails.push(format!("{tag}: inverted root {root} != prevData {:?} (ops {:?})", ev.prev_data, ev.ops));
+                            fails.push(format!(
+                                "{tag}: inverted root {root} != prevData {:?} (ops {:?})",
+                                ev.prev_data, ev.ops
+                            ));
                         }
                     }
                     Err(e) => fails.push(format!("{tag}: inversion failed: {e}")),
@@ -427,8 +482,15 @@ fn validate_stream(frames: &[Frame], keys: &HashMap<String, k256::ecdsa::Verifyi
                             if op.action == "create" && st.contains_key(&op.path) {
                                 fails.push(format!("{tag}: create of existing {}", op.path));
                             }
-                            if op.action == "update" && st.get(&op.path).map(|s| s.as_str()) != op.prev.map(|p| p.to_string()).as_deref() {
-                                fails.push(format!("{tag}: update {} prev {:?} != current {:?}", op.path, op.prev, st.get(&op.path)));
+                            if op.action == "update"
+                                && st.get(&op.path).map(|s| s.as_str()) != op.prev.map(|p| p.to_string()).as_deref()
+                            {
+                                fails.push(format!(
+                                    "{tag}: update {} prev {:?} != current {:?}",
+                                    op.path,
+                                    op.prev,
+                                    st.get(&op.path)
+                                ));
                             }
                             st.insert(op.path.clone(), op.cid.map(|c| c.to_string()).unwrap_or_default());
                         }
@@ -544,7 +606,10 @@ async fn sync11_random_writes_firehose_invariants() {
     }
     for a in &acks {
         match by_commit.get(&(a.did.clone(), a.commit.clone())) {
-            None => fails.push(format!("acked commit {} (rev {}) for {} never appeared on the firehose", a.commit, a.rev, a.did)),
+            None => fails.push(format!(
+                "acked commit {} (rev {}) for {} never appeared on the firehose",
+                a.commit, a.rev, a.did
+            )),
             Some(c) => {
                 if c.rev != a.rev {
                     fails.push(format!("ack rev {} != firehose rev {} for commit {}", a.rev, c.rev, a.commit));
@@ -555,7 +620,8 @@ async fn sync11_random_writes_firehose_invariants() {
                         Some(o) => {
                             let got = if o.action == "delete" { None } else { o.cid.map(|c| c.to_string()) };
                             if &got != cid {
-                                fails.push(format!("acked write {p} = {cid:?} but commit op says {} {got:?}", o.action));
+                                fails
+                                    .push(format!("acked write {p} = {cid:?} but commit op says {} {got:?}", o.action));
                             }
                         }
                     }
@@ -575,7 +641,12 @@ async fn sync11_random_writes_firehose_invariants() {
                 .chain(from_ops.keys().filter(|k| !models[i].contains_key(*k)).cloned())
                 .take(10)
                 .collect();
-            fails.push(format!("{}: firehose replay ({} records) != acked-write model ({} records); e.g. {diff:?}", a.did, from_ops.len(), models[i].len()));
+            fails.push(format!(
+                "{}: firehose replay ({} records) != acked-write model ({} records); e.g. {diff:?}",
+                a.did,
+                from_ops.len(),
+                models[i].len()
+            ));
         }
         let repo = s.get_repo(&a.did).await;
         if let Err(e) = repo.commit().verify(&keys[&a.did]) {
@@ -600,7 +671,9 @@ async fn sync11_random_writes_firehose_invariants() {
     // replay determinism: cursor 0 yields byte-identical frames
     let mut replay = s.subscribe(Some(0)).await;
     let last_seq = frames.iter().filter_map(|f| f.seq()).max().unwrap();
-    let again = replay.until(Duration::from_secs(30), |fs| fs.last().and_then(|f| f.seq()).map(|q| q >= last_seq).unwrap_or(false)).await;
+    let again = replay
+        .until(Duration::from_secs(30), |fs| fs.last().and_then(|f| f.seq()).map(|q| q >= last_seq).unwrap_or(false))
+        .await;
     let live: Vec<&Vec<u8>> = frames.iter().filter(|f| f.seq().is_some()).map(|f| &f.raw).collect();
     let rep: Vec<&Vec<u8>> = again.iter().filter(|f| f.seq().is_some()).map(|f| &f.raw).collect();
     if live != rep {
@@ -611,11 +684,19 @@ async fn sync11_random_writes_firehose_invariants() {
     let seqs: Vec<i64> = frames.iter().filter_map(|f| f.seq()).collect();
     let mid = seqs[seqs.len() / 2];
     let mut tail = s.subscribe(Some(mid)).await;
-    let got = tail.until(Duration::from_secs(30), |fs| fs.last().and_then(|f| f.seq()).map(|q| q >= last_seq).unwrap_or(false)).await;
+    let got = tail
+        .until(Duration::from_secs(30), |fs| fs.last().and_then(|f| f.seq()).map(|q| q >= last_seq).unwrap_or(false))
+        .await;
     let got_seqs: Vec<i64> = got.iter().filter_map(|f| f.seq()).collect();
     let want_seqs: Vec<i64> = seqs.iter().copied().filter(|q| *q > mid).collect();
     if got_seqs != want_seqs {
-        fails.push(format!("cursor {mid}: got {} events (first {:?}), want {} (first {:?})", got_seqs.len(), got_seqs.first(), want_seqs.len(), want_seqs.first()));
+        fails.push(format!(
+            "cursor {mid}: got {} events (first {:?}), want {} (first {:?})",
+            got_seqs.len(),
+            got_seqs.first(),
+            want_seqs.len(),
+            want_seqs.first()
+        ));
     }
 
     assert!(
@@ -648,13 +729,20 @@ async fn sync11_many_seeds_single_repo_bursts() {
     let head = s.latest_commit(&a.did).await.0;
     let frames = sub
         .until(Duration::from_secs(60), |fs| {
-            fs.last().map(|f| f.kind() == "#commit" && matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)).unwrap_or(false)
+            fs.last()
+                .map(|f| f.kind() == "#commit" && matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head))
+                .unwrap_or(false)
         })
         .await;
     let mut keys = HashMap::new();
     keys.insert(a.did.clone(), s.signing_key(&a.did).await);
     let (fails, state, _) = validate_stream(&frames, &keys);
-    assert!(fails.is_empty(), "{} violations:\n  {}", fails.len(), fails.iter().take(40).cloned().collect::<Vec<_>>().join("\n  "));
+    assert!(
+        fails.is_empty(),
+        "{} violations:\n  {}",
+        fails.len(),
+        fails.iter().take(40).cloned().collect::<Vec<_>>().join("\n  ")
+    );
     assert_eq!(state.get(&a.did).cloned().unwrap_or_default(), run.models[0], "firehose replay != model");
 }
 
@@ -683,7 +771,9 @@ async fn validator_detects_tampering() {
     let last = s.post(&a, "last").await;
     let head = Cid::parse(last.commit_cid.as_deref().unwrap()).unwrap();
     let frames = sub
-        .until(FH_TIMEOUT, |fs| fs.last().map(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)).unwrap_or(false))
+        .until(FH_TIMEOUT, |fs| {
+            fs.last().map(|f| matches!(f.body.get("commit"), Some(Value::Link(c)) if *c == head)).unwrap_or(false)
+        })
         .await;
     let mut keys = HashMap::new();
     keys.insert(a.did.clone(), s.signing_key(&a.did).await);
@@ -711,7 +801,10 @@ async fn validator_detects_tampering() {
     }
     let mut t = frames.clone();
     set(&mut t[idx].body, "blocks", Value::Bytes(car));
-    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("inverted")), "missing proof block not detected");
+    assert!(
+        validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("inverted")),
+        "missing proof block not detected"
+    );
     // 4. wrong signing key
     let other = vlpds::crypto::Keypair::generate();
     let mut k2 = HashMap::new();
@@ -726,11 +819,17 @@ async fn validator_detects_tampering() {
     } else {
         panic!("no ops");
     }
-    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("op says")), "op cid tamper not detected");
+    assert!(
+        validate_stream(&t, &keys).0.iter().any(|f| f.contains("inversion") || f.contains("op says")),
+        "op cid tamper not detected"
+    );
     // 6. a dropped event breaks the per-DID chain
     let mut t = frames.clone();
     t.remove(idx - 1);
-    assert!(validate_stream(&t, &keys).0.iter().any(|f| f.contains("since") || f.contains("prevData")), "dropped event not detected");
+    assert!(
+        validate_stream(&t, &keys).0.iter().any(|f| f.contains("since") || f.contains("prevData")),
+        "dropped event not detected"
+    );
     // 7. reordered events (seq goes backwards)
     let mut t = frames.clone();
     t.swap(idx - 1, idx);

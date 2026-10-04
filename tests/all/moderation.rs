@@ -4,7 +4,9 @@
 use crate::common::*;
 
 async fn update_status(s: &TestServer, subject: J, takedown: J) -> Resp {
-    s.xrpc.post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": takedown}), &Auth::Admin).await
+    s.xrpc
+        .post("com.atproto.admin.updateSubjectStatus", &json!({"subject": subject, "takedown": takedown}), &Auth::Admin)
+        .await
 }
 
 async fn subject_status(s: &TestServer, q: &[(&str, &str)]) -> Resp {
@@ -98,7 +100,11 @@ async fn blob_takedown_lifecycle() {
 
     // prevents the blob from being re-uploaded
     let r = s.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &carol.auth()).await;
-    assert!(!r.is_ok(), "re-upload of a taken-down blob must fail (reference: 'Blob has been takendown, cannot re-upload'); got {}", r.text());
+    assert!(
+        !r.is_ok(),
+        "re-upload of a taken-down blob must fail (reference: 'Blob has been takendown, cannot re-upload'); got {}",
+        r.text()
+    );
 
     // prevents the blob from being referenced again
     let body = json!({"repo": carol.did, "collection": "app.bsky.feed.post", "record": image_post("pic", &blob)});
@@ -122,9 +128,13 @@ async fn subject_status_errors() {
     let body = json!({"subject": repo_ref(&a.did), "takedown": {"applied": true}});
     s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &a.auth()).await.client_err();
     // unknown subject type
-    update_status(&s, json!({"$type": "com.example.nope", "did": a.did}), json!({"applied": true})).await.err(400, "InvalidRequest");
+    update_status(&s, json!({"$type": "com.example.nope", "did": a.did}), json!({"applied": true}))
+        .await
+        .err(400, "InvalidRequest");
     // blob status needs a did
-    subject_status(&s, &[("blob", "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm")]).await.err(400, "InvalidRequest");
+    subject_status(&s, &[("blob", "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm")])
+        .await
+        .err(400, "InvalidRequest");
     // no subject at all
     subject_status(&s, &[]).await.err(400, "InvalidRequest");
     // unknown account
@@ -157,7 +167,8 @@ async fn takendown_actor_cannot_report_or_write() {
 /// reference's 401 AccountTakedown, and so do proxied calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn suspended_account_cannot_write_or_proxy() {
-    let s = TestServer::spawn_with(|c| c.appview = Some(("http://127.0.0.1:1".into(), "did:web:appview.test".into()))).await;
+    let s = TestServer::spawn_with(|c| c.appview = Some(("http://127.0.0.1:1".into(), "did:web:appview.test".into())))
+        .await;
     let a = s.create_account("susp").await;
     set_status(&s, &a.did, "suspended").await;
     let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")});
@@ -173,9 +184,18 @@ async fn takendown_repo_write_is_account_takedown() {
     let a = s.create_account("tkw").await;
     set_status(&s, &a.did, "takendown").await;
     for (nsid, body) in [
-        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")})),
-        ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3jzfcijpj2z2a"})),
-        ("com.atproto.repo.applyWrites", json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]})),
+        (
+            "com.atproto.repo.createRecord",
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
+        ),
+        (
+            "com.atproto.repo.deleteRecord",
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3jzfcijpj2z2a"}),
+        ),
+        (
+            "com.atproto.repo.applyWrites",
+            json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post_record("x")}]}),
+        ),
     ] {
         s.xrpc.post(nsid, &body, &a.auth()).await.err(401, "AccountTakedown");
     }

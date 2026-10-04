@@ -58,7 +58,11 @@ const SECRET: &[u8] = b"level-1 wrapped secret fixture";
 fn commit_car(rec_block: &[u8]) -> (Cid, Cid, Vec<u8>, Vec<u8>) {
     let rec = Cid::dag_cbor(rec_block);
     let mut commit_block = Vec::new();
-    vlpds::cbor::Value::Map(vec![("did".into(), vlpds::cbor::Value::Text(DID.into())), ("data".into(), vlpds::cbor::Value::Link(rec))]).encode(&mut commit_block);
+    vlpds::cbor::Value::Map(vec![
+        ("did".into(), vlpds::cbor::Value::Text(DID.into())),
+        ("data".into(), vlpds::cbor::Value::Link(rec)),
+    ])
+    .encode(&mut commit_block);
     let commit = Cid::dag_cbor(&commit_block);
     let mut car = Vec::new();
     vlpds::car::write_header(&mut car, &commit);
@@ -69,7 +73,16 @@ fn commit_car(rec_block: &[u8]) -> (Cid, Cid, Vec<u8>, Vec<u8>) {
 
 /// A finished #commit frame of `ops` at `seq`.
 fn finish_commit(rev: &str, commit: Cid, car: &[u8], ops: &[vlpds::events::RepoOp], seq: i64) -> Vec<u8> {
-    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame { repo: DID, rev, since: None, commit, prev_data: None, blocks: car, ops, time: TIME });
+    let frame = vlpds::events::commit_frame(&vlpds::events::CommitFrame {
+        repo: DID,
+        rev,
+        since: None,
+        commit,
+        prev_data: None,
+        blocks: car,
+        ops,
+        time: TIME,
+    });
     let mut bytes = Vec::new();
     frame.finish(seq, &mut bytes);
     bytes
@@ -79,7 +92,8 @@ fn finish_commit(rev: &str, commit: Cid, car: &[u8], ops: &[vlpds::events::RepoO
 fn commit_frame() -> (Vec<u8>, Cid, Vec<u8>, vlpds::tid::Tid) {
     let (rec, commit, commit_block, car) = commit_car(b"\xa1aa\x01");
     let rev = vlpds::tid::Tid::parse("3l3qo2vutsw2b").unwrap();
-    let ops = [vlpds::events::RepoOp { action: "update", path: "app.bsky.feed.post/1", cid: Some(rec), prev: Some(commit) }];
+    let ops =
+        [vlpds::events::RepoOp { action: "update", path: "app.bsky.feed.post/1", cid: Some(rec), prev: Some(commit) }];
     (finish_commit(&rev.to_string(), commit, &car, &ops, 1000 << 8), commit, commit_block, rev)
 }
 
@@ -87,11 +101,23 @@ fn segment_plain() -> Vec<u8> {
     let (frame, ..) = commit_frame();
     let derived = segment::derive_commit_muts(&frame, 2).unwrap();
     let mut muts = derived.clone();
-    muts.push(Mutation { key: Bytes::from(vlpds::state::collection_key("app.bsky.feed.post", DID)), val: Some(Bytes::new()) });
-    let m = |k: &str, v: Option<&str>| Mutation { key: Bytes::from(k.to_string()), val: v.map(|v| Bytes::from(v.to_string())) };
+    muts.push(Mutation {
+        key: Bytes::from(vlpds::state::collection_key("app.bsky.feed.post", DID)),
+        val: Some(Bytes::new()),
+    });
+    let m = |k: &str, v: Option<&str>| Mutation {
+        key: Bytes::from(k.to_string()),
+        val: v.map(|v| Bytes::from(v.to_string())),
+    };
     let mut b = SegmentBuilder::for_log(LOG);
     b.push_derived(1000 << 8, ShardId(3), 7, |o| o.extend_from_slice(&frame), &muts, derived.len(), 2);
-    b.push(1001 << 8, ShardId(70_000), 1, |o| o.extend_from_slice(b"not a frame"), &[m("k-put", Some("v")), m("k-del", None)]);
+    b.push(
+        1001 << 8,
+        ShardId(70_000),
+        1,
+        |o| o.extend_from_slice(b"not a frame"),
+        &[m("k-put", Some("v")), m("k-del", None)],
+    );
     b.push(1002 << 8, ShardId(3), 7, |_| {}, &[]);
     b.seal(LOG, 5, 4)
 }
@@ -106,7 +132,12 @@ fn like_record() -> Vec<u8> {
 /// backlink put (`bl/`, `segment::derive_commit_muts`).
 fn segment_like() -> Vec<u8> {
     let (rec, commit, _, car) = commit_car(&like_record());
-    let ops = [vlpds::events::RepoOp { action: "create", path: "app.bsky.feed.like/3l3qo2vutsw2b", cid: Some(rec), prev: None }];
+    let ops = [vlpds::events::RepoOp {
+        action: "create",
+        path: "app.bsky.feed.like/3l3qo2vutsw2b",
+        cid: Some(rec),
+        prev: None,
+    }];
     let bytes = finish_commit("3l3qo2vutsw2c", commit, &car, &ops, 1010 << 8);
     let derived = segment::derive_commit_muts(&bytes, 0).unwrap();
     let mut b = SegmentBuilder::for_log(LOG);
@@ -133,7 +164,10 @@ fn backlinks() -> Vec<u8> {
 /// A repo's counts (`S/`, checkAccountStatus): its key and value.
 fn repo_stats() -> Vec<u8> {
     let st = vlpds::state::RepoStats { records: 1_000_003, nodes: 270_001, blobs: 4_096 };
-    let k: BTreeMap<&str, String> = [("key S/", hex::encode(vlpds::state::repo_stats_key(DID))), ("value", hex::encode(st.encode()))].into_iter().collect();
+    let k: BTreeMap<&str, String> =
+        [("key S/", hex::encode(vlpds::state::repo_stats_key(DID))), ("value", hex::encode(st.encode()))]
+            .into_iter()
+            .collect();
     pretty(&k)
 }
 
@@ -157,7 +191,10 @@ fn account() -> vlpds::state::Account {
         pending_signing_key: None,
         extra: Default::default(),
     };
-    a.extra.insert("preferences".into(), serde_json::json!([{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]));
+    a.extra.insert(
+        "preferences".into(),
+        serde_json::json!([{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false}]),
+    );
     a
 }
 
@@ -228,7 +265,10 @@ fn assignment() -> vlpds::cluster::Assignment {
         addr: Some("http://10.0.0.1:2583".into()),
         epoch: 3,
         seq_floor: 256_000,
-        history: vec![Span { log_id: "node-b.1".into(), epoch: 2, start: 0, end: Some(9) }, Span { log_id: LOG.into(), epoch: 3, start: 6, end: None }],
+        history: vec![
+            Span { log_id: "node-b.1".into(), epoch: 2, start: 0, end: Some(9) },
+            Span { log_id: LOG.into(), epoch: 3, start: 6, end: None },
+        ],
         frozen: None,
         applied_epoch: 0,
         extra: Default::default(),
@@ -292,7 +332,11 @@ fn frames() -> Vec<(&'static str, Vec<u8>)> {
 fn written() -> Vec<(&'static str, Vec<u8>)> {
     let plain = segment_plain();
     let zstd = segment::compress(&plain, 1).unwrap().expect("compressible");
-    let batch = vlpds::nodelog::LogBatch { log_id: LOG.into(), ordinal: 5, events: vec![(1000 << 8, Bytes::from(commit_frame().0)), (1003 << 8, Bytes::from_static(b"frame"))] };
+    let batch = vlpds::nodelog::LogBatch {
+        log_id: LOG.into(),
+        ordinal: 5,
+        events: vec![(1000 << 8, Bytes::from(commit_frame().0)), (1003 << 8, Bytes::from_static(b"frame"))],
+    };
     let h = head();
     let mut v = vec![
         ("segment/plain.seg", plain),
@@ -376,7 +420,10 @@ fn slatedb_rows() -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
     let h = head();
     vec![
         (vlpds::state::head_key(DID), Some(h.encode().to_vec())),
-        (vlpds::state::record_key(DID, 0, "app.bsky.feed.post/1"), Some(vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec())),
+        (
+            vlpds::state::record_key(DID, 0, "app.bsky.feed.post/1"),
+            Some(vlpds::state::record_value(&h.data, h.rev.0, b"\xa1aa\x01").to_vec()),
+        ),
         (vlpds::state::collection_key("app.bsky.feed.post", DID), Some(Vec::new())),
         (vlpds::state::record_key(DID, 0, "app.bsky.feed.post/2"), None),
     ]
@@ -407,7 +454,8 @@ async fn record_slatedb(dir: &std::path::Path) {
     db.flush().await.unwrap();
     db.close().await.unwrap();
     let root = vlpds::partition::db_path(&store, ShardId(0));
-    let objs: Vec<_> = mem.list(Some(&object_store::path::Path::from(root.as_str()))).map(|m| m.unwrap().location).collect().await;
+    let objs: Vec<_> =
+        mem.list(Some(&object_store::path::Path::from(root.as_str()))).map(|m| m.unwrap().location).collect().await;
     for p in objs {
         let rel = p.as_ref().strip_prefix(&format!("{root}/")).unwrap().to_string();
         let b = mem.get(&p).await.unwrap().bytes().await.unwrap();
@@ -431,9 +479,16 @@ async fn check_slatedb(level: u32) {
         let b = std::fs::read(dir.join(n)).unwrap();
         mem.put(&object_store::path::Path::from(format!("{root}/{rel}")), b.into()).await.unwrap();
     }
-    let db = vlpds::partition::open_db(&store, ShardId(0), None).await.unwrap_or_else(|e| panic!("L{level}: SlateDB fixture doesn't open: {e:#}"));
+    let db = vlpds::partition::open_db(&store, ShardId(0), None)
+        .await
+        .unwrap_or_else(|e| panic!("L{level}: SlateDB fixture doesn't open: {e:#}"));
     for (k, v) in slatedb_rows() {
-        assert_eq!(db.get(&k).await.unwrap().map(|b| b.to_vec()), v, "L{level}: SlateDB fixture key {}", hex::encode(&k));
+        assert_eq!(
+            db.get(&k).await.unwrap().map(|b| b.to_vec()),
+            v,
+            "L{level}: SlateDB fixture key {}",
+            hex::encode(&k)
+        );
     }
     db.put(b"new", b"write").await.unwrap();
     db.flush().await.unwrap();
@@ -469,9 +524,16 @@ fn check_jwts(name: &str, b: &[u8]) {
     let text = std::str::from_utf8(b).unwrap();
     let toks: Vec<&str> = text.lines().collect();
     assert_eq!(toks.len(), 2, "{name}: access and refresh");
-    for (tok, (typ, scope, jti)) in toks.iter().zip([("at+jwt", "com.atproto.access", JWT_FAMILY), ("refresh+jwt", "com.atproto.refresh", JWT_REFRESH_ID)]) {
+    for (tok, (typ, scope, jti)) in toks
+        .iter()
+        .zip([("at+jwt", "com.atproto.access", JWT_FAMILY), ("refresh+jwt", "com.atproto.refresh", JWT_REFRESH_ID)])
+    {
         let c = j.verify_signature(tok).unwrap_or_else(|| panic!("{name}: {typ} doesn't verify"));
-        assert_eq!((c.scope.as_str(), c.sub.as_str(), c.aud.as_str(), c.jti.as_deref()), (scope, DID, JWT_AUD, Some(jti)), "{name}");
+        assert_eq!(
+            (c.scope.as_str(), c.sub.as_str(), c.aud.as_str(), c.jti.as_deref()),
+            (scope, DID, JWT_AUD, Some(jti)),
+            "{name}"
+        );
         assert!(c.exp > c.iat, "{name}");
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let mut parts = tok.split('.');
@@ -521,14 +583,26 @@ async fn writers_reproduce_the_max_level_fixtures() {
     }
     for (name, bytes) in &written {
         let got = std::fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e} (VLPDS_BLESS=1 to record)"));
-        assert!(got == *bytes, "{name}: this build writes different bytes than L{} records: a format change needs a new level", version::MAX_LEVEL);
+        assert!(
+            got == *bytes,
+            "{name}: this build writes different bytes than L{} records: a format change needs a new level",
+            version::MAX_LEVEL
+        );
     }
     // plus the fixtures recorded once (random by construction)
-    let mut expected: Vec<String> = written.iter().map(|(n, _)| n.to_string()).chain([SECRET_FIXTURE.to_string(), JWT_FIXTURE.to_string()]).collect();
+    let mut expected: Vec<String> = written
+        .iter()
+        .map(|(n, _)| n.to_string())
+        .chain([SECRET_FIXTURE.to_string(), JWT_FIXTURE.to_string()])
+        .collect();
     expected.sort();
     let got: Vec<String> = files(&dir).into_iter().filter(|f| !f.starts_with(SLATEDB_DIR)).collect();
     assert_eq!(got, expected, "fixture files of L{}", version::MAX_LEVEL);
-    assert!(files(&dir).iter().any(|f| f.starts_with(SLATEDB_DIR)), "L{}: no SlateDB fixture (VLPDS_BLESS=1 to record)", version::MAX_LEVEL);
+    assert!(
+        files(&dir).iter().any(|f| f.starts_with(SLATEDB_DIR)),
+        "L{}: no SlateDB fixture (VLPDS_BLESS=1 to record)",
+        version::MAX_LEVEL
+    );
 }
 
 fn cbor_reencode(name: &str, b: &[u8]) {
@@ -564,8 +638,14 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         "segment/plain.seg" => {
             let (h, _) = segment::parse_header(b).unwrap().unwrap();
             assert_eq!((h.level, h.codec, h.ordinal, h.prefix_end, h.count), (level, segment::CODEC_NONE, 5, 4, 3));
-            assert_eq!(h.checksum.is_some(), level == version::TEST_LEVEL, "only the test level's header has a checksum");
-            let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
+            assert_eq!(
+                h.checksum.is_some(),
+                level == version::TEST_LEVEL,
+                "only the test level's header has a checksum"
+            );
+            let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else {
+                panic!("{name}")
+            };
             assert_eq!(entries[0].derived, 4, "#commit muts are derived, not stored");
             assert!(reseal(&h, &entries, level) == b, "{name}: re-encode differs");
         }
@@ -577,7 +657,9 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(segment::decode(Bytes::copy_from_slice(b)).unwrap() == plain, "{name}: decodes to plain.seg");
         }
         "segment/like.seg" => {
-            let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
+            let LogObject::Segment(h, entries) = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else {
+                panic!("{name}")
+            };
             assert_eq!(h.level, level, "{name}: segment level");
             let e = &entries[0];
             // c/ put, R/ put, the backlink put, h/
@@ -611,7 +693,9 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(st.encode() == v);
         }
         "segment/fence.bin" => {
-            let LogObject::Fence { by } = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else { panic!("{name}") };
+            let LogObject::Fence { by } = segment::parse(Bytes::copy_from_slice(b), true, None).unwrap() else {
+                panic!("{name}")
+            };
             assert!(segment::fence_object(&by) == b);
         }
         "state/head.bin" => {
@@ -644,7 +728,11 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(pretty(&k) == b);
             for (n, hexkey) in &k {
                 let key = hex::decode(hexkey).unwrap();
-                assert_eq!(vlpds::state::key_slot(&key), Some(vlpds::slots::slot_of(DID)), "{n}: slot-prefixed by the DID's slot");
+                assert_eq!(
+                    vlpds::state::key_slot(&key),
+                    Some(vlpds::slots::slot_of(DID)),
+                    "{n}: slot-prefixed by the DID's slot"
+                );
             }
         }
         "control/node_lease.json" => {
@@ -659,7 +747,11 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         }
         "control/retain_report.json" => {
             let r = json_reencode::<vlpds::retention::Report>(name, b);
-            assert_eq!(r.min_seg_format.is_some(), level == version::TEST_LEVEL, "min_seg_format is the test level's field");
+            assert_eq!(
+                r.min_seg_format.is_some(),
+                level == version::TEST_LEVEL,
+                "min_seg_format is the test level's field"
+            );
         }
         "control/ratelimits.json" => {
             let d = vlpds::ratelimit::config::parse(b).unwrap();
@@ -670,11 +762,19 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             json_reencode::<version::ClusterVersion>(name, b);
         }
         "stream/batch.bin" => {
-            let vlpds::remote::StreamMsg::Batch(batch) = vlpds::remote::decode(&Arc::from(LOG), Bytes::copy_from_slice(b)).unwrap() else { panic!("{name}") };
+            let vlpds::remote::StreamMsg::Batch(batch) =
+                vlpds::remote::decode(&Arc::from(LOG), Bytes::copy_from_slice(b)).unwrap()
+            else {
+                panic!("{name}")
+            };
             assert!(vlpds::remote::encode_batch(&batch) == b);
         }
         "stream/watermark.bin" => {
-            let vlpds::remote::StreamMsg::Watermark(w) = vlpds::remote::decode(&Arc::from(LOG), Bytes::copy_from_slice(b)).unwrap() else { panic!("{name}") };
+            let vlpds::remote::StreamMsg::Watermark(w) =
+                vlpds::remote::decode(&Arc::from(LOG), Bytes::copy_from_slice(b)).unwrap()
+            else {
+                panic!("{name}")
+            };
             assert!(vlpds::remote::encode_watermark(w) == b);
         }
         SECRET_FIXTURE => {
@@ -691,8 +791,10 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(pretty(&rows) == b, "{name}: re-encode differs");
             let mut kinds = std::collections::BTreeSet::new();
             for r in &rows {
-                let (routing, n, v) = (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
-                let kind = vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes()).unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
+                let (routing, n, v) =
+                    (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
+                let kind = vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes())
+                    .unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
                 kinds.insert(kind);
             }
             assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
@@ -701,8 +803,10 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
             assert!(pretty(&rows) == b, "{name}: re-encode differs");
             for r in &rows {
-                let (routing, n, v) = (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
-                vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes()).unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
+                let (routing, n, v) =
+                    (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
+                vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes())
+                    .unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
             }
         }
         JWT_FIXTURE => check_jwts(name, b),
@@ -741,7 +845,10 @@ fn manifest() -> BTreeMap<String, String> {
 
 fn hashes(level: u32) -> BTreeMap<String, String> {
     let dir = level_dir(level);
-    files(&dir).into_iter().map(|f| (format!("L{level}/{f}"), hex::encode(Sha256::digest(std::fs::read(dir.join(&f)).unwrap())))).collect()
+    files(&dir)
+        .into_iter()
+        .map(|f| (format!("L{level}/{f}"), hex::encode(Sha256::digest(std::fs::read(dir.join(&f)).unwrap()))))
+        .collect()
 }
 
 #[test]
@@ -770,8 +877,13 @@ fn manifest_freezes_released_levels() {
     }
     for level in 1..=version::RELEASED {
         let prefix = format!("L{level}/");
-        let recorded: BTreeMap<String, String> = m.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
+        let recorded: BTreeMap<String, String> =
+            m.iter().filter(|(k, _)| k.starts_with(&prefix)).map(|(k, v)| (k.clone(), v.clone())).collect();
         assert!(!recorded.is_empty(), "released level {level} has no manifest entries");
-        assert_eq!(hashes(level), recorded, "level {level} is released: its fixtures are frozen (testdata/formats/MANIFEST)");
+        assert_eq!(
+            hashes(level),
+            recorded,
+            "level {level} is released: its fixtures are frozen (testdata/formats/MANIFEST)"
+        );
     }
 }

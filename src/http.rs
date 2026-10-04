@@ -66,9 +66,7 @@ pub fn public() -> &'static reqwest::Client {
 pub fn proxy() -> &'static reqwest::Client {
     static C: LazyLock<Vec<reqwest::Client>> = LazyLock::new(|| {
         let n = std::thread::available_parallelism().map_or(8, |n| n.get()).clamp(2, 64);
-        (0..n)
-            .map(|_| outbound_no_read_timeout("public", 1024).build().expect("reqwest client"))
-            .collect()
+        (0..n).map(|_| outbound_no_read_timeout("public", 1024).build().expect("reqwest client")).collect()
     });
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     thread_local! {
@@ -297,7 +295,8 @@ pub mod h1 {
         let connect = async {
             let mut last = None;
             for addr in tokio::net::lookup_host(authority).await? {
-                let sock = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+                let sock =
+                    if addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
                 sock.set_keepalive(true)?;
                 sock.set_nodelay(true)?;
                 match sock.connect(addr).await {
@@ -321,11 +320,7 @@ pub mod h1 {
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
     /// `req` has an origin-form URI; Host is set here from `authority`.
-    pub async fn send(
-        role: &'static str,
-        authority: &str,
-        mut req: http::Request<Body>,
-    ) -> Result<Response, BoxError> {
+    pub async fn send(role: &'static str, authority: &str, mut req: http::Request<Body>) -> Result<Response, BoxError> {
         let host = self::host(authority);
         let h = req.headers_mut();
         h.insert(http::header::HOST, http::HeaderValue::from_str(authority)?);
@@ -703,11 +698,7 @@ impl Guarded {
 
 fn guarded_client(dev_mode: bool) -> &'static reqwest::Client {
     static STRICT: LazyLock<reqwest::Client> = LazyLock::new(|| {
-        outbound("guarded", 32)
-            .no_proxy()
-            .dns_resolver(Arc::new(PublicOnlyResolver))
-            .build()
-            .expect("reqwest client")
+        outbound("guarded", 32).no_proxy().dns_resolver(Arc::new(PublicOnlyResolver)).build().expect("reqwest client")
     });
     static DEV: LazyLock<reqwest::Client> =
         LazyLock::new(|| outbound("guarded", 32).no_proxy().build().expect("reqwest client"));
@@ -839,7 +830,11 @@ impl PeerClient {
             .map(Arc::new)
             .unwrap_or_else(|e| {
                 tracing::error!(origin, "peer TLS client: {e}");
-                Arc::new(Pool { clients: vec![refusing().clone()], bulk: vec![refusing().clone()], next: AtomicUsize::new(0) })
+                Arc::new(Pool {
+                    clients: vec![refusing().clone()],
+                    bulk: vec![refusing().clone()],
+                    next: AtomicUsize::new(0),
+                })
             });
         origins.push((o, pool.clone()));
         pool
@@ -908,10 +903,8 @@ impl reqwest::dns::Resolve for PublicOnlyResolver {
 }
 
 async fn public_addrs(host: &str) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, 0))
-        .await?
-        .filter(|a| crate::did_resolver::is_public_ip(a.ip()))
-        .collect();
+    let addrs: Vec<SocketAddr> =
+        tokio::net::lookup_host((host, 0)).await?.filter(|a| crate::did_resolver::is_public_ip(a.ip())).collect();
     if addrs.is_empty() {
         return Err(format!("{host} did not resolve to a public unicast address").into());
     }
@@ -1210,8 +1203,8 @@ pub(crate) mod tests {
     /// that upload), and it closes once the upload ends.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn h1_early_answer_during_upload_is_not_pooled() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use futures::StreamExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         const ROLE: &str = "test-h1-early";
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let authority = l.local_addr().unwrap().to_string();
@@ -1226,12 +1219,11 @@ pub(crate) mod tests {
             }
         });
         let (go, wait) = tokio::sync::oneshot::channel::<()>();
-        let upload = futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"part one")) }).chain(
-            futures::stream::once(async move {
+        let upload = futures::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"part one")) })
+            .chain(futures::stream::once(async move {
                 let _ = wait.await;
                 Ok(bytes::Bytes::from_static(b"part two"))
-            }),
-        );
+            }));
         let mut req = axum::http::Request::new(axum::body::Body::from_stream(upload));
         *req.method_mut() = axum::http::Method::POST;
         *req.uri_mut() = "/upload".parse().unwrap();

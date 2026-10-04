@@ -73,7 +73,10 @@ async fn account_changes_apply_to_the_next_proxied_request() {
     let k2 = s.signing_key(&a.did).await;
     assert_ne!(k1, k2);
     assert_eq!(timeline(&s, &a.auth()).await.status, 200);
-    assert!(verifies(seen.lock().last().unwrap(), &k2), "the first request after a rotation is signed with the new key");
+    assert!(
+        verifies(seen.lock().last().unwrap(), &k2),
+        "the first request after a rotation is signed with the new key"
+    );
 }
 
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>, appview: &str) -> TestServer {

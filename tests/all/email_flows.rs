@@ -20,7 +20,13 @@ async fn update_email(s: &TestServer, auth: &Auth, email: &str, token: Option<&s
 }
 
 async fn delete_account(s: &TestServer, did: &str, password: &str, token: &str) -> Resp {
-    s.xrpc.post("com.atproto.server.deleteAccount", &json!({"did": did, "password": password, "token": token}), &Auth::None).await
+    s.xrpc
+        .post(
+            "com.atproto.server.deleteAccount",
+            &json!({"did": did, "password": password, "token": token}),
+            &Auth::None,
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +53,8 @@ async fn email_confirmation_and_update_flow() {
     alice.email = new1.clone();
 
     // requests email confirmation: one mail to the current address
-    let (confirm, _, mail) = mailed(&s, &alice.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &alice.auth())).await;
+    let (confirm, _, mail) =
+        mailed(&s, &alice.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &alice.auth())).await;
     assert_eq!(mail["to"].as_str().map(str::to_ascii_lowercase), Some(alice.email.to_ascii_lowercase()));
 
     confirm_email(&s, &alice, &alice.email, "123456").await.err(400, "InvalidToken");
@@ -63,7 +70,8 @@ async fn email_confirmation_and_update_flow() {
     update_email(&s, &alice.auth(), new2, None).await.err(400, "TokenRequired");
 
     // requests email update: token mailed to the *current* address
-    let (update, r, _) = mailed(&s, &alice.email, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &alice.auth())).await;
+    let (update, r, _) =
+        mailed(&s, &alice.email, s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &alice.auth())).await;
     assert_eq!(r.ok()["tokenRequired"], json!(true));
 
     update_email(&s, &alice.auth(), new2, Some("123456")).await.err(400, "InvalidToken");
@@ -94,12 +102,19 @@ async fn email_tokens_are_purpose_bound() {
     // a confirmation token cannot be used to update the email and vice versa
     let s = TestServer::spawn().await;
     let a = s.create_account("dana").await;
-    let (confirm, _, _) = mailed(&s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (confirm, _, _) =
+        mailed(&s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     confirm_email(&s, &a, &a.email, &confirm).await.ok();
-    let (conf2, _, _) = mailed(&s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
+    let (conf2, _, _) =
+        mailed(&s, &a.email, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     update_email(&s, &a.auth(), "x-dana@example.com", Some(&conf2)).await.err(400, "InvalidToken");
     // a password-reset token cannot delete the account
-    let (reset, _, _) = mailed(&s, &a.email, s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None)).await;
+    let (reset, _, _) = mailed(
+        &s,
+        &a.email,
+        s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": a.email}), &Auth::None),
+    )
+    .await;
     delete_account(&s, &a.did, PASSWORD, &reset).await.client_err();
     s.get_repo(&a.did).await; // still there
 }
@@ -142,7 +157,8 @@ async fn account_deletion_flow() {
     s.create_record(&other, "app.bsky.feed.post", image_post("img", &other_blob)).await;
 
     // requests account deletion
-    let (token, r, _) = mailed(&s, &carol.email, s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &carol.auth())).await;
+    let (token, r, _) =
+        mailed(&s, &carol.email, s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &carol.auth())).await;
     r.ok();
 
     delete_account(&s, &carol.did, PASSWORD, "123456").await.err(400, "InvalidToken");
@@ -164,10 +180,17 @@ async fn account_deletion_flow() {
     s.xrpc.get("com.atproto.sync.getLatestCommit", &[("did", &carol.did)], &Auth::None).await.client_err();
     s.repo_status(&carol.did).await.client_err();
     let lr = s.list_records(&carol.did, "app.bsky.feed.post", &[]).await;
-    assert!(!lr.is_ok() || lr.json["records"].as_array().map(|a| a.is_empty()).unwrap_or(true), "records still listed after deletion: {}", lr.text());
+    assert!(
+        !lr.is_ok() || lr.json["records"].as_array().map(|a| a.is_empty()).unwrap_or(true),
+        "records still listed after deletion: {}",
+        lr.text()
+    );
     s.resolve_handle(&carol.handle).await.client_err();
     let lrs = s.xrpc.get("com.atproto.sync.listRepos", &[("limit", "1000")], &Auth::None).await.ok();
-    assert!(!lrs["repos"].as_array().unwrap().iter().any(|r| r["did"] == json!(carol.did)), "deleted repo still in listRepos");
+    assert!(
+        !lrs["repos"].as_array().unwrap().iter().any(|r| r["did"] == json!(carol.did)),
+        "deleted repo still in listRepos"
+    );
     s.account_info(&carol.did).await.client_err();
 
     // deletes the user's blobs, keeps the other user's copy
@@ -186,7 +209,8 @@ async fn account_deletion_flow() {
 async fn can_delete_an_empty_user() {
     let s = TestServer::spawn().await;
     let eve = s.create_account("eve").await;
-    let (token, _, _) = mailed(&s, &eve.email, s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &eve.auth())).await;
+    let (token, _, _) =
+        mailed(&s, &eve.email, s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &eve.auth())).await;
     delete_account(&s, &eve.did, PASSWORD, &token).await.ok();
     s.xrpc.get("com.atproto.sync.getRepo", &[("did", &eve.did)], &Auth::None).await.client_err();
 }

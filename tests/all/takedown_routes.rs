@@ -24,8 +24,14 @@ async fn check_takedown_routes_refuse_legacy_tokens() {
         ("com.atproto.server.requestEmailConfirmation", json!({})),
         ("com.atproto.server.requestEmailUpdate", json!({})),
         ("com.atproto.server.requestAccountDelete", json!({})),
-        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post("x")})),
-        ("com.atproto.repo.putRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": p.rkey(), "record": post("y")})),
+        (
+            "com.atproto.repo.createRecord",
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post("x")}),
+        ),
+        (
+            "com.atproto.repo.putRecord",
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": p.rkey(), "record": post("y")}),
+        ),
         ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": p.rkey()})),
         (
             "com.atproto.repo.applyWrites",
@@ -48,7 +54,11 @@ async fn check_takedown_routes_refuse_legacy_tokens() {
     for (who, auth) in [("session", a.auth()), ("app password", app_auth.clone())] {
         let mut check = |nsid: &str, r: Resp| {
             let takedown = (r.status, r.error_name()) == (401, Some("AccountTakedown"));
-            let ok = if who == "session" || app_pw_routes.contains(&nsid) { takedown } else { r.status >= 400 && r.status < 500 };
+            let ok = if who == "session" || app_pw_routes.contains(&nsid) {
+                takedown
+            } else {
+                r.status >= 400 && r.status < 500
+            };
             if !ok {
                 wrong.push(format!("{who} {nsid}: {} {}", r.status, r.text()));
             }
@@ -69,7 +79,14 @@ async fn check_takedown_routes_refuse_legacy_tokens() {
     // reports the status; getServiceAuth for createAccount, to migrate away)
     let j = s.xrpc.get("com.atproto.server.getSession", &[], &a.auth()).await.ok();
     assert_eq!((j["active"].clone(), j["status"].clone()), (json!(false), json!("takendown")), "{j}");
-    s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", "did:web:elsewhere.test"), ("lxm", "com.atproto.server.createAccount")], &a.auth()).await.ok();
+    s.xrpc
+        .get(
+            "com.atproto.server.getServiceAuth",
+            &[("aud", "did:web:elsewhere.test"), ("lxm", "com.atproto.server.createAccount")],
+            &a.auth(),
+        )
+        .await
+        .ok();
     // refresh tokens are gone
     s.xrpc.post_empty("com.atproto.server.refreshSession", &a.refresh_auth()).await.client_err();
 

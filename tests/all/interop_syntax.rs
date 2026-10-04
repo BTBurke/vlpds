@@ -8,7 +8,13 @@
 use crate::common::*;
 
 async fn create(s: &TestServer, a: &TestAccount, collection: &str, record: J) -> Resp {
-    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": collection, "record": record}), &a.auth()).await
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": collection, "record": record}),
+            &a.auth(),
+        )
+        .await
 }
 
 async fn signup(s: &TestServer, handle: &str) -> Resp {
@@ -121,8 +127,12 @@ async fn handles_invalid_rejected_by_create_account() {
         let r = signup(&s, &under).await;
         // Some invalid handles become valid with a suffix (e.g. a bare TLD); only
         // flag success for strings that are invalid in any position.
-        let still_invalid =
-            h.contains(' ') || h.contains("..") || h.starts_with('.') || h.starts_with('-') || h.contains("_") || !h.is_ascii();
+        let still_invalid = h.contains(' ')
+            || h.contains("..")
+            || h.starts_with('.')
+            || h.starts_with('-')
+            || h.contains("_")
+            || !h.is_ascii();
         if still_invalid && r.status != 400 {
             bad.push(format!("createAccount accepted handle {} -> {}", short(&under), r.text()));
         }
@@ -209,7 +219,10 @@ async fn at_identifiers_as_repo_param() {
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("describeRepo(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
-        let r = s.xrpc.get("com.atproto.repo.listRecords", &[("repo", &id), ("collection", "app.bsky.feed.post")], &Auth::None).await;
+        let r = s
+            .xrpc
+            .get("com.atproto.repo.listRecords", &[("repo", &id), ("collection", "app.bsky.feed.post")], &Auth::None)
+            .await;
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("listRecords(repo={}) -> {} (want 400 InvalidRequest)", short(&id), r.text()));
         }
@@ -292,7 +305,8 @@ async fn cids_invalid_rejected_in_params() {
         if !(r.status == 400 && r.error_name() == Some("InvalidRequest")) {
             bad.push(format!("getRecord(cid={}) -> {} (want 400 InvalidRequest)", short(&c), r.text()));
         }
-        let body = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c});
+        let body =
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("x"), "swapCommit": c});
         let r = s.xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await;
         if r.status != 400 {
             bad.push(format!("createRecord(swapCommit={}) -> {}", short(&c), r.text()));
@@ -335,7 +349,8 @@ async fn at_uris_in_known_records() {
     let a = s.create_account("uri").await;
     let cid = "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
     let mut bad = Diffs::new("at-uris in app.bsky.feed.like");
-    let like = |u: &str| json!({"$type": "app.bsky.feed.like", "subject": {"uri": u, "cid": cid}, "createdAt": now_iso()});
+    let like =
+        |u: &str| json!({"$type": "app.bsky.feed.like", "subject": {"uri": u, "cid": cid}, "createdAt": now_iso()});
     for u in fixture_lines("interop/syntax/aturi_syntax_valid.txt") {
         let r = create(&s, &a, "app.bsky.feed.like", like(&u)).await;
         if !r.is_ok() {

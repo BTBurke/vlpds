@@ -40,8 +40,8 @@
 use crate::common::*;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use shrike::cbor::json::{drisl_to_json, json_to_drisl, Integers};
 use shrike::cbor as sc;
+use shrike::cbor::json::{drisl_to_json, json_to_drisl, Integers};
 use shrike::crypto::SigningKey as _;
 use shrike::mst::{DetachedTree, NoBlocks};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -115,7 +115,8 @@ fn cbor_compare(b: &[u8]) -> Cbor {
             // JSON views: vlpds's tree and streaming transcoders vs shrike's
             let sj = drisl_to_json(b);
             let mut stream = Vec::new();
-            let streamed = vlpds::cbor::write_json(b, &mut stream).map(|()| serde_json::from_slice::<J>(&stream).unwrap());
+            let streamed =
+                vlpds::cbor::write_json(b, &mut stream).map(|()| serde_json::from_slice::<J>(&stream).unwrap());
             match (sj, streamed) {
                 (Ok(sj), Ok(vj)) if sj == v.to_json() && vj == sj => Cbor::Agree,
                 (sj, vj) => Cbor::Disagree(format!("JSON differs: vlpds {vj:?} / {}, shrike {sj:?}", v.to_json())),
@@ -149,8 +150,10 @@ fn mutate(rng: &mut impl Rng, b: &[u8]) -> Vec<u8> {
         }
         5 => {
             // a byte from the set that matters to heads: majors/infos
-            m[i] = [0x18, 0x19, 0x1a, 0x1b, 0x1f, 0x3f, 0x5f, 0x7f, 0x9f, 0xbf, 0xd8, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xff]
-                [rng.gen_range(0..20)]
+            m[i] = [
+                0x18, 0x19, 0x1a, 0x1b, 0x1f, 0x3f, 0x5f, 0x7f, 0x9f, 0xbf, 0xd8, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9,
+                0xfa, 0xfb, 0xff,
+            ][rng.gen_range(0..20)]
         }
         6 => {
             let j = rng.gen_range(i..m.len());
@@ -180,7 +183,12 @@ fn cbor_interop_fixtures_identical() {
         jv.encode_record(&mut one_pass, &mut RecordRefs::default()).unwrap();
         let s = json_to_drisl(&j, Integers::Any).unwrap();
         if v != cbor || one_pass != cbor || s != cbor {
-            d.push(format!("{cid}: JSON->CBOR differs (vlpds {}, one-pass {}, shrike {})", v == cbor, one_pass == cbor, s == cbor));
+            d.push(format!(
+                "{cid}: JSON->CBOR differs (vlpds {}, one-pass {}, shrike {})",
+                v == cbor,
+                one_pass == cbor,
+                s == cbor
+            ));
         }
         if Cid::dag_cbor(&cbor).to_string() != cid || sc::Cid::compute(sc::Codec::Drisl, &cbor).to_string() != cid {
             d.push(format!("{cid}: CID differs"));
@@ -245,8 +253,11 @@ fn cbor_random_values_and_mutations() {
     // MST nodes and commits too
     let mut t = Tree::new();
     for i in 0..300u32 {
-        t.insert_no_proof(format!("app.bsky.feed.post/{}", tid::Tid((1 << 40) | (i as u64 * 7919))).as_bytes(), rand_cid(&mut rng))
-            .unwrap();
+        t.insert_no_proof(
+            format!("app.bsky.feed.post/{}", tid::Tid((1 << 40) | (i as u64 * 7919))).as_bytes(),
+            rand_cid(&mut rng),
+        )
+        .unwrap();
     }
     t.root_cid().unwrap();
     t.walk_blocks(&mut |_, b| corpus.push(b.to_vec())).unwrap();
@@ -283,7 +294,12 @@ fn cbor_policy_differences_pinned() {
     assert_eq!(cbor_compare(&pi), Cbor::FloatShrikeOnly);
     assert!(drisl_to_json(&pi).is_err(), "shrike rejects the float one layer up");
     // f16/f32, NaN and infinities: rejected by both
-    for b in [&[0xf9, 0x3c, 0x00][..], &[0xfa, 0x3f, 0x80, 0, 0], &[0xfb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0], &[0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0]] {
+    for b in [
+        &[0xf9, 0x3c, 0x00][..],
+        &[0xfa, 0x3f, 0x80, 0, 0],
+        &[0xfb, 0x7f, 0xf8, 0, 0, 0, 0, 0, 0],
+        &[0xfb, 0x7f, 0xf0, 0, 0, 0, 0, 0, 0],
+    ] {
         assert_eq!(cbor_compare(b), Cbor::Agree);
         assert!(Value::decode(b).is_err());
     }
@@ -358,7 +374,9 @@ fn json_compare(text: &str) -> JsonOutcome {
     match (tree, s) {
         (Ok(v), Ok(s)) if v == s => JsonOutcome::Agree,
         (Ok(_), Ok(_)) if partial_padding(&j) => JsonOutcome::PartialPaddingShrikeMap,
-        (Ok(v), Ok(s)) => JsonOutcome::Disagree(format!("bytes differ: vlpds {} shrike {}", hex::encode(v), hex::encode(s))),
+        (Ok(v), Ok(s)) => {
+            JsonOutcome::Disagree(format!("bytes differ: vlpds {} shrike {}", hex::encode(v), hex::encode(s)))
+        }
         (Err(_), Err(_)) => JsonOutcome::Agree,
         (Err(_), Ok(_)) if lex_json_special(&j) => JsonOutcome::StrictVlpdsOnly,
         (Err(e), Ok(_)) => JsonOutcome::Disagree(format!("vlpds rejects ({e}), shrike accepts")),
@@ -373,22 +391,55 @@ fn rand_json(rng: &mut impl Rng, depth: usize) -> String {
         0 => "null".into(),
         1 => ["true", "false"][rng.gen_range(0..2)].into(),
         2 => [
-            "0", "-0", "1", "-1", "23", "24", "-25", "123.0", "1e3", "1.5", "-2.5e-3", "1E2",
-            "9007199254740991", "9007199254740992", "-9007199254740993", "9223372036854775807",
-            "9223372036854775808", "-9223372036854775808", "18446744073709551616", "1e400", "1.0e1",
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "23",
+            "24",
+            "-25",
+            "123.0",
+            "1e3",
+            "1.5",
+            "-2.5e-3",
+            "1E2",
+            "9007199254740991",
+            "9007199254740992",
+            "-9007199254740993",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "18446744073709551616",
+            "1e400",
+            "1.0e1",
         ][rng.gen_range(0..21)]
-            .into(),
+        .into(),
         3 => serde_json::to_string(&rand_text(rng)).unwrap(),
-        4 => format!("{{\"$link\": \"{}\"}}", [cid(), cid().to_uppercase(), format!("{}a", cid()), "bafy".into(), "QmQg1v4o9xdT3Q1R8tNK3z9ZkRmg7FbQfZ1J2Z6Ln8ZAwN".into(),
-            "zdj7WhuEjrB52m1BisYCtmjH1hSKa7yZ3jEZ9JcXaFRD51wVz".into()][rng.gen_range(0..6)]),
-        5 => format!("{{\"$bytes\": \"{}\"}}", ["", "AQ", "AQ==", "AQ=", "AQI", "AQID", "A", "!!", "aGVsbG8gd29ybGQ", "aGk=", "_-8"][rng.gen_range(0..11)]),
+        4 => format!(
+            "{{\"$link\": \"{}\"}}",
+            [
+                cid(),
+                cid().to_uppercase(),
+                format!("{}a", cid()),
+                "bafy".into(),
+                "QmQg1v4o9xdT3Q1R8tNK3z9ZkRmg7FbQfZ1J2Z6Ln8ZAwN".into(),
+                "zdj7WhuEjrB52m1BisYCtmjH1hSKa7yZ3jEZ9JcXaFRD51wVz".into()
+            ][rng.gen_range(0..6)]
+        ),
+        5 => format!(
+            "{{\"$bytes\": \"{}\"}}",
+            ["", "AQ", "AQ==", "AQ=", "AQI", "AQID", "A", "!!", "aGVsbG8gd29ybGQ", "aGk=", "_-8"][rng.gen_range(0..11)]
+        ),
         6 => format!(
             "{{\"$type\": \"blob\", \"ref\": {{\"$link\": \"{}\"}}, \"mimeType\": {}, \"size\": {}}}",
             Cid::raw(&[depth as u8]),
             ["\"image/png\"", "1", "null"][rng.gen_range(0..3)],
             ["12", "\"12\"", "1.5", "-1"][rng.gen_range(0..4)]
         ),
-        7 => format!("{{\"$type\": {}}}", ["\"app.bsky.feed.post\"", "\"\"", "1", "null", "\"blob\""][rng.gen_range(0..5)]),
+        7 => format!(
+            "{{\"$type\": {}}}",
+            ["\"app.bsky.feed.post\"", "\"\"", "1", "null", "\"blob\""][rng.gen_range(0..5)]
+        ),
         8 | 9 => {
             let n = rng.gen_range(0..5);
             let mut parts = Vec::new();
@@ -425,7 +476,8 @@ fn json_to_cbor_random_and_lex_json_vectors() {
     // VLPDS_JSON_DUMP=<file>: write the corpus out (one JSON text per line)
     // for bench/results/differential/json_oracle.mjs
     if let Ok(path) = std::env::var("VLPDS_JSON_DUMP") {
-        let lines: Vec<String> = texts.iter().filter_map(|t| serde_json::from_str::<J>(t).ok()).map(|j| j.to_string()).collect();
+        let lines: Vec<String> =
+            texts.iter().filter_map(|t| serde_json::from_str::<J>(t).ok()).map(|j| j.to_string()).collect();
         std::fs::write(path, lines.join("\n") + "\n").unwrap();
     }
     for t in &texts {
@@ -494,7 +546,9 @@ fn cid_str_compare(s: &str, d: &mut Diffs) -> bool {
             }
         }
         (Err(_), Err(_)) => {}
-        _ => d.push(format!("{}: vlpds {:?}, shrike {:?}", short(s), v.is_ok(), sh.as_ref().map_err(|e| e.to_string()))),
+        _ => {
+            d.push(format!("{}: vlpds {:?}, shrike {:?}", short(s), v.is_ok(), sh.as_ref().map_err(|e| e.to_string())))
+        }
     }
     v.is_ok()
 }
@@ -540,7 +594,12 @@ fn cid_strings_and_bytes() {
         let n = [35, 36, 36, 36, 37][rng.gen_range(0..5)];
         let mut b: Vec<u8> = (0..n).map(|_| rng.gen()).collect();
         if rng.gen_bool(0.7) && n >= 4 {
-            b[..4].copy_from_slice(&[1, [0x71, 0x55, 0x70, 0x72][rng.gen_range(0..4)], [0x12, 0x13][rng.gen_range(0..2)], [0x20, 0x40][rng.gen_range(0..2)]]);
+            b[..4].copy_from_slice(&[
+                1,
+                [0x71, 0x55, 0x70, 0x72][rng.gen_range(0..4)],
+                [0x12, 0x13][rng.gen_range(0..2)],
+                [0x20, 0x40][rng.gen_range(0..2)],
+            ]);
         }
         let (v, s) = (Cid::from_bytes(&b), sc::Cid::from_bytes(&b));
         if v.is_ok() != s.is_ok() || v.as_ref().ok().map(|c| c.to_bytes()) != s.as_ref().ok().map(|c| c.to_bytes()) {
@@ -576,7 +635,9 @@ fn tids() {
             d.push(format!("{s}: vlpds valid_tid {v} vs Tid::parse {:?}", vp));
         }
         match (vp, &sh) {
-            (Some(a), Ok(b)) if a.0 != b.as_u64() || a.to_string() != b.to_string() => d.push(format!("{s}: values differ")),
+            (Some(a), Ok(b)) if a.0 != b.as_u64() || a.to_string() != b.to_string() => {
+                d.push(format!("{s}: values differ"))
+            }
             (Some(_), Ok(_)) | (None, Err(_)) => {}
             _ => d.push(format!("{s}: vlpds {v}, shrike {}", sh.is_ok())),
         }
@@ -622,24 +683,78 @@ fn valid_at_identifier(s: &str) -> bool {
 fn kinds() -> Vec<Kind> {
     use shrike::syntax as ss;
     vec![
-        Kind { name: "did", fixture: "did", vlpds: syntax::valid_did, shrike: |s| ss::Did::try_from(s).is_ok(),
-            alphabet: "did:plcweb.%-_:ABZ09az~#/?", lens: &[4, 8, 12, 32, 2047, 2048, 2049, 8192] },
-        Kind { name: "handle", fixture: "handle", vlpds: syntax::valid_handle, shrike: |s| ss::Handle::try_from(s).is_ok(),
-            alphabet: "ab.-09Z_ ", lens: &[1, 3, 6, 12, 63, 64, 252, 253, 254] },
-        Kind { name: "nsid", fixture: "nsid", vlpds: syntax::valid_nsid, shrike: |s| ss::Nsid::try_from(s).is_ok(),
-            alphabet: "ab.-09Z_", lens: &[5, 8, 14, 63, 64, 253, 317, 318] },
-        Kind { name: "rkey", fixture: "recordkey", vlpds: syntax::valid_rkey, shrike: |s| ss::RecordKey::try_from(s).is_ok(),
-            alphabet: "aZ09._:~-/#@ %", lens: &[1, 2, 3, 13, 512, 513] },
-        Kind { name: "at-uri", fixture: "aturi", vlpds: lexicon::valid_at_uri, shrike: |s| ss::AtUri::try_from(s).is_ok(),
-            alphabet: "at:/.bcom-did:plc:x#?3Z_~", lens: &[5, 12, 30, 60, 8192, 8193] },
-        Kind { name: "datetime", fixture: "datetime", vlpds: lexicon::valid_datetime, shrike: |s| ss::Datetime::try_from(s).is_ok(),
-            alphabet: "0123456789-T:.Z+z t", lens: &[19, 20, 24, 25, 29, 64, 65] },
-        Kind { name: "language", fixture: "language", vlpds: lexicon::valid_language, shrike: |s| ss::Language::try_from(s).is_ok(),
-            alphabet: "enUSxi-09_", lens: &[1, 2, 3, 5, 9, 13, 20] },
-        Kind { name: "at-identifier", fixture: "atidentifier", vlpds: valid_at_identifier, shrike: |s| ss::AtIdentifier::try_from(s).is_ok(),
-            alphabet: "did:plc.ab-09", lens: &[3, 8, 20, 253] },
-        Kind { name: "tid", fixture: "tid", vlpds: syntax::valid_tid, shrike: |s| ss::Tid::try_from(s).is_ok(),
-            alphabet: "234567abcdefghijklmnopqrstuvwxyz", lens: &[12, 13, 14] },
+        Kind {
+            name: "did",
+            fixture: "did",
+            vlpds: syntax::valid_did,
+            shrike: |s| ss::Did::try_from(s).is_ok(),
+            alphabet: "did:plcweb.%-_:ABZ09az~#/?",
+            lens: &[4, 8, 12, 32, 2047, 2048, 2049, 8192],
+        },
+        Kind {
+            name: "handle",
+            fixture: "handle",
+            vlpds: syntax::valid_handle,
+            shrike: |s| ss::Handle::try_from(s).is_ok(),
+            alphabet: "ab.-09Z_ ",
+            lens: &[1, 3, 6, 12, 63, 64, 252, 253, 254],
+        },
+        Kind {
+            name: "nsid",
+            fixture: "nsid",
+            vlpds: syntax::valid_nsid,
+            shrike: |s| ss::Nsid::try_from(s).is_ok(),
+            alphabet: "ab.-09Z_",
+            lens: &[5, 8, 14, 63, 64, 253, 317, 318],
+        },
+        Kind {
+            name: "rkey",
+            fixture: "recordkey",
+            vlpds: syntax::valid_rkey,
+            shrike: |s| ss::RecordKey::try_from(s).is_ok(),
+            alphabet: "aZ09._:~-/#@ %",
+            lens: &[1, 2, 3, 13, 512, 513],
+        },
+        Kind {
+            name: "at-uri",
+            fixture: "aturi",
+            vlpds: lexicon::valid_at_uri,
+            shrike: |s| ss::AtUri::try_from(s).is_ok(),
+            alphabet: "at:/.bcom-did:plc:x#?3Z_~",
+            lens: &[5, 12, 30, 60, 8192, 8193],
+        },
+        Kind {
+            name: "datetime",
+            fixture: "datetime",
+            vlpds: lexicon::valid_datetime,
+            shrike: |s| ss::Datetime::try_from(s).is_ok(),
+            alphabet: "0123456789-T:.Z+z t",
+            lens: &[19, 20, 24, 25, 29, 64, 65],
+        },
+        Kind {
+            name: "language",
+            fixture: "language",
+            vlpds: lexicon::valid_language,
+            shrike: |s| ss::Language::try_from(s).is_ok(),
+            alphabet: "enUSxi-09_",
+            lens: &[1, 2, 3, 5, 9, 13, 20],
+        },
+        Kind {
+            name: "at-identifier",
+            fixture: "atidentifier",
+            vlpds: valid_at_identifier,
+            shrike: |s| ss::AtIdentifier::try_from(s).is_ok(),
+            alphabet: "did:plc.ab-09",
+            lens: &[3, 8, 20, 253],
+        },
+        Kind {
+            name: "tid",
+            fixture: "tid",
+            vlpds: syntax::valid_tid,
+            shrike: |s| ss::Tid::try_from(s).is_ok(),
+            alphabet: "234567abcdefghijklmnopqrstuvwxyz",
+            lens: &[12, 13, 14],
+        },
     ]
 }
 
@@ -649,7 +764,9 @@ fn seeds(kind: &str) -> &'static [&'static str] {
         "did" => &["did:plc:", "did:web:", "did:", "did:key:z", "did:plc:abc", "did:web:a.com%3A3000"],
         "handle" => &["a.", "a.b.", "xn--", "alice.bsky.", ""],
         "nsid" => &["app.bsky.", "com.example.", "a.b.", "a-0.b-1.", "1a.b."],
-        "at-uri" => &["at://did:plc:abc/", "at://a.com/", "at://did:plc:abc/app.bsky.feed.post/", "at://", "at://did:web:x.com"],
+        "at-uri" => {
+            &["at://did:plc:abc/", "at://a.com/", "at://did:plc:abc/app.bsky.feed.post/", "at://", "at://did:web:x.com"]
+        }
         "datetime" => &["1985-04-12T23:20:50", "1985-04-12T23:20:50.", "0000-01-01T00:00:00", "2024-02-30T00:00:00"],
         "language" => &["en", "en-", "x-", "i-", "zh-Hant-"],
         "at-identifier" => &["did:plc:", "a.", "did:web:"],
@@ -669,7 +786,13 @@ fn known_syntax_split(kind: &str, s: &str, vlpds: bool, shrike: bool) -> Option<
         "language" => Some("shrike's simplified language tags"),
         // impossible calendar dates: the TS reference (JS Date) rolls them
         // over and accepts, indigo (Go time.Parse) and vlpds reject
-        "datetime" if !vlpds && shrike && s.is_ascii() && s.len() > 10 && lexicon::valid_datetime(&format!("{}01{}", &s[..8], &s[10..])) => {
+        "datetime"
+            if !vlpds
+                && shrike
+                && s.is_ascii()
+                && s.len() > 10
+                && lexicon::valid_datetime(&format!("{}01{}", &s[..8], &s[10..])) =>
+        {
             Some("impossible calendar date")
         }
         _ => None,
@@ -730,15 +853,23 @@ fn identifier_syntax() {
     eprintln!("syntax checked: {}; known splits {known:?}", counts.join(", "));
     d.assert_none();
     // the pinned splits are still there (drop them from known_syntax_split once fixed)
-    assert!(syntax::valid_did("did:web:localhost%3A1234") && shrike::syntax::Did::try_from("did:web:localhost%3A1234").is_err());
+    assert!(
+        syntax::valid_did("did:web:localhost%3A1234")
+            && shrike::syntax::Did::try_from("did:web:localhost%3A1234").is_err()
+    );
     assert!(lexicon::valid_language("X-fr-CH") && shrike::syntax::Language::try_from("X-fr-CH").is_err());
-    assert!(!lexicon::valid_datetime("2024-02-30T00:00:00Z") && shrike::syntax::Datetime::try_from("2024-02-30T00:00:00Z").is_ok());
+    assert!(
+        !lexicon::valid_datetime("2024-02-30T00:00:00Z")
+            && shrike::syntax::Datetime::try_from("2024-02-30T00:00:00Z").is_ok()
+    );
     // SHRIKE_ISSUES.md repros (vlpds matches @atproto/syntax on each)
     use shrike::syntax as ss;
     for did in ["did:web:localhost%3A1234", "did:method:val%BB"] {
         assert!(syntax::valid_did(did) && ss::Did::try_from(did).is_err(), "{did}");
     }
-    for (lang, reference) in [("x-foo", true), ("X-fr-CH", true), ("i-foo", false), ("en-a", false), ("sl-rozaj-rozaj", false)] {
+    for (lang, reference) in
+        [("x-foo", true), ("X-fr-CH", true), ("i-foo", false), ("en-a", false), ("sl-rozaj-rozaj", false)]
+    {
         assert_eq!(lexicon::valid_language(lang), reference, "{lang}");
         assert_eq!(ss::Language::try_from(lang).is_ok(), !reference, "{lang}");
     }
@@ -766,7 +897,9 @@ fn car_compare(b: &[u8]) -> Result<Option<(Vec<Cid>, Blocks)>, String> {
             Ok(Some((vr, vb)))
         }
         (Err(_), Err(_)) => Ok(None),
-        (Ok((r, bl)), Err(e)) => Err(format!("vlpds reads ({} roots, {} blocks), shrike rejects: {e}", r.len(), bl.len())),
+        (Ok((r, bl)), Err(e)) => {
+            Err(format!("vlpds reads ({} roots, {} blocks), shrike rejects: {e}", r.len(), bl.len()))
+        }
         (Err(e), Ok(_)) => Err(format!("vlpds rejects ({e}), shrike reads")),
     }
 }
@@ -792,10 +925,17 @@ fn car_read_agreement() {
     for n in [0usize, 1, 5, 40, 200] {
         let mut t = Tree::new();
         for _ in 0..n {
-            t.insert_no_proof(format!("app.bsky.feed.like/{}", tid::Tid(rng.gen::<u64>() >> 1)).as_bytes(), rand_cid(&mut rng)).unwrap();
+            t.insert_no_proof(
+                format!("app.bsky.feed.like/{}", tid::Tid(rng.gen::<u64>() >> 1)).as_bytes(),
+                rand_cid(&mut rng),
+            )
+            .unwrap();
         }
         let root = t.root_cid().unwrap();
-        cars.push(tree_car(&mut t, &vlpds::events::encode_commit("did:plc:abc", "3jzfcijpj2z2a", &root, Some(&[1; 64]))));
+        cars.push(tree_car(
+            &mut t,
+            &vlpds::events::encode_commit("did:plc:abc", "3jzfcijpj2z2a", &root, Some(&[1; 64])),
+        ));
     }
     // shrike-written CARs (roots: none, one, several)
     for roots in [0usize, 1, 3] {
@@ -869,7 +1009,8 @@ fn car_header_rules_agree() {
 // ---------------------------------------------------------------------------
 
 fn rand_key(rng: &mut impl Rng) -> String {
-    let coll = ["app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.graph.follow", "com.example.k", "a.b.c"][rng.gen_range(0..5)];
+    let coll = ["app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.graph.follow", "com.example.k", "a.b.c"]
+        [rng.gen_range(0..5)];
     let rkey = match rng.gen_range(0..4) {
         0 => tid::Tid(rng.gen::<u64>() >> 1).to_string(),
         1 => tid::Tid((1 << 60) + rng.gen_range(0..5000u64)).to_string(),
@@ -923,7 +1064,11 @@ fn mst_roots_agree_on_random_histories() {
                 }
             } else {
                 let k = live.swap_remove(rng.gen_range(0..live.len()));
-                assert_eq!(v.remove(k.as_bytes()).unwrap().map(|c| s_cid(&c)), s.remove(&NoBlocks, &k).unwrap(), "remove {k}");
+                assert_eq!(
+                    v.remove(k.as_bytes()).unwrap().map(|c| s_cid(&c)),
+                    s.remove(&NoBlocks, &k).unwrap(),
+                    "remove {k}"
+                );
             }
             if step % 37 == 0 || step == n + 29 {
                 let (vr, sr) = (v.root_cid().unwrap(), s.flush().unwrap().root);
@@ -1011,7 +1156,12 @@ fn shrike_invert(after: sc::Cid, ops: &[Op], src: &HashMap<sc::Cid, Vec<u8>>) ->
 
 /// Sets the value of `key` (which must exist) in the subtree at `node`,
 /// re-encoding only the nodes on its path; returns the new subtree CID.
-fn set_existing(store: &mut HashMap<sc::Cid, Vec<u8>>, node: sc::Cid, key: &str, val: sc::Cid) -> Result<sc::Cid, String> {
+fn set_existing(
+    store: &mut HashMap<sc::Cid, Vec<u8>>,
+    node: sc::Cid,
+    key: &str,
+    val: sc::Cid,
+) -> Result<sc::Cid, String> {
     use shrike::mst::node::{decode_node_data, encode_node_data};
     let block = store.get(&node).ok_or_else(|| format!("block not found: {node}"))?;
     let mut nd = decode_node_data(block).map_err(|e| e.to_string())?;
@@ -1062,7 +1212,8 @@ fn mst_vlpds_commits_invert_in_shrike() {
             let (before, after, diff) =
                 vlpds_commit(&mut t, &ops.iter().map(|(k, n, _)| (k.clone(), *n)).collect::<Vec<_>>());
             let src = s_blocks(&diff);
-            let inv = shrike_invert(s_cid(&after), &ops, &src).unwrap_or_else(|e| panic!("round {round}: inverting: {e}"));
+            let inv =
+                shrike_invert(s_cid(&after), &ops, &src).unwrap_or_else(|e| panic!("round {round}: inverting: {e}"));
             assert_eq!(inv, s_cid(&before), "round {round}: inverted root");
             // shrike's covering proof of the created and deleted keys (over the
             // full tree) is among the emitted blocks; an update needs only its path
@@ -1112,7 +1263,8 @@ fn mst_shrike_commits_invert_in_vlpds() {
             }
             let w = s.flush().unwrap();
             let after = v_cid(&w.root);
-            let mut commit_blocks: HashMap<Cid, Vec<u8>> = w.new_blocks.iter().map(|(c, b)| (v_cid(c), b.clone())).collect();
+            let mut commit_blocks: HashMap<Cid, Vec<u8>> =
+                w.new_blocks.iter().map(|(c, b)| (v_cid(c), b.clone())).collect();
             store.extend(w.new_blocks);
             for c in s.covering_proof(&store, ops.iter().map(|o| o.0.as_str())).unwrap() {
                 commit_blocks.insert(v_cid(&c), store[&c].clone());
@@ -1303,7 +1455,11 @@ fn record_proofs_vlpds_to_shrike() {
         let mut recs: HashMap<String, Vec<u8>> = HashMap::new();
         for i in 0..n {
             let k = format!("app.bsky.feed.post/{}", tid::Tid((1 << 60) + i as u64 * 9973));
-            let rec = Value::from_json(&json!({"$type": "app.bsky.feed.post", "text": k, "createdAt": "2026-01-01T00:00:00Z"})).unwrap().to_cbor();
+            let rec = Value::from_json(
+                &json!({"$type": "app.bsky.feed.post", "text": k, "createdAt": "2026-01-01T00:00:00Z"}),
+            )
+            .unwrap()
+            .to_cbor();
             t.insert_no_proof(k.as_bytes(), Cid::dag_cbor(&rec)).unwrap();
             recs.insert(k, rec);
         }
@@ -1351,7 +1507,8 @@ fn record_proofs_reference_and_shrike_to_vlpds() {
     for c in ts["cases"].as_array().unwrap() {
         let name = c["name"].as_str().unwrap();
         let car = b64_decode(c["proof"].as_str().unwrap());
-        let (did, key, rkey) = (c["did"].as_str().unwrap(), c["signingKey"].as_str().unwrap(), c["rkey"].as_str().unwrap());
+        let (did, key, rkey) =
+            (c["did"].as_str().unwrap(), c["signingKey"].as_str().unwrap(), c["rkey"].as_str().unwrap());
         // expect: "error" (bad proof), null (proves absence) or the record CID
         let want = match &c["expect"] {
             J::Null => Ok(None),
@@ -1360,7 +1517,12 @@ fn record_proofs_reference_and_shrike_to_vlpds() {
             e => panic!("{e}"),
         };
         // vlpds's verifier (lexicon resolution) reports absence as an error
-        let v = match vlpds::oauth::lexicon::verify_record_proof(&car, did, key.strip_prefix("did:key:").unwrap(), &format!("{coll}/{rkey}")) {
+        let v = match vlpds::oauth::lexicon::verify_record_proof(
+            &car,
+            did,
+            key.strip_prefix("did:key:").unwrap(),
+            &format!("{coll}/{rkey}"),
+        ) {
             Ok(rec) => Ok(Some(Cid::dag_cbor(&Value::from_json(&rec).unwrap().to_cbor()).to_string())),
             Err(e) if e == "Record not found in proof" => Ok(None),
             Err(_) => Err(()),
@@ -1399,13 +1561,26 @@ fn record_proofs_reference_and_shrike_to_vlpds() {
     let mb = sk.public_key().multibase();
     for rk in keys.iter().step_by(7) {
         let car = repo.record_proof(&nsid, rk).unwrap();
-        let rec = vlpds::oauth::lexicon::verify_record_proof(&car, did.as_str(), &mb, &format!("{coll}/{}", rk.as_str()))
-            .unwrap_or_else(|e| panic!("{}: {e}", rk.as_str()));
+        let rec =
+            vlpds::oauth::lexicon::verify_record_proof(&car, did.as_str(), &mb, &format!("{coll}/{}", rk.as_str()))
+                .unwrap_or_else(|e| panic!("{}: {e}", rk.as_str()));
         assert_eq!(rec["id"], rk.as_str());
         // wrong key / wrong DID fail
         let other = shrike::crypto::K256SigningKey::generate().public_key().multibase();
-        assert!(vlpds::oauth::lexicon::verify_record_proof(&car, did.as_str(), &other, &format!("{coll}/{}", rk.as_str())).is_err());
-        assert!(vlpds::oauth::lexicon::verify_record_proof(&car, "did:plc:other", &mb, &format!("{coll}/{}", rk.as_str())).is_err());
+        assert!(vlpds::oauth::lexicon::verify_record_proof(
+            &car,
+            did.as_str(),
+            &other,
+            &format!("{coll}/{}", rk.as_str())
+        )
+        .is_err());
+        assert!(vlpds::oauth::lexicon::verify_record_proof(
+            &car,
+            "did:plc:other",
+            &mb,
+            &format!("{coll}/{}", rk.as_str())
+        )
+        .is_err());
     }
 }
 
@@ -1481,17 +1656,27 @@ fn mst_adversarial_nodes() {
     let k = |i: usize| h0[i].as_bytes();
     let p = |a: &[u8], b: &[u8]| a.iter().zip(b).take_while(|(x, y)| x == y).count() as u64;
     // well-formed: both accept
-    mk("valid leaf", false, &|b| add(b, raw_node(None, &[(k(0), 0, None), (&k(1)[p(k(0), k(1)) as usize..], p(k(0), k(1)), None)], None, false)));
+    mk("valid leaf", false, &|b| {
+        add(b, raw_node(None, &[(k(0), 0, None), (&k(1)[p(k(0), k(1)) as usize..], p(k(0), k(1)), None)], None, false))
+    });
     // both reject
-    mk("prefix longer than previous key", false, &|b| add(b, raw_node(None, &[(k(0), 0, None), (&b"x"[..], 40, None)], None, false)));
+    mk("prefix longer than previous key", false, &|b| {
+        add(b, raw_node(None, &[(k(0), 0, None), (&b"x"[..], 40, None)], None, false))
+    });
     mk("first entry with a prefix", false, &|b| add(b, raw_node(None, &[(k(0), 3, None)], None, false)));
     mk("keys out of order", false, &|b| add(b, raw_node(None, &[(k(1), 0, None), (k(0), 0, None)], None, false)));
     mk("duplicate keys", false, &|b| add(b, raw_node(None, &[(k(0), 0, None), (k(0), 0, None)], None, false)));
     mk("not a map", false, &|b| add(b, Value::Array(vec![]).to_cbor()));
-    mk("e not an array", false, &|b| add(b, Value::Map(vec![("e".into(), Value::Int(1)), ("l".into(), Value::Null)]).to_cbor()));
-    mk("l not a link", false, &|b| add(b, Value::Map(vec![("e".into(), Value::Array(vec![])), ("l".into(), Value::Int(1))]).to_cbor()));
+    mk("e not an array", false, &|b| {
+        add(b, Value::Map(vec![("e".into(), Value::Int(1)), ("l".into(), Value::Null)]).to_cbor())
+    });
+    mk("l not a link", false, &|b| {
+        add(b, Value::Map(vec![("e".into(), Value::Array(vec![])), ("l".into(), Value::Int(1))]).to_cbor())
+    });
     // vlpds-only checks (canonical structure)
-    mk("non-canonical prefix (0 instead of shared)", true, &|b| add(b, raw_node(None, &[(k(0), 0, None), (k(1), 0, None)], None, false)));
+    mk("non-canonical prefix (0 instead of shared)", true, &|b| {
+        add(b, raw_node(None, &[(k(0), 0, None), (k(1), 0, None)], None, false))
+    });
     mk("keys of different heights in one node", true, &|b| {
         let (a, c) = if h1[0] < h0[0] { (h1[0].as_bytes(), k(0)) } else { (k(0), h1[0].as_bytes()) };
         let pl = p(a, c);
@@ -1531,7 +1716,13 @@ fn mst_adversarial_nodes() {
     let mut d = Diffs::new("adversarial MST nodes");
     for c in &cases {
         let (v, s) = load_both(&c.blocks, c.root);
-        let want = if c.name == "valid leaf" { (true, true) } else if c.vlpds_only { (false, true) } else { (false, false) };
+        let want = if c.name == "valid leaf" {
+            (true, true)
+        } else if c.vlpds_only {
+            (false, true)
+        } else {
+            (false, false)
+        };
         if (v.is_ok(), s.is_ok()) != want {
             d.push(format!("{}: vlpds {v:?}, shrike {s:?} (expected ok = {want:?})", c.name));
         }
@@ -1597,7 +1788,8 @@ fn mst_mutated_nodes() {
     for k in tally.keys() {
         if let Some(r) = k.strip_prefix("vlpds only rejects: ") {
             assert!(
-                ["invalid MST structure", "invalid MST key"].iter().any(|p| r.starts_with(p)) && !r.contains("bad node cbor"),
+                ["invalid MST structure", "invalid MST key"].iter().any(|p| r.starts_with(p))
+                    && !r.contains("bad node cbor"),
                 "{k}"
             );
         }
@@ -1614,7 +1806,8 @@ fn k256_signatures_and_did_keys() {
     let mut rng = StdRng::seed_from_u64(0x5167);
     for i in 0..48 {
         let kp = crypto::Keypair::generate();
-        let sk = shrike::crypto::K256SigningKey::from_bytes(&<[u8; 32]>::try_from(&kp.to_bytes()[..]).unwrap()).unwrap();
+        let sk =
+            shrike::crypto::K256SigningKey::from_bytes(&<[u8; 32]>::try_from(&kp.to_bytes()[..]).unwrap()).unwrap();
         // did:key / multibase / SEC1 identical; each side parses the other's
         assert_eq!(sk.public_key().did_key(), kp.did_key());
         assert_eq!(sk.public_key().multibase(), kp.public_multibase());
@@ -1665,7 +1858,8 @@ fn signature_fixtures_both_sides() {
     for f in fs {
         let (msg, sig) = (b64_decode(&f.message_base64), b64_decode(&f.signature_base64));
         let vk = shrike::crypto::parse_did_key(&f.public_key_did).unwrap();
-        let s = <[u8; 64]>::try_from(sig.as_slice()).is_ok_and(|a| vk.verify(&msg, &shrike::crypto::Signature::from_bytes(a)).is_ok());
+        let s = <[u8; 64]>::try_from(sig.as_slice())
+            .is_ok_and(|a| vk.verify(&msg, &shrike::crypto::Signature::from_bytes(a)).is_ok());
         assert_eq!(s, f.valid_signature, "shrike: {}", f.comment);
         if f.algorithm == "ES256K" {
             let v = crypto::verify_k256(&vk.to_bytes(), &msg, &sig).unwrap_or(false);
@@ -1681,7 +1875,8 @@ fn signature_fixtures_both_sides() {
             assert_eq!(vk.did_key(), did);
             assert_eq!(vk.jwt_alg(), if k256 { "ES256K" } else { "ES256" });
             if k256 {
-                let kp = crypto::Keypair::from_bytes(&hex::decode(c["privateKeyBytesHex"].as_str().unwrap()).unwrap()).unwrap();
+                let kp = crypto::Keypair::from_bytes(&hex::decode(c["privateKeyBytesHex"].as_str().unwrap()).unwrap())
+                    .unwrap();
                 assert_eq!(kp.public_key_sec1(), vk.to_bytes());
             }
         }
@@ -1693,7 +1888,10 @@ fn signature_fixtures_both_sides() {
 // ---------------------------------------------------------------------------
 
 fn bundle() -> HashMap<String, J> {
-    serde_json::from_str(&std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/lexicons/bundle.json")).unwrap()).unwrap()
+    serde_json::from_str(
+        &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/lexicons/bundle.json")).unwrap(),
+    )
+    .unwrap()
 }
 
 fn shrike_catalog(docs: impl IntoIterator<Item = J>) -> (shrike::lexicon::Catalog, Vec<String>) {
@@ -1739,19 +1937,37 @@ fn rand_record(rng: &mut impl Rng) -> (String, J) {
     let now = "2026-01-02T03:04:05.678Z";
     let blob = json!({"$type": "blob", "ref": {"$link": Cid::raw(b"img").to_string()}, "mimeType": "image/jpeg", "size": 12345});
     let (coll, rec) = match rng.gen_range(0..10) {
-        0 => ("app.bsky.feed.post", json!({"text": "hello 😀", "createdAt": now, "langs": ["en"],
+        0 => (
+            "app.bsky.feed.post",
+            json!({"text": "hello 😀", "createdAt": now, "langs": ["en"],
             "reply": {"root": sref, "parent": sref},
             "facets": [{"index": {"byteStart": 0, "byteEnd": 5}, "features": [{"$type": "app.bsky.richtext.facet#link", "uri": "https://example.com"}]}],
-            "embed": {"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": "a"}]}})),
+            "embed": {"$type": "app.bsky.embed.images", "images": [{"image": blob, "alt": "a"}]}}),
+        ),
         1 => ("app.bsky.feed.like", json!({"subject": sref, "createdAt": now})),
         2 => ("app.bsky.feed.repost", json!({"subject": sref, "createdAt": now})),
         3 => ("app.bsky.graph.follow", json!({"subject": "did:plc:abcdefghijklmnopqrstuvwx", "createdAt": now})),
         4 => ("app.bsky.graph.block", json!({"subject": "did:plc:abcdefghijklmnopqrstuvwx", "createdAt": now})),
-        5 => ("app.bsky.actor.profile", json!({"displayName": "Alice", "description": "hi", "avatar": blob, "createdAt": now})),
-        6 => ("app.bsky.graph.list", json!({"name": "list", "purpose": "app.bsky.graph.defs#curatelist", "createdAt": now})),
-        7 => ("app.bsky.graph.listitem", json!({"subject": "did:plc:abcdefghijklmnopqrstuvwx", "list": uri.replace("feed.post", "graph.list"), "createdAt": now})),
-        8 => ("app.bsky.feed.threadgate", json!({"post": uri, "allow": [{"$type": "app.bsky.feed.threadgate#mentionRule"}], "createdAt": now})),
-        _ => ("app.bsky.feed.generator", json!({"did": "did:web:feeds.example.com", "displayName": "feed", "createdAt": now})),
+        5 => (
+            "app.bsky.actor.profile",
+            json!({"displayName": "Alice", "description": "hi", "avatar": blob, "createdAt": now}),
+        ),
+        6 => (
+            "app.bsky.graph.list",
+            json!({"name": "list", "purpose": "app.bsky.graph.defs#curatelist", "createdAt": now}),
+        ),
+        7 => (
+            "app.bsky.graph.listitem",
+            json!({"subject": "did:plc:abcdefghijklmnopqrstuvwx", "list": uri.replace("feed.post", "graph.list"), "createdAt": now}),
+        ),
+        8 => (
+            "app.bsky.feed.threadgate",
+            json!({"post": uri, "allow": [{"$type": "app.bsky.feed.threadgate#mentionRule"}], "createdAt": now}),
+        ),
+        _ => (
+            "app.bsky.feed.generator",
+            json!({"did": "did:web:feeds.example.com", "displayName": "feed", "createdAt": now}),
+        ),
     };
     let mut rec = rec;
     rec["$type"] = json!(coll);
@@ -1805,7 +2021,9 @@ fn lexicon_compare(cat: &shrike::lexicon::Catalog, coll: &str, rkey: &str, rec: 
         .map_err(|e| e.to_string())
         .and_then(|_| lexicon::validate_record(coll, rkey, rec, Some(true), None));
     let s = shrike::lexicon::validate_record(cat, coll, rec);
-    (v.is_ok() != s.is_ok()).then(|| format!("{coll} {}: vlpds {v:?}, shrike {:?}", short(&rec.to_string()), s.err().map(|e| e.to_string())))
+    (v.is_ok() != s.is_ok()).then(|| {
+        format!("{coll} {}: vlpds {v:?}, shrike {:?}", short(&rec.to_string()), s.err().map(|e| e.to_string()))
+    })
 }
 
 #[test]
@@ -1827,7 +2045,11 @@ fn lexicon_bundled_records() {
         let rkey = if coll == "app.bsky.actor.profile" { "self".to_string() } else { rkey };
         match lexicon_compare(&cat, &coll, &rkey, &rec) {
             Some(e) => d.push(e),
-            None if Value::from_json(&rec).is_ok() && lexicon::validate_record(&coll, &rkey, &rec, Some(true), None).is_ok() => ok += 1,
+            None if Value::from_json(&rec).is_ok()
+                && lexicon::validate_record(&coll, &rkey, &rec, Some(true), None).is_ok() =>
+            {
+                ok += 1
+            }
             None => bad += 1,
         }
     }
@@ -1867,7 +2089,12 @@ fn real_records_from_clickhouse() {
     for line in std::fs::read_to_string(path).unwrap().lines() {
         let cols: Vec<&str> = line.splitn(4, '\t').collect();
         let [_, coll, rkey, json] = cols[..] else { continue };
-        let unescaped = json.replace("\\\\", "\u{0}").replace("\\t", "\t").replace("\\n", "\n").replace("\\'", "'").replace('\u{0}', "\\");
+        let unescaped = json
+            .replace("\\\\", "\u{0}")
+            .replace("\\t", "\t")
+            .replace("\\n", "\n")
+            .replace("\\'", "'")
+            .replace('\u{0}', "\\");
         let Ok(mut j) = serde_json::from_str::<J>(&unescaped) else {
             *tally.entry("unparseable").or_default() += 1;
             continue;
@@ -1956,7 +2183,20 @@ fn json_reference_oracle() {
         let j: J = serde_json::from_str(text).unwrap();
         let v = Value::from_json(&j).map(|v| hex::encode(v.to_cbor())).unwrap_or_else(|_| "ERR".into());
         let s = json_to_drisl(&j, Integers::Any).map(hex::encode).unwrap_or_else(|_| "ERR".into());
-        *tally.entry(format!("shrike {}", if s == want { "agrees" } else if want == "ERR" { "accepts (reference rejects)" } else if s == "ERR" { "rejects (reference accepts)" } else { "encodes differently" })).or_default() += 1;
+        *tally
+            .entry(format!(
+                "shrike {}",
+                if s == want {
+                    "agrees"
+                } else if want == "ERR" {
+                    "accepts (reference rejects)"
+                } else if s == "ERR" {
+                    "rejects (reference accepts)"
+                } else {
+                    "encodes differently"
+                }
+            ))
+            .or_default() += 1;
         if v != want {
             // policy split (SHRIKE_ISSUES.md, "policy differences"): vlpds's
             // links are base32 dag-cbor/raw CIDs and its $bytes the standard

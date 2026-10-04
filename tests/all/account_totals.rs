@@ -20,7 +20,13 @@ fn same(kept: &Totals, scanned: &Totals) -> Result<(), String> {
     if kept.accounts == scanned.accounts && windows(kept) == windows(scanned) && kept.repos() == heads {
         return Ok(());
     }
-    Err(format!("kept {:?} {:?}, scanned {:?} {:?} ({heads} heads)", kept.accounts, windows(kept), scanned.accounts, windows(scanned)))
+    Err(format!(
+        "kept {:?} {:?}, scanned {:?} {:?} ({heads} heads)",
+        kept.accounts,
+        windows(kept),
+        scanned.accounts,
+        windows(scanned)
+    ))
 }
 
 /// Once every shard of the layout is open on one of `nodes`: each node's
@@ -69,7 +75,13 @@ async fn random_lifecycles_match_a_scan() {
     let mut done = std::collections::BTreeMap::<&str, usize>::new();
     for step in 0..80 {
         // every op once first, so each kind is exercised whatever the seed
-        let op = if live.len() < 3 { 0 } else if step < 12 { step } else { rng.gen_range(0..12) };
+        let op = if live.len() < 3 {
+            0
+        } else if step < 12 {
+            step
+        } else {
+            rng.gen_range(0..12)
+        };
         let i = rng.gen_range(0..live.len().max(1));
         let ok = match op {
             0 => {
@@ -77,13 +89,23 @@ async fn random_lifecycles_match_a_scan() {
                 ("create", true)
             }
             1 | 2 => {
-                let r = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": live[i].did, "collection": "app.bsky.feed.post", "record": post_record("x")}), &live[i].auth()).await;
+                let r = s
+                    .xrpc
+                    .post(
+                        "com.atproto.repo.createRecord",
+                        &json!({"repo": live[i].did, "collection": "app.bsky.feed.post", "record": post_record("x")}),
+                        &live[i].auth(),
+                    )
+                    .await;
                 if !r.is_ok() {
                     eprintln!("write refused: {} {}", r.status, r.text());
                 }
                 ("write", r.is_ok())
             }
-            3 => ("deactivate", s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &live[i].auth()).await.is_ok()),
+            3 => (
+                "deactivate",
+                s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &live[i].auth()).await.is_ok(),
+            ),
             4 => ("activate", s.xrpc.post_empty("com.atproto.server.activateAccount", &live[i].auth()).await.is_ok()),
             5 => {
                 let applied = step < 12 || rng.gen_bool(0.6);
@@ -107,7 +129,15 @@ async fn random_lifecycles_match_a_scan() {
             8 => {
                 let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &src.did)], &Auth::None).await;
                 let r = if car.status == 200 {
-                    let r = s.xrpc.post_bytes("com.atproto.repo.importRepo", car.body.to_vec(), "application/vnd.ipld.car", &live[i].auth()).await;
+                    let r = s
+                        .xrpc
+                        .post_bytes(
+                            "com.atproto.repo.importRepo",
+                            car.body.to_vec(),
+                            "application/vnd.ipld.car",
+                            &live[i].auth(),
+                        )
+                        .await;
                     if !r.is_ok() {
                         eprintln!("import refused: {} {}", r.status, r.text());
                     }
@@ -131,7 +161,12 @@ async fn random_lifecycles_match_a_scan() {
                 let l = cluster(&s).layout();
                 let ok = l.shards.len() >= 2 && {
                     let k = rng.gen_range(0..l.shards.len() - 1);
-                    let r = admin(&s, "vlpds.admin.mergeShards", json!({"left": l.shards[k].id, "right": l.shards[k + 1].id, "wait": true})).await;
+                    let r = admin(
+                        &s,
+                        "vlpds.admin.mergeShards",
+                        json!({"left": l.shards[k].id, "right": l.shards[k + 1].id, "wait": true}),
+                    )
+                    .await;
                     r["done"] == json!(true)
                 };
                 ("merge", ok)
@@ -152,7 +187,10 @@ async fn random_lifecycles_match_a_scan() {
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &m.auth()).await.ok();
     check(&[&s], "migrating: deactivated").await;
     let car = s.xrpc.get("com.atproto.sync.getRepo", &[("did", &src.did)], &Auth::None).await;
-    s.xrpc.post_bytes("com.atproto.repo.importRepo", car.body.to_vec(), "application/vnd.ipld.car", &m.auth()).await.ok();
+    s.xrpc
+        .post_bytes("com.atproto.repo.importRepo", car.body.to_vec(), "application/vnd.ipld.car", &m.auth())
+        .await
+        .ok();
     *done.entry("import").or_default() += 1;
     check(&[&s], "migrating: imported").await;
     s.xrpc.post_empty("com.atproto.server.activateAccount", &m.auth()).await.ok();
@@ -229,7 +267,11 @@ async fn totals_follow_shards_between_nodes() {
 
     // a merge across the two nodes
     let l = cluster(&a).layout();
-    let pair = l.shards.windows(2).find(|w| owned(&a).contains(&w[0].id) != owned(&a).contains(&w[1].id)).expect("adjacent shards on two nodes");
+    let pair = l
+        .shards
+        .windows(2)
+        .find(|w| owned(&a).contains(&w[0].id) != owned(&a).contains(&w[1].id))
+        .expect("adjacent shards on two nodes");
     let r = admin(&a, "vlpds.admin.mergeShards", json!({"left": pair[0].id, "right": pair[1].id, "wait": true})).await;
     assert_eq!(r["done"], json!(true), "{r}");
     assert_eq!(check(&[&a, &b], "merged").await, want);

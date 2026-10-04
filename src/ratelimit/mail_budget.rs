@@ -34,7 +34,12 @@ pub(crate) static REMAINING: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap()
 });
 pub(crate) static LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    prometheus::register_int_gauge_vec!("vlpds_mail_budget_limit", "The cluster's mail budget per window (window=day: mail-cluster-day)", &["window"]).unwrap()
+    prometheus::register_int_gauge_vec!(
+        "vlpds_mail_budget_limit",
+        "The cluster's mail budget per window (window=day: mail-cluster-day)",
+        &["window"]
+    )
+    .unwrap()
 });
 pub(crate) static ERRORS: LazyLock<IntCounter> = LazyLock::new(|| {
     prometheus::register_int_counter!(
@@ -110,7 +115,9 @@ pub struct Budget {
 async fn bounded<T>(f: impl std::future::Future<Output = object_store::Result<T>>) -> object_store::Result<T> {
     match tokio::time::timeout(STORE_TIMEOUT, f).await {
         Ok(r) => r,
-        Err(_) => Err(object_store::Error::Generic { store: "mail-budget", source: "mail budget call timed out".into() }),
+        Err(_) => {
+            Err(object_store::Error::Generic { store: "mail-budget", source: "mail budget call timed out".into() })
+        }
     }
 }
 
@@ -182,7 +189,10 @@ impl Budget {
                 Err(e) => return Err(e),
             }
         }
-        Err(object_store::Error::Generic { store: "mail-budget", source: format!("mail budget still contended after {CAS_RETRIES} tries").into() })
+        Err(object_store::Error::Generic {
+            store: "mail-budget",
+            source: format!("mail budget still contended after {CAS_RETRIES} tries").into(),
+        })
     }
 
     /// Re-reads the object unless a spend is under way (it reads or writes

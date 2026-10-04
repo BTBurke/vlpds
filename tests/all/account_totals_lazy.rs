@@ -46,7 +46,9 @@ async fn changes_while_totals_load_add_up() {
     for _ in 0..16 {
         accts.push(a.create_account("lazy").await);
     }
-    let loaded = eventually(Duration::from_secs(10), || async { (vlpds::xrpc::totals_loading(&a.app).1 == 0).then_some(()) }).await;
+    let loaded =
+        eventually(Duration::from_secs(10), || async { (vlpds::xrpc::totals_loading(&a.app).1 == 0).then_some(()) })
+            .await;
     assert!(loaded.is_some());
     assert_eq!(vlpds::xrpc::totals(&a.app).accounts, [16, 0, 0, 0, 0]);
 
@@ -84,7 +86,11 @@ async fn changes_while_totals_load_add_up() {
         let scanned = vlpds::xrpc::scan_totals(&a.app).await.ok()?;
         let today = vlpds::totals::today();
         let heads: i64 = scanned.days.iter().map(|d| d.1).sum();
-        (loading == 0 && kept.accounts == scanned.accounts && kept.repos() == heads && kept.written_within(1, today) == scanned.written_within(1, today)).then_some(kept)
+        (loading == 0
+            && kept.accounts == scanned.accounts
+            && kept.repos() == heads
+            && kept.written_within(1, today) == scanned.written_within(1, today))
+        .then_some(kept)
     })
     .await;
     let kept = r.expect("kept totals never matched the scan");

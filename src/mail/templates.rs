@@ -54,8 +54,7 @@ impl Branding {
             home_url: pick(home_url, "PDS_HOME_URL"),
             logo_url: pick(logo_url, "PDS_LOGO_URL"),
             primary_color: pick(primary_color, "PDS_PRIMARY_COLOR"),
-            disable_confirmation_link: disable_confirmation_link
-                || env_bool("PDS_EMAIL_DISABLE_CONFIRMATION_LINK"),
+            disable_confirmation_link: disable_confirmation_link || env_bool("PDS_EMAIL_DISABLE_CONFIRMATION_LINK"),
         }
     }
 
@@ -82,13 +81,27 @@ impl Branding {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Email<'a> {
-    ResetPassword { handle: &'a str, token: &'a str },
-    DeleteAccount { token: &'a str },
-    ConfirmEmail { token: &'a str },
+    ResetPassword {
+        handle: &'a str,
+        token: &'a str,
+    },
+    DeleteAccount {
+        token: &'a str,
+    },
+    ConfirmEmail {
+        token: &'a str,
+    },
     /// Also sent to turn email 2FA off.
-    UpdateEmail { token: &'a str },
-    PlcOperation { token: &'a str },
-    SignInAuthFactor { handle: Option<&'a str>, token: &'a str },
+    UpdateEmail {
+        token: &'a str,
+    },
+    PlcOperation {
+        token: &'a str,
+    },
+    SignInAuthFactor {
+        handle: Option<&'a str>,
+        token: &'a str,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,7 +153,9 @@ impl Email<'_> {
         let token = self.token();
         let t = esc(token);
         let color = esc(b.primary_color.as_deref().unwrap_or(DEFAULT_PRIMARY_COLOR));
-        let at_handle = |h: &str| format!("<span\n                        style='color:{color}'\n                      >@<!-- -->{}<!-- -->.</span>", esc(h));
+        let at_handle = |h: &str| {
+            format!("<span\n                        style='color:{color}'\n                      >@<!-- -->{}<!-- -->.</span>", esc(h))
+        };
         let change_pw = format!("{}/.well-known/change-password", public_url.trim_end_matches('/'));
         let verify_link = format!("https://bsky.app/intent/verify-email?code={token}");
 
@@ -338,7 +353,25 @@ pub fn html_to_text(html: &str) -> String {
                 }
             }
         }
-        if matches!(name.as_str(), "br" | "p" | "div" | "tr" | "li" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "hr" | "table" | "blockquote" | "pre" | "ul" | "ol") {
+        if matches!(
+            name.as_str(),
+            "br" | "p"
+                | "div"
+                | "tr"
+                | "li"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+                | "hr"
+                | "table"
+                | "blockquote"
+                | "pre"
+                | "ul"
+                | "ol"
+        ) {
             out.push('\n');
         }
         rest = &rest[i + j + 1..];
@@ -379,7 +412,9 @@ fn decode_entities(s: &str) -> String {
             Some("quot") => Some('"'),
             Some("apos") => Some('\''),
             Some("nbsp") => Some(' '),
-            Some(e) if e.starts_with("#x") || e.starts_with("#X") => u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32),
+            Some(e) if e.starts_with("#x") || e.starts_with("#X") => {
+                u32::from_str_radix(&e[2..], 16).ok().and_then(char::from_u32)
+            }
             Some(e) if e.starts_with('#') => e[1..].parse().ok().and_then(char::from_u32),
             _ => None,
         };
@@ -472,7 +507,9 @@ mod tests {
         assert!(r.text.contains("please enter the code below in the app."), "{}", r.text);
         let r = Email::SignInAuthFactor { handle: Some("alice.test"), token: TOKEN }.render(&b, URL);
         assert!(r.html.contains("href='https://pds.example.com/.well-known/change-password'"));
-        assert!(r.text.contains("We received a sign-in request for the account @alice.test. Use the code below to sign in."));
+        assert!(r
+            .text
+            .contains("We received a sign-in request for the account @alice.test. Use the code below to sign in."));
         let r = Email::SignInAuthFactor { handle: None, token: TOKEN }.render(&b, URL);
         assert!(r.text.contains("We received a sign-in request for your account. Use"));
     }

@@ -13,10 +13,7 @@ use std::time::Duration;
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/com.atproto.repo.uploadBlob", post(upload_blob))
-        .route(
-            "/xrpc/com.atproto.repo.listMissingBlobs",
-            get(list_missing_blobs),
-        )
+        .route("/xrpc/com.atproto.repo.listMissingBlobs", get(list_missing_blobs))
         .route("/xrpc/com.atproto.sync.getBlob", get(get_blob))
         .route("/xrpc/com.atproto.sync.listBlobs", get(list_blobs))
 }
@@ -65,12 +62,7 @@ fn blob_json(cid: &Cid, mime: &str, size: u64) -> J {
     json!({"blob": {"$type": "blob", "ref": {"$link": cid.to_string()}, "mimeType": mime, "size": size}})
 }
 
-async fn upload_blob(
-    State(app): AppState,
-    Auth(creds): Auth,
-    headers: HeaderMap,
-    body: Body,
-) -> XResult<Json<J>> {
+async fn upload_blob(State(app): AppState, Auth(creds): Auth, headers: HeaderMap, body: Body) -> XResult<Json<J>> {
     let did = creds.user_did()?.to_string();
     let mime = headers
         .get(header::CONTENT_TYPE)
@@ -96,10 +88,8 @@ async fn upload_blob(
         crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
     }
     let max = app.config.max_blob_size;
-    let declared = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+    let declared =
+        headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|n| n > max) {
         return Err(too_large(max));
     }
@@ -107,16 +97,8 @@ async fn upload_blob(
     let mut attrs = Attributes::new();
     attrs.insert(Attribute::ContentType, mime.clone().into());
 
-    let mut up = Upload {
-        app: &app,
-        did: &did,
-        attrs,
-        mime,
-        head: Vec::new(),
-        buf: Vec::new(),
-        buffered: 0,
-        multipart: None,
-    };
+    let mut up =
+        Upload { app: &app, did: &did, attrs, mime, head: Vec::new(), buf: Vec::new(), buffered: 0, multipart: None };
     let (cid, size) = match up.receive(body, max).await {
         Ok(v) => v,
         Err(e) => {
@@ -182,9 +164,7 @@ impl Upload<'_> {
         let mut hasher = Sha256::new();
         let mut size: u64 = 0;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| {
-                XrpcError::bad("InvalidRequest", format!("error reading body: {e}"))
-            })?;
+            let chunk = chunk.map_err(|e| XrpcError::bad("InvalidRequest", format!("error reading body: {e}")))?;
             size += chunk.len() as u64;
             if size > max {
                 return Err(too_large(max));
@@ -196,9 +176,7 @@ impl Upload<'_> {
             }
             match &mut self.multipart {
                 Some((w, _)) => {
-                    w.wait_for_capacity(PART_CONCURRENCY)
-                        .await
-                        .map_err(XrpcError::from_err)?;
+                    w.wait_for_capacity(PART_CONCURRENCY).await.map_err(XrpcError::from_err)?;
                     w.put(chunk);
                 }
                 None => {
@@ -210,10 +188,7 @@ impl Upload<'_> {
                 }
             }
         }
-        let cid = Cid {
-            codec: crate::cid::CODEC_RAW,
-            digest: hasher.finalize().into(),
-        };
+        let cid = Cid { codec: crate::cid::CODEC_RAW, digest: hasher.finalize().into() };
         Ok((cid, size))
     }
 
@@ -233,14 +208,8 @@ impl Upload<'_> {
             None => {
                 self.sniff();
                 let payload: PutPayload = std::mem::take(&mut self.buf).into_iter().collect();
-                let opts = PutOptions {
-                    attributes: self.attrs.clone(),
-                    ..Default::default()
-                };
-                store
-                    .put_opts(&dest, payload, opts)
-                    .await
-                    .map_err(XrpcError::from_err)?;
+                let opts = PutOptions { attributes: self.attrs.clone(), ..Default::default() };
+                store.put_opts(&dest, payload, opts).await.map_err(XrpcError::from_err)?;
             }
             Some((w, tmp)) => {
                 if let Err(e) = w.finish().await {
@@ -273,17 +242,8 @@ impl Upload<'_> {
             self.did,
             hex::encode(rand::random::<[u8; 16]>())
         ));
-        let opts = PutMultipartOptions {
-            attributes: self.attrs.clone(),
-            ..Default::default()
-        };
-        let upload = self
-            .app
-            .store
-            .raw
-            .put_multipart_opts(&tmp, opts)
-            .await
-            .map_err(XrpcError::from_err)?;
+        let opts = PutMultipartOptions { attributes: self.attrs.clone(), ..Default::default() };
+        let upload = self.app.store.raw.put_multipart_opts(&tmp, opts).await.map_err(XrpcError::from_err)?;
         let mut w = WriteMultipart::new_with_chunk_size(upload, PART_SIZE);
         for b in self.buf.drain(..) {
             w.put(b);
@@ -345,11 +305,7 @@ struct BlobQ {
     cid: String,
 }
 
-async fn get_blob(
-    State(app): AppState,
-    MaybeAuth(creds): MaybeAuth,
-    Query(q): Query<BlobQ>,
-) -> XResult<Response> {
+async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Query<BlobQ>) -> XResult<Response> {
     let cid = Cid::parse(&q.cid).map_err(|_| XrpcError::bad("InvalidRequest", "Invalid cid"))?;
     assert_available(&app, &q.did, creds.as_ref()).await?;
     let is_admin = matches!(creds, Some(Credentials::Admin));
@@ -359,14 +315,16 @@ async fn get_blob(
     let r = match app.store.raw.get(&blob_path(&app, &q.did, cid)).await {
         Ok(r) => r,
         // the operator reviewing a taken-down blob reads its quarantined copy
-        Err(object_store::Error::NotFound { .. }) if is_admin => match app.store.raw.get(&super::moderation::quarantine_path(&app, &q.did, cid)).await {
-            Ok(r) => r,
-            Err(object_store::Error::NotFound { .. }) => return Err(XrpcError::bad("BlobNotFound", "Blob not found")),
-            Err(e) => return Err(XrpcError::from_err(e)),
-        },
-        Err(object_store::Error::NotFound { .. }) => {
-            return Err(XrpcError::bad("BlobNotFound", "Blob not found"))
+        Err(object_store::Error::NotFound { .. }) if is_admin => {
+            match app.store.raw.get(&super::moderation::quarantine_path(&app, &q.did, cid)).await {
+                Ok(r) => r,
+                Err(object_store::Error::NotFound { .. }) => {
+                    return Err(XrpcError::bad("BlobNotFound", "Blob not found"))
+                }
+                Err(e) => return Err(XrpcError::from_err(e)),
+            }
         }
+        Err(object_store::Error::NotFound { .. }) => return Err(XrpcError::bad("BlobNotFound", "Blob not found")),
         Err(e) => return Err(XrpcError::from_err(e)),
     };
     let mime = stored_mime(&r.attributes);
@@ -374,24 +332,14 @@ async fn get_blob(
     let mut resp = Body::from_stream(r.into_stream()).into_response();
     let h = resp.headers_mut();
     let hv = |s: String| {
-        header::HeaderValue::from_str(&s)
-            .unwrap_or(header::HeaderValue::from_static("application/octet-stream"))
+        header::HeaderValue::from_str(&s).unwrap_or(header::HeaderValue::from_static("application/octet-stream"))
     };
     h.insert(header::CONTENT_TYPE, hv(mime));
     h.insert(header::CONTENT_LENGTH, header::HeaderValue::from(size));
     // the reference PDS's hardening headers
-    h.insert(
-        header::X_CONTENT_TYPE_OPTIONS,
-        header::HeaderValue::from_static("nosniff"),
-    );
-    h.insert(
-        header::CONTENT_DISPOSITION,
-        hv(format!("attachment; filename=\"{cid}\"")),
-    );
-    h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        header::HeaderValue::from_static("default-src 'none'; sandbox"),
-    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_DISPOSITION, hv(format!("attachment; filename=\"{cid}\"")));
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("default-src 'none'; sandbox"));
     Ok(resp)
 }
 
@@ -432,10 +380,7 @@ async fn referenced_blobs_at(
         Some(c) => state::prefix_end(&[prefix.as_slice(), c.as_bytes(), b"\0"].concat()),
         None => prefix.clone(),
     };
-    let mut iter =
-        p.db.scan(lo..state::prefix_end(&prefix))
-            .await
-            .map_err(XrpcError::from_err)?;
+    let mut iter = p.db.scan(lo..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
     let mut out: Vec<(String, String)> = Vec::new();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         let rest = String::from_utf8_lossy(&kv.key[prefix.len()..]).into_owned();
@@ -474,7 +419,9 @@ async fn list_blobs(
     Query(q): Query<ListBlobsQ>,
 ) -> XResult<Json<J>> {
     let since = match q.since.as_deref() {
-        Some(s) => Some(crate::tid::Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?.0),
+        Some(s) => {
+            Some(crate::tid::Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?.0)
+        }
         None => None,
     };
     let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
@@ -494,11 +441,7 @@ struct MissingQ {
     cursor: Option<String>,
 }
 
-async fn list_missing_blobs(
-    State(app): AppState,
-    Auth(creds): Auth,
-    Query(q): Query<MissingQ>,
-) -> XResult<Json<J>> {
+async fn list_missing_blobs(State(app): AppState, Auth(creds): Auth, Query(q): Query<MissingQ>) -> XResult<Json<J>> {
     let did = creds.user_did()?.to_string();
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let mut cursor = q.cursor.clone();
@@ -527,8 +470,7 @@ async fn list_missing_blobs(
                 }
             })
             .collect();
-        let results: Vec<XResult<bool>> =
-            futures::stream::iter(checks).buffered(32).collect().await;
+        let results: Vec<XResult<bool>> = futures::stream::iter(checks).buffered(32).collect().await;
         for ((cid, path), r) in page.iter().zip(results) {
             if r? {
                 missing.push(json!({"cid": cid, "recordUri": format!("at://{did}/{path}")}));

@@ -29,7 +29,13 @@ async fn one_shard_sustains_bulk_ingest() {
     let raw: Arc<dyn object_store::ObjectStore> = if latency.is_zero() {
         Arc::new(object_store::memory::InMemory::new())
     } else {
-        let cfg = ThrottleConfig { wait_get_per_call: latency, wait_put_per_call: latency, wait_list_per_call: latency, wait_delete_per_call: latency, ..Default::default() };
+        let cfg = ThrottleConfig {
+            wait_get_per_call: latency,
+            wait_put_per_call: latency,
+            wait_list_per_call: latency,
+            wait_delete_per_call: latency,
+            ..Default::default()
+        };
         Arc::new(ThrottledStore::new(object_store::memory::InMemory::new(), cfg))
     };
     let store = vlpds::store::Store { raw, ..vlpds::store::Store::memory(None) };
@@ -75,7 +81,10 @@ async fn one_shard_sustains_bulk_ingest() {
         written += per_batch as u64;
         if last_report.elapsed() > Duration::from_secs(5) {
             last_report = Instant::now();
-            eprintln!("ingest: {written} records, {:.0}/s, worst write {worst:?}", written as f64 / started.elapsed().as_secs_f64());
+            eprintln!(
+                "ingest: {written} records, {:.0}/s, worst write {worst:?}",
+                written as f64 / started.elapsed().as_secs_f64()
+            );
         }
     }
     let secs = started.elapsed().as_secs_f64();

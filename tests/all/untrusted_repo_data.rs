@@ -13,7 +13,8 @@ const DEPTH: usize = 200_000;
 /// key-less `{e: [], l: child}` nodes.
 fn deep_car(did: &str, kp: &Keypair, rpath: &str, depth: usize) -> Vec<u8> {
     let mut blocks: Vec<(Cid, Vec<u8>)> = Vec::new();
-    let rec = Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.deep"})).unwrap().to_cbor();
+    let rec =
+        Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.deep"})).unwrap().to_cbor();
     let rec_cid = Cid::dag_cbor(&rec);
     blocks.push((rec_cid, rec));
     let node = |l: Option<Cid>, key: Option<&str>| {
@@ -83,8 +84,9 @@ fn signed_car(did: &str, kp: &Keypair, data: Cid, blocks: &[(Cid, Vec<u8>)]) -> 
 /// from ~18 KB, and a few more levels exhaust memory.
 fn dag_car(did: &str, kp: &Keypair, rpath: &str, fan: usize, levels: i32) -> Vec<u8> {
     use std::sync::Arc;
-    use vlpds::mst::{Entry, Node, encode_node, height_for_key};
-    let rec = Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.dag"})).unwrap().to_cbor();
+    use vlpds::mst::{encode_node, height_for_key, Entry, Node};
+    let rec =
+        Value::from_json(&json!({"$type": "com.atproto.lexicon.schema", "id": "com.example.dag"})).unwrap().to_cbor();
     let rec_cid = Cid::dag_cbor(&rec);
     let mut blocks = vec![(rec_cid, rec)];
     assert_eq!(height_for_key(rpath.as_bytes()), 0, "{rpath} must be a leaf key");
@@ -165,7 +167,10 @@ fn record_proof_with_deep_mst_is_an_error() {
     let (shallow, deep) = std::thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || {
-            (vlpds::oauth::lexicon::verify_record_proof(&shallow, did, &key, rpath), vlpds::oauth::lexicon::verify_record_proof(&deep, did, &key, rpath))
+            (
+                vlpds::oauth::lexicon::verify_record_proof(&shallow, did, &key, rpath),
+                vlpds::oauth::lexicon::verify_record_proof(&deep, did, &key, rpath),
+            )
         })
         .unwrap()
         .join()

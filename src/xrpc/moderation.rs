@@ -56,7 +56,10 @@ pub struct ClientIp(pub Option<std::net::IpAddr>);
 impl axum::extract::FromRequestParts<Arc<App>> for ClientIp {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut axum::http::request::Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        app: &Arc<App>,
+    ) -> Result<Self, Self::Rejection> {
         Ok(ClientIp(crate::ratelimit::request_client_ip(&parts.headers, &parts.extensions, &app.ratelimit.trusted)))
     }
 }
@@ -156,7 +159,10 @@ fn store_err(e: object_store::Error) -> XrpcError {
     XrpcError::unavailable("Unavailable", format!("moderation store: {e}"))
 }
 
-async fn get_obj<T: serde::de::DeserializeOwned>(app: &App, p: &object_store::path::Path) -> XResult<Option<(T, Option<String>)>> {
+async fn get_obj<T: serde::de::DeserializeOwned>(
+    app: &App,
+    p: &object_store::path::Path,
+) -> XResult<Option<(T, Option<String>)>> {
     match app.store.raw.get(p).await {
         Ok(r) => {
             let etag = r.meta.e_tag.clone();
@@ -168,7 +174,12 @@ async fn get_obj<T: serde::de::DeserializeOwned>(app: &App, p: &object_store::pa
     }
 }
 
-async fn put_obj<T: serde::Serialize>(app: &App, p: &object_store::path::Path, v: &T, mode: PutMode) -> Result<(), object_store::Error> {
+async fn put_obj<T: serde::Serialize>(
+    app: &App,
+    p: &object_store::path::Path,
+    v: &T,
+    mode: PutMode,
+) -> Result<(), object_store::Error> {
     let body = serde_json::to_vec_pretty(v).expect("serializable");
     app.store.raw.put_opts(p, PutPayload::from(body), PutOptions { mode, ..Default::default() }).await.map(|_| ())
 }
@@ -186,7 +197,15 @@ async fn list_metas(app: &App, rel: &str) -> XResult<Vec<object_store::ObjectMet
 }
 
 /// Writes the audit entry and its `vlpds::audit` log line.
-pub(super) async fn audit(app: &App, who: &Who, action: &str, subject: Option<&SubjectRef>, reason: Option<&str>, case_id: Option<&str>, detail: Option<J>) -> XResult<AuditEntry> {
+pub(super) async fn audit(
+    app: &App,
+    who: &Who,
+    action: &str,
+    subject: Option<&SubjectRef>,
+    reason: Option<&str>,
+    case_id: Option<&str>,
+    detail: Option<J>,
+) -> XResult<AuditEntry> {
     let id = format!("{:016x}-{}", crate::tid::now_micros(), hex::encode(rand::random::<[u8; 4]>()));
     let e = AuditEntry {
         id: id.clone(),
@@ -221,7 +240,10 @@ fn takedown_name(s: &SubjectRef) -> XResult<String> {
             let uri = s.uri.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a record subject needs uri"))?;
             Ok(format!("rec/{}", super::admin::record_path(uri, &s.did)?))
         }
-        "blob" => Ok(format!("blob/{}", s.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a blob subject needs cid"))?)),
+        "blob" => Ok(format!(
+            "blob/{}",
+            s.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a blob subject needs cid"))?
+        )),
         k => Err(XrpcError::bad("InvalidRequest", format!("no takedown row for kind {k}"))),
     }
 }
@@ -249,9 +271,12 @@ pub(super) async fn apply(app: &App, s: &SubjectRef, act: &Action, who: &Who) ->
         }
         k => return Err(XrpcError::bad("InvalidRequest", format!("unknown subject kind {k}"))),
     }
-    crate::metrics::MODERATION_ACTIONS.with_label_values(&[s.kind.as_str(), if act.applied { "takedown" } else { "reversed" }]).inc();
+    crate::metrics::MODERATION_ACTIONS
+        .with_label_values(&[s.kind.as_str(), if act.applied { "takedown" } else { "reversed" }])
+        .inc();
     let action = if act.applied { "takedown" } else { "restore" };
-    let e = audit(app, who, action, Some(s), act.reason.as_deref(), act.case_id.as_deref(), Some(detail.clone())).await?;
+    let e =
+        audit(app, who, action, Some(s), act.reason.as_deref(), act.case_id.as_deref(), Some(detail.clone())).await?;
     let idx = index_path(app, s);
     if act.applied {
         let mut entry = json!({
@@ -322,7 +347,8 @@ async fn blob_takedown(app: &App, did: &str, cid: Cid, applied: bool, r: Option<
 pub async fn sweep_quarantine(app: &App, keep: Duration) -> anyhow::Result<usize> {
     let store = app.store.raw.clone();
     let root = object_store::path::Path::from(format!("{}/{QUARANTINE}", app.store.prefix));
-    let metas: Vec<object_store::ObjectMeta> = store.list(Some(&root)).collect::<Vec<_>>().await.into_iter().collect::<Result<_, _>>()?;
+    let metas: Vec<object_store::ObjectMeta> =
+        store.list(Some(&root)).collect::<Vec<_>>().await.into_iter().collect::<Result<_, _>>()?;
     let now = now_ms();
     let keep_ms = keep.as_millis() as u64;
     let mut purged = 0;
@@ -348,10 +374,14 @@ pub async fn sweep_quarantine(app: &App, keep: Duration) -> anyhow::Result<usize
                 if now.saturating_sub(q_at) < keep_ms {
                     continue;
                 }
-                super::blob_quota::drop_stored(app, &did, &cid, meta.size).await.map_err(|e| anyhow::anyhow!(e.message))?;
+                super::blob_quota::drop_stored(app, &did, &cid, meta.size)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
                 store.delete(&meta.location).await?;
                 row["purgedAtMs"] = json!(now);
-                super::admin::set_subject_takedown(app, &did, &format!("blob/{cid}"), Some(row)).await.map_err(|e| anyhow::anyhow!(e.message))?;
+                super::admin::set_subject_takedown(app, &did, &format!("blob/{cid}"), Some(row))
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e.message))?;
                 let s = SubjectRef::blob(&did, &cid);
                 if let Ok(Some((mut entry, _))) = get_obj::<J>(app, &index_path(app, &s)).await {
                     entry["purgedAtMs"] = json!(now);
@@ -359,7 +389,16 @@ pub async fn sweep_quarantine(app: &App, keep: Duration) -> anyhow::Result<usize
                     let _ = put_obj(app, &index_path(app, &s), &entry, PutMode::Overwrite).await;
                 }
                 let who = Who { actor: "system".into(), ip: None };
-                let _ = audit(app, &who, "blob.purge", Some(&s), Some("quarantine period over"), None, Some(json!({"bytes": meta.size}))).await;
+                let _ = audit(
+                    app,
+                    &who,
+                    "blob.purge",
+                    Some(&s),
+                    Some("quarantine period over"),
+                    None,
+                    Some(json!({"bytes": meta.size})),
+                )
+                .await;
                 crate::metrics::BLOB_QUARANTINE.with_label_values(&["purged"]).inc();
                 purged += 1;
             }
@@ -537,7 +576,11 @@ pub fn parse_input(input: &str) -> Result<Parsed, String> {
         }
     }
     if p.actor.is_none() {
-        return Err(if p.cid.is_some() { "a blob CID needs the DID of the account that stores it (paste both)".into() } else { "nothing to look up".into() });
+        return Err(if p.cid.is_some() {
+            "a blob CID needs the DID of the account that stores it (paste both)".into()
+        } else {
+            "nothing to look up".into()
+        });
     }
     Ok(p)
 }
@@ -546,7 +589,8 @@ fn parse_url(u: &str) -> Result<Parsed, String> {
     let after = u.split_once("://").map(|x| x.1).unwrap_or(u);
     let (host_path, query) = after.split_once('?').map_or((after, ""), |(a, b)| (a, b));
     let host_path = host_path.split('#').next().unwrap_or("");
-    let segs: Vec<String> = host_path.split('/').skip(1).filter(|s| !s.is_empty()).map(|s| super::sync::pct_decode(s, false)).collect();
+    let segs: Vec<String> =
+        host_path.split('/').skip(1).filter(|s| !s.is_empty()).map(|s| super::sync::pct_decode(s, false)).collect();
     let q: Vec<(String, String)> = query
         .split('&')
         .filter_map(|kv| kv.split_once('='))
@@ -575,11 +619,18 @@ fn parse_url(u: &str) -> Result<Parsed, String> {
     if segs.first().map(String::as_str) == Some("starter-pack") {
         let actor = segs.get(1).ok_or("starter-pack URL without a handle")?.clone();
         let rkey = segs.get(2).ok_or("starter-pack URL without a record key")?.clone();
-        return Ok(Parsed { actor: Some(actor), collection: Some("app.bsky.graph.starterpack".into()), rkey: Some(rkey), cid: None });
+        return Ok(Parsed {
+            actor: Some(actor),
+            collection: Some("app.bsky.graph.starterpack".into()),
+            rkey: Some(rkey),
+            cid: None,
+        });
     }
     // CDN and video URLs: .../{did}/{cid}[@jpeg][/...]
     if let Some(i) = segs.iter().position(|s| s.starts_with("did:")) {
-        if let Some(cid) = segs.get(i + 1).map(|c| c.split('@').next().unwrap_or("").to_string()).filter(|c| looks_like_cid(c)) {
+        if let Some(cid) =
+            segs.get(i + 1).map(|c| c.split('@').next().unwrap_or("").to_string()).filter(|c| looks_like_cid(c))
+        {
             return Ok(Parsed { actor: Some(segs[i].clone()), cid: Some(cid), ..Default::default() });
         }
         return Ok(Parsed { actor: Some(segs[i].clone()), ..Default::default() });
@@ -670,7 +721,13 @@ async fn blob_view(app: &App, did: &str, cid: &str, ctl: &super::server::Ctl) ->
 /// Routes to the account's owner (by `did`).
 async fn get_subject(State(app): AppState, Auth(creds): Auth, Query(q): Query<SubjectQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let acct = app.account(&q.did).await.map_err(|e| if e.error == "AccountNotFound" { not_here(format!("{} has no account on this PDS", q.did)) } else { e })?;
+    let acct = app.account(&q.did).await.map_err(|e| {
+        if e.error == "AccountNotFound" {
+            not_here(format!("{} has no account on this PDS", q.did))
+        } else {
+            e
+        }
+    })?;
     let ctl = super::server::ctl(&app, &q.did).await?;
     let tref = acct.extra.get("takedownRef").and_then(|v| v.as_str());
     let mut out = json!({
@@ -734,7 +791,12 @@ fn bounded_text(field: &str, s: &str, max: usize) -> XResult<String> {
 }
 
 /// One-step takedown or restore from the console: a reason is required.
-async fn moderate(State(app): AppState, Auth(creds): Auth, ClientIp(ip): ClientIp, Json(inp): Json<ModerateIn>) -> XResult<Json<J>> {
+async fn moderate(
+    State(app): AppState,
+    Auth(creds): Auth,
+    ClientIp(ip): ClientIp,
+    Json(inp): Json<ModerateIn>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let reason = bounded_text("reason", &inp.reason, MAX_REASON)?;
     if reason.is_empty() {
@@ -752,10 +814,19 @@ async fn moderate(State(app): AppState, Auth(creds): Auth, ClientIp(ip): ClientI
             super::admin::record_path(&uri, &inp.did)?;
             SubjectRef { kind: "record".into(), did: inp.did.clone(), uri: Some(uri), cid: inp.cid }
         }
-        "blob" => SubjectRef::blob(&inp.did, inp.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "cid required"))?),
+        "blob" => SubjectRef::blob(
+            &inp.did,
+            inp.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "cid required"))?,
+        ),
         k => return Err(XrpcError::bad("InvalidRequest", format!("kind must be account, record or blob, not {k}"))),
     };
-    app.account(&inp.did).await.map_err(|e| if e.error == "AccountNotFound" { not_here(format!("{} has no account on this PDS", inp.did)) } else { e })?;
+    app.account(&inp.did).await.map_err(|e| {
+        if e.error == "AccountNotFound" {
+            not_here(format!("{} has no account on this PDS", inp.did))
+        } else {
+            e
+        }
+    })?;
     let case_id = inp.case_id.filter(|c| !c.trim().is_empty());
     if let Some(c) = &case_id {
         get_obj::<Case>(&app, &case_path(&app, c)?).await?.ok_or_else(|| case_not_found(c))?;
@@ -874,7 +945,12 @@ fn check_subject(s: &SubjectRef) -> XResult<()> {
     Ok(())
 }
 
-async fn create_case(State(app): AppState, Auth(creds): Auth, ClientIp(ip): ClientIp, Json(inp): Json<CreateCaseIn>) -> XResult<Json<Case>> {
+async fn create_case(
+    State(app): AppState,
+    Auth(creds): Auth,
+    ClientIp(ip): ClientIp,
+    Json(inp): Json<CreateCaseIn>,
+) -> XResult<Json<Case>> {
     require_admin(&creds)?;
     let source = bounded_text("source", &inp.source, MAX_REASON)?;
     if source.is_empty() {
@@ -884,7 +960,9 @@ async fn create_case(State(app): AppState, Auth(creds): Auth, ClientIp(ip): Clie
     let who = Who { actor: actor_of(inp.actor), ip: ip.map(|i| i.to_string()) };
     let now = crate::events::now_rfc3339();
     let mut notes = Vec::new();
-    if let Some(n) = inp.note.as_deref().map(|n| bounded_text("note", n, MAX_NOTE)).transpose()?.filter(|n| !n.is_empty()) {
+    if let Some(n) =
+        inp.note.as_deref().map(|n| bounded_text("note", n, MAX_NOTE)).transpose()?.filter(|n| !n.is_empty())
+    {
         notes.push(Note { at: now.clone(), actor: who.actor.clone(), ip: who.ip.clone(), text: n });
     }
     let mut subjects: Vec<SubjectRef> = Vec::new();
@@ -893,7 +971,16 @@ async fn create_case(State(app): AppState, Auth(creds): Auth, ClientIp(ip): Clie
             subjects.push(s);
         }
     }
-    let c = Case { id: app.tids.next().to_string(), created_at: now.clone(), updated_at: now, status: "open".into(), source, subjects, notes, actions: Vec::new() };
+    let c = Case {
+        id: app.tids.next().to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        status: "open".into(),
+        source,
+        subjects,
+        notes,
+        actions: Vec::new(),
+    };
     put_obj(&app, &case_path(&app, &c.id)?, &c, PutMode::Create).await.map_err(store_err)?;
     audit(&app, &who, "case.create", None, Some(&c.source), Some(&c.id), None).await?;
     Ok(Json(c))
@@ -911,15 +998,24 @@ struct UpdateCaseIn {
     actor: Option<String>,
 }
 
-async fn update_case(State(app): AppState, Auth(creds): Auth, ClientIp(ip): ClientIp, Json(inp): Json<UpdateCaseIn>) -> XResult<Json<Case>> {
+async fn update_case(
+    State(app): AppState,
+    Auth(creds): Auth,
+    ClientIp(ip): ClientIp,
+    Json(inp): Json<UpdateCaseIn>,
+) -> XResult<Json<Case>> {
     require_admin(&creds)?;
     if let Some(s) = inp.status.as_deref().filter(|s| !STATUSES.contains(s)) {
-        return Err(XrpcError::bad("InvalidRequest", format!("status must be one of {}, not {s}", STATUSES.join(", "))));
+        return Err(XrpcError::bad(
+            "InvalidRequest",
+            format!("status must be one of {}, not {s}", STATUSES.join(", ")),
+        ));
     }
     if let Some(s) = &inp.add_subject {
         check_subject(s)?;
     }
-    let source = inp.source.as_deref().map(|s| bounded_text("source", s, MAX_REASON)).transpose()?.filter(|s| !s.is_empty());
+    let source =
+        inp.source.as_deref().map(|s| bounded_text("source", s, MAX_REASON)).transpose()?.filter(|s| !s.is_empty());
     let note = inp.note.as_deref().map(|n| bounded_text("note", n, MAX_NOTE)).transpose()?.filter(|n| !n.is_empty());
     let who = Who { actor: actor_of(inp.actor.clone()), ip: ip.map(|i| i.to_string()) };
     let at = crate::events::now_rfc3339();
@@ -962,7 +1058,16 @@ async fn update_case(State(app): AppState, Auth(creds): Auth, ClientIp(ip): Clie
         Ok(())
     })
     .await?;
-    audit(&app, &who, "case.update", inp.add_subject.as_ref(), note.as_deref(), Some(&c.id), Some(json!({"changes": changes}))).await?;
+    audit(
+        &app,
+        &who,
+        "case.update",
+        inp.add_subject.as_ref(),
+        note.as_deref(),
+        Some(&c.id),
+        Some(json!({"changes": changes})),
+    )
+    .await?;
     Ok(Json(c))
 }
 
@@ -978,14 +1083,34 @@ struct SetQuotaIn {
 }
 
 /// Per-account override of the blob quotas (routes to the owner by `did`).
-async fn set_blob_quota(State(app): AppState, Auth(creds): Auth, ClientIp(ip): ClientIp, Json(inp): Json<SetQuotaIn>) -> XResult<Json<J>> {
+async fn set_blob_quota(
+    State(app): AppState,
+    Auth(creds): Auth,
+    ClientIp(ip): ClientIp,
+    Json(inp): Json<SetQuotaIn>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    app.account(&inp.did).await.map_err(|e| if e.error == "AccountNotFound" { not_here(format!("{} has no account on this PDS", inp.did)) } else { e })?;
+    app.account(&inp.did).await.map_err(|e| {
+        if e.error == "AccountNotFound" {
+            not_here(format!("{} has no account on this PDS", inp.did))
+        } else {
+            e
+        }
+    })?;
     let reason = inp.reason.as_deref().map(|r| bounded_text("reason", r, MAX_REASON)).transpose()?;
     let l = super::blob_quota::Limits { bytes: inp.bytes, uploads_per_day: inp.uploads_per_day };
     super::blob_quota::set_limits(&app, &inp.did, l.clone()).await?;
     let who = Who { actor: actor_of(inp.actor), ip: ip.map(|i| i.to_string()) };
-    audit(&app, &who, "quota.set", Some(&SubjectRef::account(&inp.did)), reason.as_deref(), None, Some(serde_json::to_value(&l).unwrap())).await?;
+    audit(
+        &app,
+        &who,
+        "quota.set",
+        Some(&SubjectRef::account(&inp.did)),
+        reason.as_deref(),
+        None,
+        Some(serde_json::to_value(&l).unwrap()),
+    )
+    .await?;
     Ok(Json(super::blob_quota::view(&app, &inp.did).await?))
 }
 
@@ -999,27 +1124,56 @@ mod tests {
     use super::*;
 
     fn p(actor: &str, coll: Option<&str>, rkey: Option<&str>, cid: Option<&str>) -> Parsed {
-        Parsed { actor: Some(actor.into()), collection: coll.map(Into::into), rkey: rkey.map(Into::into), cid: cid.map(Into::into) }
+        Parsed {
+            actor: Some(actor.into()),
+            collection: coll.map(Into::into),
+            rkey: rkey.map(Into::into),
+            cid: cid.map(Into::into),
+        }
     }
 
     const CID: &str = "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm";
 
     #[test]
     fn parses_bsky_urls() {
-        assert_eq!(parse_input("https://bsky.app/profile/alice.pds.example.com").unwrap(), p("alice.pds.example.com", None, None, None));
-        assert_eq!(parse_input(" https://bsky.app/profile/did:plc:abc123/post/3kabc ").unwrap(), p("did:plc:abc123", Some("app.bsky.feed.post"), Some("3kabc"), None));
-        assert_eq!(parse_input("https://bsky.app/profile/did%3Aplc%3Aabc123/post/3kabc?ref=x#y").unwrap(), p("did:plc:abc123", Some("app.bsky.feed.post"), Some("3kabc"), None));
-        assert_eq!(parse_input("https://bsky.app/profile/alice.test/post/3kabc/quotes").unwrap(), p("alice.test", Some("app.bsky.feed.post"), Some("3kabc"), None));
-        assert_eq!(parse_input("https://bsky.app/profile/alice.test/feed/hot").unwrap(), p("alice.test", Some("app.bsky.feed.generator"), Some("hot"), None));
-        assert_eq!(parse_input("https://bsky.app/profile/alice.test/lists/3l").unwrap(), p("alice.test", Some("app.bsky.graph.list"), Some("3l"), None));
-        assert_eq!(parse_input("https://bsky.app/starter-pack/alice.test/3s").unwrap(), p("alice.test", Some("app.bsky.graph.starterpack"), Some("3s"), None));
+        assert_eq!(
+            parse_input("https://bsky.app/profile/alice.pds.example.com").unwrap(),
+            p("alice.pds.example.com", None, None, None)
+        );
+        assert_eq!(
+            parse_input(" https://bsky.app/profile/did:plc:abc123/post/3kabc ").unwrap(),
+            p("did:plc:abc123", Some("app.bsky.feed.post"), Some("3kabc"), None)
+        );
+        assert_eq!(
+            parse_input("https://bsky.app/profile/did%3Aplc%3Aabc123/post/3kabc?ref=x#y").unwrap(),
+            p("did:plc:abc123", Some("app.bsky.feed.post"), Some("3kabc"), None)
+        );
+        assert_eq!(
+            parse_input("https://bsky.app/profile/alice.test/post/3kabc/quotes").unwrap(),
+            p("alice.test", Some("app.bsky.feed.post"), Some("3kabc"), None)
+        );
+        assert_eq!(
+            parse_input("https://bsky.app/profile/alice.test/feed/hot").unwrap(),
+            p("alice.test", Some("app.bsky.feed.generator"), Some("hot"), None)
+        );
+        assert_eq!(
+            parse_input("https://bsky.app/profile/alice.test/lists/3l").unwrap(),
+            p("alice.test", Some("app.bsky.graph.list"), Some("3l"), None)
+        );
+        assert_eq!(
+            parse_input("https://bsky.app/starter-pack/alice.test/3s").unwrap(),
+            p("alice.test", Some("app.bsky.graph.starterpack"), Some("3s"), None)
+        );
         assert!(parse_input("https://bsky.app/profile/alice.test/post").is_err());
         assert!(parse_input("https://bsky.app/search?q=x").is_err());
     }
 
     #[test]
     fn parses_at_uris_handles_dids() {
-        assert_eq!(parse_input("at://did:plc:abc/app.bsky.feed.post/3k").unwrap(), p("did:plc:abc", Some("app.bsky.feed.post"), Some("3k"), None));
+        assert_eq!(
+            parse_input("at://did:plc:abc/app.bsky.feed.post/3k").unwrap(),
+            p("did:plc:abc", Some("app.bsky.feed.post"), Some("3k"), None)
+        );
         assert_eq!(parse_input("at://alice.test").unwrap(), p("alice.test", None, None, None));
         assert_eq!(parse_input("@Alice.Test").unwrap(), p("alice.test", None, None, None));
         assert_eq!(parse_input("did:web:example.com").unwrap(), p("did:web:example.com", None, None, None));

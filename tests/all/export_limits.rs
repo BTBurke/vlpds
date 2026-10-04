@@ -68,8 +68,12 @@ async fn stalled_export_readers_dont_block_commits() {
         }
         worst
     };
-    let (responses, worst) =
-        tokio::join!(async { tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(heads)).await.expect("export heads") }, writer);
+    let (responses, worst) = tokio::join!(
+        async {
+            tokio::time::timeout(Duration::from_secs(20), futures::future::join_all(heads)).await.expect("export heads")
+        },
+        writer
+    );
     assert!(worst < Duration::from_secs(2), "a commit took {worst:?} during stalled exports");
     let mut bodies = Vec::new();
     for r in responses {
@@ -78,7 +82,8 @@ async fn stalled_export_readers_dont_block_commits() {
         bodies.push(r.into_body()); // held, never read
     }
     // all four stall out: two at a time, each queued one after a slot frees
-    wait_until("all four stalled exports end", Duration::from_secs(15), || ended("stalled") >= stalled_before + 4).await;
+    wait_until("all four stalled exports end", Duration::from_secs(15), || ended("stalled") >= stalled_before + 4)
+        .await;
     // a reading client gets the whole repo
     let repo = s.get_repo(&a.did).await;
     repo.check_block_hashes().unwrap();
@@ -121,7 +126,10 @@ async fn subscribe_repos_per_ip_cap_and_bad_cursor() {
         Ok(_) => panic!("third connection from one address accepted"),
     }
     drop(first);
-    wait_until("the closed subscriber uncounted", Duration::from_secs(5), || s.app.firehose.connections_from(local) <= 1).await;
+    wait_until("the closed subscriber uncounted", Duration::from_secs(5), || {
+        s.app.firehose.connections_from(local) <= 1
+    })
+    .await;
     let _third = Sub::connect(&s.ws_url(None)).await;
 
     let r = s.xrpc.get("com.atproto.sync.subscribeRepos", &[("cursor", "abc")], &Auth::None).await;

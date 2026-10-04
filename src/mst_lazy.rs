@@ -13,7 +13,9 @@
 //! against the new tree finds all persisted nodes to delete.
 
 use crate::cid::Cid;
-use crate::mst::{decode_node, decode_trusted_node, encode_node, height_for_key, Entry, LeafEncoder, MstError, Node, Tree, MAX_DEPTH};
+use crate::mst::{
+    decode_node, decode_trusted_node, encode_node, height_for_key, Entry, LeafEncoder, MstError, Node, Tree, MAX_DEPTH,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Bound;
 use std::sync::Arc;
@@ -179,7 +181,10 @@ impl StreamBuilder {
         }
         let root = finish(top as i32, std::mem::take(&mut self.open[top]), true)?;
         if top >= 1 {
-            out.push((root.cid.ok_or(MstError::Invalid("unwritten node"))?, root.bytes.clone().ok_or(MstError::Invalid("root without its block"))?));
+            out.push((
+                root.cid.ok_or(MstError::Invalid("unwritten node"))?,
+                root.bytes.clone().ok_or(MstError::Invalid("root without its block"))?,
+            ));
         }
         Ok((root, self.nodes + 1))
     }
@@ -309,7 +314,12 @@ fn rebuilt_subtree_with(recs: &[(Key, Cid)], height: i32, cid: &Cid, keep_leaves
 /// Where a proof walk (`Tree::proof_blocks`) goes from `n`, whose keys lie
 /// in (`lo`, `hi`): the child entry to descend to and its key bounds, or
 /// None where the path ends (`key` is here, or would be).
-pub fn proof_child(n: &Node, key: &[u8], lo: &Option<Key>, hi: &Option<Key>) -> Option<(usize, Option<Key>, Option<Key>)> {
+pub fn proof_child(
+    n: &Node,
+    key: &[u8],
+    lo: &Option<Key>,
+    hi: &Option<Key>,
+) -> Option<(usize, Option<Key>, Option<Key>)> {
     let Loc::Gap(Some(i)) = locate(n, key) else { return None };
     let (clo, chi) = child_bounds(n, i, lo, hi);
     Some((i, clo, chi))
@@ -459,7 +469,12 @@ impl HeapMemo {
         if self.root.as_ref().is_some_and(|r| Arc::ptr_eq(r, root)) {
             return self.total;
         }
-        fn walk(n: &Arc<Node>, sub: &HashMap<usize, usize>, fresh: &mut Vec<(usize, usize)>, kept: &mut HashSet<usize>) -> usize {
+        fn walk(
+            n: &Arc<Node>,
+            sub: &HashMap<usize, usize>,
+            fresh: &mut Vec<(usize, usize)>,
+            kept: &mut HashSet<usize>,
+        ) -> usize {
             let at = Arc::as_ptr(n) as usize;
             if let Some(&b) = sub.get(&at) {
                 kept.insert(at);
@@ -716,7 +731,15 @@ impl LazyTree {
     /// one forward record scan serves it.
     pub fn load_all(&mut self, src: &dyn Source) -> Result<()> {
         #[allow(clippy::too_many_arguments)]
-        fn rec(n: &mut Arc<Node>, lo: Option<Key>, hi: Option<Key>, pm: i32, src: &dyn Source, stats: &mut LoadStats, depth: usize) -> Result<()> {
+        fn rec(
+            n: &mut Arc<Node>,
+            lo: Option<Key>,
+            hi: Option<Key>,
+            pm: i32,
+            src: &dyn Source,
+            stats: &mut LoadStats,
+            depth: usize,
+        ) -> Result<()> {
             if depth > MAX_DEPTH {
                 return Err(MstError::Invalid("tree too deep"));
             }
@@ -777,7 +800,11 @@ impl LazyTree {
     /// Also reports where the written nodes sit, leaving out nodes whose
     /// first key is in an unloaded subtree (interior ones, which `M/` finds
     /// by CID).
-    pub fn write_diff_blocks_with_refs(&mut self, out: &mut Vec<(Cid, Vec<u8>)>, report: Option<&mut Vec<(Cid, crate::mst::NodeRef)>>) -> Result<(Cid, Persist)> {
+    pub fn write_diff_blocks_with_refs(
+        &mut self,
+        out: &mut Vec<(Cid, Vec<u8>)>,
+        report: Option<&mut Vec<(Cid, crate::mst::NodeRef)>>,
+    ) -> Result<(Cid, Persist)> {
         let start = out.len();
         let mut refs = Vec::new();
         let root = self.tree.write_diff_blocks_with_refs(out, &mut refs)?;
@@ -1043,8 +1070,11 @@ pub fn export_blocks(
                 f(*c, block);
                 continue;
             }
-            let child = load_subtree_uncached(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats, true)?;
-            if child.height >= persist_min && !child.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. })) {
+            let child =
+                load_subtree_uncached(src, persist_min, *c, n.height - 1, clo.as_deref(), chi.as_deref(), stats, true)?;
+            if child.height >= persist_min
+                && !child.entries.iter().any(|e| matches!(e, Entry::Child { node: Some(_), .. }))
+            {
                 visit(&child, clo, chi, persist_min, src, f, stats, enc, depth + 1)?;
             } else {
                 // rebuilt from records: fully loaded, blocks kept
@@ -1064,7 +1094,6 @@ pub fn export_blocks(
     src.record_blocks(None, f)?;
     Ok(stats)
 }
-
 
 /// `M/` and `R/` of one repo, in memory (tests, benches).
 #[derive(Clone, Default)]

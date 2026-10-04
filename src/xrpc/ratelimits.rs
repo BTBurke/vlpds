@@ -107,7 +107,8 @@ fn merge_top(snaps: &[NodeSnapshot], n: usize) -> BTreeMap<String, Vec<ClusterCo
                     reset_ms: *reset_ms,
                     nodes: Vec::new(),
                 });
-                c.used = if key == crate::ratelimit::CLUSTER_KEY { c.used.max(*used) } else { c.used.saturating_add(*used) };
+                c.used =
+                    if key == crate::ratelimit::CLUSTER_KEY { c.used.max(*used) } else { c.used.saturating_add(*used) };
                 c.max_node_used = c.max_node_used.max(*used);
                 c.reset_ms = c.reset_ms.max(*reset_ms);
                 c.nodes.push(s.node.clone());
@@ -211,7 +212,10 @@ pub struct PeerIp(Option<std::net::IpAddr>);
 impl axum::extract::FromRequestParts<Arc<App>> for PeerIp {
     type Rejection = std::convert::Infallible;
 
-    async fn from_request_parts(parts: &mut axum::http::request::Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        app: &Arc<App>,
+    ) -> Result<Self, Self::Rejection> {
         Ok(PeerIp(crate::ratelimit::request_client_ip(&parts.headers, &parts.extensions, &app.ratelimit.trusted)))
     }
 }
@@ -224,15 +228,27 @@ fn save_error(e: SaveError) -> XrpcError {
     let message = e.to_string();
     match e {
         SaveError::Invalid(_) => XrpcError::bad("InvalidConfig", message),
-        SaveError::Conflict { .. } => XrpcError { status: StatusCode::CONFLICT, error: "ConfigConflict".into(), message },
+        SaveError::Conflict { .. } => {
+            XrpcError { status: StatusCode::CONFLICT, error: "ConfigConflict".into(), message }
+        }
         SaveError::Store(_) => upstream_failure(message),
     }
 }
 
-async fn update_rate_limits(State(app): AppState, Auth(creds): Auth, PeerIp(peer): PeerIp, Json(inp): Json<UpdateIn>) -> XResult<Json<J>> {
+async fn update_rate_limits(
+    State(app): AppState,
+    Auth(creds): Auth,
+    PeerIp(peer): PeerIp,
+    Json(inp): Json<UpdateIn>,
+) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let doc: Doc = serde_json::from_value(inp.config).map_err(|e| XrpcError::bad("InvalidConfig", format!("invalid config: {e}")))?;
-    let actor = inp.actor.map(|a| a.trim().chars().take(64).collect::<String>()).filter(|a| !a.is_empty()).unwrap_or_else(|| "admin".into());
+    let doc: Doc = serde_json::from_value(inp.config)
+        .map_err(|e| XrpcError::bad("InvalidConfig", format!("invalid config: {e}")))?;
+    let actor = inp
+        .actor
+        .map(|a| a.trim().chars().take(64).collect::<String>())
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| "admin".into());
     let ip = peer.map(|ip| ip.to_string());
     let me = node_id(&app);
     let req = SaveReq { doc, if_version: inp.if_version, actor, ip, node: me.clone(), note: inp.note };
@@ -293,10 +309,22 @@ mod tests {
     fn snap(node: &str, top: &[(&str, &str, u32)], rej: &[(&str, &str, u64)]) -> NodeSnapshot {
         let mut s = NodeSnapshot { node: node.into(), ..Default::default() };
         for (b, k, used) in top {
-            s.top.entry(b.to_string()).or_default().push(Consumer { key: k.to_string(), used: *used, limit: Some(100), reset_ms: 5 });
+            s.top.entry(b.to_string()).or_default().push(Consumer {
+                key: k.to_string(),
+                used: *used,
+                limit: Some(100),
+                reset_ms: 5,
+            });
         }
         for (l, r, n) in rej {
-            s.rejections.push(RejectionCount { limiter: l.to_string(), route: r.to_string(), last1m: *n, last5m: *n, last15m: *n, total: *n });
+            s.rejections.push(RejectionCount {
+                limiter: l.to_string(),
+                route: r.to_string(),
+                last1m: *n,
+                last5m: *n,
+                last15m: *n,
+                total: *n,
+            });
         }
         s
     }
@@ -304,7 +332,11 @@ mod tests {
     #[test]
     fn merges_nodes() {
         let a = snap("a", &[("global-ip", "1.1.1.1", 50), ("global-ip", "2.2.2.2", 40)], &[("global-ip", "x.y.z", 3)]);
-        let b = snap("b", &[("global-ip", "2.2.2.2", 30), ("repo-write-hour", "did:plc:x", 9)], &[("global-ip", "x.y.z", 2), ("repo-write-hour", "x.y.w", 1)]);
+        let b = snap(
+            "b",
+            &[("global-ip", "2.2.2.2", 30), ("repo-write-hour", "did:plc:x", 9)],
+            &[("global-ip", "x.y.z", 2), ("repo-write-hour", "x.y.w", 1)],
+        );
         let t = merge_top(&[a.clone(), b.clone()], 10);
         let g = &t["global-ip"];
         assert_eq!((g[0].key.as_str(), g[0].used, g[0].max_node_used, g[0].nodes.len()), ("2.2.2.2", 70, 40, 2));
@@ -312,7 +344,10 @@ mod tests {
         assert_eq!(t["repo-write-hour"][0].used, 9);
         assert_eq!(merge_top(&[a.clone(), b.clone()], 1)["global-ip"].len(), 1);
         // every node reports the cluster budget's one count
-        let (x, y) = (snap("a", &[("mail-cluster-day", "cluster", 7)], &[]), snap("b", &[("mail-cluster-day", "cluster", 6)], &[]));
+        let (x, y) = (
+            snap("a", &[("mail-cluster-day", "cluster", 7)], &[]),
+            snap("b", &[("mail-cluster-day", "cluster", 6)], &[]),
+        );
         let c = &merge_top(&[x, y], 10)["mail-cluster-day"][0];
         assert_eq!((c.used, c.max_node_used), (7, 7));
         let r = merge_rejections(&[a, b]);
@@ -322,7 +357,8 @@ mod tests {
 
     #[test]
     fn rows_list_builtins_then_routes() {
-        let d: Doc = serde_json::from_value(json!({"routes": [{"nsid": "a.b.c", "points": 1, "windowSecs": 2}]})).unwrap();
+        let d: Doc =
+            serde_json::from_value(json!({"routes": [{"nsid": "a.b.c", "points": 1, "windowSecs": 2}]})).unwrap();
         let p = crate::ratelimit::config::compile_with(Some(&d), 40).unwrap();
         let rows = limiter_rows(&p, &crate::ratelimit::Policy::defaults(40));
         assert_eq!(rows.len(), crate::ratelimit::BUILTIN.len() + 1);
@@ -330,8 +366,14 @@ mod tests {
         assert_eq!(rows[0]["default"]["points"], 3000);
         // the flag sets the cluster mail budget's default
         let mail = rows.iter().find(|r| r["name"] == "mail-cluster-day").unwrap();
-        assert_eq!((mail["points"].as_u64(), mail["default"]["points"].as_u64(), mail["key"].as_str()), (Some(40), Some(40), Some("cluster")));
+        assert_eq!(
+            (mail["points"].as_u64(), mail["default"]["points"].as_u64(), mail["key"].as_str()),
+            (Some(40), Some(40), Some("cluster"))
+        );
         let last = rows.last().unwrap();
-        assert_eq!((last["name"].as_str(), last["custom"].as_bool(), last["key"].as_str()), (Some("route:a.b.c"), Some(true), Some("ip")));
+        assert_eq!(
+            (last["name"].as_str(), last["custom"].as_bool(), last["key"].as_str()),
+            (Some("route:a.b.c"), Some(true), Some("ip"))
+        );
     }
 }

@@ -14,7 +14,8 @@ async fn put_prefs(s: &TestServer, auth: &Auth, prefs: J) -> Resp {
 
 /// Creates an app password and logs in with it.
 async fn app_password_auth(s: &TestServer, a: &TestAccount) -> Auth {
-    let ap = s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "test-app-pass"}), &a.auth()).await.ok();
+    let ap =
+        s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "test-app-pass"}), &a.auth()).await.ok();
     let sess = s.create_session(&a.handle, ap["password"].as_str().unwrap()).await.ok();
     Auth::Bearer(sess["accessJwt"].as_str().unwrap().to_string())
 }
@@ -55,21 +56,31 @@ async fn app_password_cannot_read_write_or_remove_personal_details() {
     let a = s.create_account("alice").await;
     let ap = app_password_auth(&s, &a).await;
     let birth = "2020-06-01T00:00:00.000Z"; // a minor
-    put_prefs(&s, &a.auth(), json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}])).await.ok();
+    put_prefs(&s, &a.auth(), json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}]))
+        .await
+        .ok();
 
     // read with app password: personal details hidden, declared age computed
     let got = get_prefs(&s, &ap).await.ok();
-    assert_eq!(got["preferences"], json!([{"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": false, "isOverAge16": false, "isOverAge18": false}]));
+    assert_eq!(
+        got["preferences"],
+        json!([{"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": false, "isOverAge16": false, "isOverAge18": false}])
+    );
 
     // write with app password: rejected
-    let r = put_prefs(&s, &ap, json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": now_iso()}])).await;
+    let r =
+        put_prefs(&s, &ap, json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": now_iso()}])).await;
     r.client_err();
 
     // clearing with an app password keeps the permissioned pref
     put_prefs(&s, &ap, json!([])).await.ok();
     let full = get_prefs(&s, &a.auth()).await.ok();
     assert!(
-        full["preferences"].as_array().unwrap().iter().any(|p| p["$type"] == json!("app.bsky.actor.defs#personalDetailsPref")),
+        full["preferences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["$type"] == json!("app.bsky.actor.defs#personalDetailsPref")),
         "app password must not remove personalDetailsPref: {full}"
     );
 }
@@ -81,7 +92,9 @@ async fn declared_age_pref_is_computed_and_not_settable() {
     let ap = app_password_auth(&s, &a).await;
     let birth = "1970-01-01T00:00:00.000Z";
     let over = json!({"$type": "app.bsky.actor.defs#declaredAgePref", "isOverAge13": true, "isOverAge16": true, "isOverAge18": true});
-    put_prefs(&s, &a.auth(), json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}])).await.ok();
+    put_prefs(&s, &a.auth(), json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}]))
+        .await
+        .ok();
     for auth in [&a.auth(), &ap] {
         let got = get_prefs(&s, auth).await.ok();
         assert!(got["preferences"].as_array().unwrap().contains(&over), "declaredAgePref missing: {got}");
@@ -98,5 +111,8 @@ async fn declared_age_pref_is_computed_and_not_settable() {
     .await
     .ok();
     let got = get_prefs(&s, &a.auth()).await.ok();
-    assert_eq!(got["preferences"], json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}, over]));
+    assert_eq!(
+        got["preferences"],
+        json!([{"$type": "app.bsky.actor.defs#personalDetailsPref", "birthDate": birth}, over])
+    );
 }

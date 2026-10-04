@@ -4,7 +4,13 @@
 use crate::common::*;
 
 async fn set_avatar(s: &TestServer, a: &TestAccount, blob: &J) -> Resp {
-    s.put_record(a, "app.bsky.actor.profile", "self", json!({"$type": "app.bsky.actor.profile", "displayName": "Alice", "avatar": blob})).await
+    s.put_record(
+        a,
+        "app.bsky.actor.profile",
+        "self",
+        json!({"$type": "app.bsky.actor.profile", "displayName": "Alice", "avatar": blob}),
+    )
+    .await
 }
 
 fn crc32(data: &[u8]) -> u32 {

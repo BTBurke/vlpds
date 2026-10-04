@@ -62,7 +62,10 @@ async fn docs_pages_are_served_with_the_spa_csp() {
     assert_eq!(app.status, 200);
     let app = body(&app);
     for slug in ["overview", "architecture", "operations/deploy", "operations/runbook"] {
-        assert!(app.contains(&format!("slug:\"{slug}\"")) || app.contains(&format!("\"slug\":\"{slug}\"")), "nav lists {slug}");
+        assert!(
+            app.contains(&format!("slug:\"{slug}\"")) || app.contains(&format!("\"slug\":\"{slug}\"")),
+            "nav lists {slug}"
+        );
     }
     let overview = chunks(&app, "overview");
     assert_eq!(overview.len(), 1, "{overview:?}");
@@ -70,5 +73,8 @@ async fn docs_pages_are_served_with_the_spa_csp() {
     assert_eq!(page.status, 200);
     assert!(page.header("content-type").unwrap().contains("javascript"));
     let html = body(&page);
-    assert!(html.contains(r#"<section class="hero">"#) && html.contains(r#"<svg class="dg""#), "overview has its hero diagram");
+    assert!(
+        html.contains(r#"<section class="hero">"#) && html.contains(r#"<svg class="dg""#),
+        "overview has its hero diagram"
+    );
 }

@@ -19,7 +19,8 @@ pub struct Cid {
 /// chosen here, and two CIDs collide outright only if 128 digest bits match.
 impl std::hash::Hash for Cid {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let [a, b] = [&self.digest[..8], &self.digest[8..16]].map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")));
+        let [a, b] =
+            [&self.digest[..8], &self.digest[8..16]].map(|w| u64::from_le_bytes(w.try_into().expect("8 bytes")));
         state.write_u64(a ^ self.codec as u64);
         state.write_u64(b);
     }
@@ -30,17 +31,11 @@ pub const CID_BYTES_LEN: usize = 36;
 
 impl Cid {
     pub fn dag_cbor(data: &[u8]) -> Cid {
-        Cid {
-            codec: CODEC_DAG_CBOR,
-            digest: Sha256::digest(data).into(),
-        }
+        Cid { codec: CODEC_DAG_CBOR, digest: Sha256::digest(data).into() }
     }
 
     pub fn raw(data: &[u8]) -> Cid {
-        Cid {
-            codec: CODEC_RAW,
-            digest: Sha256::digest(data).into(),
-        }
+        Cid { codec: CODEC_RAW, digest: Sha256::digest(data).into() }
     }
 
     pub fn to_bytes(&self) -> [u8; CID_BYTES_LEN] {
@@ -57,19 +52,12 @@ impl Cid {
         if b.len() != CID_BYTES_LEN {
             return Err(CidError::Unsupported);
         }
-        if b[0] != 0x01
-            || (b[1] != CODEC_DAG_CBOR && b[1] != CODEC_RAW)
-            || b[2] != 0x12
-            || b[3] != 0x20
-        {
+        if b[0] != 0x01 || (b[1] != CODEC_DAG_CBOR && b[1] != CODEC_RAW) || b[2] != 0x12 || b[3] != 0x20 {
             return Err(CidError::Unsupported);
         }
         let mut digest = [0u8; 32];
         digest.copy_from_slice(&b[4..]);
-        Ok(Cid {
-            codec: b[1],
-            digest,
-        })
+        Ok(Cid { codec: b[1], digest })
     }
 
     /// Returns the CID and the bytes consumed.
@@ -154,7 +142,8 @@ const B32_DEC: [u8; 256] = {
 
 #[inline(always)]
 fn enc5(src: &[u8], dst: &mut [u8]) {
-    let v = (src[0] as u64) << 32 | (src[1] as u64) << 24 | (src[2] as u64) << 16 | (src[3] as u64) << 8 | src[4] as u64;
+    let v =
+        (src[0] as u64) << 32 | (src[1] as u64) << 24 | (src[2] as u64) << 16 | (src[3] as u64) << 8 | src[4] as u64;
     for (i, d) in dst[..8].iter_mut().enumerate() {
         *d = B32[((v >> (35 - 5 * i)) & 31) as usize];
     }
@@ -253,10 +242,7 @@ mod tests {
     fn roundtrip_string() {
         // CID of the empty MST node, a well-known value in atproto.
         let c = Cid::parse("bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm").unwrap();
-        assert_eq!(
-            c.to_string(),
-            "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"
-        );
+        assert_eq!(c.to_string(), "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm");
     }
 
     #[test]

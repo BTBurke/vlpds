@@ -24,7 +24,9 @@ async fn every_commit_inverts_to_prev_data() {
     let mut sub = s.subscribe(Some(0)).await;
     let mut deletes = 0;
     let mut creates = 0;
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= 160).await;
+    let frames = sub
+        .until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= 160)
+        .await;
     let mut checked = 0;
     for f in &frames {
         let Some(c) = f.commit() else { continue };

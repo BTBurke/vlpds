@@ -7,8 +7,8 @@
 
 use crate::common::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 const SHARDS: u32 = 8;
@@ -18,7 +18,11 @@ async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServ
 }
 
 /// `put_ms`: every segment PUT of this node's log takes that long.
-pub(crate) async fn node_with(id: &str, store: &Arc<object_store::memory::InMemory>, put_ms: Option<f64>) -> TestServer {
+pub(crate) async fn node_with(
+    id: &str,
+    store: &Arc<object_store::memory::InMemory>,
+    put_ms: Option<f64>,
+) -> TestServer {
     cluster_node(id, store.clone(), SHARDS, |c| c.inject_latency = put_ms.map(|ms| (ms, 0.0))).await
 }
 
@@ -33,7 +37,11 @@ pub(crate) fn collect(mut sub: Sub, target: Arc<AtomicI64>) -> tokio::task::Join
             if t > 0 && out.last().is_some_and(|(s, _)| *s >= t) {
                 return out;
             }
-            assert!(tokio::time::Instant::now() < deadline, "subscriber never reached {t}; at {:?}", out.last().map(|x| x.0));
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "subscriber never reached {t}; at {:?}",
+                out.last().map(|x| x.0)
+            );
             match sub.next(Duration::from_millis(200)).await {
                 Some(f) => {
                     assert_ne!(f.kind(), "#info", "unexpected #info frame: {:?}", f.body);
@@ -135,19 +143,26 @@ pub(crate) fn mismatch(what: &str, got: &[(i64, Vec<u8>)], want: &[(i64, Vec<u8>
 async fn log_stream_serves_only_the_named_log() {
     let store = Arc::new(object_store::memory::InMemory::new());
     let a = node("ls-a", &store).await;
-    let rb = peer_client().get(format!("{}/internal/v1/cluster", a.peer_url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN);
+    let rb = peer_client()
+        .get(format!("{}/internal/v1/cluster", a.peer_url))
+        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN);
     let log = a.xrpc.send(rb).await.ok()["log"].as_str().expect("log id").to_string();
     let connect = |log: String| {
         let url = format!("{}/internal/v1/log/stream?log={log}", a.peer_url.replacen("https", "wss", 1));
         async move {
-            let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).unwrap();
+            let mut req =
+                tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).unwrap();
             req.headers_mut().insert("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN.parse().unwrap());
             tokio_tungstenite::connect_async_tls_with_config(req, None, false, peer_client().ws_connector("ls-a")).await
         }
     };
     let (mut ws, _) = connect(log.clone()).await.expect("own log streams");
     use futures::StreamExt;
-    let first = tokio::time::timeout(Duration::from_secs(5), ws.next()).await.expect("a heartbeat").expect("open").expect("message");
+    let first = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("a heartbeat")
+        .expect("open")
+        .expect("message");
     assert!(first.is_binary());
     let old = format!("{}.1", log.split('.').next().unwrap());
     assert!(connect(old).await.is_err(), "another incarnation's log must be refused");
@@ -185,7 +200,11 @@ async fn staggered_starts_under_load_lose_no_events() {
         assert!(got == union, "{}", mismatch(&format!("node {i} cursor-0 subscriber attached at start"), &got, &union));
         let got = l.await.unwrap();
         let start = seqs.iter().position(|s| *s == got[0].0).expect("live subscriber's first event is in the union");
-        assert!(got == union[start..], "{}", mismatch(&format!("node {i} live subscriber attached at start"), &got, &union[start..]));
+        assert!(
+            got == union[start..],
+            "{}",
+            mismatch(&format!("node {i} live subscriber attached at start"), &got, &union[start..])
+        );
         let mut replay = collect(nodes[i].subscribe(Some(0)).await, target.clone()).await.unwrap();
         replay.truncate(union.len() + 1);
         assert!(replay == union, "{}", mismatch(&format!("node {i} replay from cursor 0"), &replay, &union));
@@ -252,7 +271,10 @@ async fn stopped_node_still_serving_does_not_stall_its_peers() {
     let c_log = c.app.log.log_id.to_string();
     vlpds::server::shutdown(&c.app).await; // and no halt: c keeps serving
     for (name, n) in [("a", &a), ("b", &b)] {
-        wait_until(&format!("{name} drains c's log to its fence"), Duration::from_secs(10), || !n.app.node.follow_floors().contains_key(&c_log)).await;
+        wait_until(&format!("{name} drains c's log to its fence"), Duration::from_secs(10), || {
+            !n.app.node.follow_floors().contains_key(&c_log)
+        })
+        .await;
     }
     // the peers' firehoses settle past now, twice over, while writes go on
     for _ in 0..2 {
@@ -268,7 +290,11 @@ async fn stopped_node_still_serving_does_not_stall_its_peers() {
     target.store(*seqs.last().unwrap(), Ordering::Release);
     for (name, sub) in subs {
         let got = sub.await.unwrap();
-        let start = if name.ends_with("live") { seqs.iter().position(|s| *s == got[0].0).expect("live subscriber's first event is in the union") } else { 0 };
+        let start = if name.ends_with("live") {
+            seqs.iter().position(|s| *s == got[0].0).expect("live subscriber's first event is in the union")
+        } else {
+            0
+        };
         assert!(got == union[start..], "{}", mismatch(name, &got, &union[start..]));
     }
 }

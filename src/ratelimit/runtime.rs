@@ -196,7 +196,10 @@ pub async fn refresh(limiter: &Limiter, store: &Store) -> anyhow::Result<bool> {
     };
     match config::parse_stored(&bytes).map(|(doc, dropped)| {
         if !dropped.is_empty() {
-            tracing::warn!(?dropped, "rate-limit config has fields this build doesn't know (a newer feature level's): ignored");
+            tracing::warn!(
+                ?dropped,
+                "rate-limit config has fields this build doesn't know (a newer feature level's): ignored"
+            );
         }
         doc
     }) {
@@ -216,7 +219,11 @@ pub async fn refresh(limiter: &Limiter, store: &Store) -> anyhow::Result<bool> {
                     Ok(true)
                 }
                 Err(errs) => {
-                    tracing::warn!(version, "rate-limit config object rejected (keeping the last good config): {}", errs.join("; "));
+                    tracing::warn!(
+                        version,
+                        "rate-limit config object rejected (keeping the last good config): {}",
+                        errs.join("; ")
+                    );
                     label("invalid");
                     Ok(false)
                 }
@@ -300,7 +307,12 @@ pub async fn save(limiter: &Limiter, store: &Store, req: SaveReq) -> Result<Doc,
         Some(e) => crate::cluster::if_match(Some(e)),
         None => PutMode::Create,
     };
-    let put = bounded(store.raw.put_opts(&config_path(store), PutPayload::from(body), PutOptions { mode, ..Default::default() })).await;
+    let put = bounded(store.raw.put_opts(
+        &config_path(store),
+        PutPayload::from(body),
+        PutOptions { mode, ..Default::default() },
+    ))
+    .await;
     let new_etag = match put {
         Ok(r) => r.e_tag,
         Err(e) if is_conflict(&e) => return Err(SaveError::Conflict { expected: req.if_version, current: None }),

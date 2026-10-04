@@ -108,7 +108,10 @@ fn known(s: &Inner, did: &str) -> Result<PlcLog, Response> {
 async fn doc(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
     match known(&s, &did) {
         Ok(l) => match l.data() {
-            Some(d) => ([(axum::http::header::CONTENT_TYPE, "application/did+ld+json")], format_did_doc(&d).to_string()).into_response(),
+            Some(d) => {
+                ([(axum::http::header::CONTENT_TYPE, "application/did+ld+json")], format_did_doc(&d).to_string())
+                    .into_response()
+            }
             None => err(StatusCode::NOT_FOUND, format!("DID not available: {did}")),
         },
         Err(r) => r,
@@ -135,7 +138,10 @@ async fn last(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response 
 async fn audit(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
     match known(&s, &did) {
         Ok(l) => {
-            let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            let at = |ms: i64| {
+                chrono::DateTime::from_timestamp_millis(ms)
+                    .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            };
             let log: Vec<J> = l
                 .entries
                 .iter()
@@ -203,7 +209,10 @@ mod tests {
         let (did, op) = plc.genesis(&signing, "alice.test", "https://pds.example", None).unwrap();
         // a genesis op posted under another DID is refused
         let other = crate::crypto::random_plc_did();
-        assert!(matches!(plc.client.send(&other, &op, "create").await, Err(crate::plc::PlcError::Rejected { status: 400, .. })));
+        assert!(matches!(
+            plc.client.send(&other, &op, "create").await,
+            Err(crate::plc::PlcError::Rejected { status: 400, .. })
+        ));
         plc.create(&did, &op).await.unwrap();
         assert_eq!(m.last_op(&did).unwrap(), op);
         assert!(plc.update_handle(&did, "bob.test").await.unwrap());

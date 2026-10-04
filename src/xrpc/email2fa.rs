@@ -4,7 +4,8 @@
 //! never stands in for the stronger one.
 
 use super::server::{
-    assert_email_token, create_email_token, delete_email_tokens, deliver, email_token_age_ms, invalid_request, mail_permit, to_json_bytes,
+    assert_email_token, create_email_token, delete_email_tokens, deliver, email_token_age_ms, invalid_request,
+    mail_permit, to_json_bytes,
 };
 use super::*;
 
@@ -29,7 +30,11 @@ struct Lockout {
 
 /// Golden fixtures (`super::private_rows`).
 pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
-    vec![(did.into(), LOCKOUT_NAME.into(), super::private_rows::enc(&Lockout { failures: 3, locked_until: 1_790_000_300 }))]
+    vec![(
+        did.into(),
+        LOCKOUT_NAME.into(),
+        super::private_rows::enc(&Lockout { failures: 3, locked_until: 1_790_000_300 }),
+    )]
 }
 
 pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Result<&'static str>> {
@@ -42,7 +47,9 @@ pub(super) enum Factor {
     Totp,
     /// A code was (or would have been) mailed; `hint` is the obfuscated
     /// address, as the reference shows it (`a***e@e***m`).
-    Email { hint: String },
+    Email {
+        hint: String,
+    },
 }
 
 pub(super) struct FactorErr {
@@ -79,22 +86,35 @@ fn factor_required() -> XrpcError {
 /// bypass both. A code sent anyway is still checked as an email sign-in
 /// code, as the reference's `login()` does, and counts against the lockout
 /// like any wrong code.
-pub(super) async fn check_second_factor(app: &App, acct: &Account, code: Option<&str>, app_password: bool) -> Result<(), FactorErr> {
+pub(super) async fn check_second_factor(
+    app: &App,
+    acct: &Account,
+    code: Option<&str>,
+    app_password: bool,
+) -> Result<(), FactorErr> {
     let code = code.map(str::trim).filter(|c| !c.is_empty());
     let hint = || Factor::Email { hint: acct.email.as_deref().map(obfuscate_email).unwrap_or_default() };
     if app_password {
         return match code {
-            Some(c) => check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() }),
+            Some(c) => {
+                check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() })
+            }
             None => Ok(()),
         };
     }
     let totp = crate::totp::enabled_for(app, acct).await.map_err(|err| FactorErr { err, factor: Factor::Totp })?;
     if totp {
-        return crate::totp::check_second_factor(app, acct, code).await.map_err(|err| FactorErr { err, factor: Factor::Totp });
+        return crate::totp::check_second_factor(app, acct, code)
+            .await
+            .map_err(|err| FactorErr { err, factor: Factor::Totp });
     }
     match (&acct.email, enabled(acct), code) {
-        (Some(email), true, _) => check_email_code(app, acct, Some(email), code).await.map_err(|err| FactorErr { err, factor: hint() }),
-        (_, _, Some(c)) => check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() }),
+        (Some(email), true, _) => {
+            check_email_code(app, acct, Some(email), code).await.map_err(|err| FactorErr { err, factor: hint() })
+        }
+        (_, _, Some(c)) => {
+            check_email_code(app, acct, None, Some(c)).await.map_err(|err| FactorErr { err, factor: hint() })
+        }
         _ => Ok(()),
     }
 }
@@ -109,7 +129,8 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
     let token_name = format!("etok/{PURPOSE}");
     for _ in 0..crate::totp::CAS_ROUNDS {
         let lk_raw = app.get_private(did, LOCKOUT_NAME).await?;
-        let mut lk: Lockout = lk_raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?.unwrap_or_default();
+        let mut lk: Lockout =
+            lk_raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?.unwrap_or_default();
         let now = crate::totp::now_secs();
         if now < lk.locked_until {
             return Err(crate::totp::locked_out());
@@ -122,7 +143,12 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
             }
             let permit = mail_permit(app, Some(did), email, PURPOSE, true).await?;
             let token = create_email_token(app, did, PURPOSE).await?;
-            deliver(app, permit, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
+            deliver(
+                app,
+                permit,
+                email,
+                crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token },
+            );
             return Err(factor_required());
         };
         let token_raw = app.get_private(did, &token_name).await?;
@@ -152,7 +178,9 @@ pub(super) async fn enable(app: &App, did: &str) -> XResult<()> {
             return Ok(false);
         }
         if a.email.is_none() || !a.email_confirmed {
-            return Err(invalid_request("A confirmed email address is required to enable email-based two-factor authentication"));
+            return Err(invalid_request(
+                "A confirmed email address is required to enable email-based two-factor authentication",
+            ));
         }
         super::server::set_extra(a, FLAG, json!(crate::events::now_rfc3339()));
         Ok(true)

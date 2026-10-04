@@ -31,7 +31,9 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> TestServe
 async fn prewarmed_handback_serves_moved_repos() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let a = node("mw-a", &store).await;
-    eventually(Duration::from_secs(20), || async { (a.app.partitions.owned().len() == SHARDS as usize).then_some(()) }).await.expect("a owns every shard");
+    eventually(Duration::from_secs(20), || async { (a.app.partitions.owned().len() == SHARDS as usize).then_some(()) })
+        .await
+        .expect("a owns every shard");
     let mut accts = Vec::new();
     for _ in 0..6 {
         let acct = a.create_account("mw").await;
@@ -48,7 +50,10 @@ async fn prewarmed_handback_serves_moved_repos() {
         .partitions
         .owned()
         .iter()
-        .map(|p| vlpds::xrpc::internal::PrewarmShard { shard: p.id, recent: p.recent.snapshot().iter().map(|d| d.to_string()).collect() })
+        .map(|p| vlpds::xrpc::internal::PrewarmShard {
+            shard: p.id,
+            recent: p.recent.snapshot().iter().map(|d| d.to_string()).collect(),
+        })
         .collect();
     assert!(shards.iter().any(|s| !s.recent.is_empty()), "a recorded no recent repos");
     let warm = {
@@ -71,7 +76,15 @@ async fn prewarmed_handback_serves_moved_repos() {
     assert!(!moved.is_empty(), "no test account moved to b");
     for acct in &moved {
         b.post(acct, "after move").await;
-        let r = b.xrpc.get("com.atproto.repo.listRecords", &[("repo", acct.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "100")], &Auth::None).await.ok();
+        let r = b
+            .xrpc
+            .get(
+                "com.atproto.repo.listRecords",
+                &[("repo", acct.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "100")],
+                &Auth::None,
+            )
+            .await
+            .ok();
         assert_eq!(r["records"].as_array().map(Vec::len), Some(7), "{}: {r}", acct.did);
     }
 }

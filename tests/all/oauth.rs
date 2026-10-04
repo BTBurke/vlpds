@@ -4,12 +4,12 @@
 //! XRPC calls, refresh rotation, revocation, loopback and confidential
 //! (private_key_jwt) clients, TOTP and include: permission sets.
 
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use reqwest::header::HeaderMap;
-use serde_json::{Value as J, json};
+use serde_json::{json, Value as J};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,7 +117,11 @@ impl DpopKey {
     /// RFC 7638 thumbprint.
     pub(crate) fn jkt(&self) -> String {
         let j = self.jwk();
-        let canon = format!(r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#, j["x"].as_str().unwrap(), j["y"].as_str().unwrap());
+        let canon = format!(
+            r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+            j["x"].as_str().unwrap(),
+            j["y"].as_str().unwrap()
+        );
         b64(Sha256::digest(canon))
     }
 
@@ -161,7 +165,8 @@ fn client_key() -> (SigningKey, J) {
 
 /// A private_key_jwt client assertion for `aud`.
 fn client_assertion(sk: &SigningKey, client_id: &str, aud: &str) -> String {
-    let payload = json!({"iss": client_id, "sub": client_id, "aud": aud, "jti": rand_str(12), "iat": now(), "exp": now() + 60});
+    let payload =
+        json!({"iss": client_id, "sub": client_id, "aud": aud, "jti": rand_str(12), "iat": now(), "exp": now() + 60});
     sign_jwt(sk, &json!({"alg": "ES256", "kid": "k1", "typ": "JWT"}), &payload)
 }
 
@@ -172,7 +177,14 @@ struct Resp {
 }
 
 /// A DPoP request, retried once on use_dpop_nonce (as real clients do).
-async fn dpop_send(s: &Srv, key: &DpopKey, method: reqwest::Method, url: &str, token: Option<&str>, build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder) -> Resp {
+async fn dpop_send(
+    s: &Srv,
+    key: &DpopKey,
+    method: reqwest::Method,
+    url: &str,
+    token: Option<&str>,
+    build: impl Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+) -> Resp {
     for attempt in 0..2 {
         let mut rb = build(s.http.request(method.clone(), url)).header("dpop", key.proof(method.as_str(), url, token));
         if let Some(t) = token {
@@ -194,7 +206,10 @@ async fn dpop_send(s: &Srv, key: &DpopKey, method: reqwest::Method, url: &str, t
 /// POST a form to an AS endpoint with DPoP.
 async fn as_post(s: &Srv, key: &DpopKey, path: &str, pairs: &[(&str, &str)]) -> Resp {
     let body = form(pairs);
-    dpop_send(s, key, reqwest::Method::POST, &format!("{}{path}", s.base), None, |rb| rb.header("content-type", FORM).body(body.clone())).await
+    dpop_send(s, key, reqwest::Method::POST, &format!("{}{path}", s.base), None, |rb| {
+        rb.header("content-type", FORM).body(body.clone())
+    })
+    .await
 }
 
 /// DPoP-authenticated XRPC call.
@@ -214,7 +229,15 @@ async fn create_post(s: &Srv, key: &DpopKey, token: &str, did: &str, collection:
         }
         _ => json!({"$type": collection, "text": "hello from oauth", "createdAt": "2024-01-01T00:00:00.000Z"}),
     };
-    xrpc_dpop(s, key, token, "POST", "com.atproto.repo.createRecord", Some(json!({"repo": did, "collection": collection, "record": record}))).await
+    xrpc_dpop(
+        s,
+        key,
+        token,
+        "POST",
+        "com.atproto.repo.createRecord",
+        Some(json!({"repo": did, "collection": collection, "record": record})),
+    )
+    .await
 }
 
 // ---------- client + browser simulation ----------
@@ -288,14 +311,29 @@ impl Browser {
 
     /// The authorization page's password step.
     async fn sign_in(&mut self, s: &Srv, ru: &str, csrf: &str, identifier: &str, password: &str) -> Page {
-        self.post(s, "/oauth/authorize/sign-in", &[("request_uri", ru), ("csrf", csrf), ("identifier", identifier), ("password", password), ("action", "sign-in")])
-            .await
+        self.post(
+            s,
+            "/oauth/authorize/sign-in",
+            &[
+                ("request_uri", ru),
+                ("csrf", csrf),
+                ("identifier", identifier),
+                ("password", password),
+                ("action", "sign-in"),
+            ],
+        )
+        .await
     }
 
     /// The authorization page's second-factor (authenticator or email) step.
     async fn second_factor(&mut self, s: &Srv, ru: &str, csrf: &str, code: &str) -> (u16, String) {
-        let (st, _, html) =
-            self.post(s, "/oauth/authorize/sign-in", &[("request_uri", ru), ("csrf", csrf), ("step", "totp"), ("code", code), ("action", "sign-in")]).await;
+        let (st, _, html) = self
+            .post(
+                s,
+                "/oauth/authorize/sign-in",
+                &[("request_uri", ru), ("csrf", csrf), ("step", "totp"), ("code", code), ("action", "sign-in")],
+            )
+            .await;
         (st, html)
     }
 }
@@ -393,14 +431,22 @@ async fn login(s: &Srv, acct: &Account, scope: &str) -> (DpopKey, String) {
 /// Browser side of a pushed request: open the authorization page, pick or
 /// sign in to `acct`, and post "allow" on the consent page (with `extra`
 /// form fields). Returns the consent POST's response.
-async fn browser_consent(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account, ru: &str, extra: &[(&str, &str)]) -> Page {
+async fn browser_consent(
+    s: &Srv,
+    b: &mut Browser,
+    f: &Flow<'_>,
+    acct: &Account,
+    ru: &str,
+    extra: &[(&str, &str)],
+) -> Page {
     let (st, h, mut html) = b.authorize(s, f, ru).await;
     assert_eq!(st, 200, "{html}");
     let csp = h.get("content-security-policy").unwrap().to_str().unwrap();
     assert!(csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"), "{csp}");
     if html.contains("Choose an account") {
         let did = if html.contains(&acct.did) { acct.did.as_str() } else { "" };
-        let (st, _, next) = b.post(s, "/oauth/authorize/select", &[("request_uri", ru), ("csrf", &csrf_of(&html)), ("did", did)]).await;
+        let (st, _, next) =
+            b.post(s, "/oauth/authorize/select", &[("request_uri", ru), ("csrf", &csrf_of(&html)), ("did", did)]).await;
         assert_eq!(st, 200, "{next}");
         html = next;
     }
@@ -411,7 +457,8 @@ async fn browser_consent(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account,
     }
     assert!(html.contains("Authorize access"), "expected consent page: {html}");
     let csrf = csrf_of(&html);
-    let mut pairs: Vec<(&str, &str)> = vec![("request_uri", ru), ("csrf", &csrf), ("did", &acct.did), ("action", "allow")];
+    let mut pairs: Vec<(&str, &str)> =
+        vec![("request_uri", ru), ("csrf", &csrf), ("did", &acct.did), ("action", "allow")];
     pairs.extend_from_slice(extra);
     b.post(s, "/oauth/authorize/consent", &pairs).await
 }
@@ -451,7 +498,8 @@ async fn serve_metadata(build: impl FnOnce(&str) -> J) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_id = format!("http://{}/client-metadata.json", listener.local_addr().unwrap());
     let md = build(&client_id);
-    let router = axum::Router::new().route("/client-metadata.json", axum::routing::get(move || std::future::ready(axum::Json(md.clone()))));
+    let router = axum::Router::new()
+        .route("/client-metadata.json", axum::routing::get(move || std::future::ready(axum::Json(md.clone()))));
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     client_id
 }
@@ -474,7 +522,11 @@ fn confidential_metadata(id: &str, redirect: &str, jwk: &J) -> J {
 }
 
 fn unsecured_jwt(payload: &J) -> String {
-    format!("{}.{}.", b64(serde_json::to_vec(&json!({"alg": "none"})).unwrap()), b64(serde_json::to_vec(payload).unwrap()))
+    format!(
+        "{}.{}.",
+        b64(serde_json::to_vec(&json!({"alg": "none"})).unwrap()),
+        b64(serde_json::to_vec(payload).unwrap())
+    )
 }
 
 /// Enables TOTP for `acct`; returns the secret and the step the confirm code
@@ -483,7 +535,14 @@ async fn enable_totp(s: &Srv, acct: &Account) -> (Vec<u8>, u64) {
     let (_, setup) = s.bearer(&acct.jwt, "vlpds.server.setupTotp", true, None).await;
     let secret = vlpds::totp::base32_decode(setup["secret"].as_str().unwrap()).unwrap();
     let step = vlpds::totp::step_at(vlpds::totp::now_secs());
-    let (st, j) = s.bearer(&acct.jwt, "vlpds.server.confirmTotp", true, Some(json!({"code": vlpds::totp::code_for_step(&secret, step)}))).await;
+    let (st, j) = s
+        .bearer(
+            &acct.jwt,
+            "vlpds.server.confirmTotp",
+            true,
+            Some(json!({"code": vlpds::totp::code_for_step(&secret, step)})),
+        )
+        .await;
     assert_eq!(st, 200, "{j}");
     (secret, step)
 }
@@ -505,8 +564,21 @@ async fn dev_mail_token(s: &Srv, email: &str, purpose: &str) -> String {
 }
 
 /// The sign-up page's form.
-fn sign_up_form<'a>(ru: &'a str, csrf: &'a str, handle: &'a str, email: &'a str, invite: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
-    let mut v = vec![("request_uri", ru), ("csrf", csrf), ("handle", handle), ("email", email), ("password", PASSWORD), ("action", "sign-up")];
+fn sign_up_form<'a>(
+    ru: &'a str,
+    csrf: &'a str,
+    handle: &'a str,
+    email: &'a str,
+    invite: Option<&'a str>,
+) -> Vec<(&'a str, &'a str)> {
+    let mut v = vec![
+        ("request_uri", ru),
+        ("csrf", csrf),
+        ("handle", handle),
+        ("email", email),
+        ("password", PASSWORD),
+        ("action", "sign-up"),
+    ];
     v.extend(invite.map(|c| ("invite_code", c)));
     v
 }
@@ -584,7 +656,14 @@ async fn full_flow_create_record_refresh_and_revoke() {
     assert!(r.headers.get("dpop-nonce").is_some());
 
     // a Bearer presentation of a DPoP token is rejected
-    let r = s.http.post(format!("{}/xrpc/com.atproto.repo.createRecord", s.base)).bearer_auth(&t.access).json(&json!({})).send().await.unwrap();
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.repo.createRecord", s.base))
+        .bearer_auth(&t.access)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
     assert!(matches!(r.status().as_u16(), 400 | 401), "{}", r.status());
 
     // code reuse is rejected and revokes the session issued from it
@@ -624,7 +703,10 @@ async fn full_flow_create_record_refresh_and_revoke() {
     assert_eq!(as_post(&s, &key, "/oauth/revoke", &[("client_id", &f.client_id), ("token", rt3)]).await.status, 200);
     assert_eq!(post(t3.access.clone()).await.status, 401);
     // unknown tokens are fine (RFC 7009)
-    assert_eq!(as_post(&s, &key, "/oauth/revoke", &[("client_id", &f.client_id), ("token", "garbage")]).await.status, 200);
+    assert_eq!(
+        as_post(&s, &key, "/oauth/revoke", &[("client_id", &f.client_id), ("token", "garbage")]).await.status,
+        200
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -669,7 +751,9 @@ async fn push_registration_rpc_scope() {
     tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
     let s = spawn_with(|c| c.appview = Some((appview, APPVIEW.into()))).await;
     let acct = create_account(&s, "pushy").await;
-    let input = |service_did: &str| Some(json!({"serviceDid": service_did, "token": "device-1", "platform": "ios", "appId": "xyz.blueskyweb.app"}));
+    let input = |service_did: &str| {
+        Some(json!({"serviceDid": service_did, "token": "device-1", "platform": "ios", "appId": "xyz.blueskyweb.app"}))
+    };
     let scope_missing = |r: &Resp, scope: &str| {
         assert_eq!(r.status, 403, "{}", r.body);
         assert_eq!(r.body["error"], "ScopeMissingError");
@@ -677,7 +761,8 @@ async fn push_registration_rpc_scope() {
     };
 
     // granted for registerPush at the AppView's #bsky_notif only
-    let (key, tok) = login(&s, &acct, "atproto rpc:app.bsky.notification.registerPush?aud=did:web:appview.test%23bsky_notif").await;
+    let (key, tok) =
+        login(&s, &acct, "atproto rpc:app.bsky.notification.registerPush?aud=did:web:appview.test%23bsky_notif").await;
     let r = xrpc_dpop(&s, &key, &tok, "POST", REGISTER, input(APPVIEW)).await;
     assert_eq!(r.status, 200, "{}", r.body);
     assert_eq!(hits.lock().drain(..).collect::<Vec<_>>(), [format!("/xrpc/{REGISTER}")]);
@@ -739,7 +824,8 @@ async fn par_validation_and_nonces() {
     let nonce = nonce.expect("nonce");
     let (_, _, j) = raw(Some(key.proof_with("POST", &htu, None, Some("nope"))), body.clone()).await;
     assert_eq!(j["error"], "use_dpop_nonce", "bogus nonce");
-    let (_, _, j) = raw(Some(key.proof_with("POST", &format!("{}/oauth/token", s.base), None, Some(&nonce))), body.clone()).await;
+    let (_, _, j) =
+        raw(Some(key.proof_with("POST", &format!("{}/oauth/token", s.base), None, Some(&nonce))), body.clone()).await;
     assert_eq!(j["error"], "invalid_dpop_proof", "proof for the wrong URL");
     // good proof; then replaying the exact same proof is rejected
     let proof = key.proof_with("POST", &htu, None, Some(&nonce));
@@ -755,10 +841,12 @@ async fn par_validation_and_nonces() {
     let f = Flow::loopback("atproto", &key);
     assert_eq!(f.par(&s, &p, "x").await.body["error"], "invalid_request");
     // PKCE required, S256 only
-    let base = [("client_id", cid.as_str()), ("response_type", "code"), ("redirect_uri", REDIRECT), ("scope", "atproto")];
+    let base =
+        [("client_id", cid.as_str()), ("response_type", "code"), ("redirect_uri", REDIRECT), ("scope", "atproto")];
     assert_eq!(as_post(&s, &key, "/oauth/par", &base).await.body["error"], "invalid_request");
     let p3 = pkce();
-    let plain = [&base[..], &[("code_challenge", p3.challenge.as_str()), ("code_challenge_method", "plain")][..]].concat();
+    let plain =
+        [&base[..], &[("code_challenge", p3.challenge.as_str()), ("code_challenge_method", "plain")][..]].concat();
     assert_eq!(as_post(&s, &key, "/oauth/par", &plain).await.body["error"], "invalid_request");
     // unregistered redirect_uri
     let mut f = Flow::loopback("atproto", &key);
@@ -772,7 +860,9 @@ async fn par_validation_and_nonces() {
     assert_eq!(f.par(&s, &pkce(), "x").await.body["error"], "invalid_client_metadata");
 
     // the authorization endpoint refuses requests that skip PAR
-    let (st, _, _) = Browser::default().get(&s, &format!("{}/oauth/authorize?client_id={}&response_type=code", s.base, enc(&cid))).await;
+    let (st, _, _) = Browser::default()
+        .get(&s, &format!("{}/oauth/authorize?client_id={}&response_type=code", s.base, enc(&cid)))
+        .await;
     assert_eq!(st, 400);
 }
 
@@ -810,7 +900,10 @@ async fn resource_dpop_checks() {
     assert_eq!(send(Some(key.proof_with("GET", &url, Some(&access), n))).await.status(), 401);
     // htu with a query string is accepted (legacy), different path is not
     assert_eq!(send(Some(key.proof_with("POST", &format!("{url}?x=1"), Some(&access), n))).await.status(), 200);
-    assert_eq!(send(Some(key.proof_with("POST", &format!("{}/xrpc/other", s.base), Some(&access), n))).await.status(), 401);
+    assert_eq!(
+        send(Some(key.proof_with("POST", &format!("{}/xrpc/other", s.base), Some(&access), n))).await.status(),
+        401
+    );
     // replayed proof
     let proof = key.proof_with("POST", &url, Some(&access), n);
     assert_eq!(send(Some(proof.clone())).await.status(), 200);
@@ -857,7 +950,8 @@ async fn account_chooser_prompts_and_denial() {
     let (st, _, _) = b.post(&s, "/oauth/authorize/select", &[("request_uri", &ru), ("did", &a1.did)]).await;
     assert_eq!(st, 403);
     // choose "another account" -> login form -> sign in as a2 -> consent
-    let (st, _, html) = b.post(&s, "/oauth/authorize/select", &[("request_uri", &ru), ("csrf", &csrf), ("did", "")]).await;
+    let (st, _, html) =
+        b.post(&s, "/oauth/authorize/select", &[("request_uri", &ru), ("csrf", &csrf), ("did", "")]).await;
     assert_eq!(st, 200);
     assert!(html.contains("name=\"password\""));
     let (st, _, html) = b.sign_in(&s, &ru, &csrf, &a2.handle, "wrong").await;
@@ -866,7 +960,13 @@ async fn account_chooser_prompts_and_denial() {
     let (_, _, html) = b.sign_in(&s, &ru, &csrf, &a2.handle, PASSWORD).await;
     assert!(html.contains("Authorize access") && html.contains(&a2.handle));
     // deny -> access_denied redirect with state + iss
-    let (st, h, _) = b.post(&s, "/oauth/authorize/consent", &[("request_uri", &ru), ("csrf", &csrf), ("did", &a2.did), ("action", "deny")]).await;
+    let (st, h, _) = b
+        .post(
+            &s,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf), ("did", &a2.did), ("action", "deny")],
+        )
+        .await;
     assert_eq!(st, 303);
     let (_, q) = location_params(&h);
     assert_eq!(q["error"], "access_denied");
@@ -934,9 +1034,17 @@ async fn email_code_prompt_on_login() {
     let (st, _) = s.bearer(&acct.jwt, "com.atproto.server.requestEmailConfirmation", true, Some(json!({}))).await;
     assert_eq!(st, 200);
     let tok = dev_mail_token(&s, email, "confirm_email").await;
-    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.confirmEmail", true, Some(json!({"email": email, "token": tok}))).await;
+    let (st, j) =
+        s.bearer(&acct.jwt, "com.atproto.server.confirmEmail", true, Some(json!({"email": email, "token": tok}))).await;
     assert_eq!(st, 200, "{j}");
-    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.updateEmail", true, Some(json!({"email": email, "emailAuthFactor": true}))).await;
+    let (st, j) = s
+        .bearer(
+            &acct.jwt,
+            "com.atproto.server.updateEmail",
+            true,
+            Some(json!({"email": email, "emailAuthFactor": true})),
+        )
+        .await;
     assert_eq!(st, 200, "{j}");
 
     let key = DpopKey::new();
@@ -946,7 +1054,10 @@ async fn email_code_prompt_on_login() {
     let csrf = csrf_of(&b.authorize(&s, &f, &ru).await.2);
     let (st, _, html) = b.sign_in(&s, &ru, &csrf, &acct.handle, PASSWORD).await;
     assert_eq!(st, 200);
-    assert!(html.contains("name=\"code\"") && html.contains("We sent a sign-in code to <b>e***a@e***m</b>"), "expected email code prompt: {html}");
+    assert!(
+        html.contains("name=\"code\"") && html.contains("We sent a sign-in code to <b>e***a@e***m</b>"),
+        "expected email code prompt: {html}"
+    );
     let code = dev_mail_token(&s, email, "auth_factor").await;
     let (st, html) = b.second_factor(&s, &ru, &csrf, "AAAAA-AAAAA").await;
     assert_eq!(st, 401);
@@ -986,7 +1097,8 @@ async fn session_management() {
     let csrf = csrf_of(&html);
     let (st, _, _) = b.post(&s, "/oauth/account/revoke", &[("did", &acct.did), ("session", &sid)]).await;
     assert_eq!(st, 403, "csrf required");
-    let (st, h, _) = b.post(&s, "/oauth/account/revoke", &[("csrf", &csrf), ("did", &acct.did), ("session", &sid)]).await;
+    let (st, h, _) =
+        b.post(&s, "/oauth/account/revoke", &[("csrf", &csrf), ("did", &acct.did), ("session", &sid)]).await;
     assert_eq!(st, 303);
     assert_eq!(h.get("location").unwrap(), "/oauth/account");
     assert_eq!(create_post(&s, &key, &t.access, &acct.did, "app.bsky.feed.post").await.status, 401);
@@ -995,7 +1107,13 @@ async fn session_management() {
     let mut b2 = Browser::default();
     let (_, _, html) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
     assert!(html.contains("name=\"password\""));
-    let (st, h, _) = b2.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf_of(&html)), ("identifier", &acct.handle), ("password", PASSWORD)]).await;
+    let (st, h, _) = b2
+        .post(
+            &s,
+            "/oauth/account/sign-in",
+            &[("csrf", &csrf_of(&html)), ("identifier", &acct.handle), ("password", PASSWORD)],
+        )
+        .await;
     assert_eq!(st, 303);
     assert_eq!(h.get("location").unwrap(), "/oauth/account");
     let (_, _, html) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
@@ -1014,7 +1132,9 @@ async fn confidential_client_private_key_jwt() {
     let client_id = serve_metadata(|id| confidential_metadata(id, redirect, &jwk)).await;
     let assertion = |aud: &str| client_assertion(&client_sk, &client_id, aud);
     let key = DpopKey::new();
-    let mut f = Flow::new(&client_id, redirect, "atproto transition:generic", &key).with("client_assertion_type", JWT_BEARER).with("client_assertion", &assertion(&s.base));
+    let mut f = Flow::new(&client_id, redirect, "atproto transition:generic", &key)
+        .with("client_assertion_type", JWT_BEARER)
+        .with("client_assertion", &assertion(&s.base));
     let mut b = Browser::default();
     let p = pkce();
     let code = authorize_interactive(&s, &mut b, &f, &acct, &p).await;
@@ -1083,7 +1203,10 @@ async fn include_permission_set() {
     // the published record verifies through the network proof path too
     let car = s
         .http
-        .get(format!("{}/xrpc/com.atproto.sync.getRecord?did={}&collection=com.atproto.lexicon.schema&rkey={nsid}", s.base, publisher.did))
+        .get(format!(
+            "{}/xrpc/com.atproto.sync.getRecord?did={}&collection=com.atproto.lexicon.schema&rkey={nsid}",
+            s.base, publisher.did
+        ))
         .send()
         .await
         .unwrap()
@@ -1105,7 +1228,13 @@ async fn include_permission_set() {
     let csrf = csrf_of(&b.authorize(&s, &f, &ru).await.2);
     let (_, _, html) = b.sign_in(&s, &ru, &csrf, &user.handle, PASSWORD).await;
     assert!(html.contains("Basic test permissions"), "consent should show the permission set: {html}");
-    let (_, h, _) = b.post(&s, "/oauth/authorize/consent", &[("request_uri", &ru), ("csrf", &csrf), ("did", &user.did), ("action", "allow")]).await;
+    let (_, h, _) = b
+        .post(
+            &s,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf), ("did", &user.did), ("action", "allow")],
+        )
+        .await;
     let t = tokens(&exchange(&s, &f, &location_params(&h).1["code"], &p, &[]).await);
     // only the permission under the set's own NSID group is granted
     assert_eq!(t.scope, "repo:com.example.vlpdstest.thing atproto");
@@ -1186,7 +1315,13 @@ async fn account_page_error_codes() {
     let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=bad_code", s.base)).await;
     assert!(html.contains("Invalid authenticator code"), "{html}");
 
-    let (st, h, _) = b.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf_of(&html)), ("identifier", &acct.handle), ("password", "wrong")]).await;
+    let (st, h, _) = b
+        .post(
+            &s,
+            "/oauth/account/sign-in",
+            &[("csrf", &csrf_of(&html)), ("identifier", &acct.handle), ("password", "wrong")],
+        )
+        .await;
     assert_eq!(st, 303);
     assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=invalid");
     let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1&error=invalid", s.base)).await;
@@ -1221,12 +1356,21 @@ async fn email_code_over_mail_budget_is_rate_limited() {
     let email = "emil@example.com";
     s.bearer(&acct.jwt, "com.atproto.server.requestEmailConfirmation", true, Some(json!({}))).await;
     let tok = dev_mail_token(&s, email, "confirm_email").await;
-    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.confirmEmail", true, Some(json!({"email": email, "token": tok}))).await;
+    let (st, j) =
+        s.bearer(&acct.jwt, "com.atproto.server.confirmEmail", true, Some(json!({"email": email, "token": tok}))).await;
     assert_eq!(st, 200, "{j}");
-    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.updateEmail", true, Some(json!({"email": email, "emailAuthFactor": true}))).await;
+    let (st, j) = s
+        .bearer(
+            &acct.jwt,
+            "com.atproto.server.updateEmail",
+            true,
+            Some(json!({"email": email, "emailAuthFactor": true})),
+        )
+        .await;
     assert_eq!(st, 200, "{j}");
     // the confirmation mail spent the hour's budget
-    let d: vlpds::ratelimit::config::Doc = serde_json::from_value(json!({"limiters": {"mail-recipient-hour": {"points": 1}}})).unwrap();
+    let d: vlpds::ratelimit::config::Doc =
+        serde_json::from_value(json!({"limiters": {"mail-recipient-hour": {"points": 1}}})).unwrap();
     s.app.ratelimit.install(vlpds::ratelimit::config::compile(Some(&d)).unwrap());
 
     let mut b = Browser::default();
@@ -1263,8 +1407,19 @@ async fn jar_request_objects() {
         let (s, key, client_id) = (&s, &key, client_id.clone());
         async move {
             // "state" is ignored: only the request object's parameters count
-            as_post(s, key, "/oauth/par", &[("client_id", &client_id), ("client_assertion_type", JWT_BEARER), ("client_assertion", &a), ("request", &request), ("state", "outer")])
-                .await
+            as_post(
+                s,
+                key,
+                "/oauth/par",
+                &[
+                    ("client_id", &client_id),
+                    ("client_assertion_type", JWT_BEARER),
+                    ("client_assertion", &a),
+                    ("request", &request),
+                    ("state", "outer"),
+                ],
+            )
+            .await
         }
     };
     let expect_invalid = |r: Resp, needle: &str| {
@@ -1306,7 +1461,9 @@ async fn jar_request_objects() {
     let (_, q) = location_params(&h);
     assert_eq!(q["state"], "inner");
     let a = client_assertion(&client_sk, &client_id, &s.base);
-    let t = tokens(&exchange(&s, &f, &q["code"], &p, &[("client_assertion_type", JWT_BEARER), ("client_assertion", &a)]).await);
+    let t = tokens(
+        &exchange(&s, &f, &q["code"], &p, &[("client_assertion_type", JWT_BEARER), ("client_assertion", &a)]).await,
+    );
     assert_eq!(t.scope, "atproto transition:generic");
 }
 
@@ -1338,7 +1495,8 @@ async fn jar_unsecured_request_objects() {
             "code_challenge": pkce().challenge, "code_challenge_method": "S256",
         })
     };
-    let r = as_post(&s, &key, "/oauth/par", &[("client_id", &client_id), ("request", &unsecured_jwt(&payload()))]).await;
+    let r =
+        as_post(&s, &key, "/oauth/par", &[("client_id", &client_id), ("request", &unsecured_jwt(&payload()))]).await;
     assert_eq!(r.status, 201, "{}", r.body);
     let signed = sign_jwt(&SigningKey::random(&mut rand::rngs::OsRng), &json!({"alg": "ES256"}), &payload());
     let r = as_post(&s, &key, "/oauth/par", &[("client_id", &client_id), ("request", &signed)]).await;
@@ -1384,7 +1542,8 @@ async fn response_modes_form_post_and_fragment() {
     // errors use the same response mode
     let ru = f.request_uri(&s, &pkce(), "fp-deny").await;
     let csrf = csrf_of(&b.authorize(&s, &f, &ru).await.2);
-    let (st, _, body) = b.post(&s, "/oauth/authorize/consent", &[("request_uri", &ru), ("csrf", &csrf), ("action", "deny")]).await;
+    let (st, _, body) =
+        b.post(&s, "/oauth/authorize/consent", &[("request_uri", &ru), ("csrf", &csrf), ("action", "deny")]).await;
     assert_eq!(st, 200, "{body}");
     assert_eq!(hidden_field(&body, "error").as_deref(), Some("access_denied"));
     assert_eq!(hidden_field(&body, "state").as_deref(), Some("fp-deny"));
@@ -1441,18 +1600,26 @@ async fn prompt_create_signs_up() {
     let email = format!("{name}@example.com");
     let taken_label = taken.handle.split('.').next().unwrap();
     let csrf = csrf_of(&html);
-    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf, taken_label, &email, None)).await;
+    let (st, _, html) =
+        b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf, taken_label, &email, None)).await;
     assert_eq!(st, 400, "{html}");
     assert!(html.contains("Handle already taken") && html.contains(&email), "{html}");
     let (st, _, _) = b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, "bogus", &name, &email, None)).await;
     assert_eq!(st, 403, "a CSRF token is required");
 
     // success: signed in on the device, then consent (public client)
-    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, None)).await;
+    let (st, _, html) =
+        b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, None)).await;
     assert_eq!(st, 200, "{html}");
     assert!(html.contains("Authorize access"), "consent expected: {html}");
     let did = hidden_field(&html, "did").expect("did on the consent form");
-    let (st, h, body) = b.post(&s, "/oauth/authorize/consent", &[("request_uri", &ru), ("csrf", &csrf_of(&html)), ("did", &did), ("action", "allow")]).await;
+    let (st, h, body) = b
+        .post(
+            &s,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf_of(&html)), ("did", &did), ("action", "allow")],
+        )
+        .await;
     assert_eq!(st, 303, "{body}");
     let t = tokens(&exchange(&s, &f, &location_params(&h).1["code"], &p, &[]).await);
     let r = create_post(&s, &key, &t.access, &did, "app.bsky.feed.post").await;
@@ -1489,10 +1656,13 @@ async fn sign_up_page_with_required_invites() {
     assert!(html.contains("name=\"invite_code\""), "{html}");
     let name = format!("inv{}", rand::random::<u32>() % 100000);
     let email = format!("{name}@example.com");
-    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, Some(""))).await;
+    let (st, _, html) =
+        b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, Some(""))).await;
     assert_eq!(st, 400, "{html}");
     assert!(html.contains("No invite code provided"), "{html}");
-    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, Some("bogus-code"))).await;
+    let (st, _, html) = b
+        .post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, Some("bogus-code")))
+        .await;
     assert_eq!(st, 400, "{html}");
     assert!(html.contains("invite code not available"), "{html}");
 }
@@ -1507,7 +1677,13 @@ async fn consent_scope_narrowing() {
     let mut b = Browser::default();
     // one flow: the redirect's parameters and the granted token scope (if a
     // code was issued)
-    async fn consent(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account, extra: &[(&str, &str)]) -> (HashMap<String, String>, Option<String>) {
+    async fn consent(
+        s: &Srv,
+        b: &mut Browser,
+        f: &Flow<'_>,
+        acct: &Account,
+        extra: &[(&str, &str)],
+    ) -> (HashMap<String, String>, Option<String>) {
         let p = pkce();
         let ru = f.request_uri(s, &p, "n").await;
         let (st, h, body) = browser_consent(s, b, f, acct, &ru, extra).await;
@@ -1535,7 +1711,8 @@ async fn consent_scope_narrowing() {
     let (_, sc) = consent(&s, &mut b, &f, &acct, &[("email_choice", "1"), ("allow_email", "1")]).await;
     assert_eq!(sc.as_deref(), Some(scope));
     // explicit scope override: intersection only (nothing can be added)
-    let (_, sc) = consent(&s, &mut b, &f, &acct, &[("scope", "atproto transition:generic repo:app.bsky.feed.post")]).await;
+    let (_, sc) =
+        consent(&s, &mut b, &f, &acct, &[("scope", "atproto transition:generic repo:app.bsky.feed.post")]).await;
     assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
     // removing atproto is a denial
     let (q, sc) = consent(&s, &mut b, &f, &acct, &[("scope", "repo:app.bsky.feed.post")]).await;
@@ -1750,7 +1927,12 @@ async fn loopback_clients_work_and_metadata_fetches_are_guarded_outside_dev_mode
     ] {
         let f = Flow::new(&client_id, "https://app.example.com/cb", "atproto", &key);
         let r = f.par(&s, &pkce(), "x").await;
-        assert_eq!((r.status, r.body["error"].as_str()), (400, Some("invalid_client_metadata")), "{client_id}: {}", r.body);
+        assert_eq!(
+            (r.status, r.body["error"].as_str()),
+            (400, Some("invalid_client_metadata")),
+            "{client_id}: {}",
+            r.body
+        );
     }
     assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "a metadata fetch reached a loopback address");
 }

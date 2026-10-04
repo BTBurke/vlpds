@@ -72,12 +72,23 @@ async fn create(s: &TestServer, a: &TestAccount, coll: &str, record: J, validate
 /// The rkeys of `coll` records whose subject is `subject`.
 async fn subject_records(s: &TestServer, did: &str, coll: &str, subject: &J) -> Vec<String> {
     let l = s.list_records(did, coll, &[("limit", "100")]).await.ok();
-    l["records"].as_array().unwrap().iter().filter(|r| &r["value"]["subject"] == subject).map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect()
+    l["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| &r["value"]["subject"] == subject)
+        .map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect()
 }
 
 async fn rkeys(s: &TestServer, did: &str, coll: &str) -> Vec<String> {
     let l = s.list_records(did, coll, &[("limit", "100")]).await.ok();
-    let mut v: Vec<String> = l["records"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect();
+    let mut v: Vec<String> = l["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect();
     v.sort();
     v
 }
@@ -101,7 +112,10 @@ async fn duplicates_pruned_in_the_same_commit() {
         let c = frames.last().unwrap().commit().unwrap();
         let mut ops: Vec<(String, String)> = c.ops.iter().map(|o| (o.action.clone(), o.path.clone())).collect();
         ops.sort();
-        let mut want = vec![("create".to_string(), format!("{coll}/{}", three.rkey())), ("delete".to_string(), format!("{coll}/{}", one.rkey()))];
+        let mut want = vec![
+            ("create".to_string(), format!("{coll}/{}", three.rkey())),
+            ("delete".to_string(), format!("{coll}/{}", one.rkey())),
+        ];
         want.sort();
         assert_eq!(ops, want, "{coll}: one commit with the delete and the create");
         assert_eq!(c.rev, s.latest_commit(&a.did).await.1);
@@ -146,13 +160,18 @@ async fn apply_writes_duplicates_and_updates() {
     let s = TestServer::spawn().await;
     let a = s.create_account("blw").await;
     let w = |coll: &str, rkey: usize, n: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rk(rkey), "value": rec(coll, n)});
-    s.apply_writes(&a, json!([w(LIKE, 1, 7), w(LIKE, 2, 7), w(FOLLOW, 1, 7), w(FOLLOW, 2, 7), w(LIKE, 3, 8)])).await.ok();
+    s.apply_writes(&a, json!([w(LIKE, 1, 7), w(LIKE, 2, 7), w(FOLLOW, 1, 7), w(FOLLOW, 2, 7), w(LIKE, 3, 8)]))
+        .await
+        .ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
     assert_eq!(rkeys(&s, &a.did, FOLLOW).await, vec![rk(1), rk(2)]);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
     let raw = scan_backlinks(&s, &a.did).await;
     let k = [b"l", post_uri(7).as_bytes()].concat();
-    assert_eq!(raw.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone()), Some(format!("{}\0{}", rk(1), rk(2)).into_bytes()));
+    assert_eq!(
+        raw.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone()),
+        Some(format!("{}\0{}", rk(1), rk(2)).into_bytes())
+    );
 
     // putRecord moves rk(3) from subject 8 to 7; deleting rk(1) leaves rk(2), rk(3)
     s.put_record(&a, LIKE, &rk(3), rec(LIKE, 7)).await.ok();
@@ -163,7 +182,8 @@ async fn apply_writes_duplicates_and_updates() {
     let mut sub = s.subscribe_from_now().await;
     let last = create(&s, &a, LIKE, rec(LIKE, 7), None).await;
     let frames = sub.wait_for(Duration::from_secs(10), &a.did, "#commit").await;
-    let ops: Vec<(String, String)> = frames.last().unwrap().commit().unwrap().ops.iter().map(|o| (o.action.clone(), o.path.clone())).collect();
+    let ops: Vec<(String, String)> =
+        frames.last().unwrap().commit().unwrap().ops.iter().map(|o| (o.action.clone(), o.path.clone())).collect();
     assert_eq!(ops.iter().filter(|(a, _)| a == "delete").count(), 2, "{ops:?}");
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![last.rkey().to_string()]);
     create(&s, &a, FOLLOW, rec(FOLLOW, 7), None).await;
@@ -266,14 +286,19 @@ async fn import_with_duplicates_then_delete() {
     create(&s, &a, LIKE, rec(LIKE, 50), None).await;
     create(&s, &a, BLOCK, rec(BLOCK, 51), None).await;
     let w = |coll: &str, rkey: usize, n: usize| json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "rkey": rk(rkey), "value": rec(coll, n)});
-    s.apply_writes(&b, json!([w(LIKE, 1, 9), w(LIKE, 2, 9), w(LIKE, 3, 9), w(REPOST, 1, 9), w(FOLLOW, 1, 3)])).await.ok();
+    s.apply_writes(&b, json!([w(LIKE, 1, 9), w(LIKE, 2, 9), w(LIKE, 3, 9), w(REPOST, 1, 9), w(FOLLOW, 1, 3)]))
+        .await
+        .ok();
     let car = s.get_repo_car(&b.did).await;
     s.import_repo(&a.auth(), car.clone()).await.ok();
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![rk(1), rk(2), rk(3)]);
     assert_eq!(check_backlinks(&s, &a.did).await, 3);
     let raw = scan_backlinks(&s, &a.did).await;
     let k = [b"l", post_uri(9).as_bytes()].concat();
-    assert_eq!(raw.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone()), Some(format!("{}\0{}\0{}", rk(1), rk(2), rk(3)).into_bytes()));
+    assert_eq!(
+        raw.iter().find(|(key, _)| *key == k).map(|(_, v)| v.clone()),
+        Some(format!("{}\0{}\0{}", rk(1), rk(2), rk(3)).into_bytes())
+    );
     // right after the import (its state possibly still in flight)
     let kept = create(&s, &a, LIKE, rec(LIKE, 9), None).await;
     assert_eq!(rkeys(&s, &a.did, LIKE).await, vec![kept.rkey().to_string()]);
@@ -304,7 +329,8 @@ async fn replay_after_kill_reproduces_the_index() {
         cluster_node(id, store.clone(), SHARDS, |c| {
             c.checkpoint_every = Duration::from_secs(3600);
             let l = lease(c);
-            (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
+            (l.ttl, l.renew_every, l.skew) =
+                (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
         })
     };
     let a = node("bra").await;
@@ -330,7 +356,10 @@ async fn replay_after_kill_reproduces_the_index() {
         before.push(scan_backlinks(victim, &x.did).await);
     }
     victim.app.node.halt();
-    wait_until("survivor takes every shard", Duration::from_secs(20), || survivor.app.partitions.owned().len() == SHARDS as usize).await;
+    wait_until("survivor takes every shard", Duration::from_secs(20), || {
+        survivor.app.partitions.owned().len() == SHARDS as usize
+    })
+    .await;
     for (x, want) in moved.iter().zip(&before) {
         assert!(!want.is_empty());
         assert_eq!(&scan_backlinks(survivor, &x.did).await, want, "{}: replayed index", x.did);
@@ -365,13 +394,21 @@ async fn reshard_carries_the_index() {
     let cl = s.app.cluster.as_deref().unwrap();
     let slot = vlpds::slots::slot_of(&accts[0].did) as u32;
     let target = cl.layout().shards.iter().find(|r| r.lo <= slot && slot < r.hi).cloned().unwrap();
-    let r = admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true})).await.ok();
+    let r =
+        admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true}))
+            .await
+            .ok();
     assert_eq!(r["done"], json!(true), "{r}");
     for (x, want) in accts.iter().zip(&before) {
         assert_eq!(&scan_backlinks(&s, &x.did).await, want, "{}: after the split", x.did);
         check_backlinks(&s, &x.did).await;
     }
-    let kids: Vec<vlpds::slots::ShardId> = r["op"]["children"].as_array().unwrap().iter().map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32)).collect();
+    let kids: Vec<vlpds::slots::ShardId> = r["op"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| vlpds::slots::ShardId(c["id"].as_u64().unwrap() as u32))
+        .collect();
     for x in &accts {
         create(&s, x, FOLLOW, rec(FOLLOW, 1), None).await;
         assert!(!rkeys(&s, &x.did, FOLLOW).await.is_empty());
@@ -381,7 +418,12 @@ async fn reshard_carries_the_index() {
     for x in &accts {
         check_backlinks(&s, &x.did).await;
         let one = create(&s, x, FOLLOW, rec(FOLLOW, 1), None).await;
-        assert_eq!(subject_records(&s, &x.did, FOLLOW, &json!(subject_did(1))).await, vec![one.rkey().to_string()], "{}", x.did);
+        assert_eq!(
+            subject_records(&s, &x.did, FOLLOW, &json!(subject_did(1))).await,
+            vec![one.rkey().to_string()],
+            "{}",
+            x.did
+        );
         check_backlinks(&s, &x.did).await;
     }
 }
@@ -405,7 +447,12 @@ async fn duplicate_pruning_is_capped_per_commit() {
                 q.push(("cursor", c.as_str()));
             }
             let l = s.list_records(&a.did, LIKE, &q).await.ok();
-            let page: Vec<String> = l["records"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string()).collect();
+            let page: Vec<String> = l["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+                .collect();
             let done = page.is_empty();
             out.extend(page);
             match l["cursor"].as_str() {

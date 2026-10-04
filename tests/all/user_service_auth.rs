@@ -105,7 +105,12 @@ async fn bad_user_service_tokens_are_refused_with_the_reference_errors() {
 
     // a token for another method
     let t = service_token(&s, &a, &pds, Some("com.atproto.repo.createRecord"), None).await;
-    assert_err(&upload(&s, &t, body()).await, 401, "BadJwtLexiconMethod", "bad jwt lexicon method (\"lxm\"). must match: com.atproto.repo.uploadBlob");
+    assert_err(
+        &upload(&s, &t, body()).await,
+        401,
+        "BadJwtLexiconMethod",
+        "bad jwt lexicon method (\"lxm\"). must match: com.atproto.repo.uploadBlob",
+    );
 
     // addressed elsewhere: another service, or this PDS's service id (the
     // reference compares `aud` to the bare service DID exactly)
@@ -227,8 +232,16 @@ async fn user_service_auth_is_refused_on_every_other_method() {
     // (method, is a procedure, body)
     let methods: Vec<(&str, bool, J)> = vec![
         ("com.atproto.repo.createRecord", true, post()),
-        ("com.atproto.repo.putRecord", true, json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "x", "record": post_record("x")})),
-        ("com.atproto.repo.deleteRecord", true, json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "x"})),
+        (
+            "com.atproto.repo.putRecord",
+            true,
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "x", "record": post_record("x")}),
+        ),
+        (
+            "com.atproto.repo.deleteRecord",
+            true,
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "x"}),
+        ),
         ("com.atproto.repo.applyWrites", true, json!({"repo": a.did, "writes": []})),
         ("com.atproto.repo.listMissingBlobs", false, J::Null),
         ("com.atproto.repo.importRepo", true, J::Null),
@@ -282,10 +295,10 @@ async fn user_service_auth_is_refused_on_every_other_method() {
 /// (passes it through) and uploads the result to the user's PDS with that
 /// token, answering a completed job with the blob.
 async fn stub_video_service(pds_url: String) -> String {
-    use axum::Json;
     use axum::extract::{Query, State};
     use axum::http::HeaderMap;
     use axum::routing::{get, post};
+    use axum::Json;
     use std::collections::HashMap;
     async fn upload_video(
         State(pds): State<String>,

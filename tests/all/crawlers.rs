@@ -5,8 +5,8 @@
 //! sends once, not once per node.
 
 use crate::common::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 struct Relay {
@@ -105,7 +105,11 @@ async fn console_settings_round_trip_and_override_flags() {
     // crawl-now with nothing configured
     s.xrpc.post("vlpds.admin.requestCrawl", &json!({}), &Auth::Admin).await.err(400, "InvalidRequest");
 
-    for bad in [json!({"relays": ["not a host"]}), json!({"relays": ["https://relay.example.com/path"]}), json!({"intervalSecs": 0})] {
+    for bad in [
+        json!({"relays": ["not a host"]}),
+        json!({"relays": ["https://relay.example.com/path"]}),
+        json!({"intervalSecs": 0}),
+    ] {
         set(&s, bad.clone()).await.err(400, "InvalidRequest");
     }
     let v = set(&s, json!({"relays": [format!("{}/", relay.url), relay.url], "intervalSecs": 3600})).await.ok();
@@ -122,7 +126,11 @@ async fn console_settings_round_trip_and_override_flags() {
 
     // crawl now ignores the throttle and reports per relay
     let r = s.xrpc.post("vlpds.admin.requestCrawl", &json!({}), &Auth::Admin).await.ok();
-    assert_eq!((r["results"][0]["relay"].as_str(), r["results"][0]["ok"].as_bool()), (Some(relay.url.as_str()), Some(true)), "{r}");
+    assert_eq!(
+        (r["results"][0]["relay"].as_str(), r["results"][0]["ok"].as_bool()),
+        (Some(relay.url.as_str()), Some(true)),
+        "{r}"
+    );
     assert_eq!(relay.calls(), 2);
     // a later activity is within the hour: no ask
     let a = s.create_account("crawlset").await;
@@ -135,7 +143,11 @@ async fn console_settings_round_trip_and_override_flags() {
     assert_eq!((v["relays"].as_array().map(Vec::len), v["intervalSecs"].as_u64()), (Some(1), Some(60)), "{v}");
     // null: back to the flags (none here)
     let v = set(&s, json!({"relays": null, "intervalSecs": null})).await.ok();
-    assert_eq!((v["relays"].as_array().map(Vec::len), v["relaysSource"].as_str(), v["intervalSource"].as_str()), (Some(0), Some("flags"), Some("flags")), "{v}");
+    assert_eq!(
+        (v["relays"].as_array().map(Vec::len), v["relaysSource"].as_str(), v["intervalSource"].as_str()),
+        (Some(0), Some("flags"), Some("flags")),
+        "{v}"
+    );
     assert_eq!(v["intervalSecs"], 1200, "{v}");
 }
 

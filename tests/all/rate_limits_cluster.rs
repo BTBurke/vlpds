@@ -42,7 +42,14 @@ fn set_limits(nodes: &[&TestServer], doc: J) {
 }
 
 /// One request into `n`'s router from client `ip` (the TCP peer).
-async fn call(n: &TestServer, ip: &str, method: &str, uri: &str, headers: &[(&str, &str)], body: Option<J>) -> (u16, J) {
+async fn call(
+    n: &TestServer,
+    ip: &str,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Option<J>,
+) -> (u16, J) {
     let peer = SocketAddr::new(ip.parse::<IpAddr>().unwrap(), 40000);
     let mut b = axum::http::Request::builder().method(method).uri(uri);
     for (k, v) in headers {
@@ -63,7 +70,14 @@ async fn call(n: &TestServer, ip: &str, method: &str, uri: &str, headers: &[(&st
     (status, serde_json::from_slice(&bytes).unwrap_or(J::Null))
 }
 
-async fn sign_in(n: &TestServer, ip: &str, uri: &str, headers: &[(&str, &str)], ident: &str, password: &str) -> (u16, J) {
+async fn sign_in(
+    n: &TestServer,
+    ip: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    ident: &str,
+    password: &str,
+) -> (u16, J) {
     call(n, ip, "POST", uri, headers, Some(json!({"identifier": ident, "password": password}))).await
 }
 
@@ -155,11 +169,17 @@ async fn create_session_account_cap_across_nodes() {
     use base64::Engine;
     let sub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json!({"sub": other.did}).to_string());
     let auth = format!("Bearer x.{sub}.y");
-    let (st, j) = sign_in(&b, "203.0.113.97", CREATE_SESSION, &[("authorization", &auth)], &victim.handle, PASSWORD).await;
+    let (st, j) =
+        sign_in(&b, "203.0.113.97", CREATE_SESSION, &[("authorization", &auth)], &victim.handle, PASSWORD).await;
     assert_eq!(st, 429, "a token's sub rerouted createSession: {j}");
     // only a's counters know the victim
     let has = |n: &TestServer, id: &str| {
-        n.app.ratelimit.snapshot(id, 50).top.get("sign-in-account").is_some_and(|l| l.iter().any(|c| c.key == victim.did))
+        n.app
+            .ratelimit
+            .snapshot(id, 50)
+            .top
+            .get("sign-in-account")
+            .is_some_and(|l| l.iter().any(|c| c.key == victim.did))
     };
     assert!(has(&a, "a") && !has(&b, "b"));
     // another account is unaffected
@@ -224,7 +244,8 @@ async fn oauth_endpoints_are_limited_per_ip() {
     let s = TestServer::spawn_with(|c| c.rate_limits_enabled = true).await;
     set_limits(&[&s], json!({"limiters": {"oauth-ip": {"points": 3}}}));
     for path in ["/oauth/par", "/oauth/token", "/oauth/revoke"] {
-        let (st, j) = call(&s, "192.0.2.10", "POST", path, &[("content-type", "application/x-www-form-urlencoded")], None).await;
+        let (st, j) =
+            call(&s, "192.0.2.10", "POST", path, &[("content-type", "application/x-www-form-urlencoded")], None).await;
         assert_ne!(st, 429, "{path}: {j}");
     }
     let (st, j) = call(&s, "192.0.2.10", "POST", "/oauth/token", &[], None).await;

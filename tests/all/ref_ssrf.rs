@@ -203,7 +203,8 @@ async fn proxy_to_internal_endpoints_is_refused() {
     let plc = MockPlc::start().await;
     let mut targets = Vec::new();
     for chunk in endpoints.chunks(8) {
-        let svcs: Vec<(String, String)> = chunk.iter().enumerate().map(|(i, e)| (format!("svc{i}"), e.clone())).collect();
+        let svcs: Vec<(String, String)> =
+            chunk.iter().enumerate().map(|(i, e)| (format!("svc{i}"), e.clone())).collect();
         let did = did_with_services(&plc, &svcs).await;
         targets.extend(svcs.into_iter().map(|(id, e)| (format!("{did}#{id}"), e)));
     }

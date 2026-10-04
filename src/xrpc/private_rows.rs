@@ -28,7 +28,14 @@ pub fn blob_quota_row_fixtures(did: &str) -> Vec<PrivateRow> {
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 6] = [super::server::check_row, super::admin::check_row, super::email2fa::check_row, super::proxy::check_row, super::blob_quota::check_row, check_shared_row];
+    let checks: [Check; 6] = [
+        super::server::check_row,
+        super::admin::check_row,
+        super::email2fa::check_row,
+        super::proxy::check_row,
+        super::blob_quota::check_row,
+        check_shared_row,
+    ];
     for check in checks {
         if let Some(r) = check(routing, name, val) {
             return r;
@@ -39,7 +46,10 @@ pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Resul
 
 pub(super) use super::server::to_json_bytes as enc;
 
-pub(super) fn typed_row<T: serde::Serialize + serde::de::DeserializeOwned>(kind: &'static str, val: &[u8]) -> anyhow::Result<&'static str> {
+pub(super) fn typed_row<T: serde::Serialize + serde::de::DeserializeOwned>(
+    kind: &'static str,
+    val: &[u8],
+) -> anyhow::Result<&'static str> {
     let v: T = serde_json::from_slice(val).map_err(|e| anyhow::anyhow!("{kind}: {e}"))?;
     anyhow::ensure!(serde_json::to_vec(&v)? == val, "{kind}: re-encodes differently (a field would be dropped)");
     Ok(kind)
@@ -128,12 +138,17 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         created_at: 1_790_000_000,
         last_seen_at: 1_790_000_100,
         user_agent: Some("Mozilla/5.0".into()),
-        accounts: vec![o::DeviceAccount { did: did.into(), authenticated_at: 1_790_000_050, auth_epoch: String::new() }],
+        accounts: vec![o::DeviceAccount {
+            did: did.into(),
+            authenticated_at: 1_790_000_050,
+            auth_epoch: String::new(),
+        }],
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,
         pending_2fa_epoch: String::new(),
     };
-    let authz = o::Authorization { client_id: client.into(), scopes: vec!["atproto".into()], updated_at: 1_790_000_000 };
+    let authz =
+        o::Authorization { client_id: client.into(), scopes: vec!["atproto".into()], updated_at: 1_790_000_000 };
     let lex = o::StoredLexicon {
         uri: "at://did:plc:lex/com.atproto.lexicon.schema/app.example.perms".into(),
         doc: json!({"lexicon": 1, "id": "app.example.perms"}),
@@ -155,7 +170,9 @@ fn check_shared_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow::Res
     use crate::oauth::store as o;
     Some(match name {
         // `sealed` is not stored: everything else must round-trip
-        n if n == crate::totp::PRIVATE_NAME && routing.starts_with("did:") => typed_row::<crate::totp::TotpState>("totp", val),
+        n if n == crate::totp::PRIVATE_NAME && routing.starts_with("did:") => {
+            typed_row::<crate::totp::TotpState>("totp", val)
+        }
         "oauth/req" => typed_row::<o::RequestData>("oauth request", val),
         "oauth/dev" => typed_row::<o::Device>("oauth device", val),
         "oauth/lex" => typed_row::<o::StoredLexicon>("oauth lexicon", val),

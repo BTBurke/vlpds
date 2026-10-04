@@ -153,14 +153,26 @@ async fn procedure_inputs_are_validated() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     for (nsid, body, msg) in [
-        ("com.atproto.repo.createRecord", json!({"repo": a.did, "record": {}}), "Input must have the property \"collection\""),
-        ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": "x"}), "Input/record must be an object"),
+        (
+            "com.atproto.repo.createRecord",
+            json!({"repo": a.did, "record": {}}),
+            "Input must have the property \"collection\"",
+        ),
+        (
+            "com.atproto.repo.createRecord",
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": "x"}),
+            "Input/record must be an object",
+        ),
         (
             "com.atproto.repo.createRecord",
             json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": {}, "validate": "yes"}),
             "Input/validate must be a boolean",
         ),
-        ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "not an nsid", "rkey": "x"}), "Input/collection must be a valid nsid"),
+        (
+            "com.atproto.repo.deleteRecord",
+            json!({"repo": a.did, "collection": "not an nsid", "rkey": "x"}),
+            "Input/collection must be a valid nsid",
+        ),
         (
             "com.atproto.repo.applyWrites",
             json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#nope"}]}),
@@ -171,7 +183,11 @@ async fn procedure_inputs_are_validated() {
             json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "value": {}}]}),
             "Input/writes/0 must have the property \"collection\"",
         ),
-        ("com.atproto.server.createSession", json!({"identifier": a.handle}), "Input must have the property \"password\""),
+        (
+            "com.atproto.server.createSession",
+            json!({"identifier": a.handle}),
+            "Input must have the property \"password\"",
+        ),
         ("com.atproto.server.createSession", json!([1]), "Input must be an object"),
     ] {
         let r = s.xrpc.post(nsid, &body, &a.auth()).await;
@@ -188,8 +204,14 @@ async fn query_params_are_validated() {
     let a = s.create_account("alice").await;
     for (q, msg) in [
         (vec![("repo", a.did.as_str())], "Params must have the property \"collection\""),
-        (vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "500")], "limit can not be greater than 100"),
-        (vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("reverse", "maybe")], "reverse must be a boolean"),
+        (
+            vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("limit", "500")],
+            "limit can not be greater than 100",
+        ),
+        (
+            vec![("repo", a.did.as_str()), ("collection", "app.bsky.feed.post"), ("reverse", "maybe")],
+            "reverse must be a boolean",
+        ),
         (vec![("repo", a.did.as_str()), ("collection", "nope")], "collection must be a valid nsid"),
     ] {
         let r = s.xrpc.get("com.atproto.repo.listRecords", &q, &Auth::None).await;
@@ -200,7 +222,11 @@ async fn query_params_are_validated() {
     r.err(400, "InvalidRequest");
     assert_eq!(r.json["message"], "Params must have the property \"repo\"");
     s.xrpc
-        .get("com.atproto.repo.listRecords", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("reverse", "true"), ("limit", "2")], &Auth::None)
+        .get(
+            "com.atproto.repo.listRecords",
+            &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("reverse", "true"), ("limit", "2")],
+            &Auth::None,
+        )
         .await
         .ok();
 }
@@ -211,12 +237,15 @@ async fn query_params_are_validated() {
 async fn handler_outputs_are_checked_in_debug_builds() {
     use axum::routing::get;
     use tower::ServiceExt;
-    use vlpds::xrpc::extract::{Json, debug_output_layer};
+    use vlpds::xrpc::extract::{debug_output_layer, Json};
 
     let router = debug_output_layer(
         axum::Router::new()
             .route("/xrpc/com.atproto.repo.describeRepo", get(|| async { Json(json!({"handle": "x.test"})) }))
-            .route("/xrpc/com.atproto.server.describeServer", get(|| async { Json(json!({"did": "did:web:x", "availableUserDomains": []})) }))
+            .route(
+                "/xrpc/com.atproto.server.describeServer",
+                get(|| async { Json(json!({"did": "did:web:x", "availableUserDomains": []})) }),
+            )
             // piped-through bodies (not built by a handler's Json) are not checked
             .route("/xrpc/com.atproto.repo.getRecord", get(|| async { axum::Json(json!({})) })),
     );

@@ -102,7 +102,8 @@ impl App {
     /// Checks `conds` and, if they all hold, applies `ops` in one log write.
     pub async fn private_cas(&self, routing: &str, conds: Vec<Cond>, ops: Vec<Op>) -> Result<Outcome, XrpcError> {
         if let Some(owner) = self.remote_owner(routing) {
-            let touches_sec = ops.iter().any(|o| matches!(o, Op::Put { name, .. } if name.starts_with(super::server::SEC)));
+            let touches_sec =
+                ops.iter().any(|o| matches!(o, Op::Put { name, .. } if name.starts_with(super::server::SEC)));
             let r = internal::forward_private_cas(self, &owner, routing, conds, ops).await;
             if touches_sec {
                 // the owner dropped its view; so does this node (as put_sec)
@@ -115,7 +116,12 @@ impl App {
 }
 
 /// Never forwarded again.
-pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>, ops: Vec<Op>) -> Result<Outcome, XrpcError> {
+pub(super) async fn private_cas_local(
+    app: &App,
+    routing: &str,
+    conds: Vec<Cond>,
+    ops: Vec<Op>,
+) -> Result<Outcome, XrpcError> {
     let lock = super::server::ext(app).cas_locks.get(routing);
     let _g = lock.lock().await;
     let p = app.partition(routing)?;
@@ -137,7 +143,9 @@ pub(super) async fn private_cas_local(app: &App, routing: &str, conds: Vec<Cond>
         .collect();
     for op in &ops {
         match op {
-            Op::Put { name, val } => muts.push(Mutation { key: state::private_key(routing, name).into(), val: val.clone() }),
+            Op::Put { name, val } => {
+                muts.push(Mutation { key: state::private_key(routing, name).into(), val: val.clone() })
+            }
             Op::DeletePrefix { prefix } => {
                 for (name, v) in super::server::scan_private(app, routing, prefix).await? {
                     if !put_names.contains(&name.as_str()) {

@@ -132,13 +132,15 @@ mod tests {
     #[test]
     fn notif_endpoint_needs_id_type_and_url() {
         let doc = |svc: J| json!({"id": "did:web:push.example", "service": [svc]});
-        let ok = json!({"id": "#bsky_notif", "type": "BskyNotificationService", "serviceEndpoint": "https://push.example"});
+        let ok =
+            json!({"id": "#bsky_notif", "type": "BskyNotificationService", "serviceEndpoint": "https://push.example"});
         assert_eq!(notif_endpoint(&doc(ok)).as_deref(), Some("https://push.example"));
         let full = json!({"id": "did:web:push.example#bsky_notif", "type": "BskyNotificationService", "serviceEndpoint": "https://push.example"});
         assert!(notif_endpoint(&doc(full)).is_some());
         let wrong_type = json!({"id": "#bsky_notif", "type": "Other", "serviceEndpoint": "https://push.example"});
         assert!(notif_endpoint(&doc(wrong_type)).is_none());
-        let bad_url = json!({"id": "#bsky_notif", "type": "BskyNotificationService", "serviceEndpoint": "ftp://push.example"});
+        let bad_url =
+            json!({"id": "#bsky_notif", "type": "BskyNotificationService", "serviceEndpoint": "ftp://push.example"});
         assert!(notif_endpoint(&doc(bad_url)).is_none());
         let other_id = json!({"id": "#bsky_appview", "type": "BskyNotificationService", "serviceEndpoint": "https://push.example"});
         assert!(notif_endpoint(&doc(other_id)).is_none());

@@ -33,7 +33,11 @@ impl WebUi {
         use anyhow::Context;
         if let Some(dir) = dir {
             let ui = Self::read(dir).with_context(|| format!("--ui-dir {}", dir.display()))?;
-            anyhow::ensure!(ui.og.is_some(), "--ui-dir {}: no og/manifest.json (an incomplete UI build?)", dir.display());
+            anyhow::ensure!(
+                ui.og.is_some(),
+                "--ui-dir {}: no og/manifest.json (an incomplete UI build?)",
+                dir.display()
+            );
             return Ok(ui);
         }
         let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
@@ -67,7 +71,12 @@ fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, UiFile>) -> anyhow::R
         if meta.is_dir() {
             walk(root, &path, out)?;
         } else if meta.is_file() {
-            let rel = path.strip_prefix(root)?.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let rel = path
+                .strip_prefix(root)?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
             let data = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let mime = mime_guess::from_path(&path).first_or_octet_stream();
             out.insert(rel, UiFile { data: data.into(), mime: header::HeaderValue::from_str(mime.as_ref())? });
@@ -184,10 +193,12 @@ fn origin_and_host(public_url: &str) -> (String, String) {
     let origin = public_url.trim_end_matches('/').to_string();
     let host = reqwest::Url::parse(&origin)
         .ok()
-        .and_then(|u| u.host_str().map(|h| match u.port() {
-            Some(p) => format!("{h}:{p}"),
-            None => h.to_string(),
-        }))
+        .and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(p) => format!("{h}:{p}"),
+                None => h.to_string(),
+            })
+        })
         .unwrap_or_else(|| origin.clone());
     (origin, host)
 }
@@ -245,7 +256,9 @@ async fn account_shell(State(app): AppState) -> Response {
     let (_, host) = origin_and_host(&app.config.public_url);
     let head = PageHead {
         title: "Account · vlpds".into(),
-        description: format!("Manage your AT Protocol account on {host}: sign-in security, app passwords, your repository and data."),
+        description: format!(
+            "Manage your AT Protocol account on {host}: sign-in security, app passwords, your repository and data."
+        ),
         path: "/account".into(),
         card: app.ui.og.as_ref().map(|m| &m.site),
         og_type: "website",
@@ -286,7 +299,11 @@ Your handle, followers and posts come with you."
 /// The page's slug as DocsApp reads it (`/docs` is the overview).
 fn doc_slug(path: &str) -> &str {
     let s = path.trim_start_matches("/docs").trim_matches('/');
-    if s.is_empty() { "overview" } else { s }
+    if s.is_empty() {
+        "overview"
+    } else {
+        s
+    }
 }
 
 async fn docs_shell(State(app): AppState, uri: axum::http::Uri) -> Response {
@@ -318,7 +335,9 @@ async fn docs_shell(State(app): AppState, uri: axum::http::Uri) -> Response {
 fn shell_with(app: &App, status: StatusCode, head: &PageHead, csp: &'static str) -> Response {
     let (before, after) = &app.ui.shell;
     let html = format!("{before}{}{after}", head.render(app));
-    let mut r = (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], html).into_response();
+    let mut r =
+        (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], html)
+            .into_response();
     let h = r.headers_mut();
     h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static(csp));
     h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
@@ -332,7 +351,8 @@ async fn robots(State(app): AppState) -> Response {
     let body = format!(
         "User-agent: *\nDisallow: /admin\nDisallow: /account\nDisallow: /xrpc/\nDisallow: /oauth/\nAllow: /\n\nSitemap: {origin}/sitemap.xml\n"
     );
-    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600")], body).into_response()
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600")], body)
+        .into_response()
 }
 
 /// The landing page, /migrate and every written docs page.
@@ -342,12 +362,15 @@ async fn sitemap(State(app): AppState) -> Response {
     if let Some(m) = app.ui.og.as_ref() {
         paths.extend(m.docs.iter().filter(|(_, d)| d.status != "stub").map(|(slug, _)| format!("/docs/{slug}")));
     }
-    let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
     for p in paths {
         body.push_str(&format!("  <url><loc>{}</loc></url>\n", esc(&format!("{origin}{p}"))));
     }
     body.push_str("</urlset>\n");
-    ([(header::CONTENT_TYPE, "application/xml; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600")], body).into_response()
+    ([(header::CONTENT_TYPE, "application/xml; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600")], body)
+        .into_response()
 }
 
 async fn asset(State(app): AppState, uri: axum::http::Uri) -> Response {
@@ -487,7 +510,9 @@ async fn feature_levels(c: &crate::cluster::Cluster, nodes: &[crate::cluster::No
     let common_max = nodes.iter().map(|l| l.max_level).min();
     let active = v.as_ref().map(|v| v.active);
     let finalizable = common_max.filter(|m| active.is_some_and(|a| *m > a));
-    let finalized_at = v.as_ref().and_then(|v| v.history.iter().rev().find(|h| h.level == v.active && v.history.len() > 1).map(|h| h.at.clone()));
+    let finalized_at = v.as_ref().and_then(|v| {
+        v.history.iter().rev().find(|h| h.level == v.active && v.history.len() > 1).map(|h| h.at.clone())
+    });
     let mut out = json!({
         "active": active,
         "target": v.as_ref().and_then(|v| v.target),

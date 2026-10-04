@@ -55,7 +55,14 @@ async fn legacy_blob_refs_are_indexed_on_import() {
     // not a legacy ref: an extra field
     let other = cbor(json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2023-01-01T00:00:00Z",
         "x": {"cid": Cid::raw(b"other").to_string(), "mimeType": "image/png", "size": 1}}));
-    let car = import_car(&a.did, &[("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)), ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)), ("app.bsky.feed.post/3jzfcijpj2z2c", other)]);
+    let car = import_car(
+        &a.did,
+        &[
+            ("app.bsky.feed.post/3jzfcijpj2z2a", post(&have)),
+            ("app.bsky.feed.post/3jzfcijpj2z2b", post(&missing)),
+            ("app.bsky.feed.post/3jzfcijpj2z2c", other),
+        ],
+    );
     s.import_repo(&a.auth(), car).await.ok();
     let mut cids = s.list_blobs(&a.did).await;
     cids.sort();
@@ -63,7 +70,10 @@ async fn legacy_blob_refs_are_indexed_on_import() {
     want.sort();
     assert_eq!(cids, want);
     let m = s.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &a.auth()).await.ok();
-    assert_eq!(m["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap()).collect::<Vec<_>>(), vec![missing.as_str()]);
+    assert_eq!(
+        m["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap()).collect::<Vec<_>>(),
+        vec![missing.as_str()]
+    );
     // the GC sees the reference
     vlpds::xrpc::blobs::sweep_blobs_settle(&s.app, Duration::ZERO, Duration::ZERO).await.unwrap();
     assert_eq!(s.get_blob(&a.did, &have).await.status, 200);
@@ -75,7 +85,10 @@ async fn oversized_import_records_are_refused() {
     let s = TestServer::spawn().await;
     let a = s.create_account("bigrec").await;
     let rec = |n: usize| {
-        let mut m = vec![("$type".to_string(), Value::Text("com.example.big".into())), ("b".to_string(), Value::Bytes(vec![7; n]))];
+        let mut m = vec![
+            ("$type".to_string(), Value::Text("com.example.big".into())),
+            ("b".to_string(), Value::Bytes(vec![7; n])),
+        ];
         m.sort_by(|a, b| key_cmp(&a.0, &b.0));
         Value::Map(m).to_cbor()
     };
@@ -92,7 +105,8 @@ async fn import_size_is_configurable() {
     let a = s.create_account("capped").await;
     let small = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": 1})))]);
     s.import_repo(&a.auth(), small).await.ok();
-    let big = import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": "y".repeat(5000)})))]);
+    let big =
+        import_car(&a.did, &[("com.example.x/a", cbor(json!({"$type": "com.example.x", "v": "y".repeat(5000)})))]);
     assert_eq!(s.import_repo(&a.auth(), big).await.status, 413);
 }
 
@@ -103,7 +117,10 @@ async fn unsafe_integers_are_refused_on_write() {
     let s = TestServer::spawn().await;
     let a = s.create_account("bigint").await;
     for (n, ok) in [("9007199254740991", true), ("9007199254740992", false), ("-9223372036854775808", false)] {
-        let body = format!(r#"{{"repo": "{}", "collection": "com.example.n", "record": {{"$type": "com.example.n", "n": {n}}}}}"#, a.did);
+        let body = format!(
+            r#"{{"repo": "{}", "collection": "com.example.n", "record": {{"$type": "com.example.n", "n": {n}}}}}"#,
+            a.did
+        );
         let j: J = serde_json::from_str(&body).unwrap();
         let r = s.xrpc.post("com.atproto.repo.createRecord", &j, &a.auth()).await;
         assert_eq!(r.is_ok(), ok, "{n}: {}", r.text());

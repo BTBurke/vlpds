@@ -71,7 +71,8 @@ pub struct RepoKey {
 impl RepoKey {
     /// None: the account is gone (deleted).
     pub fn of(account: &Account, head: &Head) -> Option<RepoKey> {
-        (account.status.as_deref() != Some("deleted")).then(|| RepoKey { status: status_index(account.status.as_deref()), day: day_of(head.rev) })
+        (account.status.as_deref() != Some("deleted"))
+            .then(|| RepoKey { status: status_index(account.status.as_deref()), day: day_of(head.rev) })
     }
 }
 
@@ -171,7 +172,9 @@ impl Totals {
         anyhow::ensure!(n <= 1 << 16, "totals row: {n} days");
         let mut day = 0u32;
         for _ in 0..n {
-            day = day.checked_add(u32::try_from(get_varint(&mut b)?)?).ok_or_else(|| anyhow::anyhow!("totals row: day overflow"))?;
+            day = day
+                .checked_add(u32::try_from(get_varint(&mut b)?)?)
+                .ok_or_else(|| anyhow::anyhow!("totals row: day overflow"))?;
             t.days.push((day, unzigzag(get_varint(&mut b)?)));
         }
         anyhow::ensure!(b.is_empty(), "totals row: {} trailing bytes", b.len());
@@ -253,7 +256,9 @@ impl ShardTotals {
 
     /// Every slot's rows: (slot, its row, its delta rows). One family scan;
     /// delta rows sort right after their slot's row.
-    pub async fn read<R: slatedb::DbReadOps + ?Sized>(db: &R) -> anyhow::Result<Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>> {
+    pub async fn read<R: slatedb::DbReadOps + ?Sized>(
+        db: &R,
+    ) -> anyhow::Result<Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>> {
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
         let mut scan = state::FamilyScan::new(db, FAMILY, None, &opts).await?;
         let mut out: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> = Vec::new();
@@ -294,7 +299,14 @@ impl ShardTotals {
         self.loaded = true;
     }
 
-    fn install_slot(&mut self, slot: u16, base: Option<Totals>, deltas: Vec<(Bytes, Totals)>, pending: Vec<(Bytes, Totals)>, cut: u32) {
+    fn install_slot(
+        &mut self,
+        slot: u16,
+        base: Option<Totals>,
+        deltas: Vec<(Bytes, Totals)>,
+        pending: Vec<(Bytes, Totals)>,
+        cut: u32,
+    ) {
         let mut s = Slot { row: base.unwrap_or_default(), deltas: Vec::new() };
         for (k, d) in deltas.into_iter().chain(pending) {
             if !s.deltas.contains(&k) {
@@ -344,7 +356,8 @@ impl ShardTotals {
 }
 
 /// Nodes whose totals loads wait (tests: writes while loading).
-static HELD: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> = std::sync::LazyLock::new(Default::default);
+static HELD: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Until dropped, node `node_id`'s totals loads wait before reading.
 #[doc(hidden)]
@@ -445,7 +458,10 @@ mod tests {
         apply(&mut s, d(2, k(0, today), k(1, today)), today);
         apply(&mut s, d(2, None, k(2, today - 1)), today);
         let m = apply(&mut s, d(1, k(0, today - 3), k(0, today)), today);
-        assert_eq!(Totals::decode(m[0].val.as_ref().unwrap()).unwrap(), Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)] });
+        assert_eq!(
+            Totals::decode(m[0].val.as_ref().unwrap()).unwrap(),
+            Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)] }
+        );
         let sum = s.sum().unwrap().clone();
         assert_eq!(sum.accounts, [2, 1, 1, 0, 0]);
         assert_eq!(sum.repos(), 4);
@@ -514,7 +530,11 @@ mod tests {
             let id = rng.gen_range(0..300u32);
             let slot = (id % 17) as u16;
             let before = repos.get(&id).copied();
-            let after = if rng.gen_ratio(1, 10) { None } else { Some(RepoKey { status: rng.gen_range(0..5), day: today - rng.gen_range(0..2) }) };
+            let after = if rng.gen_ratio(1, 10) {
+                None
+            } else {
+                Some(RepoKey { status: rng.gen_range(0..5), day: today - rng.gen_range(0..2) })
+            };
             match after {
                 Some(a) => repos.insert(id, a),
                 None => repos.remove(&id),
@@ -551,7 +571,12 @@ mod tests {
                 for (_, days) in WINDOWS {
                     assert_eq!(reloaded.sum().unwrap().written_within(days, today), sum.written_within(days, today));
                 }
-                assert!(db.len() <= 17 + s.pending.values().map(Vec::len).sum::<usize>() + s.slots.values().map(|x| x.deltas.len()).sum::<usize>());
+                assert!(
+                    db.len()
+                        <= 17
+                            + s.pending.values().map(Vec::len).sum::<usize>()
+                            + s.slots.values().map(|x| x.deltas.len()).sum::<usize>()
+                );
             }
         }
     }

@@ -97,10 +97,7 @@ pub fn routes() -> Router<Arc<App>> {
     Router::new()
         .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
         .route("/xrpc/app.bsky.actor.putPreferences", post(put_preferences))
-        .route(
-            "/xrpc/com.atproto.moderation.createReport",
-            post(create_report),
-        )
+        .route("/xrpc/com.atproto.moderation.createReport", post(create_report))
         .route("/xrpc/app.bsky.notification.registerPush", post(push::register_push))
         .route("/xrpc/app.bsky.notification.unregisterPush", post(push::unregister_push))
 }
@@ -108,11 +105,7 @@ pub fn routes() -> Router<Arc<App>> {
 mod push;
 
 fn xerr(status: StatusCode, error: &str, message: impl Into<String>) -> XrpcError {
-    XrpcError {
-        status,
-        error: error.into(),
-        message: message.into(),
-    }
+    XrpcError { status, error: error.into(), message: message.into() }
 }
 
 fn lxm_in(set: &[&str], lxm: &str) -> bool {
@@ -127,11 +120,9 @@ fn valid_nsid(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
     s.len() <= 317
         && parts.len() >= 3
-        && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.len() <= 63
-                && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 63 && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
 }
 
 struct Target<'a> {
@@ -157,10 +148,7 @@ fn no_service(lxm: &str) -> XrpcError {
 fn proxy_header(headers: &HeaderMap) -> XResult<Option<&str>> {
     match headers.get("atproto-proxy") {
         None => Ok(None),
-        Some(v) => v
-            .to_str()
-            .map(Some)
-            .map_err(|_| XrpcError::bad("InvalidRequest", "invalid proxy header format")),
+        Some(v) => v.to_str().map(Some).map_err(|_| XrpcError::bad("InvalidRequest", "invalid proxy header format")),
     }
 }
 
@@ -193,9 +181,7 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
     let bad = |m: &str| XrpcError::bad("InvalidRequest", m);
     let hash = match proxy_to.find('#') {
         Some(0) => return Err(bad("no did specified in proxy header")),
-        Some(i) if i == proxy_to.len() - 1 => {
-            return Err(bad("no service id specified in proxy header"))
-        }
+        Some(i) if i == proxy_to.len() - 1 => return Err(bad("no service id specified in proxy header")),
         None => return Err(bad("no service id specified in proxy header")),
         Some(i) => i,
     };
@@ -209,9 +195,7 @@ async fn parse_proxy_header<'a>(app: &'a App, proxy_to: &str) -> XResult<Target<
     if service_id == "bsky_appview" && app.config.appview.as_ref().is_some_and(|(_, av)| av == did) {
         return Ok(configured(&app.config.appview, "bsky_appview").expect("checked"));
     }
-    let doc = resolve_did(app, did)
-        .await
-        .map_err(|_| bad("could not resolve proxy did"))?;
+    let doc = resolve_did(app, did).await.map_err(|_| bad("could not resolve proxy did"))?;
     let url = did_resolver::service_endpoint(&doc, service_id)
         .ok_or_else(|| bad("could not resolve proxy did service url"))?;
     Ok(Target {
@@ -237,7 +221,12 @@ fn upstream_failure(message: &str) -> XrpcError {
 }
 
 /// The reference's allow-list.
-fn forward_headers(src: &HeaderMap, with_body: bool, authorization: Option<&str>, accept_encoding: Option<header::HeaderValue>) -> HeaderMap {
+fn forward_headers(
+    src: &HeaderMap,
+    with_body: bool,
+    authorization: Option<&str>,
+    accept_encoding: Option<header::HeaderValue>,
+) -> HeaderMap {
     const ACCEPT_LANGUAGE: header::HeaderName = header::ACCEPT_LANGUAGE;
     const ACCEPT_LABELERS: header::HeaderName = header::HeaderName::from_static("atproto-accept-labelers");
     const BSKY_TOPICS: header::HeaderName = header::HeaderName::from_static("x-bsky-topics");
@@ -273,10 +262,7 @@ fn is_json_content_type(ct: &str) -> bool {
     let Some(rest) = ct.split_once("application/").map(|(_, r)| r) else {
         return false;
     };
-    let sub: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '+')
-        .collect();
+    let sub: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '+').collect();
     sub == "json" || sub.ends_with("+json")
 }
 
@@ -319,11 +305,8 @@ impl UpstreamError {
             }
         }
         // (the reference reads it unless it says it isn't JSON)
-        let json_body = resp
-            .headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .is_none_or(is_json_content_type);
+        let json_body =
+            resp.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).is_none_or(is_json_content_type);
         let (mut error, mut message) = (None, None);
         // decodable codings only, else the body is dropped unread
         if let Some(codings) = read_after_write::codings(&resp.headers).filter(|_| json_body) {
@@ -374,7 +357,14 @@ struct Forward<'a> {
 }
 
 impl<'a> Forward<'a> {
-    fn new(method: Method, path_and_query: &'a str, headers: &'a HeaderMap, body: Option<Body>, iss: Option<&'a str>, lxm: &'a str) -> Self {
+    fn new(
+        method: Method,
+        path_and_query: &'a str,
+        headers: &'a HeaderMap,
+        body: Option<Body>,
+        iss: Option<&'a str>,
+        lxm: &'a str,
+    ) -> Self {
         Forward { method, path_and_query, headers, body, iss, lxm, aud: None, accept_encoding: None }
     }
 }
@@ -830,12 +820,7 @@ fn observe_upstream(service_id: &str, started: std::time::Instant, status: Optio
 
 /// Reference `pipethrough(ctx, req)` without an issuer, e.g. repo.getRecord
 /// for repos not hosted here.
-pub(super) async fn pipethrough_unauthed(
-    app: &App,
-    headers: &HeaderMap,
-    uri: &Uri,
-    lxm: &str,
-) -> XResult<Response> {
+pub(super) async fn pipethrough_unauthed(app: &App, headers: &HeaderMap, uri: &Uri, lxm: &str) -> XResult<Response> {
     let target = match proxy_header(headers)? {
         Some(h) => parse_proxy_header(app, h).await?,
         None => default_target(app, lxm)?
@@ -939,7 +924,8 @@ const FEED_DID_TTL: Duration = Duration::from_secs(60);
 
 /// From the feed's record on the AppView (reference getFeed.ts).
 async fn feed_generator_did(app: &App, pq: &str) -> XResult<Arc<str>> {
-    let url = reqwest::Url::parse(&format!("http://x{pq}")).map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
+    let url = reqwest::Url::parse(&format!("http://x{pq}"))
+        .map_err(|_| XrpcError::bad("InvalidRequest", "invalid xrpc path"))?;
     let feed = url
         .query_pairs()
         .find(|(k, _)| k == "feed")
@@ -951,8 +937,15 @@ async fn feed_generator_did(app: &App, pq: &str) -> XResult<Arc<str>> {
     let bad = || XrpcError::bad("InvalidRequest", "Invalid feed: must be an at-uri");
     let rest = feed.strip_prefix("at://").ok_or_else(bad)?;
     let mut parts = rest.splitn(3, '/');
-    let (repo, collection, rkey) = (parts.next().ok_or_else(bad)?, parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    let rec = appview_json(app, "com.atproto.repo.getRecord", &[("repo", repo), ("collection", collection), ("rkey", rkey)], None).await?;
+    let (repo, collection, rkey) =
+        (parts.next().ok_or_else(bad)?, parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+    let rec = appview_json(
+        app,
+        "com.atproto.repo.getRecord",
+        &[("repo", repo), ("collection", collection), ("rkey", rkey)],
+        None,
+    )
+    .await?;
     let did: Arc<str> = rec
         .pointer("/value/did")
         .and_then(|d| d.as_str())
@@ -998,9 +991,10 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
     // anything to proxy to? (before authenticating or touching the network)
     let default = match &header {
         Some(_) => None,
-        None => Some(default_target(app, &lxm)?.ok_or_else(|| {
-            xerr(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Method Not Implemented")
-        })?),
+        None => Some(
+            default_target(app, &lxm)?
+                .ok_or_else(|| xerr(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Method Not Implemented"))?,
+        ),
     };
 
     let (parts, body) = req.into_parts();
@@ -1125,12 +1119,7 @@ async fn load_prefs(app: &App, did: &str) -> XResult<Vec<J>> {
     }
 }
 
-async fn get_preferences(
-    State(app): AppState,
-    Auth(creds): Auth,
-    headers: HeaderMap,
-    uri: Uri,
-) -> XResult<Response> {
+async fn get_preferences(State(app): AppState, Auth(creds): Auth, headers: HeaderMap, uri: Uri) -> XResult<Response> {
     // the moderation service reads any account's preferences (reference
     // authorizationOrModService, the undocumented `did` parameter)
     if let Credentials::ModService { .. } = creds {
@@ -1186,7 +1175,14 @@ async fn put_preferences(
 ) -> XResult<Response> {
     let did = user_did(&creds)?.to_string();
     if let Some(target) = prefs_target(&app, &creds, &headers, PUT_PREFERENCES).await? {
-        let f = Forward::new(Method::POST, path_and_query(&uri), &headers, Some(Body::from(body)), Some(&did), PUT_PREFERENCES);
+        let f = Forward::new(
+            Method::POST,
+            path_and_query(&uri),
+            &headers,
+            Some(Body::from(body)),
+            Some(&did),
+            PUT_PREFERENCES,
+        );
         return forward(&app, &target, f, None).await;
     }
     check_takedown(&app, &did, false).await?;
@@ -1231,10 +1227,7 @@ async fn put_preferences(
         .collect();
     stored.extend(values.iter().filter(|p| pref_type(p) != Some(DECLARED_AGE_PREF)).cloned());
     let val = Bytes::from(serde_json::to_vec(&stored).map_err(XrpcError::from_err)?);
-    let m = crate::segment::Mutation {
-        key: Bytes::from(state::private_key(&did, PREFS_KEY)),
-        val: Some(val),
-    };
+    let m = crate::segment::Mutation { key: Bytes::from(state::private_key(&did, PREFS_KEY)), val: Some(val) };
     app.put_private(&did, vec![m]).await?;
     Ok(StatusCode::OK.into_response())
 }
@@ -1291,10 +1284,7 @@ mod tests {
     #[test]
     fn ages() {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 15).unwrap();
-        assert_eq!(
-            age_from_datestring("2010-06-15T00:00:00.000Z", today),
-            Some(16)
-        );
+        assert_eq!(age_from_datestring("2010-06-15T00:00:00.000Z", today), Some(16));
         assert_eq!(age_from_datestring("2010-06-16", today), Some(15));
         assert_eq!(age_from_datestring("garbage", today), None);
     }

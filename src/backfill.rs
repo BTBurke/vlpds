@@ -50,7 +50,10 @@ pub struct Pruned {
 /// A non-segment at `ordinal` that retention made: it is below the lowest
 /// object left in the log (a hole or a fence never is).
 async fn pruned_at(store: &Store, log_id: &str, ordinal: u64) -> anyhow::Result<Option<Pruned>> {
-    Ok(first_ordinal(store, log_id).await?.is_none_or(|f| f > ordinal).then(|| Pruned { log_id: log_id.to_string(), ordinal }))
+    Ok(first_ordinal(store, log_id)
+        .await?
+        .is_none_or(|f| f > ordinal)
+        .then(|| Pruned { log_id: log_id.to_string(), ordinal }))
 }
 
 /// First ordinal of `log_id` whose segment has events with seq > `after`
@@ -102,7 +105,9 @@ pub async fn first_ordinal(store: &Store, log_id: &str) -> anyhow::Result<Option
     let mut list = store.raw.list(Some(&prefix));
     while let Some(meta) = list.next().await {
         let meta = meta?;
-        if let Some(ord) = meta.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok()) {
+        if let Some(ord) =
+            meta.location.filename().and_then(|f| f.strip_suffix(".seg")).and_then(|f| f.parse::<u64>().ok())
+        {
             return Ok(Some(ord));
         }
     }
@@ -314,7 +319,12 @@ pub struct Reader {
 impl Reader {
     /// A reader with its own cache and the default read-ahead.
     pub fn new(store: Store) -> Reader {
-        Reader { store, cache: SegCache::new(DEFAULT_CACHE_BYTES), readahead_bytes: DEFAULT_READAHEAD_BYTES, shard: None }
+        Reader {
+            store,
+            cache: SegCache::new(DEFAULT_CACHE_BYTES),
+            readahead_bytes: DEFAULT_READAHEAD_BYTES,
+            shard: None,
+        }
     }
 }
 
@@ -353,7 +363,16 @@ struct LogCursor {
 
 impl LogCursor {
     fn new(log_id: String, ordinal: u64) -> LogCursor {
-        LogCursor { log_id: log_id.into(), next: ordinal, ahead: VecDeque::new(), seg: None, pos: 0, end: false, reads: 0, read_bytes: 0 }
+        LogCursor {
+            log_id: log_id.into(),
+            next: ordinal,
+            ahead: VecDeque::new(),
+            seg: None,
+            pos: 0,
+            end: false,
+            reads: 0,
+            read_bytes: 0,
+        }
     }
 
     fn head(&self) -> Option<&(i64, Bytes)> {
@@ -371,7 +390,10 @@ impl LogCursor {
     /// (estimated from the sizes seen so far) fit in `budget`.
     fn top_up(&mut self, r: &Reader, budget: usize) {
         let avg = (self.read_bytes / self.reads.max(1)).max(1);
-        while !self.end && self.ahead.len() < MAX_AHEAD && (self.ahead.is_empty() || (self.ahead.len() + 1) * avg <= budget) {
+        while !self.end
+            && self.ahead.len() < MAX_AHEAD
+            && (self.ahead.is_empty() || (self.ahead.len() + 1) * avg <= budget)
+        {
             let (r, log_id, ord) = (r.clone(), self.log_id.clone(), self.next);
             self.ahead.push_back((ord, Ahead(tokio::spawn(async move { r.cache.get(&r.store, &log_id, ord).await }))));
             self.next += 1;
@@ -404,7 +426,7 @@ impl LogCursor {
                 Fetched::End => {
                     self.end = true;
                     self.ahead.clear(); // past the hole: never read
-                    // not the end of the log: retention deleted it under us
+                                        // not the end of the log: retention deleted it under us
                     if let Some(p) = pruned_at(&r.store, &self.log_id, ord).await? {
                         return Err(p.into());
                     }
@@ -531,7 +553,14 @@ mod tests {
         assert_eq!(seqs, (1007..=1011).collect::<Vec<_>>());
         // a segment stored under the wrong ordinal is an error, not data
         put_seg(&store, "A", 12, 2000).await;
-        store.raw.put(&segment_path(&store, "A", 13), PutPayload::from(store.raw.get(&segment_path(&store, "A", 12)).await.unwrap().bytes().await.unwrap())).await.unwrap();
+        store
+            .raw
+            .put(
+                &segment_path(&store, "A", 13),
+                PutPayload::from(store.raw.get(&segment_path(&store, "A", 12)).await.unwrap().bytes().await.unwrap()),
+            )
+            .await
+            .unwrap();
         let (tx, _rx) = mpsc::channel(64);
         assert!(backfill(&store, 1011, i64::MAX, &tx).await.is_err());
     }
@@ -599,7 +628,12 @@ mod tests {
         want.sort_unstable();
 
         for readahead in [1, 400, 64 << 20] {
-            let r = Reader { store: store.clone(), cache: SegCache::new(if readahead == 1 { 0 } else { 1 << 20 }), readahead_bytes: readahead, shard: None };
+            let r = Reader {
+                store: store.clone(),
+                cache: SegCache::new(if readahead == 1 { 0 } else { 1 << 20 }),
+                readahead_bytes: readahead,
+                shard: None,
+            };
             let (last, got) = collect(&r, -1, i64::MAX).await;
             let seqs: Vec<i64> = got.iter().map(|(s, _)| *s).collect();
             assert_eq!(seqs, want, "readahead {readahead}");

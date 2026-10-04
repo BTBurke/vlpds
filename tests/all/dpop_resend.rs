@@ -29,7 +29,14 @@ async fn shard_away(n: &TestServer, did: &str, away: Duration) -> tokio::task::J
     })
 }
 
-async fn dpop_get(entry: &TestServer, client: &Client, token: &str, nsid: &str, query: &[(&str, &str)], proof: &str) -> (u16, J) {
+async fn dpop_get(
+    entry: &TestServer,
+    client: &Client,
+    token: &str,
+    nsid: &str,
+    query: &[(&str, &str)],
+    proof: &str,
+) -> (u16, J) {
     let r = reqwest::Client::new()
         .get(format!("{}/xrpc/{nsid}", entry.url))
         .query(query)

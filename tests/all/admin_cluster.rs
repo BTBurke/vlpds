@@ -84,7 +84,11 @@ async fn admin_listings_scatter_gather_across_nodes() {
     // `_invite:{code}` hashes to, possibly a peer's)
     let mut codes = Vec::new();
     for s in [&a, &b, &c] {
-        let r = s.xrpc.post("com.atproto.server.createInviteCodes", &json!({"codeCount": 3, "useCount": 1}), &Auth::Admin).await.ok();
+        let r = s
+            .xrpc
+            .post("com.atproto.server.createInviteCodes", &json!({"codeCount": 3, "useCount": 1}), &Auth::Admin)
+            .await
+            .ok();
         for c in r["codes"][0]["codes"].as_array().unwrap() {
             codes.push(c.as_str().unwrap().to_string());
         }
@@ -100,8 +104,10 @@ async fn admin_listings_scatter_gather_across_nodes() {
                 assert!(listed.contains(c), "{c} missing from cluster-wide getInviteCodes ({sort})");
             }
             if sort == "recent" {
-                let keys: Vec<(String, String)> =
-                    got.iter().map(|v| (v["createdAt"].as_str().unwrap().to_string(), v["code"].as_str().unwrap().to_string())).collect();
+                let keys: Vec<(String, String)> = got
+                    .iter()
+                    .map(|v| (v["createdAt"].as_str().unwrap().to_string(), v["code"].as_str().unwrap().to_string()))
+                    .collect();
                 let mut desc = keys.clone();
                 desc.sort_by(|x, y| y.cmp(x));
                 assert_eq!(keys, desc, "createdAt desc, code desc");
@@ -110,7 +116,11 @@ async fn admin_listings_scatter_gather_across_nodes() {
     }
 
     // single page with room to spare: no cursor
-    let r = a.xrpc.get("com.atproto.admin.searchAccounts", &[("email", &prefix), ("limit", "100")], &Auth::Admin).await.ok();
+    let r = a
+        .xrpc
+        .get("com.atproto.admin.searchAccounts", &[("email", &prefix), ("limit", "100")], &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(r["accounts"].as_array().unwrap().len(), 9);
     // the internal endpoint wants the internal token, not admin credentials
     let rb = peer_client().get(format!("{}/internal/v1/admin/searchAccounts", b.peer_url));
@@ -151,6 +161,12 @@ async fn admin_listings_single_node_complete() {
     let (got, pages) = all_pages(&s, "com.atproto.admin.searchAccounts", "accounts", &[("email", &prefix)], 2).await;
     assert_eq!(got.len(), 3);
     assert_eq!(pages.len(), 2);
-    s.xrpc.get("com.atproto.admin.getInviteCodes", &[("cursor", "no-slash")], &Auth::Admin).await.err(400, "InvalidRequest");
-    s.xrpc.get("com.atproto.admin.searchAccounts", &[("cursor", "nope")], &Auth::Admin).await.err(400, "InvalidRequest");
+    s.xrpc
+        .get("com.atproto.admin.getInviteCodes", &[("cursor", "no-slash")], &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
+    s.xrpc
+        .get("com.atproto.admin.searchAccounts", &[("cursor", "nope")], &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
 }

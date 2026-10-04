@@ -73,12 +73,18 @@ pub fn sizing(car: u64) -> Sizing {
     let batch_bytes = (car / 4).clamp(256 * KIB, 4 * MIB);
     let batch_records = super::import_stream::BATCH_RECORDS as u64;
     let records = car / MIN_CAR_PER_RECORD + 1;
-    let bloom_words = (records * BLOOM_BITS_PER_LINK).div_ceil(64).next_power_of_two().clamp(16, MAX_BLOOM_WORDS as u64);
+    let bloom_words =
+        (records * BLOOM_BITS_PER_LINK).div_ceil(64).next_power_of_two().clamp(16, MAX_BLOOM_WORDS as u64);
     let window = LIVE_BATCHES * (2 * batch_bytes + RECORD_OVERHEAD * batch_records);
     let batches = window.min(REPO_FACTOR * car);
     let body = car.min(super::import_stream::SPILL_AFTER as u64);
     let working_set = (FIXED + body + batches + bloom_words * 8).clamp(MIN_WORKING_SET, MAX_WORKING_SET);
-    Sizing { batch_bytes: batch_bytes as usize, batch_records: batch_records as usize, bloom_words: bloom_words as usize, working_set }
+    Sizing {
+        batch_bytes: batch_bytes as usize,
+        batch_records: batch_records as usize,
+        bloom_words: bloom_words as usize,
+        working_set,
+    }
 }
 
 /// The buffered fallback holds the whole body and its parse.
@@ -272,7 +278,9 @@ impl ImportBudget {
             metrics::IMPORT_ADMISSIONS.with_label_values(&["rejected"]).inc();
             return Err(overloaded());
         }
-        metrics::IMPORT_ADMISSIONS.with_label_values(&[if waited > Duration::from_millis(1) { "waited" } else { "admitted" }]).inc();
+        metrics::IMPORT_ADMISSIONS
+            .with_label_values(&[if waited > Duration::from_millis(1) { "waited" } else { "admitted" }])
+            .inc();
         metrics::IMPORTS.with_label_values(&["running"]).inc();
         metrics::IMPORT_RESERVED_BYTES.add(need as i64);
         Ok(Arc::new(Reservation {
@@ -359,7 +367,9 @@ impl Reservation {
             if waited > Duration::from_millis(1) {
                 metrics::IMPORT_WAIT_SECONDS.with_label_values(&["grow"]).observe(waited.as_secs_f64());
             }
-            metrics::IMPORT_GROWTHS.with_label_values(&[if waited > Duration::from_millis(1) { "waited" } else { "granted" }]).inc();
+            metrics::IMPORT_GROWTHS
+                .with_label_values(&[if waited > Duration::from_millis(1) { "waited" } else { "granted" }])
+                .inc();
             metrics::IMPORT_RESERVED_BYTES.add(n as i64);
             let mut h = self.held.lock();
             h.0 += n;
@@ -396,7 +406,12 @@ mod tests {
         let ws = |q: f64| sizing(car(quantile(q))).working_set;
         for q in [0.5, 0.9, 0.99, 0.999, 1.0] {
             let s = sizing(car(quantile(q)));
-            println!("p{q}: {} records, CAR {} KiB -> {s:?} ({} KiB)", quantile(q), car(quantile(q)) >> 10, s.working_set >> 10);
+            println!(
+                "p{q}: {} records, CAR {} KiB -> {s:?} ({} KiB)",
+                quantile(q),
+                car(quantile(q)) >> 10,
+                s.working_set >> 10
+            );
         }
         assert_eq!(ws(0.5), MIN_WORKING_SET);
         assert!(ws(0.9) <= MIB, "{}", ws(0.9));
@@ -466,7 +481,11 @@ mod tests {
         drop(a);
         // a large one waiting on the budget itself: a small one behind it
         // waits too
-        let fill: Vec<_> = futures::future::join_all((0..30).map(|_| b.admit(Some(MIB)))).await.into_iter().map(|r| r.ok().unwrap()).collect();
+        let fill: Vec<_> = futures::future::join_all((0..30).map(|_| b.admit(Some(MIB))))
+            .await
+            .into_iter()
+            .map(|r| r.ok().unwrap())
+            .collect();
         assert!(b.total - b.reserved() < sizing(40 * MIB).working_set);
         let queued_big = tokio::spawn({
             let b = b.clone();
@@ -492,7 +511,11 @@ mod tests {
     async fn growth_goes_first_and_fails_cleanly() {
         let b = budget(4 * MIB);
         let r = b.admit(None).await.ok().unwrap();
-        let mut fill: Vec<_> = futures::future::join_all((0..7).map(|_| b.admit(Some(1000)))).await.into_iter().map(|r| r.ok().unwrap()).collect();
+        let mut fill: Vec<_> = futures::future::join_all((0..7).map(|_| b.admit(Some(1000))))
+            .await
+            .into_iter()
+            .map(|r| r.ok().unwrap())
+            .collect();
         let waiter = tokio::spawn({
             let b = b.clone();
             async move { b.admit(Some(1000)).await.is_ok() }
@@ -521,7 +544,11 @@ mod tests {
     #[tokio::test]
     async fn cancelled_waiters_leak_nothing() {
         let b = budget(2 * MIB);
-        let held: Vec<_> = futures::future::join_all((0..4).map(|_| b.admit(Some(1000)))).await.into_iter().map(|r| r.ok().unwrap()).collect();
+        let held: Vec<_> = futures::future::join_all((0..4).map(|_| b.admit(Some(1000))))
+            .await
+            .into_iter()
+            .map(|r| r.ok().unwrap())
+            .collect();
         let t = tokio::spawn({
             let b = b.clone();
             async move { b.admit(Some(1000)).await.is_ok() }

@@ -8,11 +8,11 @@ use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::Engine;
 use k256::ecdsa::signature::Verifier;
 use parking_lot::Mutex;
-use serde_json::{Value as J, json};
+use serde_json::{json, Value as J};
 use std::sync::Arc;
 
 const APPVIEW_DID: &str = "did:web:appview.test";
@@ -125,7 +125,15 @@ impl Env {
     }
 
     async fn signing_key(&self, did: &str) -> k256::ecdsa::VerifyingKey {
-        let v: J = self.http.get(format!("{}/xrpc/com.atproto.repo.describeRepo?repo={did}", self.url)).send().await.unwrap().json().await.unwrap();
+        let v: J = self
+            .http
+            .get(format!("{}/xrpc/com.atproto.repo.describeRepo?repo={did}", self.url))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let mb = v["didDoc"]["verificationMethod"][0]["publicKeyMultibase"].as_str().unwrap();
         let raw = bs58::decode(mb.strip_prefix('z').unwrap()).into_vec().unwrap();
         k256::ecdsa::VerifyingKey::from_sec1_bytes(&raw[2..]).unwrap()

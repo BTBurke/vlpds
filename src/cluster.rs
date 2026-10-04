@@ -334,7 +334,10 @@ pub struct Cluster {
 pub enum FinalizeError {
     Invalid(String),
     /// (node id, rev, min level, max level) of live nodes that can't run it.
-    Incompatible { level: u32, nodes: Vec<(String, String, u32, u32)> },
+    Incompatible {
+        level: u32,
+        nodes: Vec<(String, String, u32, u32)>,
+    },
     /// Retry.
     Store(anyhow::Error),
 }
@@ -344,7 +347,8 @@ impl std::fmt::Display for FinalizeError {
         match self {
             FinalizeError::Invalid(m) => write!(f, "{m}"),
             FinalizeError::Incompatible { level, nodes } => {
-                let list: Vec<String> = nodes.iter().map(|(n, rev, min, max)| format!("{n} (rev {rev}, levels {min}..={max})")).collect();
+                let list: Vec<String> =
+                    nodes.iter().map(|(n, rev, min, max)| format!("{n} (rev {rev}, levels {min}..={max})")).collect();
                 write!(f, "nodes that can't run level {level}: {}", list.join(", "))
             }
             FinalizeError::Store(e) => write!(f, "{e:#}"),
@@ -592,7 +596,11 @@ impl Cluster {
             if let Some((l, etag)) = self.get_json::<Layout>(&path).await? {
                 l.validate()?;
                 if l.shards.len() != self.cfg.shards as usize && l.version == 1 {
-                    tracing::warn!(configured = self.cfg.shards, layout = l.shards.len(), "--shards differs from this prefix's layout: the layout wins");
+                    tracing::warn!(
+                        configured = self.cfg.shards,
+                        layout = l.shards.len(),
+                        "--shards differs from this prefix's layout: the layout wins"
+                    );
                 }
                 break (l, etag);
             }
@@ -671,7 +679,10 @@ impl Cluster {
             return Ok(());
         };
         if !self.cfg.levels.contains(v.active) {
-            let why = format!("cluster level {} is outside this build's levels {}..={}", v.active, self.cfg.levels.min, self.cfg.levels.max);
+            let why = format!(
+                "cluster level {} is outside this build's levels {}..={}",
+                v.active, self.cfg.levels.min, self.cfg.levels.max
+            );
             return Err(version::refuse(&self.cfg.node_id, &why));
         }
         self.observed_version(v);
@@ -699,16 +710,24 @@ impl Cluster {
             return Ok(cur);
         }
         if level < cur.active {
-            return Err(FinalizeError::Invalid(format!("level {level} is below the active level {}: levels are never lowered", cur.active)));
+            return Err(FinalizeError::Invalid(format!(
+                "level {level} is below the active level {}: levels are never lowered",
+                cur.active
+            )));
         }
         if !self.cfg.levels.contains(level) {
-            return Err(FinalizeError::Invalid(format!("this node runs levels {}..={}, not {level}", self.cfg.levels.min, self.cfg.levels.max)));
+            return Err(FinalizeError::Invalid(format!(
+                "this node runs levels {}..={}, not {level}",
+                self.cfg.levels.min, self.cfg.levels.max
+            )));
         }
         let mut next = cur.clone();
         next.target = Some(level);
         let etag = match self.put_json(&path, &next, if_match(etag)).await {
             Ok(e) => e,
-            Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
+            Err(e) if is_conflict(&e) => {
+                return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT)))
+            }
             Err(e) => return Err(FinalizeError::Store(e.into())),
         };
         tracing::info!(level, by, "feature level raise: target written");
@@ -738,12 +757,19 @@ impl Cluster {
                         self.observed_version(v.clone());
                         Ok(v)
                     }
-                    _ => Err(FinalizeError::Store(anyhow::anyhow!("{} changed during the raise: retry", version::OBJECT))),
+                    _ => Err(FinalizeError::Store(anyhow::anyhow!(
+                        "{} changed during the raise: retry",
+                        version::OBJECT
+                    ))),
                 };
             }
             Err(e) => return Err(FinalizeError::Store(e.into())),
         }
-        tracing::warn!(level, by, "cluster feature level raised (finalized): rollback to older builds is no longer possible");
+        tracing::warn!(
+            level,
+            by,
+            "cluster feature level raised (finalized): rollback to older builds is no longer possible"
+        );
         self.observed_version(next.clone());
         Ok(next)
     }
@@ -791,7 +817,12 @@ impl Cluster {
     }
 
     /// Tests pose as builds with wire-only levels.
-    pub(crate) async fn lower_level_with(&self, table: &[version::Level], level: u32, by: &str) -> Result<ClusterVersion, FinalizeError> {
+    pub(crate) async fn lower_level_with(
+        &self,
+        table: &[version::Level],
+        level: u32,
+        by: &str,
+    ) -> Result<ClusterVersion, FinalizeError> {
         let path = self.path(version::OBJECT);
         let Some((cur, etag)) = self.read_version().await? else {
             return Err(FinalizeError::Invalid(format!("{} is missing", version::OBJECT)));
@@ -800,7 +831,10 @@ impl Cluster {
             return Ok(cur);
         }
         if let Some(t) = cur.target {
-            return Err(FinalizeError::Invalid(format!("a raise to level {t} is in progress (clear it with `cluster finalize --level {}`)", cur.active)));
+            return Err(FinalizeError::Invalid(format!(
+                "a raise to level {t} is in progress (clear it with `cluster finalize --level {}`)",
+                cur.active
+            )));
         }
         version::check_lower(table, cur.active, level).map_err(FinalizeError::Invalid)?;
         let offenders = self.leases_unable(level).await?;
@@ -812,7 +846,9 @@ impl Cluster {
         next.history.push(version::Change::new(level, by));
         match self.put_json(&path, &next, if_match(etag)).await {
             Ok(_) => {}
-            Err(e) if is_conflict(&e) => return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT))),
+            Err(e) if is_conflict(&e) => {
+                return Err(FinalizeError::Store(anyhow::anyhow!("{} changed concurrently: retry", version::OBJECT)))
+            }
             Err(e) => return Err(FinalizeError::Store(e.into())),
         }
         tracing::warn!(from = cur.active, level, by, "cluster feature level lowered");
@@ -860,7 +896,12 @@ impl Cluster {
         self.bounded.load(Ordering::Acquire).then(|| self.cfg.ttl.min(Duration::from_secs(5)))
     }
 
-    async fn with_deadline<T, E>(&self, op: &str, f: impl std::future::Future<Output = Result<T, E>>, timed_out: impl FnOnce(String) -> E) -> Result<T, E> {
+    async fn with_deadline<T, E>(
+        &self,
+        op: &str,
+        f: impl std::future::Future<Output = Result<T, E>>,
+        timed_out: impl FnOnce(String) -> E,
+    ) -> Result<T, E> {
         let Some(d) = self.call_deadline() else { return f.await };
         match tokio::time::timeout(d, f).await {
             Ok(r) => r,
@@ -871,15 +912,26 @@ impl Cluster {
         }
     }
 
-    async fn bounded_any<T>(&self, op: &str, f: impl std::future::Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+    async fn bounded_any<T>(
+        &self,
+        op: &str,
+        f: impl std::future::Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
         self.with_deadline(op, f, |m| anyhow::anyhow!(m)).await
     }
 
-    pub(crate) async fn bounded<T>(&self, op: &str, f: impl std::future::Future<Output = Result<T, object_store::Error>>) -> Result<T, object_store::Error> {
+    pub(crate) async fn bounded<T>(
+        &self,
+        op: &str,
+        f: impl std::future::Future<Output = Result<T, object_store::Error>>,
+    ) -> Result<T, object_store::Error> {
         self.with_deadline(op, f, |m| object_store::Error::Generic { store: "cluster", source: m.into() }).await
     }
 
-    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &Path) -> anyhow::Result<Option<(T, Option<String>)>> {
+    pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &Path,
+    ) -> anyhow::Result<Option<(T, Option<String>)>> {
         self.count("get");
         let got = self
             .bounded("get", async {
@@ -895,12 +947,22 @@ impl Cluster {
         }
     }
 
-    pub(crate) async fn put_json<T: Serialize>(&self, path: &Path, v: &T, mode: PutMode) -> Result<Option<String>, object_store::Error> {
+    pub(crate) async fn put_json<T: Serialize>(
+        &self,
+        path: &Path,
+        v: &T,
+        mode: PutMode,
+    ) -> Result<Option<String>, object_store::Error> {
         self.bounded("put", self.put_json_unbounded(path, v, mode)).await
     }
 
     /// Renewals: never cancelled.
-    async fn put_json_unbounded<T: Serialize>(&self, path: &Path, v: &T, mode: PutMode) -> Result<Option<String>, object_store::Error> {
+    async fn put_json_unbounded<T: Serialize>(
+        &self,
+        path: &Path,
+        v: &T,
+        mode: PutMode,
+    ) -> Result<Option<String>, object_store::Error> {
         self.count("put");
         let body = PutPayload::from(serde_json::to_vec(v).unwrap());
         self.store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
@@ -945,7 +1007,9 @@ impl Cluster {
                 None => PutMode::Create,
                 Some((v, etag)) => {
                     let holder = v["node_id"].as_str().unwrap_or_default().to_string();
-                    if holder != self.cfg.node_id && self.get_json::<NodeLease>(&self.path(&format!("nodes/{holder}"))).await?.is_some() {
+                    if holder != self.cfg.node_id
+                        && self.get_json::<NodeLease>(&self.path(&format!("nodes/{holder}"))).await?.is_some()
+                    {
                         continue;
                     }
                     if_match(etag)
@@ -1081,13 +1145,18 @@ impl Cluster {
             // An existing fence is the log's end: every fencer must agree on
             // it, so never stack another one after it.
             self.count("list");
-            let (next, fenced) = self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, log_id)).await?;
+            let (next, fenced) =
+                self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, log_id)).await?;
             if !fenced {
                 let path = crate::nodelog::segment_path(&self.store, log_id, next);
                 self.count("put");
                 // a fence PUT that times out and lands later is found by the
                 // next attempt's scan (or collides with it: conflict path)
-                let put = self.store.raw.put_opts(&path, PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)), PutOptions { mode: PutMode::Create, ..Default::default() });
+                let put = self.store.raw.put_opts(
+                    &path,
+                    PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)),
+                    PutOptions { mode: PutMode::Create, ..Default::default() },
+                );
                 match self.bounded("fence", put).await {
                     Ok(_) => {
                         if let Some(reason) = takeover {
@@ -1164,7 +1233,10 @@ impl Cluster {
                 }
                 let lapsed_for = Instant::now().saturating_duration_since(*me.valid_until.read());
                 if lapsed_for > me.cfg.skew * 2 {
-                    tracing::error!(lapsed_ms = lapsed_for.as_millis() as u64, "node lease lapsed past takeover: fail-stop");
+                    tracing::error!(
+                        lapsed_ms = lapsed_for.as_millis() as u64,
+                        "node lease lapsed past takeover: fail-stop"
+                    );
                     h.lost();
                     return;
                 }
@@ -1247,7 +1319,11 @@ impl Cluster {
     }
 
     /// One that fails to open is released (nothing was logged for it).
-    async fn open_acquired(&self, host: &Arc<dyn ShardHost>, shards: Vec<(ShardId, u64, Vec<Span>)>) -> anyhow::Result<()> {
+    async fn open_acquired(
+        &self,
+        host: &Arc<dyn ShardHost>,
+        shards: Vec<(ShardId, u64, Vec<Span>)>,
+    ) -> anyhow::Result<()> {
         {
             let mut opened = self.opened.write();
             let (mut at, now) = (self.opened_at.write(), Instant::now());
@@ -1291,7 +1367,8 @@ impl Cluster {
         if !peers.is_empty() && !self.spawned.load(Ordering::Acquire) {
             return false;
         }
-        let confirmed = |l: &NodeLease, c: &HashMap<String, i64>| l.follows.get(&self.log_id).or_else(|| c.get(&l.log_id)).copied();
+        let confirmed =
+            |l: &NodeLease, c: &HashMap<String, i64>| l.follows.get(&self.log_id).or_else(|| c.get(&l.log_id)).copied();
         let mut floor = self.join_floor.load(Ordering::Acquire);
         let mut pending = Vec::new();
         {
@@ -1317,7 +1394,11 @@ impl Cluster {
                 }
             }
             if !missing.is_empty() {
-                tracing::info!(?missing, after_ms = self.joined_at.elapsed().as_millis() as u64, "not joining yet: peers not following our log");
+                tracing::info!(
+                    ?missing,
+                    after_ms = self.joined_at.elapsed().as_millis() as u64,
+                    "not joining yet: peers not following our log"
+                );
                 return false;
             }
         }
@@ -1333,7 +1414,11 @@ impl Cluster {
         }
         self.joined.store(true, Ordering::Release);
         self.lease.write().joined = true;
-        tracing::info!(after_ms = self.joined_at.elapsed().as_millis() as u64, peers = peers.len(), "every peer follows our log: joined");
+        tracing::info!(
+            after_ms = self.joined_at.elapsed().as_millis() as u64,
+            peers = peers.len(),
+            "every peer follows our log: joined"
+        );
         self.renew(host).await;
         true
     }
@@ -1403,7 +1488,11 @@ impl Cluster {
                     host.lost();
                 }
                 _ => {
-                    let kind = if e.downcast_ref::<object_store::Error>().is_some_and(crate::objstats::is_timeout) { "timeout" } else { "error" };
+                    let kind = if e.downcast_ref::<object_store::Error>().is_some_and(crate::objstats::is_timeout) {
+                        "timeout"
+                    } else {
+                        "error"
+                    };
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&[kind]).inc();
                     tracing::warn!("node lease renew error (will retry): {e:#}");
                 }
@@ -1468,7 +1557,9 @@ impl Cluster {
             let seen = self.seen.read();
             listed
                 .iter()
-                .filter(|(id, etag)| *id != self.cfg.node_id && (etag.is_none() || seen.get(id).is_none_or(|s| s.etag != *etag)))
+                .filter(|(id, etag)| {
+                    *id != self.cfg.node_id && (etag.is_none() || seen.get(id).is_none_or(|s| s.etag != *etag))
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -1495,7 +1586,8 @@ impl Cluster {
                     Some((lease, etag)) => {
                         let same = seen.get(&id).filter(|s| s.lease.log_id == lease.log_id);
                         let first_seen = same.map_or(now, |s| s.first_seen);
-                        let changed_at = same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
+                        let changed_at =
+                            same.filter(|s| s.lease.renewals == lease.renewals).map_or(now, |s| s.changed_at);
                         seen.insert(id, Seen { etag, lease, changed_at, first_seen });
                     }
                 }
@@ -1563,7 +1655,9 @@ impl Cluster {
                 .collect()
         };
         let fetched: Vec<(ShardId, Option<Versioned<Assignment>>)> = futures::stream::iter(stale)
-            .map(|s| async move { self.get_json::<Assignment>(&self.path(&format!("assign/{}", s.key()))).await.map(|a| (s, a)) })
+            .map(|s| async move {
+                self.get_json::<Assignment>(&self.path(&format!("assign/{}", s.key()))).await.map(|a| (s, a))
+            })
             .buffered(32)
             .collect::<Vec<_>>()
             .await
@@ -1597,7 +1691,12 @@ impl Cluster {
         if l.next_id < cur.0.next_id {
             // every layout write derives from the current one, so the id
             // allocator only grows; one that went back would reuse ids
-            tracing::error!(version = l.version, next_id = l.next_id.0, ours = cur.0.next_id.0, "shard layout's id allocator went backwards: ignored");
+            tracing::error!(
+                version = l.version,
+                next_id = l.next_id.0,
+                ours = cur.0.next_id.0,
+                "shard layout's id allocator went backwards: ignored"
+            );
             return cur.0.clone();
         }
         let changed = l.version > cur.0.version;
@@ -1717,13 +1816,18 @@ impl Cluster {
         }
         // dead nodes whose shards have all moved can be forgotten
         for d in &dead {
-            if !assigns.values().any(|(a, _)| a.owner.as_deref() == Some(&d.node_id)) && self.fenced.read().contains_key(&d.log_id) {
+            if !assigns.values().any(|(a, _)| a.owner.as_deref() == Some(&d.node_id))
+                && self.fenced.read().contains_key(&d.log_id)
+            {
                 self.forget_dead(d).await?;
             }
         }
         // an early return above leaves this false
         let layout = self.layout();
-        let settled = lone && layout.op.is_none() && self.handed.lock().is_empty() && layout.ids().iter().all(|s| self.is_owner(*s));
+        let settled = lone
+            && layout.op.is_none()
+            && self.handed.lock().is_empty()
+            && layout.ids().iter().all(|s| self.is_owner(*s));
         self.settled.store(settled, Ordering::Release);
         Ok(())
     }
@@ -1731,7 +1835,11 @@ impl Cluster {
     /// (live, dead) leases. A lone node reuses its view, but still lists
     /// `nodes/` at least once per TTL, so a joiner whose greeting never
     /// arrives is seen anyway.
-    async fn membership(&self, host: &Arc<dyn ShardHost>, was_lone: bool) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
+    async fn membership(
+        &self,
+        host: &Arc<dyn ShardHost>,
+        was_lone: bool,
+    ) -> anyhow::Result<(Vec<NodeLease>, Vec<NodeLease>)> {
         let skip = was_lone && self.joined() && {
             let (at, reused) = *self.nodes_listed.lock();
             let per_ttl = (self.cfg.ttl.as_nanos() / self.cfg.renew_every.as_nanos().max(1)).max(1) as u32;
@@ -1750,7 +1858,8 @@ impl Cluster {
         let (live, dead) = self.read_nodes(host).await?;
         *self.nodes_listed.lock() = (Some(started), 0);
         let mut peers = self.peers.write();
-        *peers = live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
+        *peers =
+            live.iter().filter(|l| l.node_id != self.cfg.node_id).map(|l| (l.node_id.clone(), l.clone())).collect();
         self.alone.store(peers.is_empty(), Ordering::Release);
         Ok((live, dead))
     }
@@ -1764,11 +1873,21 @@ impl Cluster {
     /// opened, for a shard we no longer hold. Nobody else would ever take it
     /// (we look alive), and nothing of it was logged since its close, so our
     /// span may end now.
-    async fn retry_unreleased(&self, host: &Arc<dyn ShardHost>, layout: &Layout, assigns: &BTreeMap<ShardId, Versioned<Assignment>>) {
+    async fn retry_unreleased(
+        &self,
+        host: &Arc<dyn ShardHost>,
+        layout: &Layout,
+        assigns: &BTreeMap<ShardId, Versioned<Assignment>>,
+    ) {
         let unreleased: Vec<ShardId> = layout
             .ids()
             .into_iter()
-            .filter(|s| !self.is_owner(*s) && assigns.get(s).is_some_and(|(a, _)| self.names_us(a) && self.opened.read().get(s).is_some_and(|&e| e >= a.epoch)))
+            .filter(|s| {
+                !self.is_owner(*s)
+                    && assigns.get(s).is_some_and(|(a, _)| {
+                        self.names_us(a) && self.opened.read().get(s).is_some_and(|&e| e >= a.epoch)
+                    })
+            })
             .collect();
         for s in unreleased {
             let frozen = layout.op.as_ref().filter(|o| o.parents.contains(&s)).map(|o| o.id);
@@ -1783,7 +1902,14 @@ impl Cluster {
     /// short of their share. Parents of a reshard stay (they are about to
     /// freeze), and shards we opened most recently go last (a split's
     /// children). False if we fail-stopped.
-    async fn hand_back_extras(&self, host: &Arc<dyn ShardHost>, layout: &Layout, owned: &[ShardId], fair: usize, live: usize) -> bool {
+    async fn hand_back_extras(
+        &self,
+        host: &Arc<dyn ShardHost>,
+        layout: &Layout,
+        owned: &[ShardId],
+        fair: usize,
+        live: usize,
+    ) -> bool {
         let settled = self.settled_peers();
         let keep = layout.shards.len().div_ceil(settled.len() + 1);
         if owned.len() <= keep {
@@ -1872,7 +1998,8 @@ impl Cluster {
             }
             let mut history = cur.history.clone();
             let mut seq_floor = cur.seq_floor;
-            let stale_self = cur.owner.as_deref() == Some(&self.cfg.node_id) && cur.log_id.as_deref() != Some(&self.log_id);
+            let stale_self =
+                cur.owner.as_deref() == Some(&self.cfg.node_id) && cur.log_id.as_deref() != Some(&self.log_id);
             let mut restarted = stale_self;
             if let Some(o) = cur.owner.as_deref().filter(|o| live_ids.contains(*o) && !stale_self) {
                 // unless the assignment names an earlier incarnation of it
@@ -1988,7 +2115,13 @@ impl Cluster {
     /// publish, so it is never released: we fail-stop instead, and a
     /// successor fences our log and replays it. False if we fail-stopped.
     /// `frozen`: release them frozen for that reshard op (`to` empty).
-    pub(crate) async fn close_and_release(&self, host: &Arc<dyn ShardHost>, shards: Vec<ShardId>, mut to: Vec<(NodeLease, usize)>, frozen: Option<u64>) -> bool {
+    pub(crate) async fn close_and_release(
+        &self,
+        host: &Arc<dyn ShardHost>,
+        shards: Vec<ShardId>,
+        mut to: Vec<(NodeLease, usize)>,
+        frozen: Option<u64>,
+    ) -> bool {
         use futures::StreamExt;
         if shards.is_empty() {
             return true;
@@ -2015,7 +2148,11 @@ impl Cluster {
                 plan.entry(l.addr.clone()).or_default().push(*s);
             }
             host.prewarm(plan.into_iter().collect()).await;
-            tracing::info!(shards = dest.len(), elapsed_ms = started.elapsed().as_millis() as u64, "recipients prewarmed");
+            tracing::info!(
+                shards = dest.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "recipients prewarmed"
+            );
         }
         let closed = host.close_many(shards).await;
         if frozen.is_some() && crate::reshard::crash_at(&self.cfg.node_id, "closed") {
@@ -2046,7 +2183,8 @@ impl Cluster {
             .collect()
             .await;
         // a stale route forwards to us, and we no longer own the shard
-        let mut nudges: HashMap<String, Vec<Handoff>> = self.peers.read().values().map(|l| (l.addr.clone(), Vec::new())).collect();
+        let mut nudges: HashMap<String, Vec<Handoff>> =
+            self.peers.read().values().map(|l| (l.addr.clone(), Vec::new())).collect();
         for (dest, r) in released {
             match r {
                 Ok(Some(h)) => nudges.entry(dest.map(|l| l.addr).unwrap_or_default()).or_default().push(h),
@@ -2057,7 +2195,12 @@ impl Cluster {
             }
         }
         let handed: usize = nudges.values().map(|v| v.len()).sum();
-        tracing::info!(shards = n, handed, elapsed_ms = started.elapsed().as_millis() as u64, "closed and released shards");
+        tracing::info!(
+            shards = n,
+            handed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "closed and released shards"
+        );
         let nudges: Vec<(String, Vec<Handoff>)> = nudges.into_iter().filter(|(a, _)| !a.is_empty()).collect();
         crate::metrics::CLUSTER_NUDGES.with_label_values(&["sent"]).inc_by(nudges.len() as u64);
         host.nudge(nudges).await;
@@ -2071,7 +2214,14 @@ impl Cluster {
     /// Closes our span at `end` (exclusive): unowned, or handed to `to` (the
     /// next epoch, with an open span for it). CAS against the cached
     /// assignment; re-read once on a conflict. Returns the handoff for `to`.
-    async fn release(&self, shard: ShardId, end: u64, seq_floor: i64, to: Option<&NodeLease>, frozen: Option<u64>) -> anyhow::Result<Option<Handoff>> {
+    async fn release(
+        &self,
+        shard: ShardId,
+        end: u64,
+        seq_floor: i64,
+        to: Option<&NodeLease>,
+        frozen: Option<u64>,
+    ) -> anyhow::Result<Option<Handoff>> {
         let path = self.path(&format!("assign/{}", shard.key()));
         let mut cur = self.assigns.read().get(&shard).cloned().filter(|(_, e)| e.is_some());
         for attempt in 0..2 {
@@ -2113,7 +2263,12 @@ impl Cluster {
                     // Its span starts at the ordinal its lease published (a
                     // lower bound), and never inside an earlier span of the
                     // same log: replay markers must map to one span.
-                    let start = a.history.iter().filter(|sp| sp.log_id == l.log_id).filter_map(|sp| sp.end).fold(l.next_ordinal, u64::max);
+                    let start = a
+                        .history
+                        .iter()
+                        .filter(|sp| sp.log_id == l.log_id)
+                        .filter_map(|sp| sp.end)
+                        .fold(l.next_ordinal, u64::max);
                     a.epoch += 1;
                     a.owner = Some(l.node_id.clone());
                     a.addr = Some(l.addr.clone());
@@ -2145,7 +2300,12 @@ impl Cluster {
     /// assignment, so the lease is re-read: an incarnation writes its lease
     /// before any assignment, so a lease read after the assignment that
     /// still names another log names a later one. `leases` caches re-reads.
-    async fn superseded(&self, o: &str, log: Option<&str>, leases: &mut HashMap<String, Option<String>>) -> anyhow::Result<bool> {
+    async fn superseded(
+        &self,
+        o: &str,
+        log: Option<&str>,
+        leases: &mut HashMap<String, Option<String>>,
+    ) -> anyhow::Result<bool> {
         let Some(log) = log else { return Ok(false) };
         let listed = self.peers.read().get(o).map(|l| l.log_id.clone());
         if listed.is_none_or(|l| l == log) {
@@ -2157,7 +2317,12 @@ impl Cluster {
         }
         let fresh = leases[o].as_deref();
         if fresh.is_some_and(|f| f != log) {
-            tracing::warn!(owner = o, stale_log = log, live_log = fresh, "shard still names an earlier incarnation of its live owner: taking it over");
+            tracing::warn!(
+                owner = o,
+                stale_log = log,
+                live_log = fresh,
+                "shard still names an earlier incarnation of its live owner: taking it over"
+            );
             return Ok(true);
         }
         Ok(false)
@@ -2175,7 +2340,12 @@ impl Cluster {
                 .filter_map(|s| {
                     let (a, e) = assigns.get(&s)?;
                     let ours = self.names_us(a) && served.get(&s) == Some(&a.epoch);
-                    (ours && e.is_some() && a.frozen.is_none() && a.history.len() > TRIM_SPANS && a.history.iter().any(|sp| sp.epoch < a.epoch)).then(|| (s, a.clone(), e.clone()))
+                    (ours
+                        && e.is_some()
+                        && a.frozen.is_none()
+                        && a.history.len() > TRIM_SPANS
+                        && a.history.iter().any(|sp| sp.epoch < a.epoch))
+                    .then(|| (s, a.clone(), e.clone()))
                 })
                 .filter(|(s, ..)| host.checkpointed(*s))
                 .collect()
@@ -2186,7 +2356,11 @@ impl Cluster {
             let path = self.path(&format!("assign/{}", s.key()));
             match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
-                    tracing::info!(shard = s.0, spans = a.history.len(), "trimmed a shard's history to our span (checkpointed in it)");
+                    tracing::info!(
+                        shard = s.0,
+                        spans = a.history.len(),
+                        "trimmed a shard's history to our span (checkpointed in it)"
+                    );
                     self.assigns.write().insert(s, (a, e));
                 }
                 Err(e) => {
@@ -2226,7 +2400,9 @@ impl Cluster {
             }
         }
         let assigns = self.assigns.read().clone();
-        shards.extend(assigns.iter().filter(|(s, (a, _))| layout.contains(**s) && self.handed_to_us(**s, a)).map(|(s, _)| *s));
+        shards.extend(
+            assigns.iter().filter(|(s, (a, _))| layout.contains(**s) && self.handed_to_us(**s, a)).map(|(s, _)| *s),
+        );
         if !self.close_and_release(host, shards, to, None).await {
             return Ok(()); // fail-stopped (host.lost)
         }
@@ -2289,7 +2465,11 @@ impl Cluster {
                 tracing::error!(attempts = attempt, "fencing our log on shutdown failed: giving up: {e:#}");
                 return Err(e);
             }
-            tracing::warn!(attempt, retry_in_ms = backoff.min(left).as_millis() as u64, "fencing our log on shutdown failed (retrying): {e:#}");
+            tracing::warn!(
+                attempt,
+                retry_in_ms = backoff.min(left).as_millis() as u64,
+                "fencing our log on shutdown failed (retrying): {e:#}"
+            );
             tokio::time::sleep(backoff.min(left)).await;
             backoff = (backoff * 2).min(Duration::from_secs(5));
             attempt += 1;
@@ -2354,7 +2534,9 @@ mod tests {
         async fn close_many(&self, v: Vec<ShardId>) -> Vec<(ShardId, anyhow::Result<()>)> {
             self.closed.lock().push(v.clone());
             let fail = self.fail_close.lock().clone();
-            v.into_iter().map(|s| (s, if fail.contains(&s) { Err(anyhow::anyhow!("barrier timed out")) } else { Ok(()) })).collect()
+            v.into_iter()
+                .map(|s| (s, if fail.contains(&s) { Err(anyhow::anyhow!("barrier timed out")) } else { Ok(()) }))
+                .collect()
         }
         fn checkpointed(&self, _shard: ShardId) -> bool {
             self.checkpointed.load(Ordering::SeqCst)
@@ -2438,7 +2620,8 @@ mod tests {
         let id = format!("lease-metrics-{}", crate::tid::now_micros());
         let restarts0 = crate::metrics::PEER_TAKEOVERS.with_label_values(&["restart"]).get();
         let a = join(cfg(&id), store.clone()).await.unwrap();
-        let (timed0, conflicts0) = (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
+        let (timed0, conflicts0) =
+            (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
         a.renew(&hd).await;
         assert!(crate::metrics::LEASE_RENEW_SECONDS.get_sample_count() > timed0);
         let v = a.lease_validity_secs();
@@ -2483,7 +2666,11 @@ mod tests {
         let store = Store::memory(None);
         let log = "dead.1";
         for ord in 0..3 {
-            store.raw.put(&crate::nodelog::segment_path(&store, log, ord), segment(log, ord, 100 + ord as i64)).await.unwrap();
+            store
+                .raw
+                .put(&crate::nodelog::segment_path(&store, log, ord), segment(log, ord, 100 + ord as i64))
+                .await
+                .unwrap();
         }
         for ord in 4..6u64 {
             let mut b = crate::segment::SegmentBuilder::new();
@@ -2498,7 +2685,11 @@ mod tests {
         assert_eq!(b.fence(log).await.unwrap(), (3, 102), "a second fencer finds the same end instead of stacking one");
         let r = store
             .raw
-            .put_opts(&crate::nodelog::segment_path(&store, log, 3), segment(log, 3, 103), PutOptions { mode: PutMode::Create, ..Default::default() })
+            .put_opts(
+                &crate::nodelog::segment_path(&store, log, 3),
+                segment(log, 3, 103),
+                PutOptions { mode: PutMode::Create, ..Default::default() },
+            )
             .await;
         assert!(r.is_err(), "the zombie's in-flight segment collides with the fence");
     }
@@ -2526,9 +2717,17 @@ mod tests {
         assert_eq!((nudged[0].0.as_str(), nudged[0].1.len()), ("http://b", 4), "carrying the 4 handoffs");
         for h in &nudged[0].1 {
             let a = &h.assignment;
-            assert_eq!((a.owner.as_deref(), a.log_id.as_deref(), a.epoch), (Some("b"), Some(b.log_id.as_str()), 2), "handed straight to b");
+            assert_eq!(
+                (a.owner.as_deref(), a.log_id.as_deref(), a.epoch),
+                (Some("b"), Some(b.log_id.as_str()), 2),
+                "handed straight to b"
+            );
             assert_eq!(a.history.len(), 2);
-            assert_eq!(a.history[1], Span { log_id: b.log_id.clone(), epoch: 2, start: 0, end: None }, "b's span opens at b's published ordinal");
+            assert_eq!(
+                a.history[1],
+                Span { log_id: b.log_id.clone(), epoch: 2, start: 0, end: None },
+                "b's span opens at b's published ordinal"
+            );
         }
         // b adopts them from the nudge, with no control-plane read
         let before = b.store_requests();
@@ -2564,7 +2763,11 @@ mod tests {
         // a zombie write at the fence ordinal now collides
         let r = store
             .raw
-            .put_opts(&crate::nodelog::segment_path(&store, &a.log_id, 8), PutPayload::from_static(b"zombie"), PutOptions { mode: PutMode::Create, ..Default::default() })
+            .put_opts(
+                &crate::nodelog::segment_path(&store, &a.log_id, 8),
+                PutPayload::from_static(b"zombie"),
+                PutOptions { mode: PutMode::Create, ..Default::default() },
+            )
             .await;
         assert!(r.is_err(), "zombie append must fail");
         // and a stepping again (it has no valid lease) fail-stops: its
@@ -2614,7 +2817,11 @@ mod tests {
         assert_eq!(opened.len(), 5);
         let (s, epoch, hist) = opened.last().unwrap();
         assert_eq!((*s, *epoch, hist.len()), (ShardId(7), 3, 2), "{hist:?}");
-        assert_eq!((hist[1].log_id.as_str(), hist[1].epoch, hist[1].end.is_some()), (b.log_id.as_str(), 2, true), "b's span closed and replayed");
+        assert_eq!(
+            (hist[1].log_id.as_str(), hist[1].epoch, hist[1].end.is_some()),
+            (b.log_id.as_str(), 2, true),
+            "b's span closed and replayed"
+        );
     }
 
     /// No timer lets a joiner in: while a live peer doesn't confirm it
@@ -2720,7 +2927,11 @@ mod tests {
         d.step(&hd).await.unwrap();
         assert_eq!(d.owned().len(), 8);
         for ord in 0..segs {
-            store.raw.put(&crate::nodelog::segment_path(store, &d.log_id, ord), segment(&d.log_id, ord, 100 + ord as i64)).await.unwrap();
+            store
+                .raw
+                .put(&crate::nodelog::segment_path(store, &d.log_id, ord), segment(&d.log_id, ord, 100 + ord as i64))
+                .await
+                .unwrap();
         }
         d.halt();
         d
@@ -2751,7 +2962,11 @@ mod tests {
         assert!(s0.history.iter().any(|sp| sp.log_id == d.log_id && sp.end == Some(3)), "{:?}", s0.history);
         assert!(s0.history.len() <= 2, "a failed open leaves no span behind: {:?}", s0.history);
         let assigns = all_assigns(&store).await;
-        assert_eq!(crate::retention::needed_by(&d.log_id, &assigns, &HashMap::new()), Some(ShardId(0)), "retention keeps the dead log");
+        assert_eq!(
+            crate::retention::needed_by(&d.log_id, &assigns, &HashMap::new()),
+            Some(ShardId(0)),
+            "retention keeps the dead log"
+        );
         // the open finally succeeds: it replays the dead span
         ha.fail_open.lock().clear();
         a.step(&ha_dyn).await.unwrap();
@@ -2805,7 +3020,11 @@ mod tests {
         let s0 = read_assign(&store, ShardId(0)).await;
         assert_eq!((s0.history.len(), s0.applied_epoch), (1, s0.epoch), "{s0:?}");
         assert_eq!(s0.history[0].log_id, b.log_id);
-        assert_eq!(crate::retention::needed_by(&d.log_id, &all_assigns(&store).await, &HashMap::new()), None, "the dead log is no longer needed");
+        assert_eq!(
+            crate::retention::needed_by(&d.log_id, &all_assigns(&store).await, &HashMap::new()),
+            None,
+            "the dead log is no longer needed"
+        );
     }
 
     /// A same-id restart before peers presumed the old incarnation dead: b1
@@ -2832,11 +3051,21 @@ mod tests {
             b2.step(&hb2_dyn).await.unwrap();
             a.step(&ha_dyn).await.unwrap();
             let assigns = all_assigns(&store).await;
-            let served = assigns.values().filter(|x| x.log_id.as_deref() == Some(a.log_id.as_str()) || x.log_id.as_deref() == Some(b2.log_id.as_str())).count();
+            let served = assigns
+                .values()
+                .filter(|x| {
+                    x.log_id.as_deref() == Some(a.log_id.as_str()) || x.log_id.as_deref() == Some(b2.log_id.as_str())
+                })
+                .count();
             if served == 8 && a.owned().len() + b2.owned().len() == 8 {
                 break;
             }
-            assert!(t.elapsed() < Duration::from_secs(3), "stranded: a {:?}, b2 {:?}, {assigns:?}", a.owned(), b2.owned());
+            assert!(
+                t.elapsed() < Duration::from_secs(3),
+                "stranded: a {:?}, b2 {:?}, {assigns:?}",
+                a.owned(),
+                b2.owned()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert!(a.fenced_logs().contains_key(&b1.log_id) || b2.fenced_logs().contains_key(&b1.log_id));
@@ -2884,7 +3113,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(first_seen.elapsed() < Duration::from_secs(3), "never took over");
         }
-        assert!(first_seen.elapsed() >= Duration::from_millis(700), "full ttl + skew from first sight: {:?}", first_seen.elapsed());
+        assert!(
+            first_seen.elapsed() >= Duration::from_millis(700),
+            "full ttl + skew from first sight: {:?}",
+            first_seen.elapsed()
+        );
         assert!(c.fenced_logs().contains_key(&a.log_id));
         assert_eq!(hc.lost.load(Ordering::SeqCst), 0);
     }
@@ -2924,22 +3157,38 @@ mod tests {
 
     #[async_trait::async_trait]
     impl object_store::ObjectStore for Stalls {
-        async fn put_opts(&self, location: &Path, payload: PutPayload, opts: PutOptions) -> object_store::Result<object_store::PutResult> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
             if self.take("put", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
             }
             if self.take("conflict", location.as_ref()) {
-                return Err(object_store::Error::Precondition { path: location.to_string(), source: "armed conflict".into() });
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "armed conflict".into(),
+                });
             }
             if self.take("fail", location.as_ref()) {
                 return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
             self.inner.put_opts(location, payload, opts).await
         }
-        async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
             if self.take("get", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
             }
@@ -2951,10 +3200,16 @@ mod tests {
             }
             self.inner.get_opts(location, options).await
         }
-        fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
             self.inner.delete_stream(locations)
         }
-        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
             use futures::StreamExt;
             let inner = self.inner.list(prefix);
             if self.take("list", prefix.map_or("", |p| p.as_ref())) {
@@ -2970,7 +3225,12 @@ mod tests {
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> object_store::Result<object_store::ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
@@ -2998,7 +3258,12 @@ mod tests {
         let (hb, hb_dyn) = host();
         while b.owned().len() < 8 {
             let _ = b.step(&hb_dyn).await; // a stalled call fails the step
-            assert!(died.elapsed() < Duration::from_secs(10), "takeover stalled: {:?} owned after {:?}", b.owned(), died.elapsed());
+            assert!(
+                died.elapsed() < Duration::from_secs(10),
+                "takeover stalled: {:?} owned after {:?}",
+                b.owned(),
+                died.elapsed()
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         // ttl + skew (700 ms) + at most a step, plus one deadline (600 ms)
@@ -3033,7 +3298,8 @@ mod tests {
         assert!(new.fenced_logs().contains_key(&old.log_id));
         let (lease, _) = new.get_json::<NodeLease>(&new.path("nodes/r")).await.unwrap().expect("our lease");
         assert_eq!((lease.log_id.as_str(), lease.writer), (new.log_id.as_str(), new.writer));
-        let (claim, _) = new.get_json::<serde_json::Value>(&new.path(&format!("writers/{:03}", new.writer))).await.unwrap().unwrap();
+        let (claim, _) =
+            new.get_json::<serde_json::Value>(&new.path(&format!("writers/{:03}", new.writer))).await.unwrap().unwrap();
         assert_eq!((claim["log_id"].as_str(), claim["confirmed"].as_bool()), (Some(new.log_id.as_str()), Some(true)));
         // it renews, and takes its previous incarnation's shards back (once
         // its seqs pass the old one's published watermark cap)
@@ -3090,7 +3356,8 @@ mod tests {
         let new = join(cfg("fd"), store.clone()).await.unwrap();
         let p = join(cfg("fd-peer"), store.clone()).await.unwrap();
         p.forget_dead(&dead).await.unwrap();
-        let (l, _) = p.get_json::<NodeLease>(&p.path("nodes/fd")).await.unwrap().expect("the restarted node's lease stays");
+        let (l, _) =
+            p.get_json::<NodeLease>(&p.path("nodes/fd")).await.unwrap().expect("the restarted node's lease stays");
         assert_eq!(l.log_id, new.log_id);
         p.forget_dead(&new.own_lease()).await.unwrap();
         assert!(p.get_json::<NodeLease>(&p.path("nodes/fd")).await.unwrap().is_none());
@@ -3137,7 +3404,12 @@ mod tests {
                 let r = store.raw.get(&Path::from(format!("{}/assign/{}", store.prefix, s.key()))).await.unwrap();
                 let a: Assignment = serde_json::from_slice(&r.bytes().await.unwrap()).unwrap();
                 let n = nodes.iter().find(|n| n.cfg.node_id == *h).unwrap();
-                assert_eq!((a.owner.as_deref(), a.log_id.as_deref()), (Some(*h), Some(n.log_id.as_str())), "shard {}", s.0);
+                assert_eq!(
+                    (a.owner.as_deref(), a.log_id.as_deref()),
+                    (Some(*h), Some(n.log_id.as_str())),
+                    "shard {}",
+                    s.0
+                );
             }
         }
     }
@@ -3238,16 +3510,21 @@ mod tests {
         a.test_ignore_hellos(true);
         a.step(&ha_dyn).await.unwrap();
         a.step(&ha_dyn).await.unwrap(); // settled: reduced listing from here
-        // b's lease appears right after a's last `LIST nodes/` (the worst
-        // case); its greeting is lost, and its peers confirm only through
-        // their leases (`follows`)
+                                        // b's lease appears right after a's last `LIST nodes/` (the worst
+                                        // case); its greeting is lost, and its peers confirm only through
+                                        // their leases (`follows`)
         let b = lone_join(cfg("b"), store.clone()).await.unwrap();
         let (hb, hb_dyn) = host();
         hb.unheard.store(true, Ordering::SeqCst);
         let t0 = Instant::now();
         let (mut seen, mut joined) = (None, None);
         while a.owned().len() != 4 || b.owned().len() != 4 {
-            assert!(t0.elapsed() < Duration::from_secs(3), "b never got its share: a {:?} b {:?}", a.owned(), b.owned());
+            assert!(
+                t0.elapsed() < Duration::from_secs(3),
+                "b never got its share: a {:?} b {:?}",
+                a.owned(),
+                b.owned()
+            );
             a.step(&ha_dyn).await.unwrap();
             if seen.is_none() && !a.peers().is_empty() {
                 seen = Some(t0.elapsed());
@@ -3267,7 +3544,10 @@ mod tests {
             tokio::time::sleep(a.cfg.renew_every).await;
         }
         let seen = seen.unwrap();
-        eprintln!("lost hello: a saw b after {seen:?}, b joined after {joined:?}, shares settled after {:?}", t0.elapsed());
+        eprintln!(
+            "lost hello: a saw b after {seen:?}, b joined after {joined:?}, shares settled after {:?}",
+            t0.elapsed()
+        );
         // a step lists nodes/ at most TTL/renew steps apart (+ the steps' own time)
         assert!(seen <= a.cfg.ttl + a.cfg.renew_every * 2, "a saw b after {seen:?}");
         assert!(t0.elapsed() <= a.cfg.ttl + a.cfg.renew_every * 8, "b got its share after {:?}", t0.elapsed());
@@ -3333,7 +3613,10 @@ mod tests {
         let e = a.shutdown(&ha_dyn).await.unwrap_err();
         assert!(format!("{e:#}").contains("fencing our log on shutdown"), "{e:#}");
         let took = t0.elapsed();
-        assert!(took >= a.shutdown_fence_budget() && took < a.shutdown_fence_budget() + Duration::from_secs(2), "{took:?}");
+        assert!(
+            took >= a.shutdown_fence_budget() && took < a.shutdown_fence_budget() + Duration::from_secs(2),
+            "{took:?}"
+        );
         assert!(stalls.stalled.load(Ordering::SeqCst) >= 3, "retried with backoff");
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "no fail-stop from the cluster: the caller exits");
         assert!(!crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1, "not fenced");
@@ -3360,7 +3643,11 @@ mod tests {
         static R: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
         let r = R.get_or_init(|| Mutex::new(Vec::new()));
         static HOOK: std::sync::Once = std::sync::Once::new();
-        HOOK.call_once(|| version::set_refuse_hook(Some(Arc::new(|node: &str, why: &str| refusals().lock().push((node.into(), why.into()))))));
+        HOOK.call_once(|| {
+            version::set_refuse_hook(Some(Arc::new(|node: &str, why: &str| {
+                refusals().lock().push((node.into(), why.into()))
+            })))
+        });
         r
     }
 
@@ -3375,12 +3662,24 @@ mod tests {
 
     async fn put_version(store: &Store, active: u32, target: Option<u32>) {
         let v = ClusterVersion { target, ..ClusterVersion::new(active, "test") };
-        store.raw.put(&Path::from(format!("{}/{}", store.prefix, version::OBJECT)), PutPayload::from(serde_json::to_vec(&v).unwrap())).await.unwrap();
+        store
+            .raw
+            .put(
+                &Path::from(format!("{}/{}", store.prefix, version::OBJECT)),
+                PutPayload::from(serde_json::to_vec(&v).unwrap()),
+            )
+            .await
+            .unwrap();
     }
 
     async fn objects(store: &Store, rel: &str) -> Vec<String> {
         use futures::StreamExt;
-        store.raw.list(Some(&Path::from(format!("{}/{rel}", store.prefix)))).map(|m| m.unwrap().location.to_string()).collect().await
+        store
+            .raw
+            .list(Some(&Path::from(format!("{}/{rel}", store.prefix))))
+            .map(|m| m.unwrap().location.to_string())
+            .collect()
+            .await
     }
 
     /// A fresh prefix starts at the first node's max level. Leases advertise
@@ -3407,7 +3706,11 @@ mod tests {
         assert!(format!("{err:#}").contains(version::EXIT_REASON), "{err:#}");
         assert_eq!(refused(&id).len(), 1, "fail-stop 7 hook ran once");
         assert!(refused(&id)[0].contains("outside"), "{:?}", refused(&id));
-        assert!(objects(&store, "nodes").await.is_empty() && objects(&store, "writers").await.is_empty() && objects(&store, "assign").await.is_empty());
+        assert!(
+            objects(&store, "nodes").await.is_empty()
+                && objects(&store, "writers").await.is_empty()
+                && objects(&store, "assign").await.is_empty()
+        );
         // a build that can no longer read the active level, and one that is
         // older than a raise in progress, are refused too
         let id2 = format!("new-{}", crate::tid::now_micros());
@@ -3454,7 +3757,9 @@ mod tests {
         let new = join(levels("fin-new", 1, 2), store.clone()).await.unwrap();
         assert_eq!(new.cluster_version().unwrap().active, 1, "created by the level-1 build");
         match new.finalize_level(2, "op").await {
-            Err(FinalizeError::Incompatible { level: 2, nodes }) => assert_eq!(nodes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), [old_id.as_str()]),
+            Err(FinalizeError::Incompatible { level: 2, nodes }) => {
+                assert_eq!(nodes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>(), [old_id.as_str()])
+            }
             r => panic!("{r:?}"),
         }
         let (v, _) = new.read_version().await.unwrap().unwrap();
@@ -3464,7 +3769,10 @@ mod tests {
         let (_, ho) = host();
         old.shutdown(&ho).await.unwrap();
         let v = new.finalize_level(2, "op").await.unwrap();
-        assert_eq!((v.active, v.target, v.history.last().unwrap().level, v.history.last().unwrap().by.as_str()), (2, None, 2, "op"));
+        assert_eq!(
+            (v.active, v.target, v.history.last().unwrap().level, v.history.last().unwrap().by.as_str()),
+            (2, None, 2, "op")
+        );
         assert_eq!(new.finalize_level(2, "op").await.unwrap().active, 2, "idempotent");
         // a finalize that died after its target: nodes that can't run the
         // target refuse until a finalize at the active level clears it
@@ -3498,25 +3806,37 @@ mod tests {
     /// table (level 1 persistent, and the test level) lowers nothing.
     #[tokio::test]
     async fn lower_only_wire_levels_every_node_can_run() {
-        let l = |level, persistent| version::Level { level, name: "x", description: "", persistent, segment_magic: None };
+        let l =
+            |level, persistent| version::Level { level, name: "x", description: "", persistent, segment_magic: None };
         let table = [l(1, true), l(2, false), l(3, false)];
         let store = Store::memory(None);
         put_version(&store, 3, None).await;
         let a = join(levels("low-a", 1, 3), store.clone()).await.unwrap();
         let b = join(levels("low-b", 2, 3), store.clone()).await.unwrap();
         match a.lower_level_with(&table, 1, "op").await {
-            Err(FinalizeError::Incompatible { level: 1, nodes }) => assert_eq!(nodes.iter().map(|n| (n.0.as_str(), n.2)).collect::<Vec<_>>(), [("low-b", 2)]),
+            Err(FinalizeError::Incompatible { level: 1, nodes }) => {
+                assert_eq!(nodes.iter().map(|n| (n.0.as_str(), n.2)).collect::<Vec<_>>(), [("low-b", 2)])
+            }
             r => panic!("{r:?}"),
         }
         let v = a.lower_level_with(&table, 2, "op").await.unwrap();
         assert_eq!((v.active, v.history.last().unwrap().level, v.history.len()), (2, 2, 2));
         assert_eq!(b.lower_level_with(&table, 2, "op").await.unwrap().active, 2, "already there");
-        assert!(matches!(a.lower_level_with(&table, 3, "op").await, Err(FinalizeError::Invalid(_))), "lowering never raises");
-        assert!(matches!(a.lower_level(1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("unknown") || m.contains("persistent")));
+        assert!(
+            matches!(a.lower_level_with(&table, 3, "op").await, Err(FinalizeError::Invalid(_))),
+            "lowering never raises"
+        );
+        assert!(
+            matches!(a.lower_level(1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("unknown") || m.contains("persistent"))
+        );
         let persistent = [l(1, true), l(2, true)];
-        assert!(matches!(a.lower_level_with(&persistent, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("persistent")));
+        assert!(
+            matches!(a.lower_level_with(&persistent, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("persistent"))
+        );
         put_version(&store, 2, Some(3)).await;
-        assert!(matches!(a.lower_level_with(&table, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("in progress")));
+        assert!(
+            matches!(a.lower_level_with(&table, 1, "op").await, Err(FinalizeError::Invalid(m)) if m.contains("in progress"))
+        );
         version::set_active(1);
     }
 
@@ -3570,7 +3890,10 @@ mod tests {
                 assert!(matches!(raised, Err(FinalizeError::Incompatible { .. })), "round {i}: {raised:?}");
             }
             if raised.is_ok() {
-                assert!(!objects(&store, "nodes").await.iter().any(|o| o.ends_with(&old_id)), "round {i}: no lease left");
+                assert!(
+                    !objects(&store, "nodes").await.iter().any(|o| o.ends_with(&old_id)),
+                    "round {i}: no lease left"
+                );
             }
         }
         version::set_active(1);
@@ -3590,10 +3913,20 @@ mod tests {
         let (_, ha) = host();
         a.step(&ha).await.unwrap();
         assert!(a.is_owner(ShardId(0)));
-        let got: serde_json::Value = serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
-        assert_eq!((got["epoch"].as_u64(), &got["placement"]), (Some(4), &serde_json::json!({"zone": "b"})), "acquired: {got}");
+        let got: serde_json::Value =
+            serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            (got["epoch"].as_u64(), &got["placement"]),
+            (Some(4), &serde_json::json!({"zone": "b"})),
+            "acquired: {got}"
+        );
         a.release(ShardId(0), 1, 0, None, None).await.unwrap();
-        let got: serde_json::Value = serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
-        assert_eq!((&got["owner"], &got["placement"]), (&serde_json::Value::Null, &serde_json::json!({"zone": "b"})), "released: {got}");
+        let got: serde_json::Value =
+            serde_json::from_slice(&store.raw.get(&path).await.unwrap().bytes().await.unwrap()).unwrap();
+        assert_eq!(
+            (&got["owner"], &got["placement"]),
+            (&serde_json::Value::Null, &serde_json::json!({"zone": "b"})),
+            "released: {got}"
+        );
     }
 }

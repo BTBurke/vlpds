@@ -123,7 +123,11 @@ pub fn collection_family(collection: &str) -> Vec<u8> {
 }
 
 pub fn blob_ref_key(did: &str, gen: u64, blob: &crate::cid::Cid, path: &str) -> Vec<u8> {
-    keyed(did, BLOB_REF_FAMILY, &[did.as_bytes(), b"\0", &Gen(gen).bytes(), blob.to_string().as_bytes(), b"\0", path.as_bytes()])
+    keyed(
+        did,
+        BLOB_REF_FAMILY,
+        &[did.as_bytes(), b"\0", &Gen(gen).bytes(), blob.to_string().as_bytes(), b"\0", path.as_bytes()],
+    )
 }
 
 pub fn blob_ref_prefix(did: &str, gen: u64) -> Vec<u8> {
@@ -189,7 +193,8 @@ pub const BACKLINK_FAMILY: &[u8] = b"bl/";
 
 /// The families whose keys carry the repo's generation: a generation's rows
 /// are exactly these prefixes ([`gen_prefix`]).
-pub const GEN_FAMILIES: [&[u8]; 5] = [RECORD_FAMILY, RECORD_CID_FAMILY, BLOB_REF_FAMILY, BACKLINK_FAMILY, MST_NODE_FAMILY];
+pub const GEN_FAMILIES: [&[u8]; 5] =
+    [RECORD_FAMILY, RECORD_CID_FAMILY, BLOB_REF_FAMILY, BACKLINK_FAMILY, MST_NODE_FAMILY];
 
 /// A repo generation in keys: LEB128, which is prefix-free, so no
 /// generation's range holds another's keys.
@@ -287,13 +292,16 @@ impl ImportState {
     }
 
     pub fn decode(b: &[u8]) -> anyhow::Result<ImportState> {
-        let u64_at = |i: usize| -> anyhow::Result<u64> { Ok(u64::from_be_bytes(b.get(i..i + 8).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?)) };
+        let u64_at = |i: usize| -> anyhow::Result<u64> {
+            Ok(u64::from_be_bytes(b.get(i..i + 8).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?))
+        };
         let (staging, mut at) = match b.first() {
             Some(0) => (None, 1),
             Some(1) => (Some(Staging { gen: u64_at(1)?, nonce: u64_at(9)?, rev: u64_at(17)? }), 25),
             _ => anyhow::bail!("bad import state"),
         };
-        let n = u32::from_be_bytes(b.get(at..at + 4).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?) as usize;
+        let n = u32::from_be_bytes(b.get(at..at + 4).ok_or_else(|| anyhow::anyhow!("short import state"))?.try_into()?)
+            as usize;
         at += 4;
         anyhow::ensure!(b.len() == at + 8 * n, "import state of {} bytes", b.len());
         let garbage = (0..n).map(|i| u64_at(at + 8 * i)).collect::<anyhow::Result<_>>()?;
@@ -419,9 +427,7 @@ impl Head {
         Ok(Head {
             commit: Cid::from_bytes(&b[..CID_BYTES_LEN])?,
             data: Cid::from_bytes(&b[CID_BYTES_LEN..2 * CID_BYTES_LEN])?,
-            rev: Tid(u64::from_be_bytes(
-                b[2 * CID_BYTES_LEN..2 * CID_BYTES_LEN + 8].try_into()?,
-            )),
+            rev: Tid(u64::from_be_bytes(b[2 * CID_BYTES_LEN..2 * CID_BYTES_LEN + 8].try_into()?)),
             commit_block: b.slice(2 * CID_BYTES_LEN + 8..),
         })
     }
@@ -474,10 +480,7 @@ pub fn record_value(cid: &Cid, rev: u64, bytes: &[u8]) -> Bytes {
 
 pub fn decode_record_value(v: &Bytes) -> anyhow::Result<(Cid, Bytes)> {
     anyhow::ensure!(v.len() >= CID_BYTES_LEN + 8, "short record value");
-    Ok((
-        Cid::from_bytes(&v[..CID_BYTES_LEN])?,
-        v.slice(CID_BYTES_LEN + 8..),
-    ))
+    Ok((Cid::from_bytes(&v[..CID_BYTES_LEN])?, v.slice(CID_BYTES_LEN + 8..)))
 }
 
 pub fn record_value_parts(v: &[u8]) -> anyhow::Result<(Cid, &[u8])> {
@@ -534,7 +537,8 @@ pub struct PendingSigningKey {
 /// As many Argon2 runs at once as there are pooled block buffers: each takes
 /// ~20 ms of a core and 19 MiB, so more at once only adds memory and
 /// blocking-pool threads.
-static ARGON2_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*ARGON2_POOL_MAX));
+static ARGON2_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(*ARGON2_POOL_MAX));
 
 pub const ARGON2_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -576,7 +580,13 @@ pub fn hash_password_blocking(password: &str) -> String {
     use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     let salt = SaltString::generate(&mut OsRng);
     PooledArgon2
-        .hash_password_customized(password.as_bytes(), Some(argon2::Algorithm::Argon2id.ident()), Some(0x13), argon2_params(), &salt)
+        .hash_password_customized(
+            password.as_bytes(),
+            Some(argon2::Algorithm::Argon2id.ident()),
+            Some(0x13),
+            argon2_params(),
+            &salt,
+        )
         .expect("argon2 hash")
         .to_string()
 }
@@ -630,19 +640,22 @@ impl argon2::password_hash::PasswordHasher for PooledArgon2 {
         let salt_bytes = salt.decode_b64(&mut salt_arr)?;
         let ctx = argon2::Argon2::new(algorithm, version, params.clone());
         let blocks = params.block_count();
-        let output = argon2::password_hash::Output::init_with(params.output_len().unwrap_or(argon2::Params::DEFAULT_OUTPUT_LEN), |out| {
-            let mut mem = ARGON2_MEMORY.lock().pop().unwrap_or_default();
-            if mem.len() < blocks {
-                // every block is written before it is read
-                mem.resize(blocks, argon2::Block::default());
-            }
-            let r = ctx.hash_password_into_with_memory(password, salt_bytes, out, &mut mem[..blocks]);
-            let mut pool = ARGON2_MEMORY.lock();
-            if pool.len() < *ARGON2_POOL_MAX {
-                pool.push(mem);
-            }
-            Ok(r?)
-        })?;
+        let output = argon2::password_hash::Output::init_with(
+            params.output_len().unwrap_or(argon2::Params::DEFAULT_OUTPUT_LEN),
+            |out| {
+                let mut mem = ARGON2_MEMORY.lock().pop().unwrap_or_default();
+                if mem.len() < blocks {
+                    // every block is written before it is read
+                    mem.resize(blocks, argon2::Block::default());
+                }
+                let r = ctx.hash_password_into_with_memory(password, salt_bytes, out, &mut mem[..blocks]);
+                let mut pool = ARGON2_MEMORY.lock();
+                if pool.len() < *ARGON2_POOL_MAX {
+                    pool.push(mem);
+                }
+                Ok(r?)
+            },
+        )?;
         Ok(argon2::password_hash::PasswordHash {
             algorithm: algorithm.ident(),
             version: Some(version.into()),
@@ -680,7 +693,13 @@ mod tests {
             let salt = SaltString::encode_b64(&[i as u8 + 1; 16]).unwrap();
             let a = stock.hash_password(pw.as_bytes(), &salt).unwrap().to_string();
             let b = PooledArgon2
-                .hash_password_customized(pw.as_bytes(), Some(argon2::Algorithm::Argon2id.ident()), Some(0x13), argon2_params(), &salt)
+                .hash_password_customized(
+                    pw.as_bytes(),
+                    Some(argon2::Algorithm::Argon2id.ident()),
+                    Some(0x13),
+                    argon2_params(),
+                    &salt,
+                )
                 .unwrap()
                 .to_string();
             assert_eq!(a, b);
@@ -690,7 +709,11 @@ mod tests {
             assert!(PooledArgon2.verify_password(b"wrong", &PasswordHash::new(&a).unwrap()).is_err());
         }
         // a hash with other parameters (e.g. made before a cost change) still verifies
-        let small = argon2::Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, argon2::Params::new(4096, 3, 1, None).unwrap());
+        let small = argon2::Argon2::new(
+            argon2::Algorithm::Argon2id,
+            argon2::Version::V0x13,
+            argon2::Params::new(4096, 3, 1, None).unwrap(),
+        );
         let salt = SaltString::encode_b64(&[9; 16]).unwrap();
         let h = small.hash_password(b"pw", &salt).unwrap().to_string();
         assert!(PooledArgon2.verify_password(b"pw", &PasswordHash::new(&h).unwrap()).is_ok());

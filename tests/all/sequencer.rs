@@ -21,7 +21,12 @@ async fn concurrent_writes(s: &TestServer, accts: &[TestAccount], per_acct: usiz
         let mut out = Vec::new();
         let inner = (0..per_acct).map(|i| async move {
             let r = s.post(a, &format!("p{i}")).await;
-            Acked { did: a.did.clone(), path: format!("{POST}/{}", r.rkey()), commit: r.commit_cid.unwrap(), rev: r.rev.unwrap() }
+            Acked {
+                did: a.did.clone(),
+                path: format!("{POST}/{}", r.rkey()),
+                commit: r.commit_cid.unwrap(),
+                rev: r.rev.unwrap(),
+            }
         });
         out.extend(futures::future::join_all(inner).await);
         out
@@ -53,13 +58,15 @@ fn check_stream(frames: &[Frame], acked: &[Acked]) {
         }
         assert_eq!(c.invert().unwrap(), c.prev_data.unwrap(), "seq {} inverts", c.seq);
         last.insert(c.repo.clone(), (c.rev.clone(), data));
-        let prior = ops_by_commit.insert(c.commit.to_string(), c.ops.iter().map(|o| format!("{} {}", c.repo, o.path)).collect());
+        let prior = ops_by_commit
+            .insert(c.commit.to_string(), c.ops.iter().map(|o| format!("{} {}", c.repo, o.path)).collect());
         assert!(prior.is_none(), "commit {} appears twice", c.commit);
     }
     // every acked write appears exactly once, in the commit it was acked with
     let mut seen = HashSet::new();
     for a in acked {
-        let ops = ops_by_commit.get(&a.commit).unwrap_or_else(|| panic!("acked commit {} not on the firehose", a.commit));
+        let ops =
+            ops_by_commit.get(&a.commit).unwrap_or_else(|| panic!("acked commit {} not on the firehose", a.commit));
         let key = format!("{} {}", a.did, a.path);
         assert_eq!(ops.iter().filter(|o| **o == key).count(), 1, "{key} in commit {}", a.commit);
         assert!(seen.insert(key.clone()), "{key} acked twice");
@@ -93,9 +100,8 @@ async fn handles_cutover_while_writing() {
     let mut sub = s.subscribe(Some(0)).await;
     acked.extend(concurrent_writes(&s, &accts, 20).await);
     let n = acked.len();
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= n)
-        .await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= n).await;
     let extra = sub.drain(Duration::from_millis(300)).await;
     let mut all = frames;
     all.extend(extra);
@@ -137,9 +143,8 @@ async fn buffers_events_that_are_not_being_read() {
     let acked = concurrent_writes(&s, std::slice::from_ref(&a), 50).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let n = acked.len();
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= n)
-        .await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().filter_map(|f| f.commit()).map(|c| c.ops.len()).sum::<usize>() >= n).await;
     check_stream(&frames, &acked);
 }
 
@@ -161,7 +166,10 @@ async fn many_open_connections() {
     }
     for fs in &streams {
         check_stream(fs, &acked);
-        assert_eq!(fs.iter().map(|f| &f.raw).collect::<Vec<_>>(), streams[0].iter().map(|f| &f.raw).collect::<Vec<_>>());
+        assert_eq!(
+            fs.iter().map(|f| &f.raw).collect::<Vec<_>>(),
+            streams[0].iter().map(|f| &f.raw).collect::<Vec<_>>()
+        );
     }
 }
 

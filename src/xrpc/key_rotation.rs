@@ -84,7 +84,12 @@ async fn plc_names(plc: &crate::plc::Plc, did: &str, did_key: &str) -> Result<bo
 /// of the current key is a no-op). `key`: the new key, if the caller holds
 /// it (else unwrapped from `p`). Err: undecided; the rotation is still
 /// pending.
-pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<Arc<Keypair>>) -> Result<Done, XrpcError> {
+pub async fn complete(
+    app: &App,
+    did: &str,
+    p: &PendingSigningKey,
+    key: Option<Arc<Keypair>>,
+) -> Result<Done, XrpcError> {
     let did_key = format!("did:key:{}", p.pubkey);
     if let (Some(plc), true) = (&app.plc, did.starts_with("did:plc:")) {
         match plc.update_signing_key(did, &did_key).await {
@@ -115,7 +120,10 @@ pub async fn complete(app: &App, did: &str, p: &PendingSigningKey, key: Option<A
 
 fn pending_hint(mut e: XrpcError) -> XrpcError {
     if e.status.is_server_error() {
-        e.message = format!("{}; the rotation is pending (writes are refused): retry updateAccountSigningKey to finish it", e.message);
+        e.message = format!(
+            "{}; the rotation is pending (writes are refused): retry updateAccountSigningKey to finish it",
+            e.message
+        );
     }
     e
 }
@@ -142,7 +150,12 @@ pub(super) async fn rotate(app: &App, did: &str, key: Keypair) -> XResult<String
 /// pending finishes that rotation. `requested`: the did:key the retry
 /// asked for, if any; a different one than the pending key is refused once
 /// the pending rotation is finished (left reserved, for the next call).
-pub(super) async fn finish_pending(app: &App, did: &str, p: &PendingSigningKey, requested: Option<&str>) -> XResult<String> {
+pub(super) async fn finish_pending(
+    app: &App,
+    did: &str,
+    p: &PendingSigningKey,
+    requested: Option<&str>,
+) -> XResult<String> {
     let did_key = format!("did:key:{}", p.pubkey);
     let _driving = Driving::take(did);
     match complete(app, did, p, None).await.map_err(pending_hint)? {

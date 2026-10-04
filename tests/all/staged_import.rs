@@ -28,29 +28,50 @@ fn map(mut m: Vec<(String, Value)>) -> Value {
 
 fn record(i: usize, tag: &str) -> (String, Vec<u8>) {
     let (coll, mut m) = match i % 4 {
-        0 => ("app.bsky.feed.like", vec![(
-            "subject".to_string(),
-            map(vec![
-                ("cid".into(), Value::Text("bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm".into())),
-                ("uri".into(), Value::Text(format!("at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l{:011}", i % 7))),
-            ]),
-        )]),
+        0 => (
+            "app.bsky.feed.like",
+            vec![(
+                "subject".to_string(),
+                map(vec![
+                    ("cid".into(), Value::Text("bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm".into())),
+                    (
+                        "uri".into(),
+                        Value::Text(format!(
+                            "at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l{:011}",
+                            i % 7
+                        )),
+                    ),
+                ]),
+            )],
+        ),
         1 => ("app.bsky.graph.follow", vec![("subject".to_string(), Value::Text(format!("did:plc:{:024}", i % 5)))]),
-        2 => ("app.bsky.feed.post", vec![
-            ("text".to_string(), Value::Text(format!("{tag} {i}"))),
-            ("embed".to_string(), map(vec![
-                ("$type".into(), Value::Text("app.bsky.embed.images".into())),
-                ("images".into(), Value::Array(vec![map(vec![
-                    ("alt".into(), Value::Text(String::new())),
-                    ("image".into(), map(vec![
-                        ("$type".into(), Value::Text("blob".into())),
-                        ("ref".into(), Value::Link(Cid::raw(format!("blob {}", i % 13).as_bytes()))),
-                        ("mimeType".into(), Value::Text("image/png".into())),
-                        ("size".into(), Value::Int(100)),
-                    ])),
-                ])])),
-            ])),
-        ]),
+        2 => (
+            "app.bsky.feed.post",
+            vec![
+                ("text".to_string(), Value::Text(format!("{tag} {i}"))),
+                (
+                    "embed".to_string(),
+                    map(vec![
+                        ("$type".into(), Value::Text("app.bsky.embed.images".into())),
+                        (
+                            "images".into(),
+                            Value::Array(vec![map(vec![
+                                ("alt".into(), Value::Text(String::new())),
+                                (
+                                    "image".into(),
+                                    map(vec![
+                                        ("$type".into(), Value::Text("blob".into())),
+                                        ("ref".into(), Value::Link(Cid::raw(format!("blob {}", i % 13).as_bytes()))),
+                                        ("mimeType".into(), Value::Text("image/png".into())),
+                                        ("size".into(), Value::Int(100)),
+                                    ]),
+                                ),
+                            ])]),
+                        ),
+                    ]),
+                ),
+            ],
+        ),
         _ => ("com.example.thing", vec![("n".to_string(), Value::Text(format!("{tag} {i}")))]),
     };
     m.push(("$type".to_string(), Value::Text(coll.into())));
@@ -105,7 +126,10 @@ async fn seed(s: &TestServer, a: &TestAccount) -> Contents {
         let (coll, rec) = if i % 2 == 0 {
             ("app.bsky.feed.post", post_record(&format!("old {i}")))
         } else {
-            ("app.bsky.feed.like", json!({"$type": "app.bsky.feed.like", "subject": {"uri": format!("at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l{:011}", i % 3), "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}, "createdAt": now_iso()}))
+            (
+                "app.bsky.feed.like",
+                json!({"$type": "app.bsky.feed.like", "subject": {"uri": format!("at://did:plc:ewvi7nxzyoun6zhxrhs64oiz/app.bsky.feed.post/3l{:011}", i % 3), "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}, "createdAt": now_iso()}),
+            )
         };
         writes.push(json!({"$type": "com.atproto.repo.applyWrites#create", "collection": coll, "value": rec}));
     }
@@ -164,7 +188,8 @@ async fn events_of(s: &TestServer, did: &str, cursor: i64) -> Vec<Frame> {
     let m = s.create_account("mark").await;
     s.post(&m, "marker").await;
     let mut sub = s.subscribe(Some(cursor)).await;
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#commit" && f.did() == Some(m.did.as_str()))).await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#commit" && f.did() == Some(m.did.as_str()))).await;
     frames.into_iter().filter(|f| f.did() == Some(did)).collect()
 }
 
@@ -193,7 +218,10 @@ async fn import_replaces_the_repo_and_sweeps_the_old_generation() {
     s.post(&a, "after the import").await;
     let (car, newer) = repo_car(300, "newer");
     import(&s, &a, car).await.ok();
-    wait_until("swept again", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })).await;
+    wait_until("swept again", Duration::from_secs(20), || {
+        futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })
+    })
+    .await;
     settled(&s, &a, &newer, "second import").await;
     assert_eq!(s.app.repo_gen(&a.did).await.ok().unwrap(), 2);
 }
@@ -229,7 +257,8 @@ async fn readers_never_see_a_partial_import() {
     let seen = Arc::new(parking_lot::Mutex::new((0usize, 0usize)));
     let readers: Vec<_> = (0..3)
         .map(|r| {
-            let (s, a, old, new, stop, seen) = (s.clone(), a.clone(), old.clone(), new.clone(), stop.clone(), seen.clone());
+            let (s, a, old, new, stop, seen) =
+                (s.clone(), a.clone(), old.clone(), new.clone(), stop.clone(), seen.clone());
             tokio::spawn(async move {
                 while !stop.load(Ordering::Relaxed) {
                     let (got, of_old, of_new) = match r {
@@ -240,11 +269,23 @@ async fn readers_never_see_a_partial_import() {
                         }
                         1 => {
                             let l = s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "100")]).await.ok();
-                            let got: Contents = l["records"].as_array().unwrap().iter().map(|r| {
-                                let uri = r["uri"].as_str().unwrap();
-                                (uri.splitn(4, '/').nth(3).unwrap().to_string(), Cid::parse(r["cid"].as_str().unwrap()).unwrap())
-                            }).collect();
-                            let part = |c: &Contents| got.iter().all(|(p, cid)| c.get(p) == Some(cid)) && got.len() == c.keys().filter(|p| p.starts_with("app.bsky.feed.post/")).count().min(100);
+                            let got: Contents = l["records"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .map(|r| {
+                                    let uri = r["uri"].as_str().unwrap();
+                                    (
+                                        uri.splitn(4, '/').nth(3).unwrap().to_string(),
+                                        Cid::parse(r["cid"].as_str().unwrap()).unwrap(),
+                                    )
+                                })
+                                .collect();
+                            let part = |c: &Contents| {
+                                got.iter().all(|(p, cid)| c.get(p) == Some(cid))
+                                    && got.len()
+                                        == c.keys().filter(|p| p.starts_with("app.bsky.feed.post/")).count().min(100)
+                            };
                             (format!("{got:?}"), part(&old), part(&new))
                         }
                         _ => {
@@ -255,7 +296,11 @@ async fn readers_never_see_a_partial_import() {
                     };
                     assert!(of_old || of_new, "reader {r} saw a partial import: {got}");
                     let mut g = seen.lock();
-                    if of_old { g.0 += 1 } else { g.1 += 1 }
+                    if of_old {
+                        g.0 += 1
+                    } else {
+                        g.1 += 1
+                    }
                 }
             })
         })
@@ -271,7 +316,14 @@ async fn readers_never_see_a_partial_import() {
     assert_eq!(exported(&s, &a.did).await, old);
     let staged = import_state(&s, &a.did).await.unwrap().staging.expect("staged");
     assert!(rows_by_gen(&s, &a.did, staged.gen).await.get(&staged.gen).is_some_and(|n| *n > 0));
-    let w = s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("mid-import")}), &a.auth()).await;
+    let w = s
+        .xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("mid-import")}),
+            &a.auth(),
+        )
+        .await;
     w.err(400, "InvalidRequest");
     go.store(true, Ordering::SeqCst);
     imp.await.unwrap().ok();
@@ -283,7 +335,10 @@ async fn readers_never_see_a_partial_import() {
     }
     let (o, n) = *seen.lock();
     assert!(o > 0 && n > 0, "readers saw old {o} times, new {n} times");
-    wait_until("swept", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })).await;
+    wait_until("swept", Duration::from_secs(20), || {
+        futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })
+    })
+    .await;
     settled(&s, &a, &new, "after").await;
 }
 
@@ -292,7 +347,8 @@ async fn crash_node(id: &str, store: &Arc<dyn object_store::ObjectStore>) -> Tes
         // nothing checkpointed: the survivor replays the victim's log
         c.checkpoint_every = Duration::from_secs(3600);
         let l = lease(c);
-        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
+        (l.ttl, l.renew_every, l.skew) =
+            (Duration::from_secs(2), Duration::from_millis(200), Duration::from_millis(400));
     })
     .await
 }
@@ -306,7 +362,10 @@ async fn crash_mid_import(phase: &'static str, n: usize) {
     let tag = unique_name("si");
     let a = crash_node(&format!("{tag}-a"), &store).await;
     let b = crash_node(&format!("{tag}-b"), &store).await;
-    wait_until("both own shards", Duration::from_secs(15), || owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4).await;
+    wait_until("both own shards", Duration::from_secs(15), || {
+        owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4
+    })
+    .await;
     let x = b.create_account("six").await;
     assert!(b.app.partition(&x.did).is_ok());
     let mut old = seed(&b, &x).await;
@@ -314,7 +373,10 @@ async fn crash_mid_import(phase: &'static str, n: usize) {
         // an old generation big enough to take several sweep entries
         let (car, big) = repo_car(RECORDS, "old");
         import(&b, &x, car).await.ok();
-        wait_until("first import swept", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&b, &x.did).await.is_none() })).await;
+        wait_until("first import swept", Duration::from_secs(20), || {
+            futures::executor::block_on(async { import_state(&b, &x.did).await.is_none() })
+        })
+        .await;
         old = big;
     }
     let cursor = a.settled_now().await;
@@ -359,7 +421,10 @@ async fn crash_mid_import(phase: &'static str, n: usize) {
     a.post(&x, "after the crash").await;
     let (car, last) = repo_car(500, "last");
     import(&a, &x, car).await.ok();
-    wait_until("swept", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&a, &x.did).await.is_none() })).await;
+    wait_until("swept", Duration::from_secs(20), || {
+        futures::executor::block_on(async { import_state(&a, &x.did).await.is_none() })
+    })
+    .await;
     settled(&a, &x, &last, "re-import").await;
 }
 
@@ -399,7 +464,10 @@ async fn shard_move_mid_import_aborts_it() {
     let tag = unique_name("sm");
     let a = cluster_node(&format!("{tag}-a"), store.clone(), 4, |_| {}).await;
     let b = cluster_node(&format!("{tag}-b"), store.clone(), 4, |_| {}).await;
-    wait_until("both own shards", Duration::from_secs(15), || owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4).await;
+    wait_until("both own shards", Duration::from_secs(15), || {
+        owned(&a) > 0 && owned(&b) > 0 && owned(&a) + owned(&b) == 4
+    })
+    .await;
     let x = b.create_account("smx").await;
     assert!(b.app.partition(&x.did).is_ok());
     let old = seed(&b, &x).await;
@@ -423,7 +491,10 @@ async fn shard_move_mid_import_aborts_it() {
     assert_eq!(swept.aborted, 1, "{swept:?}");
     settled(&a, &x, &old, "after the move").await;
     import(&a, &x, car).await.ok();
-    wait_until("swept", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&a, &x.did).await.is_none() })).await;
+    wait_until("swept", Duration::from_secs(20), || {
+        futures::executor::block_on(async { import_state(&a, &x.did).await.is_none() })
+    })
+    .await;
     settled(&a, &x, &new, "imported on the new owner").await;
 }
 
@@ -448,9 +519,15 @@ async fn deleted_account_generations_are_swept() {
     go.store(true, Ordering::SeqCst);
     assert!(!imp.await.unwrap().is_ok());
     si::set_crash_hook(&a.did, None);
-    assert!(import_state(&s, &a.did).await.is_none_or(|g| g.staging.is_none()), "the staged import went to the garbage");
+    assert!(
+        import_state(&s, &a.did).await.is_none_or(|g| g.staging.is_none()),
+        "the staged import went to the garbage"
+    );
     si::sweep_pending(&s.app).await;
     // the aborted driver may be sweeping it too
-    wait_until("swept", Duration::from_secs(20), || futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })).await;
+    wait_until("swept", Duration::from_secs(20), || {
+        futures::executor::block_on(async { import_state(&s, &a.did).await.is_none() })
+    })
+    .await;
     assert!(rows_by_gen(&s, &a.did, staged + 2).await.is_empty());
 }

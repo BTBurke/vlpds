@@ -118,9 +118,7 @@ pub fn write_opt_cid(out: &mut Vec<u8>, c: Option<&Cid>) {
 
 /// DAG-CBOR canonical map key order.
 pub fn key_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len()
-        .cmp(&b.len())
-        .then_with(|| a.as_bytes().cmp(b.as_bytes()))
+    a.len().cmp(&b.len()).then_with(|| a.as_bytes().cmp(b.as_bytes()))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -209,31 +207,25 @@ impl Value {
                 Some(_) => return Err(dm("integers beyond 2^53 - 1 are not allowed")),
                 None => match n.as_f64() {
                     // integer-valued floats within JS's safe integer range
-                    Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => {
-                        Value::Int(f as i64)
-                    }
+                    Some(f) if f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_991.0 => Value::Int(f as i64),
                     _ => return Err(dm("floats are not allowed")),
                 },
             },
             serde_json::Value::String(s) => Value::Text(s.clone()),
-            serde_json::Value::Array(a) => {
-                Value::Array(a.iter().map(Value::from_json).collect::<Result<_, _>>()?)
-            }
+            serde_json::Value::Array(a) => Value::Array(a.iter().map(Value::from_json).collect::<Result<_, _>>()?),
             serde_json::Value::Object(o) => {
                 if let Some(l) = o.get("$link") {
                     return match (l, o.len()) {
-                        (serde_json::Value::String(s), 1) => Cid::parse(s)
-                            .map(Value::Link)
-                            .map_err(|_| CborError::DataModel(format!("bad $link {s}"))),
+                        (serde_json::Value::String(s), 1) => {
+                            Cid::parse(s).map(Value::Link).map_err(|_| CborError::DataModel(format!("bad $link {s}")))
+                        }
                         _ => Err(dm("$link must be the only field and a CID string")),
                     };
                 }
                 if let Some(b) = o.get("$bytes") {
                     return match (b, o.len()) {
                         (serde_json::Value::String(s), 1) => {
-                            decode_bytes(s)
-                                .map(Value::Bytes)
-                                .map_err(|_| dm("bad $bytes"))
+                            decode_bytes(s).map(Value::Bytes).map_err(|_| dm("bad $bytes"))
                         }
                         _ => Err(dm("$bytes must be the only field and a base64 string")),
                     };
@@ -243,7 +235,9 @@ impl Value {
                     Some(serde_json::Value::String(t)) if !t.is_empty() => {
                         if t == "blob" {
                             let link = match o.get("ref") {
-                                Some(serde_json::Value::Object(r)) if r.len() == 1 => r.get("$link").and_then(|l| l.as_str()),
+                                Some(serde_json::Value::Object(r)) if r.len() == 1 => {
+                                    r.get("$link").and_then(|l| l.as_str())
+                                }
                                 _ => None,
                             };
                             let ok = o.len() == 4
@@ -463,9 +457,7 @@ fn blob_size_ok(size: i64) -> bool {
 }
 
 fn obj_get<'v, 'a>(m: &'v [(Cow<'a, str>, JsonValue<'a>)], key: &str) -> Option<&'v JsonValue<'a>> {
-    m.binary_search_by(|(k, _)| key_cmp(k, key))
-        .ok()
-        .map(|i| &m[i].1)
+    m.binary_search_by(|(k, _)| key_cmp(k, key)).ok().map(|i| &m[i].1)
 }
 
 impl<'a> JsonValue<'a> {
@@ -599,7 +591,8 @@ impl<'a> JsonValue<'a> {
                                 Some(JsonValue::Object(r)) if r.len() == 1 => obj_get(r, "$link").ok_or(())?,
                                 _ => return Err(()),
                             };
-                            let (Some(mime), Some(JsonValue::Int(size))) = (text("mimeType"), obj_get(m, "size")) else {
+                            let (Some(mime), Some(JsonValue::Int(size))) = (text("mimeType"), obj_get(m, "size"))
+                            else {
                                 return Err(());
                             };
                             let JsonValue::Str(link) = link else { return Err(()) };
@@ -788,18 +781,9 @@ impl<'a> Decoder<'a> {
         let (n, min) = match info {
             0..=23 => (info as u64, 0),
             24 => (self.byte()? as u64, 24),
-            25 => (
-                u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64,
-                1 << 8,
-            ),
-            26 => (
-                u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64,
-                1 << 16,
-            ),
-            27 => (
-                u64::from_be_bytes(self.take(8)?.try_into().unwrap()),
-                1 << 32,
-            ),
+            25 => (u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as u64, 1 << 8),
+            26 => (u32::from_be_bytes(self.take(4)?.try_into().unwrap()) as u64, 1 << 16),
+            27 => (u64::from_be_bytes(self.take(8)?.try_into().unwrap()), 1 << 32),
             _ => return Err(CborError::Invalid("indefinite length or reserved")),
         };
         if n < min {
@@ -844,9 +828,9 @@ impl<'a> Decoder<'a> {
                     return Err(CborError::Invalid("unsupported tag"));
                 }
                 match self.value(depth + 1)? {
-                    Value::Bytes(b) if b.first() == Some(&0) => Value::Link(
-                        Cid::from_bytes(&b[1..]).map_err(|_| CborError::Invalid("bad cid"))?,
-                    ),
+                    Value::Bytes(b) if b.first() == Some(&0) => {
+                        Value::Link(Cid::from_bytes(&b[1..]).map_err(|_| CborError::Invalid("bad cid"))?)
+                    }
                     _ => return Err(CborError::Invalid("bad cid link")),
                 }
             }
@@ -1196,9 +1180,7 @@ mod tests {
         // @atproto/lex-data strict isTypedBlobRef
         let raw = Cid::raw(b"x").to_string();
         let dag = Cid::dag_cbor(b"x").to_string();
-        let blob = |link: &str, mime: serde_json::Value, size: serde_json::Value| {
-            serde_json::json!({"$type": "blob", "ref": {"$link": link}, "mimeType": mime, "size": size})
-        };
+        let blob = |link: &str, mime: serde_json::Value, size: serde_json::Value| serde_json::json!({"$type": "blob", "ref": {"$link": link}, "mimeType": mime, "size": size});
         let mut extra = blob(&raw, "image/png".into(), 1.into());
         extra["alt"] = "x".into();
         for (j, ok) in [
@@ -1216,7 +1198,8 @@ mod tests {
             let rec = serde_json::json!({"img": j});
             let text = rec.to_string();
             let mut out = Vec::new();
-            let one_pass = JsonValue::parse(text.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
+            let one_pass =
+                JsonValue::parse(text.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
             assert_eq!(Value::from_json(&rec).is_ok(), ok, "{text}");
             assert_eq!(one_pass.is_ok(), ok, "{text}");
         }
@@ -1241,7 +1224,8 @@ mod tests {
             let rec = format!(r#"{{"n": {text}}}"#);
             let j: serde_json::Value = serde_json::from_str(&rec).unwrap();
             let mut out = Vec::new();
-            let one_pass = JsonValue::parse(rec.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
+            let one_pass =
+                JsonValue::parse(rec.as_bytes()).unwrap().encode_record(&mut out, &mut RecordRefs::default());
             assert_eq!(Value::from_json(&j).is_ok(), ok, "{text}");
             assert_eq!(one_pass.is_ok(), ok, "{text}");
         }
@@ -1279,10 +1263,7 @@ mod tests {
             &[0xff],                                                 // break
         ] {
             assert!(Value::decode(b).is_err(), "{b:02x?} accepted");
-            assert!(
-                write_json(b, &mut Vec::new()).is_err(),
-                "{b:02x?} transcoded"
-            );
+            assert!(write_json(b, &mut Vec::new()).is_err(), "{b:02x?} transcoded");
         }
     }
 
@@ -1312,6 +1293,9 @@ mod tests {
         let big = Value::Array([i64::MAX, i64::MIN + 1, i64::MIN].map(Value::Int).to_vec()).to_cbor();
         let mut out = Vec::new();
         write_json(&big, &mut out).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&out).unwrap(), serde_json::json!([i64::MAX, i64::MIN + 1, i64::MIN]));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&out).unwrap(),
+            serde_json::json!([i64::MAX, i64::MIN + 1, i64::MIN])
+        );
     }
 }

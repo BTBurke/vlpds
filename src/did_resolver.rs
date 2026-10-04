@@ -68,9 +68,7 @@ impl DidResolver {
 
     pub fn cached(&self, did: &str) -> Option<Arc<J>> {
         let c = self.cache.lock();
-        c.get(did)
-            .filter(|(at, _)| at.elapsed() < CACHE_TTL)
-            .map(|(_, d)| d.clone())
+        c.get(did).filter(|(at, _)| at.elapsed() < CACHE_TTL).map(|(_, d)| d.clone())
     }
 
     pub fn invalidate(&self, did: &str) {
@@ -131,10 +129,7 @@ impl DidResolver {
                 FetchError::Other(m) => ResolveError::Failed(did.into(), m),
             })?;
         if doc.get("id").and_then(|v| v.as_str()) != Some(did) {
-            return Err(ResolveError::Failed(
-                did.into(),
-                "document id does not match DID".into(),
-            ));
+            return Err(ResolveError::Failed(did.into(), "document id does not match DID".into()));
         }
         let doc = Arc::new(doc);
         let cap = crate::caches::cap(crate::caches::Cache::DidDocs);
@@ -148,10 +143,7 @@ impl DidResolver {
             return Err(ResolveError::BadDid(did.into()));
         }
         let host = rest.replace("%3A", ":").replace("%3a", ":");
-        if !host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':')
-        {
+        if !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b':') {
             return Err(ResolveError::BadDid(did.into()));
         }
         let hostname = host.split(':').next().unwrap_or("");
@@ -179,17 +171,13 @@ async fn fetch_json(req: reqwest::RequestBuilder) -> Result<J, FetchError> {
         .send()
         .await
         .map_err(|e| FetchError::Other(e.to_string()))?;
-    if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status() == reqwest::StatusCode::GONE
-    {
+    if resp.status() == reqwest::StatusCode::NOT_FOUND || resp.status() == reqwest::StatusCode::GONE {
         return Err(FetchError::NotFound);
     }
     if !resp.status().is_success() {
         return Err(FetchError::Other(format!("status {}", resp.status())));
     }
-    if resp
-        .content_length()
-        .is_some_and(|l| l as usize > MAX_DOC_BYTES)
-    {
+    if resp.content_length().is_some_and(|l| l as usize > MAX_DOC_BYTES) {
         return Err(FetchError::Other("document too large".into()));
     }
     let mut buf = Vec::new();
@@ -215,9 +203,7 @@ pub fn service_endpoint(doc: &J, service_id: &str) -> Option<String> {
             return None;
         }
         let ep = s.get("serviceEndpoint")?.as_str()?;
-        reqwest::Url::parse(ep)
-            .ok()
-            .filter(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())?;
+        reqwest::Url::parse(ep).ok().filter(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())?;
         Some(ep.to_string())
     })
 }
@@ -225,14 +211,10 @@ pub fn service_endpoint(doc: &J, service_id: &str) -> Option<String> {
 pub fn signing_key_multibase(doc: &J) -> Option<String> {
     let did = doc.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let full = format!("{did}#atproto");
-    doc.get("verificationMethod")?
-        .as_array()?
-        .iter()
-        .find_map(|m| {
-            let id = m.get("id")?.as_str()?;
-            (id == "#atproto" || id == full)
-                .then(|| m.get("publicKeyMultibase")?.as_str().map(String::from))?
-        })
+    doc.get("verificationMethod")?.as_array()?.iter().find_map(|m| {
+        let id = m.get("id")?.as_str()?;
+        (id == "#atproto" || id == full).then(|| m.get("publicKeyMultibase")?.as_str().map(String::from))?
+    })
 }
 
 /// Globally routable unicast only (SSRF protection).
@@ -348,7 +330,15 @@ mod tests {
         ] {
             assert!(!is_public_ip(s.parse().unwrap()), "{s}");
         }
-        for s in ["8.8.8.8", "1.1.1.1", "2606:4700::1111", "::ffff:8.8.8.8", "2001:4860:4860::8888", "2001:200::1", "2003::1"] {
+        for s in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "2606:4700::1111",
+            "::ffff:8.8.8.8",
+            "2001:4860:4860::8888",
+            "2001:200::1",
+            "2003::1",
+        ] {
             assert!(is_public_ip(s.parse().unwrap()), "{s}");
         }
     }
@@ -421,7 +411,10 @@ mod tests {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let router = axum::Router::new().fallback(|| async {
-            (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "http://169.254.169.254/latest/meta-data/")])
+            (
+                axum::http::StatusCode::FOUND,
+                [(axum::http::header::LOCATION, "http://169.254.169.254/latest/meta-data/")],
+            )
         });
         tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
         let dev = DidResolver::new("https://plc.invalid", true);
@@ -438,20 +431,11 @@ mod tests {
             r.did_web_url("did:web:example.com", "example.com").unwrap(),
             "https://example.com/.well-known/did.json"
         );
-        assert_eq!(
-            r.did_web_url("x", "localhost%3A1234").unwrap(),
-            "http://localhost:1234/.well-known/did.json"
-        );
+        assert_eq!(r.did_web_url("x", "localhost%3A1234").unwrap(), "http://localhost:1234/.well-known/did.json");
         assert!(r.did_web_url("x", "example.com:path").is_err());
         let dev = DidResolver::new("https://plc.directory", true);
-        assert_eq!(
-            dev.did_web_url("x", "127.0.0.1%3A99").unwrap(),
-            "http://127.0.0.1:99/.well-known/did.json"
-        );
-        assert_eq!(
-            dev.did_web_url("x", "example.com").unwrap(),
-            "https://example.com/.well-known/did.json"
-        );
+        assert_eq!(dev.did_web_url("x", "127.0.0.1%3A99").unwrap(), "http://127.0.0.1:99/.well-known/did.json");
+        assert_eq!(dev.did_web_url("x", "example.com").unwrap(), "https://example.com/.well-known/did.json");
     }
 
     #[test]
@@ -460,14 +444,8 @@ mod tests {
             {"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "https://pds.example"},
             {"id": "did:web:x#bsky_appview", "type": "BskyAppView", "serviceEndpoint": "https://api.example"},
         ]});
-        assert_eq!(
-            service_endpoint(&doc, "atproto_pds").as_deref(),
-            Some("https://pds.example")
-        );
-        assert_eq!(
-            service_endpoint(&doc, "bsky_appview").as_deref(),
-            Some("https://api.example")
-        );
+        assert_eq!(service_endpoint(&doc, "atproto_pds").as_deref(), Some("https://pds.example"));
+        assert_eq!(service_endpoint(&doc, "bsky_appview").as_deref(), Some("https://api.example"));
         assert_eq!(service_endpoint(&doc, "nope"), None);
     }
 }

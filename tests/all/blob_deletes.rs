@@ -183,7 +183,8 @@ async fn blob_refs_load_lazily() {
     for round in 0..24usize {
         let auth = a.auth();
         let cbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{round}"), "record": image_post("img", &imgs[round % 3])});
-        let dbody = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{}", round.saturating_sub(1))});
+        let dbody =
+            json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": format!("p{}", round.saturating_sub(1))});
         let mut profile = json!({"$type": "app.bsky.actor.profile"});
         if round % 4 != 3 {
             profile["avatar"] = imgs[(round + 1) % 3].clone();

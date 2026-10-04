@@ -1,10 +1,9 @@
 //! Prometheus metrics, exposed at /metrics.
 
 use prometheus::{
-    exponential_buckets, register_gauge, register_gauge_vec, register_histogram,
-    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
-    register_int_gauge_vec, Encoder, Gauge, GaugeVec, Histogram, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
+    exponential_buckets, register_gauge, register_gauge_vec, register_histogram, register_histogram_vec,
+    register_int_counter, register_int_counter_vec, register_int_gauge, register_int_gauge_vec, Encoder, Gauge,
+    GaugeVec, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, TextEncoder,
 };
 use std::sync::LazyLock;
 
@@ -193,9 +192,11 @@ impl LeaseRenewHistogram {
     }
 }
 
-pub static LEASE_RENEW_SECONDS: LazyLock<LeaseRenewHistogram> = LazyLock::new(|| LeaseRenewHistogram {
+pub static LEASE_RENEW_SECONDS: LazyLock<LeaseRenewHistogram> = LazyLock::new(|| {
+    LeaseRenewHistogram {
     secs: register_histogram!("vlpds_lease_renew_seconds", "Node lease renewal round trip (the CAS PUT of nodes/{node_id}), answered or failed. Validity ends TTL - skew after a renewal's send time, so round trips over 0.4 x TTL (4 s at the default TTL) open a gap and the node fail-stops", exponential_buckets(0.001, 2.0, 14).unwrap()).unwrap(),
     ttl_ratio: register_histogram!("vlpds_lease_renew_ttl_ratio", "Node lease renewal round trip as a fraction of the lease TTL (vlpds_lease_renew_seconds / vlpds_lease_ttl_seconds). Over 0.4 the node's validity gaps and it fail-stops", vec![0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8, 1.0]).unwrap(),
+}
 });
 lazy!(LEASE_TTL: Gauge = register_gauge!("vlpds_lease_ttl_seconds", "Configured node lease TTL (--lease-ttl-ms). Renewal ceiling = 0.4 x TTL; a crashed node's shards are taken over after about TTL + skew"));
 lazy!(LEASE_RENEW_INTERVAL: Gauge = register_gauge!("vlpds_lease_renew_interval_seconds", "Configured node lease renewal interval (TTL / 5)"));
@@ -283,10 +284,7 @@ const KNOWN_COLLECTIONS: [&str; 18] = [
 const RECORD_ACTIONS: [&str; 3] = ["create", "update", "delete"];
 
 static RECORD_COUNTERS: LazyLock<Vec<[IntCounter; 3]>> = LazyLock::new(|| {
-    KNOWN_COLLECTIONS
-        .iter()
-        .map(|c| RECORD_ACTIONS.map(|a| RECORDS_WRITTEN.with_label_values(&[c, a])))
-        .collect()
+    KNOWN_COLLECTIONS.iter().map(|c| RECORD_ACTIONS.map(|a| RECORDS_WRITTEN.with_label_values(&[c, a]))).collect()
 });
 
 pub fn record_written(path: &str, action: &str) {
@@ -380,7 +378,9 @@ pub fn init_counters() {
             }
             UPSTREAM_DURATION.with_label_values(&[service]);
         }
-        for purpose in ["reset_password", "delete_account", "confirm_email", "update_email", "plc_operation", "auth_factor"] {
+        for purpose in
+            ["reset_password", "delete_account", "confirm_email", "update_email", "plc_operation", "auth_factor"]
+        {
             for r in ["sent", "failed", "dropped"] {
                 crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
             }
@@ -411,7 +411,8 @@ pub fn request_crawl(relay: &str, result: &str) {
     }
 }
 
-const LOGIN_RESULTS: [&str; 7] = ["success", "failed", "second_factor_required", "second_factor_failed", "blocked", "rate_limited", "error"];
+const LOGIN_RESULTS: [&str; 7] =
+    ["success", "failed", "second_factor_required", "second_factor_failed", "blocked", "rate_limited", "error"];
 
 pub fn login(method: &str, result: &str) {
     LOGINS.with_label_values(&[method, result]).inc();
@@ -447,19 +448,45 @@ static UNLABELLED_COUNTERS: &[&LazyLock<IntCounter>] = &[
 ];
 
 /// Histograms whose `_count` an alert rates.
-static ALERT_HISTOGRAMS: &[&LazyLock<Histogram>] = &[&COMMIT_LATENCY, &CHECKPOINT_SHARD, &FORWARD_DURATION, &FIREHOSE_EMIT_DELAY, &REPLAY_SECONDS];
+static ALERT_HISTOGRAMS: &[&LazyLock<Histogram>] =
+    &[&COMMIT_LATENCY, &CHECKPOINT_SHARD, &FORWARD_DURATION, &FIREHOSE_EMIT_DELAY, &REPLAY_SECONDS];
 
 #[allow(clippy::type_complexity)]
 static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&PEER_TAKEOVERS, &["peer", "restart"]),
-    (&LEASE_EVENTS, &["opened", "closed", "lost", "peer_refused", "lease_recreated", "history_full", "join_lease_moved", "shutdown_fence_failed"]),
+    (
+        &LEASE_EVENTS,
+        &[
+            "opened",
+            "closed",
+            "lost",
+            "peer_refused",
+            "lease_recreated",
+            "history_full",
+            "join_lease_moved",
+            "shutdown_fence_failed",
+        ],
+    ),
     (&LEASE_RENEW_ERRORS, &["timeout", "error", "conflict", "lapsed"]),
     (&CLUSTER_STORE_TIMEOUTS, &["get", "put", "list", "delete", "fence", "fence-scan"]),
     (&SHARDS_OPENED, &["ok", "error"]),
     (&SHARD_WARM_SSTS, &["ok", "error"]),
     (&SHARD_PREWARMS, &["ok", "failed"]),
     (&PUT_ATTEMPTS, &["ok", "already_exists", "error"]),
-    (&WRITE_ERRORS, &["repo_not_found", "repo_inactive", "invalid_swap", "invalid", "internal", "unavailable", "key_unavailable", "signature_fault", "not_started"]),
+    (
+        &WRITE_ERRORS,
+        &[
+            "repo_not_found",
+            "repo_inactive",
+            "invalid_swap",
+            "invalid",
+            "internal",
+            "unavailable",
+            "key_unavailable",
+            "signature_fault",
+            "not_started",
+        ],
+    ),
     (&WRITE_RETRIES, &["unreachable", "loading", "moved"]),
     (&READ_RETRIES, &["unreachable", "loading", "moved"]),
     (&FORWARDS, &["2xx", "3xx", "4xx", "5xx"]),
@@ -563,9 +590,7 @@ pub fn render() -> String {
     refresh_tokio();
     crate::caches::refresh_metrics();
     let mut buf = Vec::new();
-    TextEncoder::new()
-        .encode(&prometheus::gather(), &mut buf)
-        .unwrap();
+    TextEncoder::new().encode(&prometheus::gather(), &mut buf).unwrap();
     String::from_utf8(buf).unwrap()
 }
 
@@ -708,9 +733,7 @@ mod sys {
     pub fn rss_threads() -> Option<(u64, u64)> {
         let s = std::fs::read_to_string("/proc/self/status").ok()?;
         let field = |name: &str| {
-            s.lines()
-                .find_map(|l| l.strip_prefix(name))
-                .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+            s.lines().find_map(|l| l.strip_prefix(name)).and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
         };
         Some((field("VmRSS:")? * 1024, field("Threads:")?))
     }
@@ -786,7 +809,11 @@ mod slatedb_bridge {
     }
 
     fn help(description: &str, name: &str) -> String {
-        if description.is_empty() { name.to_string() } else { description.to_string() }
+        if description.is_empty() {
+            name.to_string()
+        } else {
+            description.to_string()
+        }
     }
 
     /// One vec per name (first registration's label keys win; a mismatching
@@ -881,7 +908,10 @@ mod slatedb_bridge {
         fn register_counter(&self, name: &str, description: &str, labels: &[(&str, &str)]) -> Arc<dyn CounterFn> {
             let labels = &keep(labels);
             let v = vec(&self.counters, name, labels, |keys| {
-                prometheus::register_int_counter_vec!(Opts::new(prom_name(name) + "_total", help(description, name)), keys)
+                prometheus::register_int_counter_vec!(
+                    Opts::new(prom_name(name) + "_total", help(description, name)),
+                    keys
+                )
             });
             match v.and_then(|v| v.get_metric_with_label_values(&values(labels)).ok()) {
                 Some(c) => Arc::new(Counter(c)),
@@ -896,14 +926,25 @@ mod slatedb_bridge {
             }
         }
 
-        fn register_up_down_counter(&self, name: &str, description: &str, labels: &[(&str, &str)]) -> Arc<dyn UpDownCounterFn> {
+        fn register_up_down_counter(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+        ) -> Arc<dyn UpDownCounterFn> {
             match self.share(name, description, labels) {
                 Some(s) => Arc::new(s),
                 None => Arc::new(Noop),
             }
         }
 
-        fn register_histogram(&self, name: &str, description: &str, labels: &[(&str, &str)], boundaries: &[f64]) -> Arc<dyn HistogramFn> {
+        fn register_histogram(
+            &self,
+            name: &str,
+            description: &str,
+            labels: &[(&str, &str)],
+            boundaries: &[f64],
+        ) -> Arc<dyn HistogramFn> {
             let labels = &keep(labels);
             let v = vec(&self.hists, name, labels, |keys| {
                 prometheus::register_histogram_vec!(

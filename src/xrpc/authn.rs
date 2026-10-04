@@ -98,7 +98,9 @@ impl Credentials {
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_repo(collection, action),
-            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
+                false
+            }
             _ => true,
         }
     }
@@ -127,7 +129,9 @@ impl Credentials {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_account(attr, action),
             Credentials::AppPassword { .. } => action == "read",
-            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => false,
+            Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
+                false
+            }
             _ => true,
         }
     }
@@ -160,9 +164,7 @@ impl Credentials {
     }
 
     pub fn need_repo(&self, collection: &str, action: &str) -> XResult<()> {
-        self.require_scope(self.allows_repo(collection, action), || {
-            format!("repo:{collection}?action={action}")
-        })
+        self.require_scope(self.allows_repo(collection, action), || format!("repo:{collection}?action={action}"))
     }
 
     pub fn need_rpc(&self, lxm: &str, aud: &str) -> XResult<()> {
@@ -170,9 +172,7 @@ impl Credentials {
         if matches!(self, Credentials::AppPassword { .. }) && !self.allows_rpc(lxm, aud) {
             return Err(XrpcError::bad("InvalidToken", "Bad token method"));
         }
-        self.require_scope(self.allows_rpc(lxm, aud), || {
-            format!("rpc:{lxm}?aud={}", aud.replace('#', "%23"))
-        })
+        self.require_scope(self.allows_rpc(lxm, aud), || format!("rpc:{lxm}?aud={}", aud.replace('#', "%23")))
     }
 
     pub fn need_blob(&self, mime: &str) -> XResult<()> {
@@ -324,7 +324,10 @@ const FORWARDED_AUTH_WAIT: std::time::Duration = std::time::Duration::from_milli
 async fn authenticate_within(app: &Arc<App>, parts: &Parts) -> XResult<Credentials> {
     let h = parts.headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     let (bearer, dpop) = (h.and_then(|h| h.strip_prefix("Bearer ")), h.and_then(|h| h.strip_prefix("DPoP ")));
-    if (bearer.is_none() && dpop.is_none()) || app.config.forwarded_write_start.is_none() || !crate::forward::is_forwarded() {
+    if (bearer.is_none() && dpop.is_none())
+        || app.config.forwarded_write_start.is_none()
+        || !crate::forward::is_forwarded()
+    {
         return authenticate(app, parts).await;
     }
     match tokio::time::timeout(FORWARDED_AUTH_WAIT, authenticate(app, parts)).await {
@@ -353,10 +356,7 @@ pub struct Auth(pub Credentials);
 
 impl FromRequestParts<Arc<App>> for Auth {
     type Rejection = XrpcError;
-    async fn from_request_parts(
-        parts: &mut Parts,
-        app: &Arc<App>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
         authenticate_within(app, parts).await.map(Auth)
     }
 }
@@ -365,10 +365,7 @@ pub struct MaybeAuth(pub Option<Credentials>);
 
 impl FromRequestParts<Arc<App>> for MaybeAuth {
     type Rejection = XrpcError;
-    async fn from_request_parts(
-        parts: &mut Parts,
-        app: &Arc<App>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, app: &Arc<App>) -> Result<Self, Self::Rejection> {
         if parts.headers.get(header::AUTHORIZATION).is_none() {
             return Ok(MaybeAuth(None));
         }
@@ -395,11 +392,7 @@ pub struct ServiceAuth {
 }
 
 fn service_auth_err(error: &str, message: &str) -> XrpcError {
-    XrpcError {
-        status: StatusCode::UNAUTHORIZED,
-        error: error.into(),
-        message: message.into(),
-    }
+    XrpcError { status: StatusCode::UNAUTHORIZED, error: error.into(), message: message.into() }
 }
 
 /// The `#atproto` (`#atproto_label` for a `#atproto_labeler` issuer) key of
@@ -516,10 +509,8 @@ async fn verify_jwt(
 /// Reference `userServiceAuthOptional`: a Bearer token must be a valid
 /// service JWT for `lxm`; no header or another scheme is unauthenticated.
 pub async fn optional_service_auth(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<Option<ServiceAuth>> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
+    let bearer =
+        headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     match bearer {
         Some(tok) => verify_jwt(app, tok.trim(), Some(lxm), None, false).await.map(Some),
         None => Ok(None),

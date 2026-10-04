@@ -159,7 +159,8 @@ fn route_name(nsid: &str) -> String {
 fn valid_nsid(s: &str) -> bool {
     s.len() <= 317
         && s.split('.').count() >= 3
-        && s.split('.').all(|seg| !seg.is_empty() && seg.len() <= 63 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && s.split('.')
+            .all(|seg| !seg.is_empty() && seg.len() <= 63 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 fn valid_did(s: &str) -> bool {
@@ -234,7 +235,14 @@ pub fn compile_with(doc: Option<&Doc>, mail_daily_budget: u32) -> Result<Policy,
         }
         check_points(&mut errs, &at, r.points);
         check_window(&mut errs, &at, r.window_secs);
-        let spec = Spec::new(&route_name(&r.nsid), KeyKind::Ip, &r.nsid, r.window_secs.saturating_mul(1000), r.points, r.enabled);
+        let spec = Spec::new(
+            &route_name(&r.nsid),
+            KeyKind::Ip,
+            &r.nsid,
+            r.window_secs.saturating_mul(1000),
+            r.points,
+            r.enabled,
+        );
         if p.routes.insert(path, spec).is_some() {
             errs.push(format!("{at}.nsid: {} listed twice", r.nsid));
         }
@@ -276,8 +284,12 @@ pub fn compile_with(doc: Option<&Doc>, mail_daily_budget: u32) -> Result<Policy,
                 if !valid_did(did) {
                     errs.push(format!("{at}.did: not a DID: {did:?}"));
                 } else {
-                    if !o.limiters.is_empty() && !o.limiters.iter().any(|l| p.spec(l).is_some_and(|s| s.key == KeyKind::Did)) {
-                        errs.push(format!("{at}.limiters: a DID override only applies to DID-keyed buckets; none listed"));
+                    if !o.limiters.is_empty()
+                        && !o.limiters.iter().any(|l| p.spec(l).is_some_and(|s| s.key == KeyKind::Did))
+                    {
+                        errs.push(format!(
+                            "{at}.limiters: a DID override only applies to DID-keyed buckets; none listed"
+                        ));
                     }
                     p.did_ov.entry(did.clone()).or_default().push(ov);
                 }
@@ -297,7 +309,8 @@ pub fn parse(bytes: &[u8]) -> Result<Doc, String> {
     serde_json::from_slice(bytes).map_err(|e| format!("invalid config JSON: {e}"))
 }
 
-const DOC_FIELDS: &[&str] = &["version", "enabled", "limiters", "routes", "overrides", "updatedAt", "updatedBy", "note", "history"];
+const DOC_FIELDS: &[&str] =
+    &["version", "enabled", "limiters", "routes", "overrides", "updatedAt", "updatedBy", "note", "history"];
 const LIMITER_FIELDS: &[&str] = &["enabled", "points", "windowSecs"];
 const ROUTE_FIELDS: &[&str] = &["nsid", "points", "windowSecs", "enabled"];
 const OVERRIDE_FIELDS: &[&str] = &["ip", "did", "limiters", "exempt", "points", "note"];
@@ -336,7 +349,11 @@ pub fn parse_stored(bytes: &[u8]) -> Result<(Doc, Vec<String>), String> {
 }
 
 fn ov_label(o: &OverrideCfg) -> String {
-    let who = o.ip.as_deref().map(|ip| format!("ip {ip}")).or_else(|| o.did.as_deref().map(|d| format!("did {d}"))).unwrap_or_default();
+    let who =
+        o.ip.as_deref()
+            .map(|ip| format!("ip {ip}"))
+            .or_else(|| o.did.as_deref().map(|d| format!("did {d}")))
+            .unwrap_or_default();
     let what = if o.exempt { "exempt".to_string() } else { format!("{} points", o.points.unwrap_or(0)) };
     let on = if o.limiters.is_empty() { "all buckets".to_string() } else { o.limiters.join(",") };
     format!("{who} {what} on {on}")
@@ -441,7 +458,10 @@ mod tests {
         assert_eq!((g.points, g.window_ms), (10, 60_000));
         assert!(!p.spec("oauth-sign-in-ip").unwrap().enabled);
         let r = &p.routes["/xrpc/app.bsky.feed.getTimeline"];
-        assert_eq!((&*r.name, r.points, r.window_ms, r.key), ("route:app.bsky.feed.getTimeline", 5, 30_000, KeyKind::Ip));
+        assert_eq!(
+            (&*r.name, r.points, r.window_ms, r.key),
+            ("route:app.bsky.feed.getTimeline", 5, 30_000, KeyKind::Ip)
+        );
         // the IP override covers global-ip for 10.x clients only
         let m = p.ip_matches(Some("10.1.2.3".parse().unwrap()));
         assert_eq!(p.override_for("global-ip", "10.1.2.3", &m), Some(Action::Exempt));
@@ -521,7 +541,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dropped, ["burst", "limiters.global-ip.jitter", "routes[0].cost", "overrides[0].until"]);
-        assert_eq!((d.version, d.limiters["global-ip"].points, d.routes[0].points, d.overrides[0].exempt), (3, Some(5), 1, true));
+        assert_eq!(
+            (d.version, d.limiters["global-ip"].points, d.routes[0].points, d.overrides[0].exempt),
+            (3, Some(5), 1, true)
+        );
         assert!(parse_stored(br#"{"routes": [{"nsid": "a.b.c"}]}"#).is_err(), "a missing field is still an error");
         assert!(parse_stored(b"nope").is_err());
         assert!(parse(b"not json").is_err());

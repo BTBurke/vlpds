@@ -32,7 +32,8 @@ async fn populate(nodes: &[TestServer], shards: u32, n: u64) -> std::collections
     let commit = Cid::dag_cbor(b"commit");
     let data = Cid::dag_cbor(b"data");
     for (shard, dids) in by_shard.into_iter().enumerate() {
-        let p = nodes.iter().find_map(|s| s.app.partitions.get(vlpds::slots::ShardId(shard as u32))).expect("shard owner");
+        let p =
+            nodes.iter().find_map(|s| s.app.partitions.get(vlpds::slots::ShardId(shard as u32))).expect("shard owner");
         for chunk in dids.chunks(5000) {
             let mut wb = slatedb::WriteBatch::new();
             for (did, i) in chunk {

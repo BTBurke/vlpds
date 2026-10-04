@@ -112,8 +112,7 @@ impl Keypair {
     }
 
     fn public_key(&self) -> &PublicKey {
-        self.pk
-            .get_or_init(|| PublicKey::from_secret_key(SECP256K1, &self.sk))
+        self.pk.get_or_init(|| PublicKey::from_secret_key(SECP256K1, &self.sk))
     }
 
     pub fn public_key_sec1(&self) -> [u8; 33] {
@@ -174,8 +173,8 @@ fn verify_compact(pk: &PublicKey, data: &[u8], sig: &[u8; 64]) -> bool {
 
 /// The secp256k1 group order n.
 const ORDER: [u8; 32] = [
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
-    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0xba, 0xae, 0xdc,
+    0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41,
 ];
 
 /// m < 2^256 < 2n: at most one subtraction. Constant time.
@@ -315,7 +314,8 @@ pub enum Purpose {
 }
 
 impl Purpose {
-    pub const ALL: [Purpose; 5] = [Purpose::Commit, Purpose::ServiceAuth, Purpose::OAuthToken, Purpose::KeyLoad, Purpose::PlcOperation];
+    pub const ALL: [Purpose; 5] =
+        [Purpose::Commit, Purpose::ServiceAuth, Purpose::OAuthToken, Purpose::KeyLoad, Purpose::PlcOperation];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -508,7 +508,11 @@ mod tests {
             let key: [u8; 32] = if i % 3 == 0 { [0xff; 32] } else { rng.r#gen() };
             let data: [u8; 32] = if i % 5 == 0 { [0u8; 32] } else { rng.r#gen() };
             for counter in [0, 1, 2, 7] {
-                assert_eq!(rust_nonce(msg, &key, None, counter), c_nonce(msg, &key, None, counter), "msg {i} counter {counter}");
+                assert_eq!(
+                    rust_nonce(msg, &key, None, counter),
+                    c_nonce(msg, &key, None, counter),
+                    "msg {i} counter {counter}"
+                );
                 assert_eq!(
                     rust_nonce(msg, &key, Some(&data), counter),
                     c_nonce(msg, &key, Some(&data), counter),
@@ -661,7 +665,12 @@ mod tests {
         }
         for (name, mut r) in names.iter().zip(res) {
             r.sort_by(f64::total_cmp);
-            println!("bench_sign {name:>22}: median {:>8.0} ns  (min {:.0}, max {:.0}, {rounds} rounds x {n})", r[r.len() / 2], r[0], r[r.len() - 1]);
+            println!(
+                "bench_sign {name:>22}: median {:>8.0} ns  (min {:.0}, max {:.0}, {rounds} rounds x {n})",
+                r[r.len() / 2],
+                r[0],
+                r[r.len() - 1]
+            );
         }
     }
 }

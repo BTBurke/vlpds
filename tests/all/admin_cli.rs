@@ -43,7 +43,11 @@ async fn account_commands_match_pdsadmin() {
     assert!(info["invitedBy"]["code"].is_string(), "used a fresh invite: {info}");
     // --json, a given password
     let h2 = format!("{}.{HANDLE_DOMAIN}", unique_name("cli"));
-    let j = admin_json(u, &["account", "create", &format!("{}@example.com", unique_name("cli")), &h2, "--password", "a-given-password-1"]).await;
+    let j = admin_json(
+        u,
+        &["account", "create", &format!("{}@example.com", unique_name("cli")), &h2, "--password", "a-given-password-1"],
+    )
+    .await;
     let did2 = j["did"].as_str().unwrap().to_string();
     assert_eq!(j["handle"], json!(h2));
     s.create_session(&h2, "a-given-password-1").await.ok();
@@ -181,8 +185,10 @@ async fn publish_identity_and_key_rotation() {
     let out = ok(admin_cli(&s.url, &["publish-identity", &a.did, "--file", file.to_str().unwrap()]).await);
     let _ = std::fs::remove_file(&file);
     assert!(out.contains(&format!("published identity evt for {} ({})", a.did, a.handle)), "{out}");
-    let frames = sub.until(Duration::from_secs(10), |f| f.iter().filter(|f| f.kind() == "#identity").count() >= 2).await;
-    let ids: Vec<(&str, Option<&str>)> = frames.iter().filter(|f| f.kind() == "#identity").map(|f| (f.did().unwrap(), f.str("handle"))).collect();
+    let frames =
+        sub.until(Duration::from_secs(10), |f| f.iter().filter(|f| f.kind() == "#identity").count() >= 2).await;
+    let ids: Vec<(&str, Option<&str>)> =
+        frames.iter().filter(|f| f.kind() == "#identity").map(|f| (f.did().unwrap(), f.str("handle"))).collect();
     assert_eq!(ids, vec![(a.did.as_str(), Some(a.handle.as_str())), (b.did.as_str(), Some(b.handle.as_str()))]);
     // an unknown DID fails the batch, the others still go out
     let (r, out) = admin_cli(&s.url, &["publish-identity", "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa", &a.did]).await;
@@ -211,7 +217,11 @@ async fn publish_identity_and_key_rotation() {
     let j = admin_json(&s.url, &["rotate-plc-keys", "--dry-run"]).await;
     assert_eq!(j.as_array().unwrap().len(), 1, "{j}");
     let r = &j[0]["result"];
-    assert_eq!((r["accounts"].as_u64(), r["current"].as_u64(), r["rotated"].as_u64()), (Some(2), Some(2), Some(0)), "{j}");
+    assert_eq!(
+        (r["accounts"].as_u64(), r["current"].as_u64(), r["rotated"].as_u64()),
+        (Some(2), Some(2), Some(0)),
+        "{j}"
+    );
     let (r, out) = admin_cli(&s.url, &["ensure-recovery-key", "--dry-run", "--per-second", "20"]).await;
     assert!(r.is_err() && out.contains("no operator recovery key configured"), "{out}");
     let out = ok(admin_cli(&s.url, &["rewrap-secrets", "--dry-run"]).await);
@@ -275,7 +285,10 @@ async fn check_and_rebuild_repo() {
     p.db.put(vlpds::state::mst_node_key(&a.did, 0, &stray), b"\xa0".to_vec()).await.unwrap();
     let (r, out) = admin_cli(u, &["check-repo", &a.did]).await;
     assert!(r.unwrap_err().to_string().contains("2 problem(s)"), "{out}");
-    assert!(out.contains("1 persisted MST node(s) missing") && out.contains("1 persisted MST node(s) not in the tree"), "{out}");
+    assert!(
+        out.contains("1 persisted MST node(s) missing") && out.contains("1 persisted MST node(s) not in the tree"),
+        "{out}"
+    );
 
     // rebuild: dry run changes nothing; then a new commit, #sync, clean state
     let (head0, rev0) = s.latest_commit(&a.did).await;
@@ -298,17 +311,36 @@ async fn check_and_rebuild_repo() {
     assert_eq!(j["records"]["count"], json!(120));
     // the same tree, re-signed
     assert_eq!(j["mst"]["rebuiltRoot"], json!(j["head"]["data"]));
-    assert_eq!(s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "100")]).await.ok()["records"].as_array().unwrap().len(), 100);
+    assert_eq!(
+        s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "100")]).await.ok()["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        100
+    );
     s.post(&a, "still writable").await;
     let repo = s.get_repo(&a.did).await;
     assert!(repo.blocks.len() > 120);
 
     // the replace is guarded by the head the records were read at
     let stale = Some(Cid::from_bytes(&head0.to_bytes()).unwrap());
-    let r =
-        s.app.account_op(&a.did, vlpds::worker::AccountOp::ReplaceRepo { records: Vec::new(), swap_commit: stale, stale_keys: Vec::new(), tree: None }).await;
+    let r = s
+        .app
+        .account_op(
+            &a.did,
+            vlpds::worker::AccountOp::ReplaceRepo {
+                records: Vec::new(),
+                swap_commit: stale,
+                stale_keys: Vec::new(),
+                tree: None,
+            },
+        )
+        .await;
     assert_eq!(r.err().map(|e| e.error), Some("InvalidSwap".to_string()));
-    assert_eq!(s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "5")]).await.ok()["records"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        s.list_records(&a.did, "app.bsky.feed.post", &[("limit", "5")]).await.ok()["records"].as_array().unwrap().len(),
+        5
+    );
 
     // a lost record: the check says so, and rebuild refuses
     let rprefix = vlpds::state::record_prefix(&a.did, 0);
@@ -335,7 +367,12 @@ async fn per_node_commands_cover_the_cluster() {
     let b = cluster_node("cli-b", store.clone(), SHARDS, |_| {}).await;
     balanced(&[&a, &b]).await;
 
-    let accts = [a.create_account("pn").await, a.create_account("pn").await, b.create_account("pn").await, b.create_account("pn").await];
+    let accts = [
+        a.create_account("pn").await,
+        a.create_account("pn").await,
+        b.create_account("pn").await,
+        b.create_account("pn").await,
+    ];
     let on_b = accts.iter().find(|t| b.app.partition(&t.did).is_ok()).expect("an account on b");
 
     // every node, totals summed
@@ -354,7 +391,10 @@ async fn per_node_commands_cover_the_cluster() {
     // DID-keyed calls through the other node reach the owner
     let mut sub = b.subscribe_from_now().await;
     ok(admin_cli(&a.url, &["publish-identity", &on_b.did]).await);
-    sub.until(Duration::from_secs(10), |f| f.iter().any(|f| f.kind() == "#identity" && f.did() == Some(on_b.did.as_str()))).await;
+    sub.until(Duration::from_secs(10), |f| {
+        f.iter().any(|f| f.kind() == "#identity" && f.did() == Some(on_b.did.as_str()))
+    })
+    .await;
     let j = admin_json(&a.url, &["check-repo", &on_b.did]).await;
     assert_eq!(j["ok"], json!(true), "{j}");
     let j = admin_json(&a.url, &["account", "list"]).await;
@@ -368,15 +408,30 @@ async fn the_binary_runs_admin_commands() {
     let a = s.create_account("bin").await;
     let bin = env!("CARGO_BIN_EXE_vlpds");
     let run_bin = |args: Vec<String>| async move {
-        tokio::process::Command::new(bin).args(args).env("VLPDS_ADMIN_TOKEN", vlpds::server::DEV_ADMIN_TOKEN).output().await.unwrap()
+        tokio::process::Command::new(bin)
+            .args(args)
+            .env("VLPDS_ADMIN_TOKEN", vlpds::server::DEV_ADMIN_TOKEN)
+            .output()
+            .await
+            .unwrap()
     };
-    let o = run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "account".into(), "list".into(), "--json".into()]).await;
+    let o =
+        run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "account".into(), "list".into(), "--json".into()])
+            .await;
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let j: J = serde_json::from_slice(&o.stdout).unwrap();
     assert!(j.as_array().unwrap().iter().any(|x| x["did"] == json!(a.did)), "{j}");
     let o = run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "check-repo".into(), a.did.clone()]).await;
     assert!(o.status.success() && String::from_utf8_lossy(&o.stdout).contains("(ok)"));
-    let o = run_bin(vec!["admin".into(), "--url".into(), s.url.clone(), "account".into(), "takedown".into(), "nope".into()]).await;
+    let o = run_bin(vec![
+        "admin".into(),
+        "--url".into(),
+        s.url.clone(),
+        "account".into(),
+        "takedown".into(),
+        "nope".into(),
+    ])
+    .await;
     assert!(!o.status.success());
 }
 
@@ -428,7 +483,11 @@ async fn the_binary_reads_the_admin_token_file() {
     assert!(o.status.success(), "VLPDS_ADMIN_TOKEN wins: {}", String::from_utf8_lossy(&o.stderr));
     let missing = std::env::temp_dir().join("vlpds-cli-admin-missing");
     let o = run_bin(vec![file(&missing)]).await;
-    assert!(String::from_utf8_lossy(&o.stderr).contains("--admin-token-file"), "{}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("--admin-token-file"),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     for p in [good, bad] {
         std::fs::remove_file(p).unwrap();
     }
@@ -460,9 +519,14 @@ async fn the_node_reads_secret_files() {
     assert_ne!(code, Some(0));
     assert!(err.contains("VLPDS_JWT_SECRET must be at least"), "{err}");
     assert!(!err.contains("shhh-short"), "secret echoed: {err}");
-    let (_, err) = run(vec!["--jwt-secret-file".into(), path(&jwt), "--admin-token-file".into(), path(&short)], vec![]).await;
+    let (_, err) =
+        run(vec!["--jwt-secret-file".into(), path(&jwt), "--admin-token-file".into(), path(&short)], vec![]).await;
     assert!(err.contains("VLPDS_ADMIN_TOKEN must be at least"), "{err}");
-    let env = vec![("VLPDS_JWT_SECRET_FILE", path(&jwt)), ("VLPDS_ADMIN_TOKEN_FILE", path(&jwt)), ("VLPDS_INTERNAL_TOKEN_FILE", path(&short))];
+    let env = vec![
+        ("VLPDS_JWT_SECRET_FILE", path(&jwt)),
+        ("VLPDS_ADMIN_TOKEN_FILE", path(&jwt)),
+        ("VLPDS_INTERNAL_TOKEN_FILE", path(&short)),
+    ];
     let (_, err) = run(vec![], env).await;
     assert!(err.contains("VLPDS_INTERNAL_TOKEN must be at least"), "{err}");
 

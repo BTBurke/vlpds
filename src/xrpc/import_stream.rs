@@ -76,7 +76,9 @@ pub(super) fn start(body: Body, max: usize, res: Arc<Reservation>) -> mpsc::Rece
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(Chunk::Fail(XrpcError::bad("InvalidRequest", format!("error reading body: {e}")))).await;
+                    let _ = tx
+                        .send(Chunk::Fail(XrpcError::bad("InvalidRequest", format!("error reading body: {e}"))))
+                        .await;
                     return;
                 }
             };
@@ -120,7 +122,15 @@ struct Sink<'a> {
 
 impl<'a> Sink<'a> {
     fn new(tx: &'a mpsc::Sender<XResult<Item>>, res: &'a Reservation) -> Self {
-        Sink { tx, res, builder: StreamBuilder::default(), records: Vec::new(), nodes: Vec::new(), bytes: 0, sent: false }
+        Sink {
+            tx,
+            res,
+            builder: StreamBuilder::default(),
+            records: Vec::new(),
+            nodes: Vec::new(),
+            bytes: 0,
+            sent: false,
+        }
     }
 
     fn record(&mut self, r: ImportedRecord) -> Result<(), Stop> {
@@ -480,8 +490,8 @@ impl Input {
 mod tests {
     use super::*;
     use crate::cbor::key_cmp;
-    use std::collections::HashMap;
     use crate::mst::Tree;
+    use std::collections::HashMap;
 
     struct Repo {
         commit: (Cid, Vec<u8>),
@@ -557,7 +567,11 @@ mod tests {
     type Parsed = XResult<(Vec<ImportedRecord>, Cid)>;
 
     fn unbounded() -> Arc<Reservation> {
-        futures::executor::block_on(super::super::import_budget::ImportBudget::new(1 << 40, std::time::Duration::ZERO).admit(None)).ok().expect("room")
+        futures::executor::block_on(
+            super::super::import_budget::ImportBudget::new(1 << 40, std::time::Duration::ZERO).admit(None),
+        )
+        .ok()
+        .expect("room")
     }
 
     /// Feeds `car` in chunks of `chunk` bytes, as a request body would, and
@@ -637,7 +651,11 @@ mod tests {
     async fn bodies_past_their_estimate_grow_the_reservation() {
         use super::super::import_budget::{sizing, ImportBudget};
         let car = repo(20_000).streamed();
-        let chunked = |car: Vec<u8>| Body::from_stream(futures::stream::iter(car.chunks(8192).map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c))).collect::<Vec<_>>()));
+        let chunked = |car: Vec<u8>| {
+            Body::from_stream(futures::stream::iter(
+                car.chunks(8192).map(|c| Ok::<_, std::io::Error>(Bytes::copy_from_slice(c))).collect::<Vec<_>>(),
+            ))
+        };
         let budget = ImportBudget::new(64 << 20, std::time::Duration::from_millis(100));
         let res = budget.admit(Some(100)).await.ok().expect("room");
         let before = res.held();
@@ -718,8 +736,14 @@ mod tests {
         assert!(summary(&got).unwrap_err().contains("block does not match its cid"));
 
         let same = record("com.example.a/x");
-        let recs: Vec<(String, Vec<u8>)> =
-            (0..40).map(|i| (format!("com.example.a/{i:03}"), if i % 10 == 0 { same.clone() } else { record(&format!("com.example.a/{i:03}")) })).collect();
+        let recs: Vec<(String, Vec<u8>)> = (0..40)
+            .map(|i| {
+                (
+                    format!("com.example.a/{i:03}"),
+                    if i % 10 == 0 { same.clone() } else { record(&format!("com.example.a/{i:03}")) },
+                )
+            })
+            .collect();
         let r = repo_of(&recs);
         let car = r.streamed();
         let (got, path) = run(&car, 100);
@@ -780,7 +804,10 @@ mod tests {
         // a record too big, and not CBOR
         let mut tree = Tree::new();
         let big = {
-            let m = vec![("$type".to_string(), Value::Text("com.example.a".into())), ("b".to_string(), Value::Bytes(vec![1; (2 << 20) + 1]))];
+            let m = vec![
+                ("$type".to_string(), Value::Text("com.example.a".into())),
+                ("b".to_string(), Value::Bytes(vec![1; (2 << 20) + 1])),
+            ];
             Value::Map(m).to_cbor()
         };
         let junk = b"\xff\xff".to_vec();
@@ -862,9 +889,7 @@ mod tests {
         let n = mst::Node::clean(0, vec![mst::Entry::Value { key: Arc::from(&b"com.example.a/x"[..]), val: rc }], None);
         mst::encode_node(&n, &mut leaf).unwrap();
         let lc = Cid::dag_cbor(&leaf);
-        let entries = vec![
-            mst::Entry::Child { node: None, cid: Some(lc) },
-        ];
+        let entries = vec![mst::Entry::Child { node: None, cid: Some(lc) }];
         let mut parent = Vec::new();
         mst::encode_node(&mst::Node::clean(1, entries, None), &mut parent).unwrap();
         let pc = Cid::dag_cbor(&parent);
@@ -912,7 +937,11 @@ mod tests {
     }
 
     fn key_at(h: i32, n: usize) -> Vec<String> {
-        let mut ks: Vec<String> = (0..).map(|i| format!("com.example.a/k{i}")).filter(|k| mst::height_for_key(k.as_bytes()) == h).take(n).collect();
+        let mut ks: Vec<String> = (0..)
+            .map(|i| format!("com.example.a/k{i}"))
+            .filter(|k| mst::height_for_key(k.as_bytes()) == h)
+            .take(n)
+            .collect();
         ks.sort();
         ks
     }
@@ -930,7 +959,8 @@ mod tests {
         let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
 
         // control: the canonical one-node tree imports
-        let (good, gb) = raw_node(None, &[(0, k0, None, rc), (count_prefix(k0, k1), &k1[count_prefix(k0, k1)..], None, rc)]);
+        let (good, gb) =
+            raw_node(None, &[(0, k0, None, rc), (count_prefix(k0, k1), &k1[count_prefix(k0, k1)..], None, rc)]);
         let ok = car_over(None, good, &[(good, &gb), (rc, &rec), (rc, &rec)]);
         assert_eq!(buffered(&ok).unwrap().0.len(), 2);
         assert_eq!(run(&ok, 64).1, "stream");
@@ -956,7 +986,8 @@ mod tests {
         let (top, tb) = over(raw_leaf);
         let (canon, cb) = over(leaf);
         assert!(buffered(&car_over(None, canon, &[(canon, &cb), (leaf, &lb), (rc, &rec), (rc, &rec)])).is_ok());
-        cases.push(("raw-codec node link", car_over(None, top, &[(top, &tb), (raw_leaf, &lb), (rc, &rec), (rc, &rec)])));
+        cases
+            .push(("raw-codec node link", car_over(None, top, &[(top, &tb), (raw_leaf, &lb), (rc, &rec), (rc, &rec)])));
 
         // a record under a raw-codec CID (the tree itself is canonical)
         let raw_rec = Cid::raw(&rec);

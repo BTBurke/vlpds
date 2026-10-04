@@ -17,7 +17,11 @@ async fn optional_invite_code_is_checked_and_recorded() {
     let s = TestServer::spawn().await;
     let j = s.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok();
     assert_eq!(j["inviteCodeRequired"], json!(false));
-    let code = s.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 1}), &Auth::Admin).await.ok()["code"].as_str().unwrap().to_string();
+    let code = s.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 1}), &Auth::Admin).await.ok()
+        ["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
 
     let did = signup(&s, Some(&code)).await.ok()["did"].as_str().unwrap().to_string();
     let codes = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();

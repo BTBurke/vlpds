@@ -44,10 +44,7 @@ pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 /// Every node shares `jwt_secret`, so derived keys agree across nodes with
 /// no stored state.
 pub fn derive_secret(server_secret: &str, label: &str) -> [u8; 32] {
-    hmac_sha256(
-        server_secret.as_bytes(),
-        &[b"vlpds-oauth-v1", label.as_bytes()],
-    )
+    hmac_sha256(server_secret.as_bytes(), &[b"vlpds-oauth-v1", label.as_bytes()])
 }
 
 fn hex_upper(b: u8) -> [u8; 3] {
@@ -121,10 +118,7 @@ fn form_decode_component(s: &str) -> String {
                 i += 1;
             }
             b'%' if i + 3 <= b.len() => {
-                match std::str::from_utf8(&b[i + 1..i + 3])
-                    .ok()
-                    .and_then(|h| u8::from_str_radix(h, 16).ok())
-                {
+                match std::str::from_utf8(&b[i + 1..i + 3]).ok().and_then(|h| u8::from_str_radix(h, 16).ok()) {
                     Some(v) => {
                         out.push(v);
                         i += 3;
@@ -206,8 +200,13 @@ pub enum ClaimKind {
 }
 
 impl ClaimKind {
-    const ALL: [ClaimKind; 5] =
-        [ClaimKind::ResourceProof, ClaimKind::AsProof, ClaimKind::Assertion, ClaimKind::RequestObject, ClaimKind::Guard];
+    const ALL: [ClaimKind; 5] = [
+        ClaimKind::ResourceProof,
+        ClaimKind::AsProof,
+        ClaimKind::Assertion,
+        ClaimKind::RequestObject,
+        ClaimKind::Guard,
+    ];
 
     /// By the prefix its maker gives `key`.
     pub fn of(key: &str, durable: bool) -> ClaimKind {
@@ -249,8 +248,7 @@ impl NodeState {
     }
 }
 
-static NODES: parking_lot::RwLock<Vec<(usize, std::sync::Arc<NodeState>)>> =
-    parking_lot::RwLock::new(Vec::new());
+static NODES: parking_lot::RwLock<Vec<(usize, std::sync::Arc<NodeState>)>> = parking_lot::RwLock::new(Vec::new());
 
 pub(crate) fn node_state(app: &crate::xrpc::App) -> std::sync::Arc<NodeState> {
     let id = app as *const crate::xrpc::App as usize;
@@ -379,7 +377,11 @@ impl ReplayInner {
 
 impl ReplayCache {
     pub fn new(max: usize, max_per_group: usize) -> ReplayCache {
-        ReplayCache { inner: parking_lot::Mutex::new(ReplayInner::default()), max: max.max(1), max_per_group: max_per_group.max(1) }
+        ReplayCache {
+            inner: parking_lot::Mutex::new(ReplayInner::default()),
+            max: max.max(1),
+            max_per_group: max_per_group.max(1),
+        }
     }
 
     /// Also done on every insert; the GC calls it so an idle cache does not
@@ -494,7 +496,10 @@ mod tests {
         }
         assert_eq!(c.len(), 15);
         for i in 0..5 {
-            assert!(!c.insert_unique("victim", &format!("v{i}"), now + 300), "victim claim {i} evicted by another key's flood");
+            assert!(
+                !c.insert_unique("victim", &format!("v{i}"), now + 300),
+                "victim claim {i} evicted by another key's flood"
+            );
         }
         // the newest of the flood are still claimed
         assert!(!c.insert_unique("flood", "f999", now + 60));

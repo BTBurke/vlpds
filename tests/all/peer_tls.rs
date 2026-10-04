@@ -48,7 +48,10 @@ fn forwards() -> u64 {
 }
 
 async fn cluster_status(c: &reqwest::Client, base: &str) -> reqwest::Result<reqwest::Response> {
-    c.get(format!("{base}/internal/v1/cluster")).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN).send().await
+    c.get(format!("{base}/internal/v1/cluster"))
+        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
+        .send()
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -77,7 +80,18 @@ async fn mtls_cluster_end_to_end() {
             break;
         }
     }
-    let owned: Vec<TestAccount> = owned.into_iter().enumerate().map(|(i, o)| o.unwrap_or_else(|| panic!("no account on node {i}: owned {:?}", nodes.iter().map(|n| n.app.partitions.owned().len()).collect::<Vec<_>>()))).collect();
+    let owned: Vec<TestAccount> = owned
+        .into_iter()
+        .enumerate()
+        .map(|(i, o)| {
+            o.unwrap_or_else(|| {
+                panic!(
+                    "no account on node {i}: owned {:?}",
+                    nodes.iter().map(|n| n.app.partitions.owned().len()).collect::<Vec<_>>()
+                )
+            })
+        })
+        .collect();
 
     // a firehose on a: b's and c's commits reach it through their log streams
     let mut sub = a.subscribe_from_now().await;
@@ -94,15 +108,31 @@ async fn mtls_cluster_end_to_end() {
 
     // internal private put/get, from c, for an account a owns
     let did = &owned[0].did;
-    let m = vlpds::segment::Mutation { key: vlpds::state::private_key(did, "mtls").into(), val: Some(bytes::Bytes::from_static(b"v")) };
+    let m = vlpds::segment::Mutation {
+        key: vlpds::state::private_key(did, "mtls").into(),
+        val: Some(bytes::Bytes::from_static(b"v")),
+    };
     c.app.put_private(did, vec![m]).await.unwrap_or_else(|e| panic!("private put: {}", e.message));
-    assert_eq!(c.app.get_private(did, "mtls").await.unwrap_or_else(|e| panic!("{}", e.message)).as_deref(), Some(&b"v"[..]));
+    assert_eq!(
+        c.app.get_private(did, "mtls").await.unwrap_or_else(|e| panic!("{}", e.message)).as_deref(),
+        Some(&b"v"[..])
+    );
 
     // the OAuth replay claim at the routing key's owner (a), from c
     let until = chrono::Utc::now().timestamp() + 60;
     let key = format!("mtls-jti-{}", rand::random::<u64>());
-    assert!(vlpds::xrpc::internal::claim_replay_anywhere(&c.app, did, &key, until).await.unwrap_or_else(|e| panic!("{}", e.message)), "first claim");
-    assert!(!vlpds::xrpc::internal::claim_replay_anywhere(&b.app, did, &key, until).await.unwrap_or_else(|e| panic!("{}", e.message)), "replay refused");
+    assert!(
+        vlpds::xrpc::internal::claim_replay_anywhere(&c.app, did, &key, until)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message)),
+        "first claim"
+    );
+    assert!(
+        !vlpds::xrpc::internal::claim_replay_anywhere(&b.app, did, &key, until)
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message)),
+        "replay refused"
+    );
 
     // the public listener: no /internal/*, even with the token
     let plain = reqwest::Client::new();
@@ -127,7 +157,12 @@ async fn mtls_cluster_end_to_end() {
     assert!(cluster_status(&plain, &a_peer.replace("https://", "http://")).await.is_err());
     // a peer client of this cluster gets in (and the token still applies)
     let peer = peer_client();
-    let r = peer.get(format!("{a_peer}/internal/v1/cluster")).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN).send().await.unwrap();
+    let r = peer
+        .get(format!("{a_peer}/internal/v1/cluster"))
+        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.version(), reqwest::Version::HTTP_2);
     let r = peer.get(format!("{a_peer}/internal/v1/cluster")).header("x-vlpds-internal", "nope").send().await.unwrap();
@@ -136,13 +171,32 @@ async fn mtls_cluster_end_to_end() {
     // operators reach a given node through any node's public listener: an
     // admin call naming it (x-vlpds-node) is relayed over mTLS
     for (id, n) in [("tls-a", &a), ("tls-b", &b), ("tls-c", &c)] {
-        let r = a.xrpc.send(a.xrpc.http.get(format!("{}/xrpc/vlpds.admin.getClusterStatus", a.url)).header("x-vlpds-node", id).basic_auth("admin", Some(ADMIN_TOKEN))).await.ok();
+        let r = a
+            .xrpc
+            .send(
+                a.xrpc
+                    .http
+                    .get(format!("{}/xrpc/vlpds.admin.getClusterStatus", a.url))
+                    .header("x-vlpds-node", id)
+                    .basic_auth("admin", Some(ADMIN_TOKEN)),
+            )
+            .await
+            .ok();
         assert_eq!(r["node"], id, "{r}");
         assert_eq!(n.app.cluster.as_ref().unwrap().cfg.node_id, id);
     }
     let rb = a.xrpc.http.get(format!("{}/xrpc/vlpds.admin.getClusterStatus", a.url)).header("x-vlpds-node", "tls-b");
     assert_eq!(a.xrpc.send(rb).await.status, 401, "relayed with the caller's (missing) credentials");
-    let r = a.xrpc.send(a.xrpc.http.get(format!("{}/xrpc/vlpds.admin.getClusterStatus", a.url)).header("x-vlpds-node", "nope").basic_auth("admin", Some(ADMIN_TOKEN))).await;
+    let r = a
+        .xrpc
+        .send(
+            a.xrpc
+                .http
+                .get(format!("{}/xrpc/vlpds.admin.getClusterStatus", a.url))
+                .header("x-vlpds-node", "nope")
+                .basic_auth("admin", Some(ADMIN_TOKEN)),
+        )
+        .await;
     r.err(404, "NodeNotFound");
 }
 
@@ -206,13 +260,15 @@ async fn peer_listener_refuses_foreign_and_missing_certs() {
 
     // a client of another CA doesn't trust our server either
     let s = peer_tls::issue_node(&other.cert_pem, &other.key_pem, "tls-stranger", &["127.0.0.1".into()], 30).unwrap();
-    let stranger = vlpds::http::PeerClient::new(1, PeerTls::from_pem(&other.cert_pem, &s.cert_pem, &s.key_pem).unwrap());
+    let stranger =
+        vlpds::http::PeerClient::new(1, PeerTls::from_pem(&other.cert_pem, &s.cert_pem, &s.key_pem).unwrap());
     assert!(stranger.get(&url).send().await.is_err());
 
     // no cleartext either way: the peer client refuses http:// before
     // connecting, and the peer listener answers no plain HTTP
     assert!(ok.get(url.replace("https://", "http://")).send().await.is_err());
-    let plain = reqwest::Client::new().get(url.replace("https://", "http://")).header("x-vlpds-internal", token).send().await;
+    let plain =
+        reqwest::Client::new().get(url.replace("https://", "http://")).header("x-vlpds-internal", token).send().await;
     assert!(plain.is_err(), "{plain:?}");
 }
 
@@ -243,7 +299,8 @@ async fn peer_identity_must_match_the_lease() {
     let ws = format!("{}/internal/v1/log/stream", a_peer.replace("https://", "wss://"));
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(ws.as_str()).unwrap();
     req.headers_mut().insert("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN.parse().unwrap());
-    let bad = tokio_tungstenite::connect_async_tls_with_config(req.clone(), None, false, right.ws_connector("tls-y")).await;
+    let bad =
+        tokio_tungstenite::connect_async_tls_with_config(req.clone(), None, false, right.ws_connector("tls-y")).await;
     assert!(bad.is_err());
     let good = tokio_tungstenite::connect_async_tls_with_config(req, None, false, right.ws_connector("tls-x")).await;
     assert!(good.is_ok(), "{:?}", good.err());
@@ -255,7 +312,12 @@ async fn peer_identity_must_match_the_lease() {
 async fn lone_node_has_no_peer_side() {
     let s = TestServer::spawn_lone(|_| {}).await;
     assert!(s.peer_url.is_empty());
-    let r = reqwest::Client::new().get(format!("{}/internal/v1/cluster", s.url)).header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN).send().await.unwrap();
+    let r = reqwest::Client::new()
+        .get(format!("{}/internal/v1/cluster", s.url))
+        .header("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(r.status(), 404);
     let a = s.create_account("lone").await;
     s.post(&a, "still serves").await;

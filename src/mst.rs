@@ -80,10 +80,7 @@ impl Entry {
         }
     }
     fn child(node: Arc<Node>) -> Entry {
-        Entry::Child {
-            node: Some(node),
-            cid: None,
-        }
+        Entry::Child { node: Some(node), cid: None }
     }
 }
 
@@ -295,12 +292,10 @@ impl Node {
                 None => Ok(None),
             };
         }
-        Ok(self
-            .find_existing_entry(key)
-            .map(|i| match &self.entries[i] {
-                Entry::Value { val, .. } => *val,
-                _ => unreachable!(),
-            }))
+        Ok(self.find_existing_entry(key).map(|i| match &self.entries[i] {
+            Entry::Value { val, .. } => *val,
+            _ => unreachable!(),
+        }))
     }
 }
 
@@ -325,9 +320,7 @@ fn prove_mutation(n: &mut Node, key: &[u8]) -> Result<()> {
                 continue;
             }
         }
-        let Entry::Child { node, .. } = &mut n.entries[i] else {
-            unreachable!()
-        };
+        let Entry::Child { node, .. } = &mut n.entries[i] else { unreachable!() };
         let child = Arc::make_mut(node.as_mut().ok_or(MstError::Partial)?);
         match child.compare_key_mark(key)? {
             Ordering::Greater => continue,
@@ -345,13 +338,7 @@ fn ignore_partial(r: Result<()>) -> Result<()> {
     }
 }
 
-fn insert(
-    mut n: Arc<Node>,
-    key: &[u8],
-    val: Cid,
-    height: i32,
-    prove: bool,
-) -> Result<(Arc<Node>, Option<Cid>)> {
+fn insert(mut n: Arc<Node>, key: &[u8], val: Cid, height: i32, prove: bool) -> Result<(Arc<Node>, Option<Cid>)> {
     if n.stub {
         return Err(MstError::Partial);
     }
@@ -368,9 +355,7 @@ fn insert(
             }
         }
         let nm = Arc::make_mut(&mut n);
-        let Entry::Value { val: existing, .. } = &mut nm.entries[idx] else {
-            unreachable!()
-        };
+        let Entry::Value { val: existing, .. } = &mut nm.entries[idx] else { unreachable!() };
         let prev = *existing;
         *existing = val;
         nm.touch();
@@ -383,10 +368,7 @@ fn insert(
     if prove {
         ignore_partial(prove_mutation(nm, key))?;
     }
-    let new_entry = Entry::Value {
-        key: key.into(),
-        val,
-    };
+    let new_entry = Entry::Value { key: key.into(), val };
     if !split {
         nm.entries.insert(idx, new_entry);
         return Ok((n, None));
@@ -396,10 +378,7 @@ fn insert(
         _ => return Err(MstError::Partial),
     };
     let (left, right) = split_node(&child, key)?;
-    nm.entries.splice(
-        idx..idx + 1,
-        [Entry::child(left), new_entry, Entry::child(right)],
-    );
+    nm.entries.splice(idx..idx + 1, [Entry::child(left), new_entry, Entry::child(right)]);
     Ok((n, None))
 }
 
@@ -407,14 +386,8 @@ fn split_entries(n: &Node, idx: usize) -> Result<(Arc<Node>, Arc<Node>)> {
     if idx == 0 || idx >= n.entries.len() {
         return Err(MstError::Invalid("splitting at one end of entries"));
     }
-    let left = Node {
-        entries: n.entries[..idx].to_vec(),
-        ..Node::empty(n.height)
-    };
-    let right = Node {
-        entries: n.entries[idx..].to_vec(),
-        ..Node::empty(n.height)
-    };
+    let left = Node { entries: n.entries[..idx].to_vec(), ..Node::empty(n.height) };
+    let right = Node { entries: n.entries[idx..].to_vec(), ..Node::empty(n.height) };
     Ok((Arc::new(left), Arc::new(right)))
 }
 
@@ -436,48 +409,25 @@ fn split_node(n: &Node, key: &[u8]) -> Result<(Arc<Node>, Arc<Node>)> {
     let mut re = vec![Entry::child(lower_right)];
     re.extend_from_slice(&n.entries[idx + 1..]);
     Ok((
-        Arc::new(Node {
-            entries: le,
-            ..Node::empty(n.height)
-        }),
-        Arc::new(Node {
-            entries: re,
-            ..Node::empty(n.height)
-        }),
+        Arc::new(Node { entries: le, ..Node::empty(n.height) }),
+        Arc::new(Node { entries: re, ..Node::empty(n.height) }),
     ))
 }
 
-fn insert_parent(
-    n: Arc<Node>,
-    key: &[u8],
-    val: Cid,
-    height: i32,
-    prove: bool,
-) -> Result<(Arc<Node>, Option<Cid>)> {
+fn insert_parent(n: Arc<Node>, key: &[u8], val: Cid, height: i32, prove: bool) -> Result<(Arc<Node>, Option<Cid>)> {
     let parent = if n.is_empty() {
         Node::empty(height)
     } else {
         let h = n.height + 1;
-        Node {
-            entries: vec![Entry::child(n)],
-            ..Node::empty(h)
-        }
+        Node { entries: vec![Entry::child(n)], ..Node::empty(h) }
     };
     insert(Arc::new(parent), key, val, height, prove)
 }
 
-fn insert_child(
-    mut n: Arc<Node>,
-    key: &[u8],
-    val: Cid,
-    height: i32,
-    prove: bool,
-) -> Result<(Arc<Node>, Option<Cid>)> {
+fn insert_child(mut n: Arc<Node>, key: &[u8], val: Cid, height: i32, prove: bool) -> Result<(Arc<Node>, Option<Cid>)> {
     if let Some(idx) = n.find_existing_child(key) {
         let nm = Arc::make_mut(&mut n);
-        let Entry::Child { node, .. } = &mut nm.entries[idx] else {
-            unreachable!()
-        };
+        let Entry::Child { node, .. } = &mut nm.entries[idx] else { unreachable!() };
         let child = node.take().ok_or(MstError::Partial)?;
         let (new_child, prev) = insert(child, key, val, height, prove)?;
         *node = Some(new_child);
@@ -493,23 +443,12 @@ fn insert_child(
     }
     let nm = Arc::make_mut(&mut n);
     nm.touch();
-    let (new_child, _) = insert(
-        Arc::new(Node::empty(nm.height - 1)),
-        key,
-        val,
-        height,
-        prove,
-    )?;
+    let (new_child, _) = insert(Arc::new(Node::empty(nm.height - 1)), key, val, height, prove)?;
     nm.entries.insert(idx, Entry::child(new_child));
     Ok((n, None))
 }
 
-fn remove(
-    mut n: Arc<Node>,
-    key: &[u8],
-    height: Option<i32>,
-    prove: bool,
-) -> Result<(Arc<Node>, Option<Cid>)> {
+fn remove(mut n: Arc<Node>, key: &[u8], height: Option<i32>, prove: bool) -> Result<(Arc<Node>, Option<Cid>)> {
     if n.stub {
         return Err(MstError::Partial);
     }
@@ -526,17 +465,12 @@ fn remove(
     };
     let nm = Arc::make_mut(&mut n);
     nm.touch();
-    let Entry::Value { val: prev, .. } = nm.entries[idx] else {
-        unreachable!()
-    };
+    let Entry::Value { val: prev, .. } = nm.entries[idx] else { unreachable!() };
 
     let len = nm.entries.len();
-    if idx > 0 && idx + 1 < len && nm.entries[idx - 1].is_child() && nm.entries[idx + 1].is_child()
-    {
+    if idx > 0 && idx + 1 < len && nm.entries[idx - 1].is_child() && nm.entries[idx + 1].is_child() {
         let (left, right) = match (&nm.entries[idx - 1], &nm.entries[idx + 1]) {
-            (Entry::Child { node: Some(l), .. }, Entry::Child { node: Some(r), .. }) => {
-                (l.clone(), r.clone())
-            }
+            (Entry::Child { node: Some(l), .. }, Entry::Child { node: Some(r), .. }) => (l.clone(), r.clone()),
             _ => return Err(MstError::Partial),
         };
         let merged = merge_nodes(&left, &right)?;
@@ -555,9 +489,7 @@ fn remove(
             if n.entries.len() != 1 || !n.entries[0].is_child() {
                 break;
             }
-            let Entry::Child { node, cid } = &n.entries[0] else {
-                unreachable!()
-            };
+            let Entry::Child { node, cid } = &n.entries[0] else { unreachable!() };
             n = match (node, cid) {
                 (Some(c), _) => c.clone(),
                 (None, Some(c)) => Arc::new(Node::stub(n.height - 1, Some(*c))),
@@ -575,35 +507,23 @@ fn merge_nodes(left: &Node, right: &Node) -> Result<Arc<Node>> {
     entries.extend_from_slice(&right.entries);
     if idx > 0 && idx < entries.len() && entries[idx - 1].is_child() && entries[idx].is_child() {
         let merged = match (&entries[idx - 1], &entries[idx]) {
-            (Entry::Child { node: Some(l), .. }, Entry::Child { node: Some(r), .. }) => {
-                merge_nodes(l, r)?
-            }
+            (Entry::Child { node: Some(l), .. }, Entry::Child { node: Some(r), .. }) => merge_nodes(l, r)?,
             _ => return Err(MstError::Partial),
         };
         entries[idx - 1] = Entry::child(merged);
         entries.remove(idx);
     }
-    Ok(Arc::new(Node {
-        entries,
-        ..Node::empty(left.height)
-    }))
+    Ok(Arc::new(Node { entries, ..Node::empty(left.height) }))
 }
 
-fn remove_child(
-    mut n: Arc<Node>,
-    key: &[u8],
-    height: i32,
-    prove: bool,
-) -> Result<(Arc<Node>, Option<Cid>)> {
+fn remove_child(mut n: Arc<Node>, key: &[u8], height: i32, prove: bool) -> Result<(Arc<Node>, Option<Cid>)> {
     // Tree::remove checked the key exists, so a no-op delete doesn't
     // copy-on-write the path
     let Some(idx) = n.find_existing_child(key) else {
         return Ok((n, None));
     };
     let nm = Arc::make_mut(&mut n);
-    let Entry::Child { node, .. } = &mut nm.entries[idx] else {
-        unreachable!()
-    };
+    let Entry::Child { node, .. } = &mut nm.entries[idx] else { unreachable!() };
     let child = node.take().ok_or(MstError::Partial)?;
     let (new_child, prev) = remove(child, key, Some(height), prove)?;
     if !new_child.is_empty() {
@@ -621,8 +541,8 @@ fn count_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
     while i + 8 <= n {
-        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap())
-            ^ u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let x =
+            u64::from_le_bytes(a[i..i + 8].try_into().unwrap()) ^ u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         if x != 0 {
             return i + (x.trailing_zeros() / 8) as usize;
         }
@@ -961,10 +881,7 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> Result<Node> {
     }
     let mut entries = Vec::new();
     if let Some(l) = link(v.get("l"))? {
-        entries.push(Entry::Child {
-            node: None,
-            cid: Some(l),
-        });
+        entries.push(Entry::Child { node: None, cid: Some(l) });
     }
     let Some(Value::Array(es)) = v.get("e") else {
         return Err(MstError::Invalid("bad e"));
@@ -1004,16 +921,10 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> Result<Node> {
         } else if h != height {
             return Err(MstError::Invalid("keys of different heights in one node"));
         }
-        entries.push(Entry::Value {
-            key: key.clone().into(),
-            val: *val,
-        });
+        entries.push(Entry::Value { key: key.clone().into(), val: *val });
         prev = key;
         if let Some(t) = t {
-            entries.push(Entry::Child {
-                node: None,
-                cid: Some(t),
-            });
+            entries.push(Entry::Child { node: None, cid: Some(t) });
         }
     }
     if height == 0 && entries.iter().any(Entry::is_child) {
@@ -1063,9 +974,7 @@ impl<B: AsRef<[u8]>> Loader<'_, B> {
         }
         let first = n.entries.iter().find_map(Entry::key);
         let last = n.entries.iter().rev().find_map(Entry::key);
-        if first.zip(lo).is_some_and(|(k, lo)| k <= &lo[..])
-            || last.zip(hi).is_some_and(|(k, hi)| k >= &hi[..])
-        {
+        if first.zip(lo).is_some_and(|(k, lo)| k <= &lo[..]) || last.zip(hi).is_some_and(|(k, hi)| k >= &hi[..]) {
             return Err(MstError::Invalid("node key outside its parent's range"));
         }
         let value_key = |e: Option<&Entry>| match e {
@@ -1077,10 +986,7 @@ impl<B: AsRef<[u8]>> Loader<'_, B> {
                 continue;
             };
             // decode_node never puts two children side by side
-            let clo = i
-                .checked_sub(1)
-                .and_then(|j| value_key(n.entries.get(j)))
-                .or_else(|| lo.cloned());
+            let clo = i.checked_sub(1).and_then(|j| value_key(n.entries.get(j))).or_else(|| lo.cloned());
             let chi = value_key(n.entries.get(i + 1)).or_else(|| hi.cloned());
             if let Some(k) = self.path {
                 if clo.as_ref().is_some_and(|l| k <= &l[..]) || chi.as_ref().is_some_and(|h| k >= &h[..]) {
@@ -1155,10 +1061,7 @@ impl Default for Tree {
 
 impl Tree {
     pub fn new() -> Tree {
-        Tree {
-            root: Arc::new(Node::empty(0)),
-            built: true,
-        }
+        Tree { root: Arc::new(Node::empty(0)), built: true }
     }
 
     /// Runs a mutation that consumes the root. A built tree hands over its
@@ -1167,11 +1070,7 @@ impl Tree {
     /// built tree's mutation fails anyway, the tree is poisoned: its root
     /// becomes a stub, so every later read or write fails rather than report
     /// a half-applied tree's root.
-    fn mutate<T>(
-        &mut self,
-        root: Arc<Node>,
-        f: impl FnOnce(Arc<Node>) -> Result<(Arc<Node>, T)>,
-    ) -> Result<T> {
+    fn mutate<T>(&mut self, root: Arc<Node>, f: impl FnOnce(Arc<Node>) -> Result<(Arc<Node>, T)>) -> Result<T> {
         if self.built {
             return match f(root) {
                 Ok((r, x)) => {
@@ -1215,11 +1114,8 @@ impl Tree {
         let root = std::mem::replace(&mut self.root, placeholder());
         // an emptied tree can be left with a non-zero height: restart it at
         // the key's to keep the shape canonical
-        let root = if root.is_empty() && !root.stub && root.height != height {
-            Arc::new(Node::empty(height))
-        } else {
-            root
-        };
+        let root =
+            if root.is_empty() && !root.stub && root.height != height { Arc::new(Node::empty(height)) } else { root };
         self.mutate(root, |r| insert(r, key, val, height, prove))
     }
 
@@ -1327,12 +1223,7 @@ impl Tree {
 
     /// The tree must be fully written (no dirty nodes).
     pub fn walk_blocks(&self, f: &mut dyn FnMut(Cid, &[u8])) -> Result<()> {
-        fn rec(
-            n: &Node,
-            buf: &mut Vec<u8>,
-            f: &mut dyn FnMut(Cid, &[u8]),
-            depth: usize,
-        ) -> Result<()> {
+        fn rec(n: &Node, buf: &mut Vec<u8>, f: &mut dyn FnMut(Cid, &[u8]), depth: usize) -> Result<()> {
             if depth > MAX_DEPTH {
                 return Err(MstError::Invalid("tree too deep"));
             }
@@ -1525,10 +1416,7 @@ mod tests {
     #[test]
     fn empty_tree_cid() {
         let mut t = Tree::new();
-        assert_eq!(
-            t.root_cid().unwrap().to_string(),
-            "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"
-        );
+        assert_eq!(t.root_cid().unwrap().to_string(), "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm");
     }
 
     #[test]
@@ -1572,12 +1460,7 @@ mod tests {
             for k in &f.keys {
                 t.insert_no_proof(k.as_bytes(), v).unwrap();
             }
-            assert_eq!(
-                t.root_cid().unwrap().to_string(),
-                f.root_before,
-                "{}",
-                f.comment
-            );
+            assert_eq!(t.root_cid().unwrap().to_string(), f.root_before, "{}", f.comment);
             for k in &f.adds {
                 t.insert(k.as_bytes(), v).unwrap();
             }
@@ -1589,11 +1472,7 @@ mod tests {
             assert_eq!(root.to_string(), f.root_after, "{}", f.comment);
             let map: HashMap<Cid, Vec<u8>> = blocks.into_iter().collect();
             for b in &f.blocks_in_proof {
-                assert!(
-                    map.contains_key(&Cid::parse(b).unwrap()),
-                    "{}: missing proof block {b}",
-                    f.comment
-                );
+                assert!(map.contains_key(&Cid::parse(b).unwrap()), "{}: missing proof block {b}", f.comment);
             }
             // invert using only the diff blocks
             let mut inv = Tree::load_from_blocks(&map, root).unwrap();
@@ -1603,21 +1482,12 @@ mod tests {
             for k in &f.dels {
                 assert_eq!(inv.insert(k.as_bytes(), v).unwrap(), None, "{}", f.comment);
             }
-            assert_eq!(
-                inv.root_cid().unwrap().to_string(),
-                f.root_before,
-                "{}",
-                f.comment
-            );
+            assert_eq!(inv.root_cid().unwrap().to_string(), f.root_before, "{}", f.comment);
         }
     }
 
     fn rand_key(rng: &mut impl Rng) -> String {
-        let colls = [
-            "app.bsky.feed.post",
-            "app.bsky.feed.like",
-            "app.bsky.graph.follow",
-        ];
+        let colls = ["app.bsky.feed.post", "app.bsky.feed.like", "app.bsky.graph.follow"];
         format!(
             "{}/{}",
             colls[rng.gen_range(0..3)],
@@ -1656,10 +1526,7 @@ mod tests {
                     let (k, newv) = if roll < 5 || existing.is_empty() {
                         (rand_key(&mut rng), Some(rand_cid(&mut rng)))
                     } else if roll < 7 {
-                        (
-                            existing.choose(&mut rng).unwrap().clone(),
-                            Some(rand_cid(&mut rng)),
-                        )
+                        (existing.choose(&mut rng).unwrap().clone(), Some(rand_cid(&mut rng)))
                     } else {
                         (existing.choose(&mut rng).unwrap().clone(), None)
                     };
@@ -1696,11 +1563,7 @@ mod tests {
                         (None, None) => unreachable!(),
                     }
                 }
-                assert_eq!(
-                    inv.root_cid().unwrap(),
-                    prev_root,
-                    "round {round}: inversion failed"
-                );
+                assert_eq!(inv.root_cid().unwrap(), prev_root, "round {round}: inversion failed");
                 prev_root = root;
             }
             let mut fresh = Tree::new();
@@ -1709,11 +1572,7 @@ mod tests {
             for (k, v) in entries {
                 fresh.insert_no_proof(k.as_bytes(), *v).unwrap();
             }
-            assert_eq!(
-                fresh.root_cid().unwrap(),
-                prev_root,
-                "round {round}: not canonical"
-            );
+            assert_eq!(fresh.root_cid().unwrap(), prev_root, "round {round}: not canonical");
             let mut walked = Vec::new();
             t.walk(&mut |k, v| walked.push((String::from_utf8(k.to_vec()).unwrap(), v)));
             assert_eq!(walked, model.into_iter().collect::<Vec<_>>());
@@ -2026,10 +1885,7 @@ mod tests {
         let h0 = add(&mut blocks, raw_node(None, &[(b"asdf", 0, None)]));
         let h1 = add(&mut blocks, raw_node(None, &[(b"blue", 0, None)]));
         let good = add(&mut blocks, raw_node(Some(h0), &[(b"blue", 0, None)]));
-        assert_eq!(
-            load(&blocks, good).unwrap().get(b"asdf").unwrap(),
-            Some(leaf())
-        );
+        assert_eq!(load(&blocks, good).unwrap().get(b"asdf").unwrap(), Some(leaf()));
         // height 2 over height 0, height 1 over height 1
         let skip = add(&mut blocks, raw_node(Some(h0), &[(b"88bfafc7", 0, None)]));
         let same = add(&mut blocks, raw_node(None, &[(b"blue", 0, Some(h1))]));
@@ -2047,10 +1903,7 @@ mod tests {
         let stub = add(&mut blocks, raw_node(Some(leaf()), &[]));
         let mid0 = add(&mut blocks, raw_node(Some(stub), &[]));
         let top = add(&mut blocks, raw_node(Some(mid0), &[(b"blue", 0, None)]));
-        assert_eq!(
-            load(&blocks, top).err(),
-            Some(MstError::Invalid("child of a height-0 node"))
-        );
+        assert_eq!(load(&blocks, top).err(), Some(MstError::Invalid("child of a height-0 node")));
         // empty non-root nodes don't exist in a canonical tree
         let empty = add(&mut blocks, raw_node(None, &[]));
         let over_empty = add(&mut blocks, raw_node(Some(empty), &[(b"blue", 0, None)]));
@@ -2116,10 +1969,7 @@ mod tests {
         let mut blocks = HashMap::new();
         let low = add(&mut blocks, raw_node(None, &[(b"2653ae71", 0, None)]));
         let high = add(&mut blocks, raw_node(None, &[(b"asdf", 0, None)]));
-        let zkey = (0..)
-            .map(|i| format!("z{i}").into_bytes())
-            .find(|k| height_for_key(k) == 0)
-            .unwrap();
+        let zkey = (0..).map(|i| format!("z{i}").into_bytes()).find(|k| height_for_key(k) == 0).unwrap();
         let late = add(&mut blocks, raw_node(None, &[(&zkey, 0, None)]));
         let both = add(&mut blocks, raw_node(Some(low), &[(b"blue", 0, Some(late))]));
         assert!(load(&blocks, both).is_ok());
@@ -2164,29 +2014,14 @@ mod tests {
         // "asdf" < "asdg", both height 0, sharing a 3-byte prefix
         assert!(ok(raw_node(None, &[(b"asdf", 0, None), (b"g", 3, None)])).is_ok());
         let bad: Vec<(&str, Vec<u8>)> = vec![
-            (
-                "unsorted",
-                raw_node(None, &[(b"asdf", 0, None), (b"2653ae71", 0, None)]),
-            ),
-            (
-                "duplicate",
-                raw_node(None, &[(b"asdf", 0, None), (b"", 4, None)]),
-            ),
-            (
-                "mixed heights",
-                raw_node(None, &[(b"asdf", 0, None), (b"blue", 0, None)]),
-            ),
+            ("unsorted", raw_node(None, &[(b"asdf", 0, None), (b"2653ae71", 0, None)])),
+            ("duplicate", raw_node(None, &[(b"asdf", 0, None), (b"", 4, None)])),
+            ("mixed heights", raw_node(None, &[(b"asdf", 0, None), (b"blue", 0, None)])),
             ("first p != 0", raw_node(None, &[(b"asdf", 1, None)])),
-            (
-                "prefix not maximal",
-                raw_node(None, &[(b"asdf", 0, None), (b"asdg", 0, None)]),
-            ),
+            ("prefix not maximal", raw_node(None, &[(b"asdf", 0, None), (b"asdg", 0, None)])),
             ("empty key", raw_node(None, &[(b"", 0, None)])),
             ("height-0 child", raw_node(Some(c), &[(b"asdf", 0, None)])),
-            (
-                "height-0 right child",
-                raw_node(None, &[(b"asdf", 0, Some(c))]),
-            ),
+            ("height-0 right child", raw_node(None, &[(b"asdf", 0, Some(c))])),
         ];
         for (what, b) in bad {
             assert!(ok(b).is_err(), "{what} accepted");
@@ -2223,38 +2058,11 @@ mod tests {
         let bad = [
             ("missing l", node(entry(None, Some(V::Null)), None, None)),
             ("missing t", node(entry(None, None), Some(V::Null), None)),
-            (
-                "unknown node field",
-                node(
-                    entry(None, Some(V::Null)),
-                    Some(V::Null),
-                    Some(("x", V::Null)),
-                ),
-            ),
-            (
-                "unknown entry field",
-                node(
-                    entry(Some(("x", V::Null)), Some(V::Null)),
-                    Some(V::Null),
-                    None,
-                ),
-            ),
-            (
-                "t not a link",
-                node(
-                    entry(None, Some(V::Bytes(c.to_bytes().to_vec()))),
-                    Some(V::Null),
-                    None,
-                ),
-            ),
-            (
-                "t int",
-                node(entry(None, Some(V::Int(0))), Some(V::Null), None),
-            ),
-            (
-                "l not a link",
-                node(entry(None, Some(V::Null)), Some(V::Text("x".into())), None),
-            ),
+            ("unknown node field", node(entry(None, Some(V::Null)), Some(V::Null), Some(("x", V::Null)))),
+            ("unknown entry field", node(entry(Some(("x", V::Null)), Some(V::Null)), Some(V::Null), None)),
+            ("t not a link", node(entry(None, Some(V::Bytes(c.to_bytes().to_vec()))), Some(V::Null), None)),
+            ("t int", node(entry(None, Some(V::Int(0))), Some(V::Null), None)),
+            ("l not a link", node(entry(None, Some(V::Null)), Some(V::Text("x".into())), None)),
         ];
         for (what, b) in bad {
             assert!(ok(b).is_err(), "{what} accepted");
@@ -2298,7 +2106,8 @@ mod tests {
         .unwrap();
         assert!(leaves > 500 && interior > 100, "{leaves} leaves, {interior} interior");
         let mut big = LeafEncoder::default();
-        let entries: Vec<Entry> = (0..30u32).map(|i| Entry::Value { key: Arc::from(format!("a/{i:03}").as_bytes()), val: leaf() }).collect();
+        let entries: Vec<Entry> =
+            (0..30u32).map(|i| Entry::Value { key: Arc::from(format!("a/{i:03}").as_bytes()), val: leaf() }).collect();
         for e in &entries {
             let Entry::Value { key, val } = e else { unreachable!() };
             big.push(key, val);

@@ -17,7 +17,8 @@ async fn pds(plc: &MockPlc, key: &Arc<Keypair>, service_did: &str, recovery: Opt
     TestServer::spawn_with(move |c| {
         c.plc_url = url;
         c.service_did = sd;
-        c.plc = PlcConfig { rotation_key: Some(RotationKey::Key(key)), recovery_did_key: recovery, ..Default::default() };
+        c.plc =
+            PlcConfig { rotation_key: Some(RotationKey::Key(key)), recovery_did_key: recovery, ..Default::default() };
     })
     .await
 }
@@ -58,7 +59,8 @@ async fn create_account_registers_the_genesis_op() {
     vlpds::plc::verify_sig(&[rot.did_key()], op).expect("signed by the server rotation key");
     // the directory's document is the one this PDS serves
     let data = plc.data(&a.did).unwrap();
-    let local = s.xrpc.get("com.atproto.identity.resolveDid", &[("did", &a.did)], &Auth::None).await.ok()["didDoc"].clone();
+    let local =
+        s.xrpc.get("com.atproto.identity.resolveDid", &[("did", &a.did)], &Auth::None).await.ok()["didDoc"].clone();
     let served = vlpds::plc::format_did_doc(&data);
     for k in ["id", "alsoKnownAs", "verificationMethod", "service"] {
         assert_eq!(served[k], local[k], "{k}");
@@ -118,7 +120,10 @@ async fn plc_failure_at_create_leaves_nothing() {
     s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await.err(500, "InternalServerError");
     plc.set_down(false);
     assert!(plc.dids().is_empty());
-    s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &handle)], &Auth::None).await.err(400, "HandleNotFound");
+    s.xrpc
+        .get("com.atproto.identity.resolveHandle", &[("handle", &handle)], &Auth::None)
+        .await
+        .err(400, "HandleNotFound");
     s.create_session(&email, PASSWORD).await.client_err();
     assert!(sub.next(std::time::Duration::from_millis(300)).await.is_none(), "no events for a failed creation");
     // the same handle and email then work
@@ -140,7 +145,8 @@ async fn update_handle_submits_a_plc_update_first() {
     assert_eq!(ops[1]["alsoKnownAs"], json!([format!("at://{h2}")]));
     assert_eq!(ops[1]["prev"], json!(vlpds::plc::op_cid(&ops[0]).unwrap().to_string()));
     assert_eq!(ops[1]["verificationMethods"], ops[0]["verificationMethods"]);
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#identity" && f.did() == Some(a.did.as_str()))).await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#identity" && f.did() == Some(a.did.as_str()))).await;
     let id = frames.iter().find(|f| f.kind() == "#identity").unwrap();
     assert_eq!(id.str("handle"), Some(h2.as_str()));
     // the same handle again: re-announced, nothing new for the directory
@@ -150,7 +156,10 @@ async fn update_handle_submits_a_plc_update_first() {
     // a failed PLC update changes nothing here, and frees the new handle
     let h3 = format!("{}.{HANDLE_DOMAIN}", unique_name("uh3"));
     plc.fail_posts(1, 503);
-    s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h3}), &a.auth()).await.err(500, "InternalServerError");
+    s.xrpc
+        .post("com.atproto.identity.updateHandle", &json!({"handle": h3}), &a.auth())
+        .await
+        .err(500, "InternalServerError");
     assert_eq!(s.app.account(&a.did).await.ok().unwrap().handle, h2);
     assert_eq!(plc.ops(&a.did).len(), 2);
     let r = s.xrpc.get("com.atproto.identity.resolveHandle", &[("handle", &h2)], &Auth::None).await.ok();
@@ -171,7 +180,10 @@ async fn signing_key_rotation_updates_the_directory() {
     let before = signing_did_key(&s, &a.did).await;
     // a refusal (an outage leaves the rotation pending: tests/all/key_rotation.rs)
     plc.fail_posts(1, 400);
-    s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.err(500, "InternalServerError");
+    s.xrpc
+        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
+        .await
+        .err(500, "InternalServerError");
     assert_eq!(signing_did_key(&s, &a.did).await, before, "no local change on a PLC refusal");
     let j = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     let new = j["signingKey"].as_str().unwrap();
@@ -235,8 +247,14 @@ async fn sign_and_submit_plc_operations() {
         (json!({"type": "plc_tombstone", "prev": op["prev"], "sig": "x"}), "Invalid operation"),
         (resign(&|u| u["rotationKeys"] = json!([extra])), "Rotation keys do not include server's rotation key"),
         (resign(&|u| u["services"]["atproto_pds"]["type"] = json!("Other")), "Incorrect type on atproto_pds service"),
-        (resign(&|u| u["services"]["atproto_pds"]["endpoint"] = json!("https://elsewhere.test")), "Incorrect endpoint on atproto_pds service"),
-        (resign(&|u| u["verificationMethods"]["atproto"] = json!(Keypair::generate().did_key())), "Incorrect signing key"),
+        (
+            resign(&|u| u["services"]["atproto_pds"]["endpoint"] = json!("https://elsewhere.test")),
+            "Incorrect endpoint on atproto_pds service",
+        ),
+        (
+            resign(&|u| u["verificationMethods"]["atproto"] = json!(Keypair::generate().did_key())),
+            "Incorrect signing key",
+        ),
         (resign(&|u| u["alsoKnownAs"] = json!(["at://someone.else"])), "Incorrect handle in alsoKnownAs"),
     ];
     for (bad, msg) in cases {
@@ -277,7 +295,11 @@ async fn migration_out_to_another_pds() {
     // 1. the account on the new PDS, deactivated, from service auth
     let token = old
         .xrpc
-        .get("com.atproto.server.getServiceAuth", &[("aud", "did:web:new-pds.test"), ("lxm", "com.atproto.server.createAccount")], &alice.auth())
+        .get(
+            "com.atproto.server.getServiceAuth",
+            &[("aud", "did:web:new-pds.test"), ("lxm", "com.atproto.server.createAccount")],
+            &alice.auth(),
+        )
         .await
         .ok()["token"]
         .as_str()
@@ -287,7 +309,11 @@ async fn migration_out_to_another_pds() {
     let email = format!("{}@example.com", unique_name("moved"));
     let created = new
         .xrpc
-        .post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": PASSWORD, "did": did}), &Auth::Bearer(token))
+        .post(
+            "com.atproto.server.createAccount",
+            &json!({"handle": handle, "email": email, "password": PASSWORD, "did": did}),
+            &Auth::Bearer(token),
+        )
         .await
         .ok();
     assert_eq!(created["did"], json!(did));
@@ -305,7 +331,8 @@ async fn migration_out_to_another_pds() {
     let tok = old.mail_token(&alice.email).await.unwrap();
     let mut body = rec.clone();
     body["token"] = json!(tok);
-    let op = old.xrpc.post("com.atproto.identity.signPlcOperation", &body, &alice.auth()).await.ok()["operation"].clone();
+    let op =
+        old.xrpc.post("com.atproto.identity.signPlcOperation", &body, &alice.auth()).await.ok()["operation"].clone();
     // 4. the new PDS submits it (#identity) and activates (#account)
     let mut new_sub = new.subscribe_from_now().await;
     new.xrpc.post("com.atproto.identity.submitPlcOperation", &json!({"operation": op}), &auth).await.ok();
@@ -316,16 +343,22 @@ async fn migration_out_to_another_pds() {
     let st = new.xrpc.get("com.atproto.server.checkAccountStatus", &[], &auth).await.ok();
     assert_eq!(st["validDid"], json!(true), "{st}");
     new.xrpc.post_empty("com.atproto.server.activateAccount", &auth).await.ok();
-    let frames =
-        new_sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()) && f.bool("active") == Some(true))).await;
+    let frames = new_sub
+        .until(FH_TIMEOUT, |fs| {
+            fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()) && f.bool("active") == Some(true))
+        })
+        .await;
     assert!(frames.iter().any(|f| f.kind() == "#identity" && f.did() == Some(did.as_str())), "#identity after submit");
     // the new PDS serves the directory's document
-    let new_doc = new.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
+    let new_doc =
+        new.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
     assert_eq!(new_doc["service"][0]["serviceEndpoint"], json!(new.url));
     // 5. the old PDS steps back; it no longer controls the DID
     let mut old_sub = old.subscribe_from_now().await;
     old.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &alice.auth()).await.ok();
-    let fr = old_sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str()))).await;
+    let fr = old_sub
+        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.kind() == "#account" && f.did() == Some(did.as_str())))
+        .await;
     let fr = fr.iter().find(|f| f.kind() == "#account").unwrap();
     assert_eq!((fr.bool("active"), fr.str("status")), (Some(false), Some("deactivated")));
     // its DID now resolves through the directory, not to the stale local
@@ -389,7 +422,11 @@ async fn unregistered_mode_keeps_local_dids() {
     assert!(plc.dids().is_empty() && plc.posts() == 0);
     let rec = s.xrpc.get("com.atproto.identity.getRecommendedDidCredentials", &[], &a.auth()).await.ok();
     assert_eq!(rec["rotationKeys"], json!([]));
-    for m in ["com.atproto.identity.requestPlcOperationSignature", "com.atproto.identity.signPlcOperation", "com.atproto.identity.submitPlcOperation"] {
+    for m in [
+        "com.atproto.identity.requestPlcOperationSignature",
+        "com.atproto.identity.signPlcOperation",
+        "com.atproto.identity.submitPlcOperation",
+    ] {
         s.xrpc.post(m, &json!({"operation": {}}), &a.auth()).await.err(501, "MethodNotImplemented");
     }
     let h2 = format!("{}.{HANDLE_DOMAIN}", unique_name("unreg2"));
@@ -403,7 +440,15 @@ async fn unregistered_mode_keeps_local_dids() {
 async fn bulk_create_skips_plc() {
     let plc = MockPlc::start().await;
     let s = pds(&plc, &new_key(), "did:web:pds.test", None).await;
-    let j = s.xrpc.post("vlpds.admin.bulkCreate", &json!({"start": 0, "count": 20, "records": 1}), &Auth::Bearer(ADMIN_TOKEN.into())).await.ok();
+    let j = s
+        .xrpc
+        .post(
+            "vlpds.admin.bulkCreate",
+            &json!({"start": 0, "count": 20, "records": 1}),
+            &Auth::Bearer(ADMIN_TOKEN.into()),
+        )
+        .await
+        .ok();
     assert_eq!(j["created"], json!(20), "{j}");
     assert_eq!(plc.posts(), 0);
 }
@@ -443,8 +488,12 @@ async fn rotation_key_rotation() {
     a.app.log.checkpoint_all().await;
     vlpds::server::shutdown(&a.app).await;
 
-    let b =
-        node(PlcConfig { rotation_key: Some(RotationKey::Key(k2.clone())), old_rotation_keys: vec![RotationKey::Key(k1.clone())], ..Default::default() }).await;
+    let b = node(PlcConfig {
+        rotation_key: Some(RotationKey::Key(k2.clone())),
+        old_rotation_keys: vec![RotationKey::Key(k1.clone())],
+        ..Default::default()
+    })
+    .await;
     let rotate = |dry: bool| {
         let x = b.xrpc.clone();
         async move { x.post("vlpds.admin.rotatePlcKeys", &json!({"dryRun": dry}), &Auth::Admin).await.ok() }
@@ -456,7 +505,11 @@ async fn rotation_key_rotation() {
     assert_eq!(last["rotationKeys"], json!([k2.did_key()]));
     vlpds::plc::verify_sig(&[k1.did_key()], &last).expect("signed by the retired key");
     let dry = rotate(true).await;
-    assert_eq!((dry["current"].clone(), dry["rotated"].clone(), dry["failed"].clone()), (json!(1), json!(2), json!(0)), "{dry}");
+    assert_eq!(
+        (dry["current"].clone(), dry["rotated"].clone(), dry["failed"].clone()),
+        (json!(1), json!(2), json!(0)),
+        "{dry}"
+    );
     assert_eq!(plc.ops(&accts[1].did).len(), 1, "dry run changes nothing");
     let done = rotate(false).await;
     assert_eq!((done["rotated"].clone(), done["failed"].clone()), (json!(2), json!(0)), "{done}");
@@ -498,7 +551,16 @@ async fn user_recovery_key_on_a_local_account() {
         async move {
             s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
             let token = s.mail_token(&a.email).await.unwrap();
-            let op = s.xrpc.post("com.atproto.identity.signPlcOperation", &json!({"token": token, "rotationKeys": keys}), &a.auth()).await.ok()["operation"].clone();
+            let op = s
+                .xrpc
+                .post(
+                    "com.atproto.identity.signPlcOperation",
+                    &json!({"token": token, "rotationKeys": keys}),
+                    &a.auth(),
+                )
+                .await
+                .ok()["operation"]
+                .clone();
             s.xrpc.post("com.atproto.identity.submitPlcOperation", &json!({"operation": op}), &a.auth()).await.ok();
         }
     };
@@ -521,7 +583,11 @@ async fn user_recovery_key_on_a_local_account() {
     m.insert("prev".into(), json!(vlpds::plc::op_cid(&before).unwrap().to_string()));
     let undo = vlpds::plc::sign(undo, &user).unwrap();
     vlpds::plc::PlcClient::new(&plc.url).send(&a.did, &undo, "test").await.unwrap();
-    assert_eq!(plc.data(&a.did).unwrap()["alsoKnownAs"], json!([format!("at://{}", a.handle)]), "the handle update was nullified");
+    assert_eq!(
+        plc.data(&a.did).unwrap()["alsoKnownAs"],
+        json!([format!("at://{}", a.handle)]),
+        "the handle update was nullified"
+    );
     // re-announcing the local handle brings the directory back in line
     s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h2}), &a.auth()).await.ok();
     assert_eq!(plc.data(&a.did).unwrap()["alsoKnownAs"], json!([format!("at://{h2}")]));
@@ -548,7 +614,11 @@ async fn migration_in_with_a_user_key_first() {
     old.post(&alice, "before the move").await;
     let token = old
         .xrpc
-        .get("com.atproto.server.getServiceAuth", &[("aud", "did:web:new-pds.test"), ("lxm", "com.atproto.server.createAccount")], &alice.auth())
+        .get(
+            "com.atproto.server.getServiceAuth",
+            &[("aud", "did:web:new-pds.test"), ("lxm", "com.atproto.server.createAccount")],
+            &alice.auth(),
+        )
         .await
         .ok()["token"]
         .as_str()
@@ -558,7 +628,11 @@ async fn migration_in_with_a_user_key_first() {
     let email = format!("{}@example.com", unique_name("ukf"));
     let created = new
         .xrpc
-        .post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": PASSWORD, "did": did}), &Auth::Bearer(token))
+        .post(
+            "com.atproto.server.createAccount",
+            &json!({"handle": handle, "email": email, "password": PASSWORD, "did": did}),
+            &Auth::Bearer(token),
+        )
         .await
         .ok();
     let auth = Auth::Bearer(created["accessJwt"].as_str().unwrap().into());
@@ -572,7 +646,8 @@ async fn migration_in_with_a_user_key_first() {
     let mut body = rec.clone();
     body["token"] = json!(old.mail_token(&alice.email).await.unwrap());
     body["rotationKeys"] = json!([user, recovery, new_key_.did_key()]);
-    let op = old.xrpc.post("com.atproto.identity.signPlcOperation", &body, &alice.auth()).await.ok()["operation"].clone();
+    let op =
+        old.xrpc.post("com.atproto.identity.signPlcOperation", &body, &alice.auth()).await.ok()["operation"].clone();
     new.xrpc.post("com.atproto.identity.submitPlcOperation", &json!({"operation": op}), &auth).await.ok();
     assert_eq!(plc.data(&did).unwrap()["rotationKeys"], json!([user, recovery, new_key_.did_key()]));
     let st = new.xrpc.get("com.atproto.server.checkAccountStatus", &[], &auth).await.ok();
@@ -615,28 +690,52 @@ async fn ensure_recovery_key_backfills_existing_accounts() {
     let rot = new_key();
     let recovery = Keypair::generate().did_key();
     let a = node(PlcConfig { rotation_key: Some(RotationKey::Key(rot.clone())), ..Default::default() }).await;
-    a.xrpc.post("vlpds.admin.ensureRecoveryKey", &json!({"dryRun": true}), &Auth::Admin).await.err(400, "InvalidRequest");
+    a.xrpc
+        .post("vlpds.admin.ensureRecoveryKey", &json!({"dryRun": true}), &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
     let plain = a.create_account("erk").await;
     let user = Keypair::generate().did_key();
     let (_, _, mut body) = account_body("erk");
     body["recoveryKey"] = json!(user);
-    let with_user = a.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await.ok()["did"].as_str().unwrap().to_string();
+    let with_user = a.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await.ok()["did"]
+        .as_str()
+        .unwrap()
+        .to_string();
     // one that left: its DID lists only another server's key
     let gone = a.create_account("erk").await;
     a.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &gone.auth()).await.ok();
     let token = a.mail_token(&gone.email).await.unwrap();
     let elsewhere = Keypair::generate().did_key();
-    let op = a.xrpc.post("com.atproto.identity.signPlcOperation", &json!({"token": token, "rotationKeys": [elsewhere]}), &gone.auth()).await.ok()["operation"].clone();
+    let op = a
+        .xrpc
+        .post(
+            "com.atproto.identity.signPlcOperation",
+            &json!({"token": token, "rotationKeys": [elsewhere]}),
+            &gone.auth(),
+        )
+        .await
+        .ok()["operation"]
+        .clone();
     vlpds::plc::PlcClient::new(&plc.url).send(&gone.did, &op, "test").await.unwrap();
     a.app.log.checkpoint_all().await;
     vlpds::server::shutdown(&a.app).await;
 
-    let b = node(PlcConfig { rotation_key: Some(RotationKey::Key(rot.clone())), recovery_did_key: Some(recovery.clone()), ..Default::default() }).await;
+    let b = node(PlcConfig {
+        rotation_key: Some(RotationKey::Key(rot.clone())),
+        recovery_did_key: Some(recovery.clone()),
+        ..Default::default()
+    })
+    .await;
     let ensure = |dry: bool| {
         let x = b.xrpc.clone();
-        async move { x.post("vlpds.admin.ensureRecoveryKey", &json!({"dryRun": dry, "perSecond": 50}), &Auth::Admin).await.ok() }
+        async move {
+            x.post("vlpds.admin.ensureRecoveryKey", &json!({"dryRun": dry, "perSecond": 50}), &Auth::Admin).await.ok()
+        }
     };
-    let counts = |r: &J| (r["accounts"].clone(), r["present"].clone(), r["added"].clone(), r["foreign"].clone(), r["failed"].clone());
+    let counts = |r: &J| {
+        (r["accounts"].clone(), r["present"].clone(), r["added"].clone(), r["foreign"].clone(), r["failed"].clone())
+    };
     let posts = plc.posts();
     let dry = ensure(true).await;
     assert_eq!(counts(&dry), (json!(3), json!(0), json!(2), json!(1), json!(0)), "{dry}");
@@ -696,7 +795,10 @@ async fn audit_log_for_hosted_accounts_only() {
     let stranger = other.create_account("elsewhere").await;
     assert!(!plc.ops(&stranger.did).is_empty());
     s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", &stranger.did)], &Auth::None).await.err(400, "DidNotFound");
-    s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", "did:web:example.com")], &Auth::None).await.err(400, "InvalidRequest");
+    s.xrpc
+        .get("vlpds.identity.getPlcAuditLog", &[("did", "did:web:example.com")], &Auth::None)
+        .await
+        .err(400, "InvalidRequest");
 
     plc.set_down(true);
     s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", &a.did)], &Auth::None).await.err_status(500);

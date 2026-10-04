@@ -14,7 +14,13 @@ use std::time::{Duration, Instant};
 
 const SHARDS: u32 = 8;
 
-async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: Option<String>, ttl: Duration, renew: Duration) -> TestServer {
+async fn node(
+    id: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    advertise: Option<String>,
+    ttl: Duration,
+    renew: Duration,
+) -> TestServer {
     cluster_node(id, store.clone(), SHARDS, |c| {
         let l = lease(c);
         (l.ttl, l.renew_every, l.skew) = (ttl, renew, ttl / 5);
@@ -45,7 +51,10 @@ async fn refused_peer_is_taken_over_before_its_ttl() {
     // b advertises an address that refuses connections: once it stops
     // renewing, a's probe finds nobody there
     let b = node("b", &store, Some(refusing_addr().await), ttl, renew).await;
-    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || {
+        owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize
+    })
+    .await;
     b.app.node.halt();
     let took = wait_until("a takes b's shards", Duration::from_secs(4), || owned(&a) == SHARDS as usize).await;
     assert!(took < ttl / 2, "takeover after {took:?} (TTL {ttl:?})");
@@ -58,7 +67,10 @@ async fn accepting_peer_keeps_the_ttl_rule() {
     let (ttl, renew) = (Duration::from_secs(3), Duration::from_millis(200));
     let a = node("a", &store, None, ttl, renew).await;
     let b = node("b", &store, None, ttl, renew).await;
-    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || {
+        owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize
+    })
+    .await;
     // a halted in-process node still accepts connections: frozen, not gone
     b.app.node.halt();
     let t = Instant::now();
@@ -90,7 +102,8 @@ impl LeaseHooks {
     /// Catches the next GET of the lease not caught by an earlier hook:
     /// (fires once it has read the lease, releases its answer).
     fn arm(&self) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
-        let ((reached_tx, reached_rx), (go_tx, go_rx)) = (tokio::sync::oneshot::channel(), tokio::sync::oneshot::channel());
+        let ((reached_tx, reached_rx), (go_tx, go_rx)) =
+            (tokio::sync::oneshot::channel(), tokio::sync::oneshot::channel());
         self.hooks.lock().push_back((reached_tx, go_rx));
         (reached_rx, go_tx)
     }
@@ -98,7 +111,10 @@ impl LeaseHooks {
     async fn lease_exists(&self) -> bool {
         use futures::StreamExt;
         use object_store::ObjectStore;
-        self.inner.list(None).any(|m| std::future::ready(m.is_ok_and(|m| m.location.as_ref().ends_with(self.lease)))).await
+        self.inner
+            .list(None)
+            .any(|m| std::future::ready(m.is_ok_and(|m| m.location.as_ref().ends_with(self.lease))))
+            .await
     }
 }
 
@@ -110,13 +126,26 @@ impl std::fmt::Display for LeaseHooks {
 
 #[async_trait::async_trait]
 impl object_store::ObjectStore for LeaseHooks {
-    async fn put_opts(&self, location: &object_store::path::Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
         self.inner.put_opts(location, payload, opts).await
     }
-    async fn put_multipart_opts(&self, location: &object_store::path::Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
-    async fn get_opts(&self, location: &object_store::path::Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
         let r = self.inner.get_opts(location, options).await;
         if location.as_ref().ends_with(self.lease) {
             let hook = self.hooks.lock().pop_front();
@@ -133,13 +162,24 @@ impl object_store::ObjectStore for LeaseHooks {
     ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
         self.inner.delete_stream(locations)
     }
-    fn list(&self, prefix: Option<&object_store::path::Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.inner.list(prefix)
     }
-    async fn list_with_delimiter(&self, prefix: Option<&object_store::path::Path>) -> object_store::Result<object_store::ListResult> {
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy_opts(&self, from: &object_store::path::Path, to: &object_store::path::Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
         self.inner.copy_opts(from, to, options).await
     }
 }
@@ -161,7 +201,11 @@ impl object_store::ObjectStore for LeaseHooks {
 /// incarnation must start, renew and get its share.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn same_id_restarts_race_the_refused_probe_takeover() {
-    let hooks = Arc::new(LeaseHooks { inner: object_store::memory::InMemory::new(), lease: "nodes/r", hooks: Default::default() });
+    let hooks = Arc::new(LeaseHooks {
+        inner: object_store::memory::InMemory::new(),
+        lease: "nodes/r",
+        hooks: Default::default(),
+    });
     let store: Arc<dyn object_store::ObjectStore> = hooks.clone();
     let (ttl, renew) = (Duration::from_secs(3), Duration::from_millis(400));
     let events = |e: &str| vlpds::metrics::LEASE_EVENTS.with_label_values(&[e]).get();
@@ -169,7 +213,9 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
     let a = node("a", &store, None, ttl, renew).await;
     // each incarnation advertises an address that refuses connects, so a
     // presumes it dead within ~2 renew intervals of its halt
-    let restart = |store: Arc<dyn object_store::ObjectStore>| async move { node("r", &store, Some(refusing_addr().await), ttl, renew).await };
+    let restart = |store: Arc<dyn object_store::ObjectStore>| async move {
+        node("r", &store, Some(refusing_addr().await), ttl, renew).await
+    };
     let mut r = restart(store.clone()).await;
     let mut dead = Vec::new();
     for round in 0..9u32 {
@@ -190,7 +236,10 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
                     // the delete lands between the join's read and its CAS
                     let (r_read, r_go) = hooks.arm();
                     let join = tokio::spawn(restart(store.clone()));
-                    tokio::time::timeout(Duration::from_secs(10), r_read).await.expect("the join reads its lease").unwrap();
+                    tokio::time::timeout(Duration::from_secs(10), r_read)
+                        .await
+                        .expect("the join reads its lease")
+                        .unwrap();
                     let moved = events("join_lease_moved");
                     a_go.send(()).unwrap();
                     retry("a deletes the old lease", || async { (!hooks.lease_exists().await).then_some(()) }).await;
@@ -203,19 +252,29 @@ async fn same_id_restarts_race_the_refused_probe_takeover() {
                     let recreated = events("lease_recreated");
                     let n = restart(store.clone()).await;
                     a_go.send(()).unwrap();
-                    wait_until("the renewal recreates the deleted lease", Duration::from_secs(5), || events("lease_recreated") > recreated).await;
+                    wait_until("the renewal recreates the deleted lease", Duration::from_secs(5), || {
+                        events("lease_recreated") > recreated
+                    })
+                    .await;
                     n
                 }
             }
         };
         dead.push(std::mem::replace(&mut r, next));
     }
-    wait_until("the last incarnation and a split the shards", Duration::from_secs(15), || owned(&r) > 0 && owned(&a) + owned(&r) == SHARDS as usize).await;
+    wait_until("the last incarnation and a split the shards", Duration::from_secs(15), || {
+        owned(&r) > 0 && owned(&a) + owned(&r) == SHARDS as usize
+    })
+    .await;
     // still renewing well past a step (a lost lease would have exited)
     tokio::time::sleep(renew * 4).await;
     assert!(r.app.cluster.as_ref().unwrap().lease_valid());
     assert!(hooks.lease_exists().await);
-    eprintln!("lease vanished under a join {}x, recreated at a renewal {}x", events("join_lease_moved") - moved0, events("lease_recreated") - recreated0);
+    eprintln!(
+        "lease vanished under a join {}x, recreated at a renewal {}x",
+        events("join_lease_moved") - moved0,
+        events("lease_recreated") - recreated0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

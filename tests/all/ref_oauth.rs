@@ -91,7 +91,13 @@ async fn ref_oauth_sign_in_errors_are_indistinguishable() {
     for ident in [unknown.as_str(), acct.handle.as_str()] {
         let mut b = Browser::default();
         let (_, _, html) = b.get(&s, &format!("{}/oauth/account?add=1", s.base)).await;
-        let (st, h, _) = b.post(&s, "/oauth/account/sign-in", &[("csrf", &csrf_of(&html)), ("identifier", ident), ("password", "wrong-password")]).await;
+        let (st, h, _) = b
+            .post(
+                &s,
+                "/oauth/account/sign-in",
+                &[("csrf", &csrf_of(&html)), ("identifier", ident), ("password", "wrong-password")],
+            )
+            .await;
         outcomes.push((st, h.get("location").map(|v| v.to_str().unwrap().to_string())));
     }
     assert_eq!(outcomes[0], outcomes[1]);

@@ -47,10 +47,7 @@ impl fmt::Display for Tid {
 }
 
 pub fn now_micros() -> u64 {
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64;
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as u64;
     #[cfg(test)]
     let t = t.wrapping_add_signed(TEST_SKEW_US.with(|s| s.get()));
     t
@@ -74,10 +71,7 @@ pub struct TidClock {
 
 impl TidClock {
     pub fn new() -> TidClock {
-        TidClock {
-            last: AtomicU64::new(0),
-            clock_id: rand::random::<u64>() & 0x3ff,
-        }
+        TidClock { last: AtomicU64::new(0), clock_id: rand::random::<u64>() & 0x3ff }
     }
 
     pub fn next(&self) -> Tid {
@@ -85,10 +79,7 @@ impl TidClock {
         let mut prev = self.last.load(Ordering::Relaxed);
         loop {
             let next = now.max(prev + 1);
-            match self
-                .last
-                .compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.last.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
                 Ok(_) => return Tid::from_parts(next, self.clock_id),
                 Err(p) => prev = p,
             }

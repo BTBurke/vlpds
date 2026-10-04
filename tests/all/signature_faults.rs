@@ -58,9 +58,7 @@ async fn faulty_signatures_are_never_emitted_and_repeats_fail_stop() {
 
     // the firehose: exactly the two good commits, both validly signed, in
     // an unbroken since/prevData chain
-    let frames = sub
-        .until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.commit().is_some_and(|c| c.rev == after_rev)))
-        .await;
+    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.commit().is_some_and(|c| c.rev == after_rev))).await;
     let commits: Vec<CommitEvt> = frames.iter().filter_map(|f| f.commit()).filter(|c| c.repo == a.did).collect();
     assert_eq!(commits.len(), 2, "{:?}", commits.iter().map(|c| &c.rev).collect::<Vec<_>>());
     for c in &commits {

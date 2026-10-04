@@ -131,7 +131,10 @@ const AT_VALUE: &[(&str, f64)] = &[
 
 /// A local relay stand-in that accepts every requestCrawl.
 async fn accepting_relay() -> String {
-    let app = axum::Router::new().route("/xrpc/com.atproto.sync.requestCrawl", axum::routing::post(|| async { axum::Json(serde_json::json!({})) }));
+    let app = axum::Router::new().route(
+        "/xrpc/com.atproto.sync.requestCrawl",
+        axum::routing::post(|| async { axum::Json(serde_json::json!({})) }),
+    );
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", l.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(l, app).await.unwrap() });

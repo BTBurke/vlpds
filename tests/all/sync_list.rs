@@ -80,7 +80,8 @@ async fn includes_inactive_repos_with_status() {
     let b = s.create_account("bob").await;
     s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &a.auth()).await.ok();
     let r = s.xrpc.get("com.atproto.sync.listRepos", &[], &Auth::None).await.ok();
-    let find = |did: &str| r["repos"].as_array().unwrap().iter().find(|x| x["did"] == json!(did)).cloned().expect("listed");
+    let find =
+        |did: &str| r["repos"].as_array().unwrap().iter().find(|x| x["did"] == json!(did)).cloned().expect("listed");
     let ea = find(&a.did);
     assert_eq!(ea["active"], json!(false));
     assert_eq!(ea["status"], json!("deactivated"));

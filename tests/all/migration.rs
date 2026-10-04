@@ -44,7 +44,10 @@ async fn pds(plc: &str, service_did: &str) -> TestServer {
 }
 
 async fn service_auth(s: &TestServer, a: &TestAccount, aud: &str, lxm: &str) -> String {
-    s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", aud), ("lxm", lxm)], &a.auth()).await.ok()["token"].as_str().unwrap().to_string()
+    s.xrpc.get("com.atproto.server.getServiceAuth", &[("aud", aud), ("lxm", lxm)], &a.auth()).await.ok()["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
 }
 
 async fn account_status(s: &TestServer, auth: &Auth) -> J {
@@ -72,7 +75,8 @@ async fn migrate_account_with_records_and_blobs() {
     let blob_cid = blob["ref"]["$link"].as_str().unwrap().to_string();
     posts.push(old.create_record(&alice, "app.bsky.feed.post", image_post("with image", &blob)).await);
     // its DID document as published by the old PDS
-    let doc = old.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
+    let doc =
+        old.xrpc.get("com.atproto.identity.resolveDid", &[("did", &did)], &Auth::None).await.ok()["didDoc"].clone();
     docs.lock().unwrap().insert(did.clone(), doc);
 
     let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("moved"));
@@ -161,7 +165,8 @@ async fn migrate_account_with_records_and_blobs() {
     assert_eq!(vlpds::xrpc::totals(&new.app).accounts, [1, 0, 0, 0, 0]);
 
     // the first events for the DID here are the activation's
-    let frames = sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == "#sync")).await;
+    let frames =
+        sub.until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == "#sync")).await;
     let mine: Vec<&Frame> = frames.iter().filter(|f| f.did() == Some(did.as_str())).collect();
     let kinds: Vec<&str> = mine.iter().map(|f| f.kind()).collect();
     assert_eq!(kinds, vec!["#account", "#identity", "#sync"], "{mine:?}");

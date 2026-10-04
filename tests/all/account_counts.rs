@@ -55,14 +55,20 @@ async fn check(s: &TestServer, a: &TestAccount, what: &str) {
     let (records, nodes) = vlpds::repo_stats::count_tree(&repo.tree()).unwrap();
     assert_eq!((walked.records, walked.nodes), (records, nodes), "{what}: walk vs exported tree");
     let got = (count(&st, "indexedRecords"), count(&st, "repoBlocks"), count(&st, "expectedBlobs"));
-    assert_eq!(got, (walked.records, 1 + walked.nodes + walked.records, walked.blobs), "{what}: checkAccountStatus vs walk ({walked:?})");
+    assert_eq!(
+        got,
+        (walked.records, 1 + walked.nodes + walked.records, walked.blobs),
+        "{what}: checkAccountStatus vs walk ({walked:?})"
+    );
     assert_eq!(st["repoCommit"], json!(repo.root.to_string()), "{what}");
 }
 
 async fn upload_blobs(s: &TestServer, a: &TestAccount, n: u8) -> Vec<J> {
     let mut out = Vec::new();
     for t in 1..=n {
-        out.push(s.xrpc.post_bytes("com.atproto.repo.uploadBlob", png(t), "image/png", &a.auth()).await.ok()["blob"].clone());
+        out.push(
+            s.xrpc.post_bytes("com.atproto.repo.uploadBlob", png(t), "image/png", &a.auth()).await.ok()["blob"].clone(),
+        );
     }
     out
 }
@@ -72,12 +78,26 @@ fn pick(rng: &mut StdRng, live: &[Path]) -> Option<Path> {
 }
 
 /// One random step against `a`; `live` tracks its paths, `cars` its exports.
-async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], live: &mut Vec<Path>, cars: &mut Vec<Vec<u8>>) -> String {
+async fn step(
+    s: &TestServer,
+    a: &TestAccount,
+    rng: &mut StdRng,
+    blobs: &[J],
+    live: &mut Vec<Path>,
+    cars: &mut Vec<Vec<u8>>,
+) -> String {
     match rng.gen_range(0..100) {
         0..=24 => {
             let (coll, rec) = if rng.gen_bool(0.3) { (LIKE, like(rng)) } else { (THING, thing(rng, blobs)) };
             let rkey = tid_key(rng);
-            s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec}), &a.auth()).await.ok();
+            s.xrpc
+                .post(
+                    "com.atproto.repo.createRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec}),
+                    &a.auth(),
+                )
+                .await
+                .ok();
             if coll == LIKE {
                 // pruned likes of the subject are gone: re-read the collection
                 let listed = s.list_records(&a.did, LIKE, &[("limit", "100")]).await.ok();
@@ -97,7 +117,14 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
                 _ => (THING.to_string(), tid_key(rng)),
             };
             let rec = thing(rng, blobs);
-            s.xrpc.post("com.atproto.repo.putRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec}), &a.auth()).await.ok();
+            s.xrpc
+                .post(
+                    "com.atproto.repo.putRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey, "record": rec}),
+                    &a.auth(),
+                )
+                .await
+                .ok();
             if !live.contains(&(coll.clone(), rkey.clone())) {
                 live.push((coll, rkey));
             }
@@ -105,7 +132,14 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
         }
         40..=54 => {
             let Some((coll, rkey)) = pick(rng, live) else { return "noop".into() };
-            s.xrpc.post("com.atproto.repo.deleteRecord", &json!({"repo": a.did, "collection": coll, "rkey": rkey}), &a.auth()).await.ok();
+            s.xrpc
+                .post(
+                    "com.atproto.repo.deleteRecord",
+                    &json!({"repo": a.did, "collection": coll, "rkey": rkey}),
+                    &a.auth(),
+                )
+                .await
+                .ok();
             live.retain(|p| *p != (coll.clone(), rkey.clone()));
             "delete".into()
         }
@@ -121,12 +155,19 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
                         live.push((THING.into(), rkey));
                     }
                     1 => {
-                        let Some((coll, rkey)) = pick(rng, live).filter(|p| p.0 == THING && touched.insert(p.clone())) else { continue };
+                        let Some((coll, rkey)) = pick(rng, live).filter(|p| p.0 == THING && touched.insert(p.clone()))
+                        else {
+                            continue;
+                        };
                         writes.push(json!({"$type": "com.atproto.repo.applyWrites#update", "collection": coll, "rkey": rkey, "value": thing(rng, blobs)}));
                     }
                     _ => {
-                        let Some((coll, rkey)) = pick(rng, live).filter(|p| touched.insert(p.clone())) else { continue };
-                        writes.push(json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": coll, "rkey": rkey}));
+                        let Some((coll, rkey)) = pick(rng, live).filter(|p| touched.insert(p.clone())) else {
+                            continue;
+                        };
+                        writes.push(
+                            json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": coll, "rkey": rkey}),
+                        );
                         live.retain(|p| *p != (coll.clone(), rkey.clone()));
                     }
                 }
@@ -134,7 +175,10 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
             if writes.is_empty() {
                 return "noop".into();
             }
-            s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+            s.xrpc
+                .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+                .await
+                .ok();
             format!("applyWrites x{}", writes.len())
         }
         75..=84 => {
@@ -142,7 +186,10 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
             let n = rng.gen_range(2..12);
             let reqs: Vec<(String, J)> = (0..n).map(|_| (tid_key(rng), thing(rng, blobs))).collect();
             let auth = a.auth();
-            let bodies: Vec<J> = reqs.iter().map(|(rkey, rec)| json!({"repo": a.did, "collection": THING, "rkey": rkey, "record": rec})).collect();
+            let bodies: Vec<J> = reqs
+                .iter()
+                .map(|(rkey, rec)| json!({"repo": a.did, "collection": THING, "rkey": rkey, "record": rec}))
+                .collect();
             let posts = bodies.iter().map(|b| s.xrpc.post("com.atproto.repo.createRecord", b, &auth));
             for r in futures::future::join_all(posts).await {
                 r.ok();
@@ -159,7 +206,10 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
                 return "noop".into();
             }
             let car = cars[rng.gen_range(0..cars.len())].clone();
-            s.xrpc.post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth()).await.ok();
+            s.xrpc
+                .post_bytes("com.atproto.repo.importRepo", car.clone(), "application/vnd.ipld.car", &a.auth())
+                .await
+                .ok();
             *live = Repo::from_car(&car)
                 .unwrap()
                 .entries()
@@ -178,8 +228,14 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
         _ => {
             // emptied, then a batch into the empty tree
             for chunk in live.chunks(100) {
-                let writes: Vec<J> = chunk.iter().map(|(c, r)| json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": c, "rkey": r})).collect();
-                s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+                let writes: Vec<J> = chunk
+                    .iter()
+                    .map(|(c, r)| json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": c, "rkey": r}))
+                    .collect();
+                s.xrpc
+                    .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+                    .await
+                    .ok();
             }
             live.clear();
             let writes: Vec<J> = (0..rng.gen_range(2..6))
@@ -189,7 +245,10 @@ async fn step(s: &TestServer, a: &TestAccount, rng: &mut StdRng, blobs: &[J], li
                     json!({"$type": "com.atproto.repo.applyWrites#create", "collection": THING, "rkey": rkey, "value": thing(rng, blobs)})
                 })
                 .collect();
-            s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+            s.xrpc
+                .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+                .await
+                .ok();
             "clear and refill".into()
         }
     }
@@ -222,7 +281,10 @@ async fn random_history(unload_idle: bool, seed: u64, steps: usize) {
     let r = s.xrpc.get("vlpds.admin.checkRepo", &[("did", &a.did)], &Auth::Admin).await.ok();
     assert_eq!(r["ok"], json!(true), "{r}");
     s.xrpc.post("com.atproto.admin.deleteAccount", &json!({"did": a.did}), &Auth::Admin).await.ok();
-    assert!(p.db.get(vlpds::state::repo_stats_key(&a.did)).await.unwrap().is_none(), "S/ left after the account delete");
+    assert!(
+        p.db.get(vlpds::state::repo_stats_key(&a.did)).await.unwrap().is_none(),
+        "S/ left after the account delete"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -257,7 +319,14 @@ async fn missing_stats_are_recounted() {
     let mut rng = StdRng::seed_from_u64(3);
     for _ in 0..30 {
         let rec = thing(&mut rng, &blobs);
-        s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": THING, "record": rec}), &a.auth()).await.ok();
+        s.xrpc
+            .post(
+                "com.atproto.repo.createRecord",
+                &json!({"repo": a.did, "collection": THING, "record": rec}),
+                &a.auth(),
+            )
+            .await
+            .ok();
     }
     let p = s.app.partition(&a.did).unwrap_or_else(|_| panic!("shard not owned"));
     let key = vlpds::state::repo_stats_key(&a.did);
@@ -267,7 +336,14 @@ async fn missing_stats_are_recounted() {
     assert!(r["problems"].to_string().contains("repo stats (S/) missing"), "{r}");
     // the next open (after another repo took the one-repo cache) counts it
     s.post(&other, "evict").await;
-    s.xrpc.post("com.atproto.repo.createRecord", &json!({"repo": a.did, "collection": THING, "record": thing(&mut rng, &blobs)}), &a.auth()).await.ok();
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": a.did, "collection": THING, "record": thing(&mut rng, &blobs)}),
+            &a.auth(),
+        )
+        .await
+        .ok();
     check(&s, &a, "after the recount").await;
     let r = s.xrpc.get("vlpds.admin.checkRepo", &[("did", &a.did)], &Auth::Admin).await.ok();
     assert_eq!(r["ok"], json!(true), "{r}");
@@ -308,7 +384,10 @@ async fn counts_survive_replay() {
     let a = node("cra").await;
     let b = node("crb").await;
     let owned = || a.app.partitions.owned().len() + b.app.partitions.owned().len();
-    wait_until("both own shards", Duration::from_secs(15), || !a.app.partitions.owned().is_empty() && !b.app.partitions.owned().is_empty() && owned() == SHARDS as usize).await;
+    wait_until("both own shards", Duration::from_secs(15), || {
+        !a.app.partitions.owned().is_empty() && !b.app.partitions.owned().is_empty() && owned() == SHARDS as usize
+    })
+    .await;
     let mut accts = Vec::new();
     for i in 0..6 {
         accts.push(a.create_account(&format!("crp{i}")).await);
@@ -327,7 +406,10 @@ async fn counts_survive_replay() {
         check(victim, x, "before the kill").await;
     }
     victim.app.node.halt();
-    wait_until("survivor takes every shard", Duration::from_secs(20), || survivor.app.partitions.owned().len() == SHARDS as usize).await;
+    wait_until("survivor takes every shard", Duration::from_secs(20), || {
+        survivor.app.partitions.owned().len() == SHARDS as usize
+    })
+    .await;
     for x in &moved {
         check(survivor, x, "replayed").await;
     }
@@ -345,7 +427,10 @@ async fn bench_check_account_status() {
     let n: u32 = env_or("VLPDS_STATUS_RECORDS", 1_000_000);
     let s = TestServer::spawn_with(|c| c.shards = 4).await;
     let t = Instant::now();
-    let r = s.xrpc.post("vlpds.admin.bulkCreate", &json!({"indices": [0], "records": [n]}), &Auth::Bearer(ADMIN_TOKEN.into())).await;
+    let r = s
+        .xrpc
+        .post("vlpds.admin.bulkCreate", &json!({"indices": [0], "records": [n]}), &Auth::Bearer(ADMIN_TOKEN.into()))
+        .await;
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(r.json["created"].as_u64(), Some(1), "{}", r.text());
     s.app.log.checkpoint_all().await;
@@ -362,5 +447,11 @@ async fn bench_check_account_status() {
     }
     lat.sort();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
-    println!("checkAccountStatus, {n} records: min {:.2} ms, median {:.2} ms, max {:.2} ms ({} calls)", ms(lat[0]), ms(lat[lat.len() / 2]), ms(lat[lat.len() - 1]), lat.len());
+    println!(
+        "checkAccountStatus, {n} records: min {:.2} ms, median {:.2} ms, max {:.2} ms ({} calls)",
+        ms(lat[0]),
+        ms(lat[lat.len() / 2]),
+        ms(lat[lat.len() - 1]),
+        lat.len()
+    );
 }

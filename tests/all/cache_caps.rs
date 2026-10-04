@@ -19,14 +19,18 @@ async fn cache_metrics_report_entries_bytes_and_caps() {
     s.get_session(&a.auth()).await.ok();
     let m = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
     for c in vlpds::caches::Cache::ALL {
-        let cap = gauge(&m, "vlpds_cache_capacity_entries", c.name()).unwrap_or_else(|| panic!("no cap for {}", c.name()));
+        let cap =
+            gauge(&m, "vlpds_cache_capacity_entries", c.name()).unwrap_or_else(|| panic!("no cap for {}", c.name()));
         assert!(cap >= 1, "{}: cap {cap}", c.name());
         assert!(gauge(&m, "vlpds_cache_entries", c.name()).is_some(), "{}", c.name());
         assert!(gauge(&m, "vlpds_cache_bytes", c.name()).is_some(), "{}", c.name());
     }
     let n = gauge(&m, "vlpds_cache_entries", "session_tokens").unwrap();
     assert!(n >= 1, "session token cached: {n}");
-    assert_eq!(gauge(&m, "vlpds_cache_bytes", "session_tokens").unwrap(), n * vlpds::caches::Cache::SessionTokens.entry_bytes() as i64);
+    assert_eq!(
+        gauge(&m, "vlpds_cache_bytes", "session_tokens").unwrap(),
+        n * vlpds::caches::Cache::SessionTokens.entry_bytes() as i64
+    );
 }
 
 /// The high-S form of an ES256K signature.

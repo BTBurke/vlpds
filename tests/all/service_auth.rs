@@ -68,7 +68,10 @@ async fn issues_verifiable_token_for_bare_did_aud() {
 
     // ...and not against an unrelated key
     let other = vlpds::crypto::Keypair::generate();
-    assert!(verify_jwt(&j, &k256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key_sec1()).unwrap()).is_err(), "JWT verified with an unrelated key");
+    assert!(
+        verify_jwt(&j, &k256::ecdsa::VerifyingKey::from_sec1_bytes(&other.public_key_sec1()).unwrap()).is_err(),
+        "JWT verified with an unrelated key"
+    );
 
     // each token is unique
     let t2 = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await.ok();
@@ -95,7 +98,14 @@ async fn rejects_malformed_aud() {
     for aud in ["not-a-did".to_string(), "did:foo:bar".to_string(), format!("{pds}#")] {
         let r = service_auth(&s, &a.auth(), &[("aud", &aud), ("lxm", "com.atproto.server.describeServer")]).await;
         r.err(400, "InvalidRequest");
-        assert!(r.json["message"].as_str().unwrap_or("").contains("aud must be a valid atproto DID or did#serviceId reference"), "aud {aud}: {}", r.text());
+        assert!(
+            r.json["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("aud must be a valid atproto DID or did#serviceId reference"),
+            "aud {aud}: {}",
+            r.text()
+        );
     }
 }
 
@@ -118,7 +128,11 @@ async fn expiration_rules() {
 
     // explicit exp within an hour, bound to a method: honored
     let exp = (now() + 1800).to_string();
-    let j = decode_jwt(service_auth(&s, &a.auth(), &[("aud", &pds), ("lxm", lxm), ("exp", &exp)]).await.ok()["token"].as_str().unwrap());
+    let j = decode_jwt(
+        service_auth(&s, &a.auth(), &[("aud", &pds), ("lxm", lxm), ("exp", &exp)]).await.ok()["token"]
+            .as_str()
+            .unwrap(),
+    );
     assert!((j.claims["exp"].as_i64().unwrap() - (now() + 1800)).abs() <= 5, "exp not honored: {}", j.claims);
 
     // in the past
@@ -132,7 +146,8 @@ async fn expiration_rules() {
     service_auth(&s, &a.auth(), &[("aud", &pds), ("exp", &min5)]).await.err(400, "BadExpiration");
     // ...but a method-less 30s token is fine and carries no lxm
     let s30 = (now() + 30).to_string();
-    let j = decode_jwt(service_auth(&s, &a.auth(), &[("aud", &pds), ("exp", &s30)]).await.ok()["token"].as_str().unwrap());
+    let j =
+        decode_jwt(service_auth(&s, &a.auth(), &[("aud", &pds), ("exp", &s30)]).await.ok()["token"].as_str().unwrap());
     assert!(j.claims.get("lxm").map(|v| v.is_null()).unwrap_or(true), "unexpected lxm: {}", j.claims);
 }
 
@@ -170,7 +185,11 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     assert_ne!(cur, old, "describeRepo still shows the old key after rotation");
     assert_eq!(cur, new, "describeRepo key != key returned by updateAccountSigningKey");
 
-    let j = decode_jwt(service_auth(&s, &a.auth(), &[("aud", &pds), ("lxm", "app.bsky.feed.getTimeline")]).await.ok()["token"].as_str().unwrap());
+    let j = decode_jwt(
+        service_auth(&s, &a.auth(), &[("aud", &pds), ("lxm", "app.bsky.feed.getTimeline")]).await.ok()["token"]
+            .as_str()
+            .unwrap(),
+    );
     verify_jwt(&j, &cur).expect("token after rotation must verify with the DID document's current key");
     assert!(verify_jwt(&j, &old).is_err(), "token after rotation still signed with the old key");
 
@@ -182,6 +201,12 @@ async fn token_and_commit_key_track_signing_key_rotation() {
     repo.commit().verify(&cur).expect("commit after rotation must be signed with the new key");
 
     // relays learn about the key change via #identity
-    let (frames, ok) = sub.try_until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(a.did.as_str()) && f.kind() == "#identity")).await;
-    assert!(ok, "no #identity event after signing key rotation; got {:?}", frames.iter().map(|f| f.kind().to_string()).collect::<Vec<_>>());
+    let (frames, ok) = sub
+        .try_until(FH_TIMEOUT, |fs| fs.iter().any(|f| f.did() == Some(a.did.as_str()) && f.kind() == "#identity"))
+        .await;
+    assert!(
+        ok,
+        "no #identity event after signing key rotation; got {:?}",
+        frames.iter().map(|f| f.kind().to_string()).collect::<Vec<_>>()
+    );
 }

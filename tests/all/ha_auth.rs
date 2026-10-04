@@ -38,8 +38,11 @@ async fn enforced_everywhere(nodes: &[&TestServer], rec: &RecordRef, did: &str, 
             let b = s.get_blob(did, blob).await;
             let dead = s.get_session(&Auth::Bearer(revoked.into())).await;
             let ok = s.get_session(&Auth::Bearer(live.into())).await;
-            (r.error_name() == Some("RecordNotFound") && b.error_name() == Some("BlobNotFound") && dead.error_name() == Some("ExpiredToken") && ok.is_ok())
-                .then_some(())
+            (r.error_name() == Some("RecordNotFound")
+                && b.error_name() == Some("BlobNotFound")
+                && dead.error_name() == Some("ExpiredToken")
+                && ok.is_ok())
+            .then_some(())
         })
         .await;
     }
@@ -58,19 +61,34 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
     assert!(std::ptr::eq(owner_of(&[&a, &b, &c], &acct.did), &a));
     let rec = b.create_record(&acct, "app.bsky.feed.post", post_record("taken down soon")).await;
     let keep = c.create_record(&acct, "app.bsky.feed.post", post_record("stays")).await;
-    let blob = c.upload_blob(&acct, b"some blob bytes", "image/png").await["ref"]["$link"].as_str().unwrap().to_string();
+    let blob =
+        c.upload_blob(&acct, b"some blob bytes", "image/png").await["ref"]["$link"].as_str().unwrap().to_string();
 
     // record takedown through b, blob takedown through c (routed by subject)
     let strong_ref = json!({"$type": "com.atproto.repo.strongRef", "uri": rec.uri, "cid": rec.cid});
     let status = |n: &TestServer, subject: J, takedown: J| {
-        n.xrpc.post_owned("com.atproto.admin.updateSubjectStatus", json!({"subject": subject, "takedown": takedown}), Auth::Admin)
+        n.xrpc.post_owned(
+            "com.atproto.admin.updateSubjectStatus",
+            json!({"subject": subject, "takedown": takedown}),
+            Auth::Admin,
+        )
     };
     status(&b, strong_ref.clone(), json!({"applied": true, "ref": "t1"})).await.ok();
-    status(&c, json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": acct.did, "cid": blob}), json!({"applied": true})).await.ok();
+    status(
+        &c,
+        json!({"$type": "com.atproto.admin.defs#repoBlobRef", "did": acct.did, "cid": blob}),
+        json!({"applied": true}),
+    )
+    .await
+    .ok();
     for s in [&a, &b, &c] {
         let st = s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("uri", &rec.uri)], &Auth::Admin).await.ok();
         assert_eq!(st["takedown"], json!({"applied": true, "ref": "t1"}), "{st}");
-        let st = s.xrpc.get("com.atproto.admin.getSubjectStatus", &[("did", &acct.did), ("blob", &blob)], &Auth::Admin).await.ok();
+        let st = s
+            .xrpc
+            .get("com.atproto.admin.getSubjectStatus", &[("did", &acct.did), ("blob", &blob)], &Auth::Admin)
+            .await
+            .ok();
         assert_eq!(st["takedown"]["applied"], true, "{st}");
         let l = s.list_records(&acct.did, "app.bsky.feed.post", &[]).await.ok();
         let uris: Vec<&str> = l["records"].as_array().unwrap().iter().map(|r| r["uri"].as_str().unwrap()).collect();
@@ -81,7 +99,8 @@ async fn takedowns_and_revocations_are_cluster_wide_and_survive_failover() {
     // a second session, ended with deleteSession through c (its owner, a,
     // records the revocation in the account's partition)
     let sess = b.create_session(&acct.handle, PASSWORD).await.ok();
-    let (access, refresh) = (sess["accessJwt"].as_str().unwrap().to_string(), sess["refreshJwt"].as_str().unwrap().to_string());
+    let (access, refresh) =
+        (sess["accessJwt"].as_str().unwrap().to_string(), sess["refreshJwt"].as_str().unwrap().to_string());
     c.get_session(&Auth::Bearer(access.clone())).await.ok();
     c.xrpc.post_empty("com.atproto.server.deleteSession", &Auth::Bearer(refresh)).await.ok();
     enforced_everywhere(&[&a, &b, &c], &rec, &acct.did, &blob, &access, &acct.access).await;
@@ -116,7 +135,13 @@ fn http() -> reqwest::Client {
 
 /// POST to an AS endpoint of `node` with a fresh DPoP proof (htu on the
 /// shared issuer); retries once for a nonce. `proof` overrides the proof.
-pub(crate) async fn as_post(node: &TestServer, key: &DpopKey, path: &str, pairs: &[(&str, &str)], proof: Option<&str>) -> (u16, J) {
+pub(crate) async fn as_post(
+    node: &TestServer,
+    key: &DpopKey,
+    path: &str,
+    pairs: &[(&str, &str)],
+    proof: Option<&str>,
+) -> (u16, J) {
     for attempt in 0..2 {
         let p = proof.map(String::from).unwrap_or_else(|| key.proof("POST", &format!("{PUBLIC}{path}"), None));
         let r = http()
@@ -181,8 +206,16 @@ impl Browser {
         self.send(http().get(format!("{}{path}", node.url))).await
     }
 
-    pub(crate) async fn post(&mut self, node: &TestServer, path: &str, pairs: &[(&str, &str)]) -> (u16, reqwest::header::HeaderMap, String) {
-        let rb = http().post(format!("{}{path}", node.url)).header("content-type", "application/x-www-form-urlencoded").body(form_body(pairs));
+    pub(crate) async fn post(
+        &mut self,
+        node: &TestServer,
+        path: &str,
+        pairs: &[(&str, &str)],
+    ) -> (u16, reqwest::header::HeaderMap, String) {
+        let rb = http()
+            .post(format!("{}{path}", node.url))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(form_body(pairs));
         self.send(rb).await
     }
 }
@@ -203,13 +236,20 @@ impl Client {
     pub(crate) fn new() -> Client {
         let redirect = "http://127.0.0.1/callback".to_string();
         let enc = vlpds::oauth::util::form_encode_component;
-        let id = format!("http://localhost?scope={}&redirect_uri={}", enc("atproto transition:generic"), enc(&redirect));
+        let id =
+            format!("http://localhost?scope={}&redirect_uri={}", enc("atproto transition:generic"), enc(&redirect));
         Client { id, redirect, key: DpopKey::new() }
     }
 
     /// PAR on `par`, then the browser: authorization page on `page`, sign-in
     /// on `sign_in`, consent on `consent`. Returns (code, verifier).
-    pub(crate) async fn authorize(&self, b: &mut Browser, [par, page, sign_in, consent]: [&TestServer; 4], handle: &str, did: &str) -> (String, String) {
+    pub(crate) async fn authorize(
+        &self,
+        b: &mut Browser,
+        [par, page, sign_in, consent]: [&TestServer; 4],
+        handle: &str,
+        did: &str,
+    ) -> (String, String) {
         let verifier = rand_b64url(32);
         let challenge = b64url(Sha256::digest(&verifier));
         let (st, j) = as_post(
@@ -231,20 +271,33 @@ impl Client {
         assert_eq!(st, 201, "PAR: {j}");
         let request_uri = j["request_uri"].as_str().unwrap().to_string();
         let enc = vlpds::oauth::util::form_encode_component;
-        let (st, _, html) = b.get(page, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&self.id), enc(&request_uri))).await;
+        let (st, _, html) = b
+            .get(page, &format!("/oauth/authorize?client_id={}&request_uri={}", enc(&self.id), enc(&request_uri)))
+            .await;
         assert_eq!(st, 200, "{html}");
         assert!(html.contains("name=\"password\""), "sign-in page: {html}");
         let (st, _, html) = b
             .post(
                 sign_in,
                 "/oauth/authorize/sign-in",
-                &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("identifier", handle), ("password", PASSWORD), ("action", "sign-in")],
+                &[
+                    ("request_uri", &request_uri),
+                    ("csrf", &csrf_of(&html)),
+                    ("identifier", handle),
+                    ("password", PASSWORD),
+                    ("action", "sign-in"),
+                ],
             )
             .await;
         assert_eq!(st, 200, "{html}");
         assert!(html.contains("Authorize access"), "consent page: {html}");
-        let (st, h, html) =
-            b.post(consent, "/oauth/authorize/consent", &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", did), ("action", "allow")]).await;
+        let (st, h, html) = b
+            .post(
+                consent,
+                "/oauth/authorize/consent",
+                &[("request_uri", &request_uri), ("csrf", &csrf_of(&html)), ("did", did), ("action", "allow")],
+            )
+            .await;
         assert_eq!(st, 303, "{html}");
         let q = location_params(&h);
         assert_eq!(q.get("iss").map(String::as_str), Some(PUBLIC));
@@ -256,14 +309,27 @@ impl Client {
             node,
             &self.key,
             "/oauth/token",
-            &[("grant_type", "authorization_code"), ("client_id", &self.id), ("code", code), ("redirect_uri", &self.redirect), ("code_verifier", verifier)],
+            &[
+                ("grant_type", "authorization_code"),
+                ("client_id", &self.id),
+                ("code", code),
+                ("redirect_uri", &self.redirect),
+                ("code_verifier", verifier),
+            ],
             None,
         )
         .await
     }
 
     pub(crate) async fn refresh(&self, node: &TestServer, rt: &str) -> (u16, J) {
-        as_post(node, &self.key, "/oauth/token", &[("grant_type", "refresh_token"), ("client_id", &self.id), ("refresh_token", rt)], None).await
+        as_post(
+            node,
+            &self.key,
+            "/oauth/token",
+            &[("grant_type", "refresh_token"), ("client_id", &self.id), ("refresh_token", rt)],
+            None,
+        )
+        .await
     }
 
     /// createRecord with the access token on `node` (fresh proof, nonce retry).
@@ -271,7 +337,14 @@ impl Client {
         let body = json!({"repo": did, "collection": "app.bsky.feed.post", "record": post_record("via oauth")});
         let htu = format!("{PUBLIC}/xrpc/com.atproto.repo.createRecord");
         for _ in 0..2 {
-            let (st, j, nonce) = xrpc_dpop(node, token, &self.key.proof("POST", &htu, Some(token)), "com.atproto.repo.createRecord", &body).await;
+            let (st, j, nonce) = xrpc_dpop(
+                node,
+                token,
+                &self.key.proof("POST", &htu, Some(token)),
+                "com.atproto.repo.createRecord",
+                &body,
+            )
+            .await;
             if let Some(n) = nonce {
                 *self.key.nonce.lock() = Some(n);
             }
@@ -323,7 +396,8 @@ async fn oauth_flow_across_nodes_single_use_cluster_wide() {
         assert_eq!((st, j["error"].as_str()), (401, Some("invalid_dpop_proof")), "{j}");
         // ... also at the token endpoint (proofs there are claimed per key)
         let p = client.key.proof("POST", &format!("{PUBLIC}/oauth/token"), None);
-        let bogus = [("grant_type", "refresh_token"), ("client_id", client.id.as_str()), ("refresh_token", "ref-bogus")];
+        let bogus =
+            [("grant_type", "refresh_token"), ("client_id", client.id.as_str()), ("refresh_token", "ref-bogus")];
         let (_, j) = as_post(n(0), &client.key, "/oauth/token", &bogus, Some(&p)).await;
         assert_ne!(j["error"], "invalid_dpop_proof", "{j}");
         let (_, j) = as_post(n(1), &client.key, "/oauth/token", &bogus, Some(&p)).await;
@@ -344,7 +418,14 @@ async fn oauth_flow_across_nodes_single_use_cluster_wide() {
         assert!(html.contains(&acct.handle) && html.contains("localhost"), "account page lists the grant: {html}");
 
         // revocation through a third node ends the session
-        let (st, j) = as_post(n(2), &client.key, "/oauth/revoke", &[("client_id", &client.id), ("token", t2["refresh_token"].as_str().unwrap())], None).await;
+        let (st, j) = as_post(
+            n(2),
+            &client.key,
+            "/oauth/revoke",
+            &[("client_id", &client.id), ("token", t2["refresh_token"].as_str().unwrap())],
+            None,
+        )
+        .await;
         assert_eq!(st, 200, "{j}");
         let (st, _) = client.create_post(n(0), &access2, &acct.did).await;
         assert_eq!(st, 401, "revoked session");
@@ -390,12 +471,21 @@ async fn user_service_auth_uploads_route_to_the_owner() {
     let pds = a.pds_did().await;
     for n in nodes.iter().filter(|n| !std::ptr::eq(**n, owner)) {
         let q = [("aud", pds.as_str()), ("lxm", "com.atproto.repo.uploadBlob")];
-        let tok = n.xrpc.get("com.atproto.server.getServiceAuth", &q, &acct.auth()).await.ok()["token"].as_str().unwrap().to_string();
+        let tok = n.xrpc.get("com.atproto.server.getServiceAuth", &q, &acct.auth()).await.ok()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
         let bytes = format!("video bytes via {}", n.url).into_bytes();
-        let up = n.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "video/mp4", &Auth::Bearer(tok)).await.ok();
+        let up =
+            n.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "video/mp4", &Auth::Bearer(tok)).await.ok();
         let cid = up["blob"]["ref"]["$link"].as_str().unwrap().to_string();
         let embed = json!({"$type": "app.bsky.embed.video", "video": up["blob"]});
-        n.create_record(&acct, "app.bsky.feed.post", json!({"$type": "app.bsky.feed.post", "text": "v", "createdAt": now_iso(), "embed": embed})).await;
+        n.create_record(
+            &acct,
+            "app.bsky.feed.post",
+            json!({"$type": "app.bsky.feed.post", "text": "v", "createdAt": now_iso(), "embed": embed}),
+        )
+        .await;
         let g = n.get_blob(&acct.did, &cid).await;
         assert_eq!(g.status, 200, "{}", g.text());
         assert_eq!(g.body.as_ref() as &[u8], bytes.as_slice());

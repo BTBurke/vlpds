@@ -29,8 +29,7 @@ pub fn valid_rkey(s: &str) -> bool {
         && s.len() <= 512
         && s != "."
         && s != ".."
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:~-".contains(&b))
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:~-".contains(&b))
 }
 
 pub fn valid_record_path(path: &str) -> bool {
@@ -45,8 +44,7 @@ pub fn valid_handle(h: &str) -> bool {
 pub fn valid_tid(s: &str) -> bool {
     s.len() == 13
         && b"234567abcdefghij".contains(&s.as_bytes()[0])
-        && s.bytes()
-            .all(|b| b"234567abcdefghijklmnopqrstuvwxyz".contains(&b))
+        && s.bytes().all(|b| b"234567abcdefghijklmnopqrstuvwxyz".contains(&b))
 }
 
 pub fn valid_did(s: &str) -> bool {
@@ -62,9 +60,7 @@ pub fn valid_did(s: &str) -> bool {
         && !id.is_empty()
         && !id.ends_with(':')
         && !id.ends_with('%')
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
 }
 
 #[cfg(test)]
@@ -73,12 +69,7 @@ mod tests {
 
     #[test]
     fn nsids() {
-        for ok in [
-            "app.bsky.feed.post",
-            "com.example.fooBar",
-            "a-0.b-1.c",
-            "com.example.f00",
-        ] {
+        for ok in ["app.bsky.feed.post", "com.example.fooBar", "a-0.b-1.c", "com.example.f00"] {
             assert!(valid_nsid(ok), "{ok}");
         }
         for bad in [

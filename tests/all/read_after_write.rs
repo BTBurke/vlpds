@@ -65,7 +65,12 @@ async fn spawn_stub() -> (Arc<Stub>, String) {
             let nsid = req.uri().path().trim_start_matches("/xrpc/").to_string();
             let query = req.uri().query().unwrap_or("").to_string();
             let h = |n: &str| req.headers().get(n).map(|v| v.to_str().unwrap().to_string()).unwrap_or_default();
-            let seen = Seen { nsid: nsid.clone(), query: query.clone(), authorization: h("authorization"), accept_encoding: h("accept-encoding") };
+            let seen = Seen {
+                nsid: nsid.clone(),
+                query: query.clone(),
+                authorization: h("authorization"),
+                accept_encoding: h("accept-encoding"),
+            };
             st.seen.lock().push(seen.clone());
             let mut b = axum::http::Response::builder().header("content-type", "application/json");
             let rev = st.rev.lock().clone();
@@ -144,7 +149,8 @@ async fn put_profile(s: &TestServer, a: &TestAccount, record: J) {
 }
 
 async fn upload_png(s: &TestServer, a: &TestAccount) -> J {
-    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG_1X1.to_vec(), "image/png", &a.auth()).await.ok()["blob"].clone()
+    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG_1X1.to_vec(), "image/png", &a.auth()).await.ok()["blob"]
+        .clone()
 }
 
 fn author(a: &TestAccount, name: &str) -> J {
@@ -173,7 +179,10 @@ async fn profile_overlay_and_images() {
     stub.set_rev(&rev(&s, &a.did).await);
     let upstream = json!({"did": a.did, "handle": a.handle, "displayName": "old", "description": "old desc", "banner": "https://x/b", "followersCount": 7});
     stub.set("app.bsky.actor.getProfile", upstream.clone());
-    stub.set("app.bsky.actor.getProfiles", json!({"profiles": [upstream.clone(), {"did": b.did, "handle": b.handle, "displayName": "b"}]}));
+    stub.set(
+        "app.bsky.actor.getProfiles",
+        json!({"profiles": [upstream.clone(), {"did": b.did, "handle": b.handle, "displayName": "b"}]}),
+    );
 
     // nothing written since the rev: the upstream's answer
     let r = s.xrpc.get("app.bsky.actor.getProfile", &[("actor", &a.did)], &a.auth()).await;
@@ -316,8 +325,16 @@ async fn threads_get_new_replies() {
         r
     };
     let r1 = s
-        .create_record(&a, "app.bsky.feed.post", reply(&root, "images", json!({"$type": "app.bsky.embed.images",
-            "images": [{"image": blob, "alt": "alt text", "aspectRatio": {"height": 2, "width": 1}}]})))
+        .create_record(
+            &a,
+            "app.bsky.feed.post",
+            reply(
+                &root,
+                "images",
+                json!({"$type": "app.bsky.embed.images",
+            "images": [{"image": blob, "alt": "alt text", "aspectRatio": {"height": 2, "width": 1}}]}),
+            ),
+        )
         .await;
     let r2 = s
         .create_record(&a, "app.bsky.feed.post", reply(&r1, "external", json!({"$type": "app.bsky.embed.external",
@@ -340,8 +357,11 @@ async fn threads_get_new_replies() {
     assert_eq!(nested["post"]["uri"], r2.uri);
     let ext = &nested["post"]["embed"];
     assert_eq!(ext["$type"], "app.bsky.embed.external#view");
-    assert_eq!(ext["external"], json!({"uri": "https://example.com", "title": "TestImage", "description": "testLink",
-        "thumb": cdn("feed_thumbnail", &a.did, &cid)}));
+    assert_eq!(
+        ext["external"],
+        json!({"uri": "https://example.com", "title": "TestImage", "description": "testLink",
+        "thumb": cdn("feed_thumbnail", &a.did, &cid)})
+    );
 
     // a handle-form URI gets the same thread
     let by_handle = root.uri.replace(&a.did, &a.handle);
@@ -349,7 +369,11 @@ async fn threads_get_new_replies() {
     assert_eq!(j2["thread"], j["thread"]);
 
     // a reply the AppView hasn't indexed: built locally, parents from the AppView
-    stub.set_status(&format!("app.bsky.feed.getPostThread {}", r1.uri), 400, json!({"error": "NotFound", "message": "Post not found"}));
+    stub.set_status(
+        &format!("app.bsky.feed.getPostThread {}", r1.uri),
+        400,
+        json!({"error": "NotFound", "message": "Post not found"}),
+    );
     let j = s.xrpc.get("app.bsky.feed.getPostThread", &[("uri", &r1.uri), ("parentHeight", "5")], &a.auth()).await.ok();
     assert_eq!(j["thread"]["post"]["uri"], r1.uri);
     assert_eq!(j["thread"]["parent"]["post"]["uri"], root.uri);
@@ -361,22 +385,40 @@ async fn threads_get_new_replies() {
     assert_eq!(q["parentHeight"], "5");
     assert_eq!(claims(&parents.authorization)["lxm"], "app.bsky.feed.getPostThread");
     let r1_handle = r1.uri.replace(&a.did, &a.handle);
-    stub.set_status(&format!("app.bsky.feed.getPostThread {r1_handle}"), 400, json!({"error": "NotFound", "message": "Post not found"}));
+    stub.set_status(
+        &format!("app.bsky.feed.getPostThread {r1_handle}"),
+        400,
+        json!({"error": "NotFound", "message": "Post not found"}),
+    );
     let j2 = s.xrpc.get("app.bsky.feed.getPostThread", &[("uri", &r1_handle)], &a.auth()).await.ok();
     assert_eq!(j2["thread"]["post"]["uri"], r1.uri);
 
     // someone else's unindexed post: the AppView's NotFound
-    stub.set_status(&format!("app.bsky.feed.getPostThread {}", r1.uri), 400, json!({"error": "NotFound", "message": "Post not found"}));
+    stub.set_status(
+        &format!("app.bsky.feed.getPostThread {}", r1.uri),
+        400,
+        json!({"error": "NotFound", "message": "Post not found"}),
+    );
     let r = s.xrpc.get("app.bsky.feed.getPostThread", &[("uri", &r1.uri)], &b.auth()).await;
     r.err(400, "NotFound");
 
     // a record embed: viewed through the AppView's getPosts
     stub.set("app.bsky.feed.getPosts", json!({"posts": [post_view(&root, author(&a, "a"), "root", OLD)]}));
     let q = s
-        .create_record(&a, "app.bsky.feed.post", reply(&root, "quote", json!({"$type": "app.bsky.embed.record", "record": strong(&root)})))
+        .create_record(
+            &a,
+            "app.bsky.feed.post",
+            reply(&root, "quote", json!({"$type": "app.bsky.embed.record", "record": strong(&root)})),
+        )
         .await;
     let j = s.xrpc.get("app.bsky.feed.getPostThread", &[("uri", &root.uri)], &a.auth()).await.ok();
-    let quote = j["thread"]["replies"].as_array().unwrap().iter().find(|r| r["post"]["uri"] == q.uri).expect("quote reply").clone();
+    let quote = j["thread"]["replies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["post"]["uri"] == q.uri)
+        .expect("quote reply")
+        .clone();
     let rec = &quote["post"]["embed"];
     assert_eq!(rec["$type"], "app.bsky.embed.record#view");
     assert_eq!(rec["record"]["$type"], "app.bsky.embed.record#viewRecord");
@@ -384,7 +426,10 @@ async fn threads_get_new_replies() {
     assert_eq!(rec["record"]["value"]["text"], "root");
     let gp = stub.last("app.bsky.feed.getPosts");
     let c = claims(&gp.authorization);
-    assert_eq!((c["lxm"].as_str(), c["aud"].as_str(), c["iss"].as_str()), (Some("app.bsky.feed.getPosts"), Some(APPVIEW_DID), Some(a.did.as_str())));
+    assert_eq!(
+        (c["lxm"].as_str(), c["aud"].as_str(), c["iss"].as_str()),
+        (Some("app.bsky.feed.getPosts"), Some(APPVIEW_DID), Some(a.did.as_str()))
+    );
 }
 
 /// No records since the AppView's rev: the response streams through as the
@@ -409,7 +454,12 @@ async fn no_local_records_passes_through() {
                 .unwrap()
         }
     };
-    for nsid in ["app.bsky.feed.getTimeline", "app.bsky.actor.getProfile", "app.bsky.feed.getPostThread", "app.bsky.feed.getAuthorFeed"] {
+    for nsid in [
+        "app.bsky.feed.getTimeline",
+        "app.bsky.actor.getProfile",
+        "app.bsky.feed.getPostThread",
+        "app.bsky.feed.getAuthorFeed",
+    ] {
         let r = get(nsid).await;
         assert_eq!(r.status(), 200, "{nsid}");
         assert_eq!(r.headers().get("content-encoding").unwrap(), "gzip");
@@ -462,7 +512,13 @@ async fn compressed_upstream_is_munged() {
     assert_eq!(j["cursor"], pad);
     // methods without read-after-write forward the client's Accept-Encoding as is
     s.xrpc
-        .send(s.xrpc.http.get(format!("{}/xrpc/app.bsky.feed.getLikes?uri=x", s.url)).header("authorization", format!("Bearer {}", a.access)).header("accept-encoding", "gzip, compress"))
+        .send(
+            s.xrpc
+                .http
+                .get(format!("{}/xrpc/app.bsky.feed.getLikes?uri=x", s.url))
+                .header("authorization", format!("Bearer {}", a.access))
+                .header("accept-encoding", "gzip, compress"),
+        )
         .await;
     assert_eq!(stub.last("app.bsky.feed.getLikes").accept_encoding, "gzip, compress");
 }
@@ -566,7 +622,10 @@ async fn rev_older_than_every_record_is_ignored() {
 async fn get_feed_service_auth_names_the_generator() {
     let (stub, s) = setup().await;
     let a = s.create_account("rawgetfeed").await;
-    stub.set("com.atproto.repo.getRecord", json!({"uri": "at://did:plc:fg/app.bsky.feed.generator/hot", "value": {"did": "did:web:feedgen.test"}}));
+    stub.set(
+        "com.atproto.repo.getRecord",
+        json!({"uri": "at://did:plc:fg/app.bsky.feed.generator/hot", "value": {"did": "did:web:feedgen.test"}}),
+    );
     stub.set("app.bsky.feed.getFeed", json!({"feed": []}));
     let feed = "at://did:plc:fg/app.bsky.feed.generator/hot";
     let r = s.xrpc.get("app.bsky.feed.getFeed", &[("feed", feed)], &a.auth()).await;
@@ -574,13 +633,19 @@ async fn get_feed_service_auth_names_the_generator() {
     let gr = stub.last("com.atproto.repo.getRecord");
     assert!(gr.authorization.is_empty(), "getRecord is unauthenticated");
     let q = qmap(&gr.query);
-    assert_eq!((q["repo"].as_str(), q["collection"].as_str(), q["rkey"].as_str()), ("did:plc:fg", "app.bsky.feed.generator", "hot"));
+    assert_eq!(
+        (q["repo"].as_str(), q["collection"].as_str(), q["rkey"].as_str()),
+        ("did:plc:fg", "app.bsky.feed.generator", "hot")
+    );
     let c = claims(&stub.last("app.bsky.feed.getFeed").authorization);
     assert_eq!(c["aud"], "did:web:feedgen.test");
     assert_eq!(c["lxm"], "app.bsky.feed.getFeedSkeleton");
     assert_eq!(c["iss"], a.did);
     // an unknown generator
     stub.set("com.atproto.repo.getRecord", json!({"value": {}}));
-    let r = s.xrpc.get("app.bsky.feed.getFeed", &[("feed", "at://did:plc:fg/app.bsky.feed.generator/other")], &a.auth()).await;
+    let r = s
+        .xrpc
+        .get("app.bsky.feed.getFeed", &[("feed", "at://did:plc:fg/app.bsky.feed.generator/other")], &a.auth())
+        .await;
     r.err(400, "UnknownFeed");
 }

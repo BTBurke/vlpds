@@ -23,7 +23,8 @@ async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, advertise: O
         // no checkpoints: a takeover replays everything the dead node wrote
         c.checkpoint_every = Duration::from_secs(3600);
         let l = lease(c);
-        (l.ttl, l.renew_every, l.skew) = (Duration::from_secs(6), Duration::from_millis(200), Duration::from_millis(1200));
+        (l.ttl, l.renew_every, l.skew) =
+            (Duration::from_secs(6), Duration::from_millis(200), Duration::from_millis(1200));
         if let Some(a) = advertise {
             l.addr = a;
         }
@@ -44,7 +45,10 @@ async fn takeover_replay_and_lease_metrics_move() {
         format!("https://{}", l.local_addr().unwrap())
     };
     let b = node(&idb, &store, Some(refusing)).await;
-    wait_until("b gets its share", Duration::from_secs(10), || owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize).await;
+    wait_until("b gets its share", Duration::from_secs(10), || {
+        owned(&b) > 0 && owned(&a) + owned(&b) == SHARDS as usize
+    })
+    .await;
 
     // writes in b's shards (a node creates accounts in shards it owns),
     // never checkpointed
@@ -66,17 +70,24 @@ async fn takeover_replay_and_lease_metrics_move() {
     // lease renewals are timed; validity is exported per node at scrape
     assert!(m::LEASE_RENEW_SECONDS.get_sample_count() > renewals0);
     let text = m::render();
-    let valid = scraped(&text, &format!("vlpds_lease_validity_seconds{{node_id=\"{ida}\"}}")).expect("validity gauge for a");
+    let valid =
+        scraped(&text, &format!("vlpds_lease_validity_seconds{{node_id=\"{ida}\"}}")).expect("validity gauge for a");
     assert!(valid > 0.0 && valid <= 6.0 - 1.2, "a's lease validity left: {valid}");
     // process-wide: the last layout any in-process test node installed
     assert!(scraped(&text, "vlpds_shard_layout_shards").is_some_and(|v| v >= 1.0));
     assert!(scraped(&text, "process_start_time_seconds").is_some_and(|v| v > 1.7e9));
     assert!(scraped(&text, "vlpds_memory_limit_bytes").is_some_and(|v| v > 0.0));
     assert!(
-        text.lines().any(|l| l.starts_with("vlpds_object_store_requests_total{") && l.contains("component=\"ctl_lease\"") && l.contains("op=\"put_cas\"") && l.contains("result=\"ok\"")),
+        text.lines().any(|l| l.starts_with("vlpds_object_store_requests_total{")
+            && l.contains("component=\"ctl_lease\"")
+            && l.contains("op=\"put_cas\"")
+            && l.contains("result=\"ok\"")),
         "lease CAS PUTs counted with their result"
     );
-    assert!(text.contains("vlpds_object_store_request_seconds_bucket{component=\"ctl_lease\""), "control-plane latency histogram");
+    assert!(
+        text.contains("vlpds_object_store_request_seconds_bucket{component=\"ctl_lease\""),
+        "control-plane latency histogram"
+    );
 
     let replayed0 = m::REPLAYED_SEGMENTS.get();
     let takeovers0 = m::PEER_TAKEOVERS.with_label_values(&["peer"]).get();

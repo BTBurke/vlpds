@@ -71,11 +71,7 @@ pub struct OAuthError {
 
 impl OAuthError {
     pub fn new(status: StatusCode, error: &str, description: &str) -> OAuthError {
-        OAuthError {
-            status,
-            error: error.into(),
-            description: description.into(),
-        }
+        OAuthError { status, error: error.into(), description: description.into() }
     }
     pub fn invalid_request(d: &str) -> OAuthError {
         Self::new(StatusCode::BAD_REQUEST, "invalid_request", d)
@@ -125,13 +121,10 @@ impl From<crate::xrpc::XrpcError> for OAuthError {
 
 impl IntoResponse for OAuthError {
     fn into_response(self) -> Response {
-        let mut r = (
-            self.status,
-            Json(serde_json::json!({"error": self.error, "error_description": self.description})),
-        )
-            .into_response();
-        r.headers_mut()
-            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        let mut r =
+            (self.status, Json(serde_json::json!({"error": self.error, "error_description": self.description})))
+                .into_response();
+        r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         if self.status == StatusCode::SERVICE_UNAVAILABLE {
             r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }

@@ -92,7 +92,8 @@ const LOCAL_RELOAD_SECS: u64 = 60;
 /// older fails closed.
 const STALE_MAX_SECS: u64 = 300;
 const CTL_RETRY_FOR: std::time::Duration = std::time::Duration::from_secs(3);
-const CTL_MOVE_WAIT_FORWARDED: std::time::Duration = crate::forward::TTFB_FAST.saturating_sub(std::time::Duration::from_millis(500));
+const CTL_MOVE_WAIT_FORWARDED: std::time::Duration =
+    crate::forward::TTFB_FAST.saturating_sub(std::time::Duration::from_millis(500));
 const EMAIL_TOKEN_TTL_MS: u64 = 15 * 60 * 1000;
 pub(super) const NEW_PASSWORD_MAX_LENGTH: usize = 256;
 pub(super) const OLD_PASSWORD_MAX_LENGTH: usize = 512;
@@ -168,7 +169,11 @@ pub(super) fn to_json_bytes<T: serde::Serialize>(v: &T) -> Vec<u8> {
     serde_json::to_vec(v).expect("serializable")
 }
 
-pub(super) async fn get_json<T: serde::de::DeserializeOwned>(app: &App, routing: &str, name: &str) -> XResult<Option<T>> {
+pub(super) async fn get_json<T: serde::de::DeserializeOwned>(
+    app: &App,
+    routing: &str,
+    name: &str,
+) -> XResult<Option<T>> {
     app.get_private(routing, name).await?.map(|v| serde_json::from_slice(&v).map_err(XrpcError::from_err)).transpose()
 }
 
@@ -195,7 +200,10 @@ pub(super) async fn scan_private_routing(app: &App, routing_prefix: &str) -> XRe
     scan_private_routing_in(&app.partitions.owned(), routing_prefix).await
 }
 
-pub(super) async fn scan_private_routing_in(parts: &[Arc<Partition>], routing_prefix: &str) -> XResult<Vec<(String, String, Bytes)>> {
+pub(super) async fn scan_private_routing_in(
+    parts: &[Arc<Partition>],
+    routing_prefix: &str,
+) -> XResult<Vec<(String, String, Bytes)>> {
     // keys are slot-major: walk each slot's run of p/{routing_prefix}
     let fam = [state::PRIVATE_FAMILY, routing_prefix.as_bytes()].concat();
     let mut out = Vec::new();
@@ -257,9 +265,7 @@ pub(super) fn valid_email(e: &str) -> bool {
         && domain.contains('.')
         && !domain.starts_with('.')
         && !domain.ends_with('.')
-        && domain
-            .split('.')
-            .all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        && domain.split('.').all(|l| !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
 /// The reference's `isEmailValid(email) && !isDisposableEmail(email)`.
@@ -287,9 +293,9 @@ fn full_access(creds: &Credentials) -> XResult<String> {
 /// The reference's ACCESS_STANDARD (OAuth refused).
 fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
     match creds {
-        Credentials::Session { did }
-        | Credentials::AppPassword { did, .. }
-        | Credentials::Takendown { did } => Ok(did.clone()),
+        Credentials::Session { did } | Credentials::AppPassword { did, .. } | Credentials::Takendown { did } => {
+            Ok(did.clone())
+        }
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
         Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
             Err(XrpcError::auth("user credentials required"))
@@ -353,9 +359,7 @@ pub(super) fn ext(app: &App) -> Arc<Ext> {
 impl Ext {
     /// Node-local only: cross-node races need `private_cas`.
     pub(super) async fn lock(&self, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
-        self.locks[(state::did_hash(key) % self.locks.len() as u64) as usize]
-            .lock()
-            .await
+        self.locks[(state::did_hash(key) % self.locks.len() as u64) as usize].lock().await
     }
 }
 
@@ -378,9 +382,7 @@ pub(super) struct Ctl {
 impl Ctl {
     fn is_revoked(&self, jti: Option<&str>, iat: u64) -> bool {
         let now = now_secs();
-        let issued_us = jti
-            .and_then(family_micros)
-            .unwrap_or(iat.saturating_mul(1_000_000));
+        let issued_us = jti.and_then(family_micros).unwrap_or(iat.saturating_mul(1_000_000));
         if self.before.is_some_and(|(before, exp)| exp >= now && issued_us <= before) {
             return true;
         }
@@ -531,7 +533,9 @@ async fn load_ctl(app: &App, e: &Ext, did: &str, gen0: u64, cached: Option<Arc<C
                 if start.elapsed() + wait >= CTL_RETRY_FOR {
                     tracing::warn!(%did, "loading session revocations/takedowns failed: {}", err.message);
                     let r = stale_or_unavailable(cached, now);
-                    crate::metrics::CTL_LOADS.with_label_values(&[if r.is_ok() { "stale_unreachable" } else { "unavailable" }]).inc();
+                    crate::metrics::CTL_LOADS
+                        .with_label_values(&[if r.is_ok() { "stale_unreachable" } else { "unavailable" }])
+                        .inc();
                     return r;
                 }
                 tokio::time::sleep(wait).await;
@@ -550,11 +554,15 @@ fn stale(cached: &Option<Arc<Ctl>>, now: u64) -> Option<Arc<Ctl>> {
 }
 
 fn moved(did: &str) -> XrpcError {
-    XrpcError::unavailable(crate::forward::SHARD_MOVED, format!("security state of {did} is unavailable while its shard moves; try again"))
+    XrpcError::unavailable(
+        crate::forward::SHARD_MOVED,
+        format!("security state of {did} is unavailable while its shard moves; try again"),
+    )
 }
 
 fn stale_or_unavailable(cached: Option<Arc<Ctl>>, now: u64) -> XResult<Arc<Ctl>> {
-    stale(&cached, now).ok_or_else(|| XrpcError::unavailable("Unavailable", "account security state is unavailable; try again"))
+    stale(&cached, now)
+        .ok_or_else(|| XrpcError::unavailable("Unavailable", "account security state is unavailable; try again"))
 }
 
 pub(super) fn ctl_changed(app: &App, did: &str) {
@@ -611,7 +619,13 @@ pub(crate) fn is_mail_limited(e: &XrpcError) -> bool {
 /// Taken before the token is minted, so a refused request leaves the last
 /// mailed token working. The recipient is the account `did`, else the
 /// normalized address. `report`: see `Limiter::consume_unbypassable`.
-pub(super) async fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose: &'static str, report: bool) -> XResult<MailPermit> {
+pub(super) async fn mail_permit(
+    app: &App,
+    did: Option<&str>,
+    to: &str,
+    purpose: &'static str,
+    report: bool,
+) -> XResult<MailPermit> {
     use crate::ratelimit::{MAIL_NODE_HOUR, MAIL_RECIPIENT_DAY, MAIL_RECIPIENT_HOUR, NODE_KEY};
     let key = match did {
         Some(d) => d.to_string(),
@@ -620,10 +634,15 @@ pub(super) async fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose:
     let route = format!("mail:{purpose}");
     let limited = |reason: &str| {
         crate::mail::MAIL_SUPPRESSED.with_label_values(&[purpose, reason]).inc();
-        XrpcError { status: StatusCode::TOO_MANY_REQUESTS, error: "RateLimitExceeded".into(), message: MAIL_LIMITED.into() }
+        XrpcError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            error: "RateLimitExceeded".into(),
+            message: MAIL_LIMITED.into(),
+        }
     };
     let rl = &app.ratelimit;
-    rl.consume_unbypassable(&[&MAIL_RECIPIENT_DAY, &MAIL_RECIPIENT_HOUR], &key, &route, report).map_err(|_| limited("recipient_limit"))?;
+    rl.consume_unbypassable(&[&MAIL_RECIPIENT_DAY, &MAIL_RECIPIENT_HOUR], &key, &route, report)
+        .map_err(|_| limited("recipient_limit"))?;
     rl.consume_unbypassable(&[&MAIL_NODE_HOUR], NODE_KEY, &route, report).map_err(|_| {
         tracing::warn!(purpose, "mail not sent: this node's mail budget (mail-node-hour) is spent");
         limited("node_limit")
@@ -697,14 +716,8 @@ fn email_token_digest(app: &App, token: &str) -> String {
     hex::encode(crate::oauth::util::hmac_sha256(&key, &[token.trim().to_ascii_uppercase().as_bytes()]))
 }
 
-pub(super) const EMAIL_PURPOSES: &[&str] = &[
-    "confirm_email",
-    "update_email",
-    "reset_password",
-    "delete_account",
-    "plc_operation",
-    super::email2fa::PURPOSE,
-];
+pub(super) const EMAIL_PURPOSES: &[&str] =
+    &["confirm_email", "update_email", "reset_password", "delete_account", "plc_operation", super::email2fa::PURPOSE];
 
 /// Replaces any previous token for `purpose`.
 pub(super) async fn create_email_token(app: &App, did: &str, purpose: &str) -> XResult<String> {
@@ -748,9 +761,7 @@ fn email_path(app: &App, email: &str) -> object_store::path::Path {
 
 pub(super) async fn did_by_email(app: &App, email: &str) -> XResult<Option<String>> {
     match app.store.raw.get(&email_path(app, email)).await {
-        Ok(r) => Ok(Some(
-            String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string(),
-        )),
+        Ok(r) => Ok(Some(String::from_utf8_lossy(&r.bytes().await.map_err(XrpcError::from_err)?).to_string())),
         Err(object_store::Error::NotFound { .. }) => Ok(None),
         Err(e) => Err(XrpcError::from_err(e)),
     }
@@ -759,7 +770,10 @@ pub(super) async fn did_by_email(app: &App, email: &str) -> XResult<Option<Strin
 /// Ok(false) when another account holds it.
 pub(super) async fn claim_email(app: &App, email: &str, did: &str) -> XResult<bool> {
     let email = email.to_ascii_lowercase();
-    claim(app, &email_path(app, &email), did, move |a: &Account| a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&email))).await
+    claim(app, &email_path(app, &email), did, move |a: &Account| {
+        a.email.as_deref().is_some_and(|e| e.eq_ignore_ascii_case(&email))
+    })
+    .await
 }
 
 /// How old a handle or email claim must be before it can be taken over
@@ -774,7 +788,10 @@ pub fn set_stale_claim_grace(app: &App, grace: std::time::Duration) {
 }
 
 /// (holder, version, age)
-async fn read_claim(app: &App, path: &object_store::path::Path) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
+async fn read_claim(
+    app: &App,
+    path: &object_store::path::Path,
+) -> XResult<Option<(String, object_store::UpdateVersion, std::time::Duration)>> {
     match app.store.raw.get(path).await {
         Ok(r) => {
             let meta = r.meta.clone();
@@ -793,7 +810,12 @@ async fn read_claim(app: &App, path: &object_store::path::Path) -> XResult<Optio
 /// holder definitely has no account standing on it per `holds`; a failed
 /// lookup is not "no account"), by a compare-and-swap on the version read,
 /// so two takers can't both win and a holder mid-createAccount keeps it.
-async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: impl Fn(&Account) -> bool) -> XResult<bool> {
+async fn claim(
+    app: &App,
+    path: &object_store::path::Path,
+    did: &str,
+    holds: impl Fn(&Account) -> bool,
+) -> XResult<bool> {
     let payload = || PutPayload::from(did.as_bytes().to_vec());
     let grace = std::time::Duration::from_millis(ext(app).claim_grace_ms.load(Ordering::Relaxed));
     for _ in 0..3 {
@@ -825,7 +847,11 @@ async fn claim(app: &App, path: &object_store::path::Path, did: &str, holds: imp
                 return Ok(true);
             }
             // changed since read (another taker, or released): look again
-            Err(object_store::Error::Precondition { .. } | object_store::Error::AlreadyExists { .. } | object_store::Error::NotFound { .. }) => {}
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. }
+                | object_store::Error::NotFound { .. },
+            ) => {}
             Err(e) => return Err(XrpcError::from_err(e)),
         }
     }
@@ -880,7 +906,8 @@ pub(super) fn normalize_handle(h: &str) -> XResult<String> {
     if !super::syntax::valid_handle(&h) {
         return Err(XrpcError::bad("InvalidHandle", "Input/handle must be a valid handle"));
     }
-    const DISALLOWED_TLDS: &[&str] = &[".local", ".arpa", ".invalid", ".localhost", ".internal", ".example", ".alt", ".onion"];
+    const DISALLOWED_TLDS: &[&str] =
+        &[".local", ".arpa", ".invalid", ".localhost", ".internal", ".example", ".alt", ".onion"];
     if DISALLOWED_TLDS.iter().any(|t| h.ends_with(t)) {
         return Err(XrpcError::bad("InvalidHandle", "Handle TLD is invalid or disallowed"));
     }
@@ -1036,7 +1063,10 @@ pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
     let before = crate::tid::now_micros();
     let exp = now_secs() + REVOKE_ALL_TTL;
     let ops = vec![
-        Op::put(format!("{REVOKED_ALL}{before:016x}"), Some(Bytes::from(to_json_bytes(&json!({"before": before, "exp": exp}))))),
+        Op::put(
+            format!("{REVOKED_ALL}{before:016x}"),
+            Some(Bytes::from(to_json_bytes(&json!({"before": before, "exp": exp})))),
+        ),
         new_auth_epoch_op(),
         Op::DeletePrefix { prefix: "sess/".into() },
     ];
@@ -1072,7 +1102,11 @@ pub(super) async fn revoke_refresh_tokens(app: &App, did: &str) -> XResult<()> {
 /// Deletes the refresh rows matching `pred`, each on condition that it is
 /// unchanged: a racing rotation changes its row, so the delete is redone
 /// over the new rows and no rotation of a matched session survives.
-async fn delete_sessions_where(app: &App, did: &str, pred: impl Fn(&str, &RefreshState) -> bool) -> XResult<Vec<RefreshState>> {
+async fn delete_sessions_where(
+    app: &App,
+    did: &str,
+    pred: impl Fn(&str, &RefreshState) -> bool,
+) -> XResult<Vec<RefreshState>> {
     use super::cas::{Cond, Op};
     for _ in 0..CAS_ROUNDS {
         let (mut conds, mut ops, mut out) = (Vec::new(), Vec::new(), Vec::new());
@@ -1092,17 +1126,15 @@ async fn delete_sessions_where(app: &App, did: &str, pred: impl Fn(&str, &Refres
 }
 
 async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
-    let gone = delete_sessions_where(app, did, |_, st| st.app_password.as_ref().is_some_and(|a| a.name == name)).await?;
+    let gone =
+        delete_sessions_where(app, did, |_, st| st.app_password.as_ref().is_some_and(|a| a.name == name)).await?;
     let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
     revoke_families(app, did, &fams).await
 }
 
 /// Legacy (non-OAuth) access JWTs. Hot path: no storage reads.
 pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
-    let c = app
-        .jwt
-        .verify_signature_cached(token)
-        .ok_or_else(|| invalid_token("Token could not be verified"))?;
+    let c = app.jwt.verify_signature_cached(token).ok_or_else(|| invalid_token("Token could not be verified"))?;
     if c.aud != app.jwt.service_did || !c.sub.starts_with("did:") {
         return Err(invalid_token("Malformed token"));
     }
@@ -1209,7 +1241,11 @@ pub(super) fn has_external_did(a: &Account) -> bool {
 /// createAccount, with the reference's optional service auth
 /// (`userServiceAuthOptional`): a Bearer token must be a service JWT for
 /// this method, and its issuer may then bring its own DID (migration in).
-async fn create_account(State(app): AppState, headers: HeaderMap, Json(inp): Json<CreateAccountIn>) -> XResult<Json<J>> {
+async fn create_account(
+    State(app): AppState,
+    headers: HeaderMap,
+    Json(inp): Json<CreateAccountIn>,
+) -> XResult<Json<J>> {
     const LXM: &str = "com.atproto.server.createAccount";
     let requester = super::authn::optional_service_auth(&app, &headers, LXM).await?;
     // The requester is the token's whole `iss` (the reference's
@@ -1455,7 +1491,13 @@ async fn create_account_checked(app: &App, inp: CreateAccountIn, requester: Opti
 }
 
 /// Err((error, definite)): a definite failure applied nothing.
-async fn create_repo(app: &App, did: &str, handle: &str, key: Arc<Keypair>, acct: &Account) -> Result<(), (XrpcError, bool)> {
+async fn create_repo(
+    app: &App,
+    did: &str,
+    handle: &str,
+    key: Arc<Keypair>,
+    acct: &Account,
+) -> Result<(), (XrpcError, bool)> {
     let (tx, rx) = oneshot::channel();
     let req = CreateRepoReq {
         did: did.into(),
@@ -1635,10 +1677,8 @@ async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginS
 
 async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    let acct =
+        app.account(&did).await.map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
     let include_email = !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
     Ok(Json(session_info(&app, &acct, include_email).await))
 }
@@ -1647,10 +1687,8 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
     let c = refresh_claims(&app, &headers, false)?;
     let did = c.sub.clone();
     let rid = c.jti.clone().unwrap_or_default();
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    let acct =
+        app.account(&did).await.map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
     if is_takendown_account(&acct) {
         return Err(takedown_error());
     }
@@ -1672,7 +1710,8 @@ async fn rotate_refresh(app: &App, did: &str, rid: &str) -> XResult<(RefreshStat
     let name = format!("sess/{rid}");
     for _ in 0..CAS_ROUNDS {
         let raw = app.get_private(did, &name).await?;
-        let st: Option<RefreshState> = raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?;
+        let st: Option<RefreshState> =
+            raw.as_deref().map(serde_json::from_slice).transpose().map_err(XrpcError::from_err)?;
         let now = now_secs();
         let st = st.filter(|s| s.exp >= now).ok_or_else(|| expired_token("Token has been revoked"))?;
         if ctl(app, did).await?.is_revoked(Some(&st.family), 0) {
@@ -1721,7 +1760,11 @@ struct CreateAppPasswordIn {
     privileged: Option<bool>,
 }
 
-async fn create_app_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateAppPasswordIn>) -> XResult<Json<J>> {
+async fn create_app_password(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateAppPasswordIn>,
+) -> XResult<Json<J>> {
     let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
     if is_takendown_account(&acct) {
@@ -1767,7 +1810,11 @@ struct RevokeAppPasswordIn {
     name: String,
 }
 
-async fn revoke_app_password(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RevokeAppPasswordIn>) -> XResult<StatusCode> {
+async fn revoke_app_password(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<RevokeAppPasswordIn>,
+) -> XResult<StatusCode> {
     // app passwords can't revoke app passwords (stricter than the reference)
     let did = full_access(&creds)?;
     let e = ext(&app);
@@ -1785,7 +1832,13 @@ async fn revoke_app_password(State(app): AppState, Auth(creds): Auth, Json(inp):
 }
 
 /// [`App::mutate_account`] that always writes; returns the account as written.
-pub(super) async fn update_account<F>(app: &App, did: &str, identity_event: bool, account_event: bool, f: F) -> XResult<Account>
+pub(super) async fn update_account<F>(
+    app: &App,
+    did: &str,
+    identity_event: bool,
+    account_event: bool,
+    f: F,
+) -> XResult<Account>
 where
     F: FnOnce(&mut Account) -> XResult<()> + Send + 'static,
 {
@@ -1799,7 +1852,12 @@ struct DeactivateIn {
     delete_after: Option<String>,
 }
 
-pub(super) async fn set_deactivated(app: &App, did: &str, deactivated: bool, delete_after: Option<String>) -> XResult<Account> {
+pub(super) async fn set_deactivated(
+    app: &App,
+    did: &str,
+    deactivated: bool,
+    delete_after: Option<String>,
+) -> XResult<Account> {
     update_account(app, did, !deactivated, true, move |a| {
         if deactivated {
             if a.extra.get("deactivatedAt").is_none_or(|v| v.is_null()) {
@@ -1826,7 +1884,11 @@ pub(super) async fn set_deactivated(app: &App, did: &str, deactivated: bool, del
     })
 }
 
-async fn deactivate_account(State(app): AppState, Auth(creds): Auth, body: Option<Json<DeactivateIn>>) -> XResult<StatusCode> {
+async fn deactivate_account(
+    State(app): AppState,
+    Auth(creds): Auth,
+    body: Option<Json<DeactivateIn>>,
+) -> XResult<StatusCode> {
     let did = full_or_oauth_account(&creds, "status", "manage")?;
     let inp = body.map(|Json(b)| b).unwrap_or_default();
     if let Some(d) = &inp.delete_after {
@@ -1848,11 +1910,8 @@ async fn deactivate_account(State(app): AppState, Auth(creds): Auth, body: Optio
 /// Password sessions stay.
 pub(super) async fn delete_delegated_credentials(app: &App, did: &str) -> XResult<()> {
     crate::oauth::store::revoke_all_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))?;
-    let mut dels: Vec<_> = scan_private(app, did, "oauth/authz/")
-        .await?
-        .into_iter()
-        .map(|(name, _)| pmut(did, &name, None))
-        .collect();
+    let mut dels: Vec<_> =
+        scan_private(app, did, "oauth/authz/").await?.into_iter().map(|(name, _)| pmut(did, &name, None)).collect();
     let mut names = Vec::new();
     for (key, v) in scan_private(app, did, "apppass/").await? {
         dels.push(pmut(did, &key, None));
@@ -1909,7 +1968,9 @@ async fn assert_valid_did_doc(app: &App, a: &Account) -> XResult<()> {
     if let (Some(plc), true) = (&app.plc, a.did.starts_with("did:plc:")) {
         let data = plc.client.document_data(&a.did).await?;
         // (a retired server key counts: `vlpds.admin.rotatePlcKeys` moves it)
-        let has_key = data["rotationKeys"].as_array().is_some_and(|k| k.iter().any(|k| k.as_str().is_some_and(|k| plc.is_server_key(k))));
+        let has_key = data["rotationKeys"]
+            .as_array()
+            .is_some_and(|k| k.iter().any(|k| k.as_str().is_some_and(|k| plc.is_server_key(k))));
         if !has_key {
             return Err(invalid_request("Server rotation key not included in PLC DID data"));
         }
@@ -1947,10 +2008,15 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     let acct = app.account(&did).await?;
     let p = app.partition(&did)?;
     let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
-    let (hv, sv) = tokio::try_join!(slatedb::DbReadOps::get(snap.as_ref(), state::head_key(&did)), slatedb::DbReadOps::get(snap.as_ref(), state::repo_stats_key(&did))).map_err(XrpcError::from_err)?;
+    let (hv, sv) = tokio::try_join!(
+        slatedb::DbReadOps::get(snap.as_ref(), state::head_key(&did)),
+        slatedb::DbReadOps::get(snap.as_ref(), state::repo_stats_key(&did))
+    )
+    .map_err(XrpcError::from_err)?;
     let hv = hv.ok_or_else(|| XrpcError::bad("RepoNotFound", format!("could not find repo: {did}")))?;
     let head = Head::decode(&hv).map_err(XrpcError::from_err)?;
-    let stats = state::RepoStats::decode(&sv.ok_or_else(|| XrpcError::internal(format!("{did}: repo stats missing")))?).map_err(XrpcError::from_err)?;
+    let stats = state::RepoStats::decode(&sv.ok_or_else(|| XrpcError::internal(format!("{did}: repo stats missing")))?)
+        .map_err(XrpcError::from_err)?;
     let count_blobs = async { super::blobs::count_stored(snap.as_ref(), &did).await.map_err(XrpcError::from_err) };
     let (imported, valid_did) = tokio::join!(count_blobs, assert_valid_did_doc(&app, &acct));
     Ok(Json(json!({
@@ -2071,7 +2137,9 @@ async fn finish_delete(app: &App, did: &str, from: DeleteFrom) -> XResult<()> {
     // revive access tokens issued before; so does the credential epoch
     // (device logins and codes from before must not match a fresh account)
     let mut private = scan_private(app, did, "").await?;
-    private.retain(|(name, _)| !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH && name != DELETING);
+    private.retain(|(name, _)| {
+        !name.starts_with(REVOKED_ALL) && !name.starts_with(REVOKED_FAMILY) && name != AUTH_EPOCH && name != DELETING
+    });
     for chunk in private.chunks(500) {
         app.put_private(did, chunk.iter().map(|(name, _)| pmut(did, name, None)).collect()).await?;
     }
@@ -2240,7 +2308,11 @@ struct ConfirmEmailIn {
     token: String,
 }
 
-async fn confirm_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<ConfirmEmailIn>) -> XResult<StatusCode> {
+async fn confirm_email(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<ConfirmEmailIn>,
+) -> XResult<StatusCode> {
     let did = standard_or_oauth_account(&creds, "email", "manage")?;
     let acct = app.account(&did).await.map_err(|_| XrpcError::bad("AccountNotFound", "user not found"))?;
     if is_takendown_account(&acct) {
@@ -2329,10 +2401,8 @@ struct UpdateEmailIn {
 async fn update_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateEmailIn>) -> XResult<StatusCode> {
     // app passwords can't change the email (stricter than the reference)
     let did = full_or_oauth_account(&creds, "email", "manage")?;
-    let acct = app
-        .account(&did)
-        .await
-        .map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
+    let acct =
+        app.account(&did).await.map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
     if is_takendown_account(&acct) {
         return Err(takedown_error());
     }
@@ -2385,7 +2455,8 @@ async fn request_password_reset(State(app): AppState, Json(inp): Json<RequestPas
     // Over a budget it answers exactly as a mailed request does (no headers
     // from these buckets either): the caller is unauthenticated, and an
     // account's mail budget is nobody else's business.
-    let acct_limits: [&'static crate::ratelimit::Limit; 2] = [&crate::ratelimit::PASSWORD_RESET_ACCOUNT_DAY, &crate::ratelimit::PASSWORD_RESET_ACCOUNT_HOUR];
+    let acct_limits: [&'static crate::ratelimit::Limit; 2] =
+        [&crate::ratelimit::PASSWORD_RESET_ACCOUNT_DAY, &crate::ratelimit::PASSWORD_RESET_ACCOUNT_HOUR];
     if app.ratelimit.consume_unbypassable(&acct_limits, &acct.did, "mail:reset_password", false).is_err() {
         crate::mail::MAIL_SUPPRESSED.with_label_values(&["reset_password", "account_limit"]).inc();
         return Ok(StatusCode::OK);
@@ -2453,7 +2524,11 @@ struct CreateInviteCodeIn {
     for_account: Option<String>,
 }
 
-async fn create_invite_code(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateInviteCodeIn>) -> XResult<Json<J>> {
+async fn create_invite_code(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateInviteCodeIn>,
+) -> XResult<Json<J>> {
     super::admin::require_admin(&creds)?;
     let account = inp.for_account.unwrap_or_else(|| "admin".into());
     let code = super::admin::gen_invite_code(&app);
@@ -2474,7 +2549,11 @@ fn one() -> usize {
     1
 }
 
-async fn create_invite_codes(State(app): AppState, Auth(creds): Auth, Json(inp): Json<CreateInviteCodesIn>) -> XResult<Json<J>> {
+async fn create_invite_codes(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Json(inp): Json<CreateInviteCodesIn>,
+) -> XResult<Json<J>> {
     super::admin::require_admin(&creds)?;
     let accounts = inp.for_accounts.unwrap_or_else(|| vec!["admin".into()]);
     let mut out = Vec::new();
@@ -2524,7 +2603,11 @@ pub(super) fn codes_to_create(
 /// With `--invite-interval` (and invites required), creates the codes the
 /// account has earned; returns all its codes. A concurrent creation on
 /// another node is caught afterwards (`DuplicateCreate`), as the reference.
-async fn create_earned_invites(app: &App, acct: &Account, codes: Vec<super::admin::InviteCode>) -> XResult<Vec<super::admin::InviteCode>> {
+async fn create_earned_invites(
+    app: &App,
+    acct: &Account,
+    codes: Vec<super::admin::InviteCode>,
+) -> XResult<Vec<super::admin::InviteCode>> {
     let Some(interval) = app.config.invite_interval.filter(|_| app.config.invite_required) else {
         return Ok(codes);
     };
@@ -2549,7 +2632,11 @@ async fn create_earned_invites(app: &App, acct: &Account, codes: Vec<super::admi
     Ok(after)
 }
 
-async fn get_account_invite_codes(State(app): AppState, Auth(creds): Auth, Query(q): Query<AccountInviteCodesQ>) -> XResult<Json<J>> {
+async fn get_account_invite_codes(
+    State(app): AppState,
+    Auth(creds): Auth,
+    Query(q): Query<AccountInviteCodesQ>,
+) -> XResult<Json<J>> {
     let did = full_access(&creds)?;
     let acct = app.account(&did).await.map_err(|_| XrpcError::bad("NotFound", "Account not found"))?;
     if is_takendown_account(&acct) {
@@ -2619,7 +2706,9 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
         Credentials::OAuth { .. } => creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?,
         Credentials::AppPassword { privileged: false, .. } => {
             if let Some(l) = lxm.filter(|l| privileged_method(l)) {
-                return Err(invalid_request(format!("insufficient access to request a service auth token for the following method: {l}")));
+                return Err(invalid_request(format!(
+                    "insufficient access to request a service auth token for the following method: {l}"
+                )));
             }
         }
         _ => {}
@@ -2635,16 +2724,24 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
             if diff < 0 {
                 return Err(XrpcError::bad("BadExpiration", "expiration is in past"));
             } else if diff > 3600 {
-                return Err(XrpcError::bad("BadExpiration", "cannot request a token with an expiration more than an hour in the future"));
+                return Err(XrpcError::bad(
+                    "BadExpiration",
+                    "cannot request a token with an expiration more than an hour in the future",
+                ));
             } else if lxm.is_none() && diff > 60 {
-                return Err(XrpcError::bad("BadExpiration", "cannot request a method-less token with an expiration more than a minute in the future"));
+                return Err(XrpcError::bad(
+                    "BadExpiration",
+                    "cannot request a method-less token with an expiration more than a minute in the future",
+                ));
             }
             diff as u64
         }
         None => 60,
     };
     if let Some(l) = lxm.filter(|l| protected_method(l)) {
-        return Err(invalid_request(format!("cannot request a service auth token for the following protected method: {l}")));
+        return Err(invalid_request(format!(
+            "cannot request a service auth token for the following protected method: {l}"
+        )));
     }
     let key = app.secrets.account_signing_key(&acct).await?;
     let token = crate::auth::service_auth_jwt(&key, &did, &q.aud, lxm, ttl)?;
@@ -2696,7 +2793,8 @@ async fn check_handle_availability(State(app): AppState, Query(q): Query<HandleA
         })));
     }
     let suffix = format!(".{}", app.handle_domain);
-    let base: String = handle.split('.').next().unwrap_or("user").chars().filter(|c| c.is_ascii_alphanumeric()).take(14).collect();
+    let base: String =
+        handle.split('.').next().unwrap_or("user").chars().filter(|c| c.is_ascii_alphanumeric()).take(14).collect();
     let base = if base.len() < 3 { format!("{base}user") } else { base };
     let mut suggestions = Vec::new();
     for _ in 0..12 {
@@ -2759,9 +2857,12 @@ async fn confirm_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<C
             if st.enabled() {
                 return Err(invalid_request("TOTP is already enabled"));
             }
-            let pending =
-                st.pending.clone().ok_or_else(|| invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first"))?;
-            let secret = crate::totp::base32_decode(&pending).ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
+            let pending = st
+                .pending
+                .clone()
+                .ok_or_else(|| invalid_request("No pending TOTP setup; call vlpds.server.setupTotp first"))?;
+            let secret = crate::totp::base32_decode(&pending)
+                .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
             let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
                 .ok_or_else(|| invalid_token("Token is invalid"))?;
             let codes = crate::totp::generate_recovery_codes();
@@ -2826,7 +2927,8 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
 async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = standard_no_oauth(&creds)?;
     let st = crate::totp::load(&app, &did).await?;
-    let mut out = json!({"enabled": st.enabled(), "pending": st.pending.is_some(), "recoveryCodesRemaining": st.recovery.len()});
+    let mut out =
+        json!({"enabled": st.enabled(), "pending": st.pending.is_some(), "recoveryCodesRemaining": st.recovery.len()});
     if let Some(at) = &st.enabled_at {
         out["enabledAt"] = json!(at);
     }
@@ -2853,7 +2955,10 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     let r = |name: String, v: Vec<u8>| (did.to_string(), name, v);
     vec![
         r("sess/00112233445566778899aabbccddeeff0011223344556600".into(), enc(&st)),
-        r("apppass/ci".into(), enc(&json!({"name": "ci", "createdAt": "2026-10-01T00:00:00.000Z", "privileged": true, "hash": hash}))),
+        r(
+            "apppass/ci".into(),
+            enc(&json!({"name": "ci", "createdAt": "2026-10-01T00:00:00.000Z", "privileged": true, "hash": hash})),
+        ),
         r(format!("apphash/{hash}"), b"ci".to_vec()),
         r("etok/update_email".into(), enc(&et)),
         r(format!("{REVOKED_ALL}{before:016x}"), enc(&json!({"before": before, "exp": 1_790_007_200u64}))),
@@ -2861,12 +2966,27 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         // no AUTH_EPOCH row: it postdates L1, whose rows.json is frozen
         r(
             format!("{TAKEDOWN}rec/app.bsky.feed.post/3l3qo2vutsw2b"),
-            enc(&json!({"uri": format!("at://{did}/app.bsky.feed.post/3l3qo2vutsw2b"), "did": did, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": "mod-1"})),
+            enc(
+                &json!({"uri": format!("at://{did}/app.bsky.feed.post/3l3qo2vutsw2b"), "did": did, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": "mod-1"}),
+            ),
         ),
-        r(format!("{TAKEDOWN}blob/bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"), enc(&json!({"did": did, "cid": "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": null}))),
+        r(
+            format!("{TAKEDOWN}blob/bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"),
+            enc(
+                &json!({"did": did, "cid": "bafkreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm", "ref": null}),
+            ),
+        ),
         (format!("_reset:{digest}"), "t".into(), did.as_bytes().to_vec()),
-        (reserved_routing(did_key), "k".into(), enc(&json!({"key": "vw1.kid.cmVzZXJ2ZWQ", "did": did, "createdAt": "2026-10-01T00:00:00.000Z"}))),
-        (reserved_routing(did), "k".into(), enc(&json!({"signingKey": did_key, "createdAt": "2026-10-01T00:00:00.000Z"}))),
+        (
+            reserved_routing(did_key),
+            "k".into(),
+            enc(&json!({"key": "vw1.kid.cmVzZXJ2ZWQ", "did": did, "createdAt": "2026-10-01T00:00:00.000Z"})),
+        ),
+        (
+            reserved_routing(did),
+            "k".into(),
+            enc(&json!({"signingKey": did_key, "createdAt": "2026-10-01T00:00:00.000Z"})),
+        ),
     ]
 }
 
@@ -2877,7 +2997,11 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
         return Some(utf8_row("reset token", val));
     }
     if routing.starts_with("_reserved:") && name == "k" {
-        let fields: &[(&str, char)] = if routing.starts_with("_reserved:did:key:") { &[("key", 's'), ("createdAt", 's')] } else { &[("signingKey", 's'), ("createdAt", 's')] };
+        let fields: &[(&str, char)] = if routing.starts_with("_reserved:did:key:") {
+            &[("key", 's'), ("createdAt", 's')]
+        } else {
+            &[("signingKey", 's'), ("createdAt", 's')]
+        };
         return Some(json_row("reserved signing key", val, fields));
     }
     if !routing.starts_with("did:") {
@@ -2896,9 +3020,13 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
     } else if name == DELETING {
         typed_row::<Deleting>("deletion in progress", val)
     } else if name.starts_with(REVOKED_ALL) || name.starts_with(REVOKED_FAMILY) {
-        let fields: &[(&str, char)] = if name.starts_with(REVOKED_ALL) { &[("before", 'u'), ("exp", 'u')] } else { &[("exp", 'u')] };
+        let fields: &[(&str, char)] =
+            if name.starts_with(REVOKED_ALL) { &[("before", 'u'), ("exp", 'u')] } else { &[("exp", 'u')] };
         json_row("session revocation", val, fields).and_then(|k| {
-            anyhow::ensure!(revocation_expired(routing, name, val, 0) == Some(false), "the revocation GC can't read it");
+            anyhow::ensure!(
+                revocation_expired(routing, name, val, 0) == Some(false),
+                "the revocation GC can't read it"
+            );
             Ok(k)
         })
     } else if name.starts_with(&format!("{TAKEDOWN}rec/")) {

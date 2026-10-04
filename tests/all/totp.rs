@@ -29,7 +29,8 @@ fn hotp(secret: &[u8], counter: u64) -> String {
     mac.update(&counter.to_be_bytes());
     let h = mac.finalize().into_bytes();
     let off = (h[19] & 0xf) as usize;
-    let bin = ((h[off] as u32 & 0x7f) << 24) | ((h[off + 1] as u32) << 16) | ((h[off + 2] as u32) << 8) | h[off + 3] as u32;
+    let bin =
+        ((h[off] as u32 & 0x7f) << 24) | ((h[off + 1] as u32) << 16) | ((h[off + 2] as u32) << 8) | h[off + 3] as u32;
     format!("{:06}", bin % 1_000_000)
 }
 
@@ -67,7 +68,8 @@ async fn enable(s: &TestServer, a: &TestAccount) -> (Vec<u8>, u64, Vec<String>) 
     s.xrpc.post("vlpds.server.confirmTotp", &json!({"code": "000000"}), &a.auth()).await.client_err();
     let step = step_now();
     let j = s.xrpc.post("vlpds.server.confirmTotp", &json!({"code": hotp(&secret, step)}), &a.auth()).await.ok();
-    let codes: Vec<String> = j["recoveryCodes"].as_array().expect("recoveryCodes").iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    let codes: Vec<String> =
+        j["recoveryCodes"].as_array().expect("recoveryCodes").iter().map(|c| c.as_str().unwrap().to_string()).collect();
     assert!(!codes.is_empty());
     let st = status(s, a).await;
     assert_eq!(st["enabled"], json!(true));
@@ -124,7 +126,11 @@ async fn login_requires_totp_once_enabled() {
     // wrong password with a valid factor still fails as a password error
     let r = s
         .xrpc
-        .post("com.atproto.server.createSession", &json!({"identifier": a.handle, "password": "nope", "authFactorToken": recovery[0]}), &Auth::None)
+        .post(
+            "com.atproto.server.createSession",
+            &json!({"identifier": a.handle, "password": "nope", "authFactorToken": recovery[0]}),
+            &Auth::None,
+        )
         .await;
     r.err(401, "AuthenticationRequired");
 
@@ -149,7 +155,10 @@ async fn app_password_login_bypasses_totp() {
     // ...but an app-password session cannot manage TOTP
     let app_auth = Auth::Bearer(j["accessJwt"].as_str().unwrap().into());
     s.xrpc.post_empty("vlpds.server.setupTotp", &app_auth).await.client_err();
-    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &app_auth).await.client_err();
+    s.xrpc
+        .post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &app_auth)
+        .await
+        .client_err();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -158,14 +167,23 @@ async fn disable_totp() {
     let a = s.create_account("td").await;
     let (_secret, _step, recovery) = enable(&s, &a).await;
     // wrong password
-    let r = s.xrpc.post("vlpds.server.disableTotp", &json!({"password": "nope", "recoveryCode": recovery[1]}), &a.auth()).await;
+    let r = s
+        .xrpc
+        .post("vlpds.server.disableTotp", &json!({"password": "nope", "recoveryCode": recovery[1]}), &a.auth())
+        .await;
     r.client_err();
     // missing / wrong code
     s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password}), &a.auth()).await.client_err();
-    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &a.auth()).await.client_err();
+    s.xrpc
+        .post("vlpds.server.disableTotp", &json!({"password": a.password, "code": "000000"}), &a.auth())
+        .await
+        .client_err();
     assert_eq!(status(&s, &a).await["enabled"], json!(true));
     // valid recovery code disables
-    s.xrpc.post("vlpds.server.disableTotp", &json!({"password": a.password, "recoveryCode": recovery[1]}), &a.auth()).await.ok();
+    s.xrpc
+        .post("vlpds.server.disableTotp", &json!({"password": a.password, "recoveryCode": recovery[1]}), &a.auth())
+        .await
+        .ok();
     assert_eq!(status(&s, &a).await["enabled"], json!(false));
     login(&s, &a, None).await.ok();
     // can be enabled again with a fresh secret

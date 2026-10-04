@@ -19,7 +19,12 @@ use std::time::{Duration, Instant};
 use vlpds::state::bulk_did;
 use vlpds::worker::{CachedRepo, WorkerMsg};
 
-async fn node(id: &str, store: &Arc<dyn object_store::ObjectStore>, shards: u32, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
+async fn node(
+    id: &str,
+    store: &Arc<dyn object_store::ObjectStore>,
+    shards: u32,
+    f: impl FnOnce(&mut vlpds::server::Config),
+) -> TestServer {
     cluster_node(id, store.clone(), shards, f).await
 }
 
@@ -43,7 +48,10 @@ async fn populate(nodes: &[&TestServer], range: std::ops::Range<u64>, records: u
         .map(|(k, c)| {
             let auth = &auth;
             async move {
-                let r = nodes[k].xrpc.post("vlpds.admin.bulkCreate", &json!({"indices": c, "records": records}), auth).await;
+                let r = nodes[k]
+                    .xrpc
+                    .post("vlpds.admin.bulkCreate", &json!({"indices": c, "records": records}), auth)
+                    .await;
                 assert_eq!(r.status, 200, "{}", r.text());
                 assert_eq!(r.json["created"].as_u64(), Some(c.len() as u64), "{}", r.text());
             }
@@ -80,7 +88,10 @@ async fn writes_survive_a_handback() {
                 let i = (k % 40) as usize;
                 sent[i] += 1;
                 let body = json!({"repo": bulk_did(i as u64), "collection": "app.bsky.feed.post", "record": post_record("hb")});
-                let rb = http.post(format!("{url_a}/xrpc/com.atproto.repo.createRecord")).bearer_auth(&tokens[i]).json(&body);
+                let rb = http
+                    .post(format!("{url_a}/xrpc/com.atproto.repo.createRecord"))
+                    .bearer_auth(&tokens[i])
+                    .json(&body);
                 futs.push(tokio::spawn(async move {
                     let r = rb.send().await.unwrap();
                     (r.status().as_u16(), r.text().await.unwrap_or_default())
@@ -160,7 +171,9 @@ async fn recent_repos_preloaded_after_restart() {
     let b = node("rp", &store, 4, |_| {}).await;
     for i in 0..10 {
         let did = bulk_did(i);
-        let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await }).await.unwrap_or_else(|| panic!("repo {i} not preloaded"));
+        let info = eventually(Duration::from_secs(10), || async { cache_info(&b, &did).await })
+            .await
+            .unwrap_or_else(|| panic!("repo {i} not preloaded"));
         assert!(info.loaded_nodes >= 1, "{info:?}");
     }
     for i in 10..30 {
@@ -171,7 +184,6 @@ async fn recent_repos_preloaded_after_restart() {
 // ---------------------------------------------------------------------------
 // measurement
 // ---------------------------------------------------------------------------
-
 
 /// Zipf(s) over `n` ranks, mapped through a fixed permutation (so the hot
 /// repos spread over the shards).
@@ -184,7 +196,12 @@ impl Zipf {
     fn new(n: usize, s: f64) -> Zipf {
         use rand::seq::SliceRandom;
         let mut acc = 0.0;
-        let mut cdf: Vec<f64> = (1..=n).map(|k| { acc += 1.0 / (k as f64).powf(s); acc }).collect();
+        let mut cdf: Vec<f64> = (1..=n)
+            .map(|k| {
+                acc += 1.0 / (k as f64).powf(s);
+                acc
+            })
+            .collect();
         for c in &mut cdf {
             *c /= acc;
         }
@@ -220,13 +237,15 @@ async fn restart_window(label: &str, tuned: bool) {
     let lat_ms: u64 = env_or("COLD_STORE_MS", 10);
     let limit: usize = env_or("COLD_STORE_CONCURRENCY", 48);
     vlpds::partition::set_block_cache_bytes(64 << 20);
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::limit::LimitStore::new(throttled_store(lat_ms), limit));
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::limit::LimitStore::new(throttled_store(lat_ms), limit));
     let shards: u32 = 48;
     let set = move |c: &mut vlpds::server::Config| {
         c.workers = 2;
         // production-like leases: a saturated store must not fail-stop a node
         if let Some(cl) = &mut c.cluster {
-            (cl.ttl, cl.renew_every, cl.skew) = (Duration::from_secs(5), Duration::from_secs(1), Duration::from_secs(1));
+            (cl.ttl, cl.renew_every, cl.skew) =
+                (Duration::from_secs(5), Duration::from_secs(1), Duration::from_secs(1));
         }
         if !tuned {
             c.preload_recent = 0;
@@ -273,7 +292,8 @@ async fn restart_window(label: &str, tuned: bool) {
                     n += 1;
                     let i = zipf.sample(&mut rng);
                     let url = format!("{}/xrpc/com.atproto.repo.createRecord", urls[(n % 2) as usize]);
-                    let body = json!({"repo": bulk_did(i), "collection": "app.bsky.feed.post", "record": post_record("zipf")});
+                    let body =
+                        json!({"repo": bulk_did(i), "collection": "app.bsky.feed.post", "record": post_record("zipf")});
                     let (http, tokens, seconds) = (http.clone(), tokens.clone(), seconds.clone());
                     tasks.push(tokio::spawn(async move {
                         let r = http.post(url).bearer_auth(&tokens[i as usize]).json(&body).send().await;
@@ -307,7 +327,11 @@ async fn restart_window(label: &str, tuned: bool) {
     tokio::time::sleep_until((start + Duration::from_secs(down_at)).into()).await;
     let td = Instant::now();
     vlpds::server::shutdown(&c.app).await;
-    eprintln!("[{label}] c down at {:.1}s (shutdown {:.1}s)", start.elapsed().as_secs_f64(), td.elapsed().as_secs_f64());
+    eprintln!(
+        "[{label}] c down at {:.1}s (shutdown {:.1}s)",
+        start.elapsed().as_secs_f64(),
+        td.elapsed().as_secs_f64()
+    );
     drop(c);
     tokio::time::sleep_until((start + Duration::from_secs(up_at)).into()).await;
     let c2 = node("cs-c", &store, shards, set).await;
@@ -324,7 +348,14 @@ async fn restart_window(label: &str, tuned: bool) {
         l.sort_unstable();
         let q = |p: f64| l.get(((l.len() as f64 * p) as usize).min(l.len().saturating_sub(1))).copied().unwrap_or(0);
         let e = sec.err.load(Ordering::Relaxed);
-        eprintln!("[{label}] {s:3} {:6} {e:6} {:5} {:5} {:5} {:?}", sec.ok.load(Ordering::Relaxed), q(0.5), q(0.99), l.last().copied().unwrap_or(0), sec.kinds.lock());
+        eprintln!(
+            "[{label}] {s:3} {:6} {e:6} {:5} {:5} {:5} {:?}",
+            sec.ok.load(Ordering::Relaxed),
+            q(0.5),
+            q(0.99),
+            l.last().copied().unwrap_or(0),
+            sec.kinds.lock()
+        );
         if s as u64 >= down_at {
             if e > 0 {
                 err_secs.push(s);

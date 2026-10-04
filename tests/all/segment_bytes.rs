@@ -51,11 +51,14 @@ async fn segment_bytes_per_commit() {
     let store = &s.app.store;
     let prefix = object_store::path::Path::from(format!("{}/log/{}", store.prefix, s.app.log.log_id));
     let metas: Vec<_> = store.raw.list(Some(&prefix)).map(|m| m.unwrap()).collect().await;
-    let (mut frames, mut keys, mut vals, mut n, mut total, mut by_prefix) = (0usize, 0usize, 0usize, 0usize, 0usize, std::collections::BTreeMap::<String, (usize, usize)>::new());
+    let (mut frames, mut keys, mut vals, mut n, mut total, mut by_prefix) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, std::collections::BTreeMap::<String, (usize, usize)>::new());
     for m in metas.iter().rev().take(50) {
         let data = store.raw.get(&m.location).await.unwrap().bytes().await.unwrap();
         total += data.len();
-        let vlpds::segment::LogObject::Segment(_, entries) = vlpds::segment::parse(data, true, None).unwrap() else { continue };
+        let vlpds::segment::LogObject::Segment(_, entries) = vlpds::segment::parse(data, true, None).unwrap() else {
+            continue;
+        };
         for e in entries {
             n += 1;
             frames += e.frame.len();

@@ -329,7 +329,9 @@ mod tests {
             prev_nonempty: true,
             ops: Some(
                 ops.into_iter()
-                    .map(|(p, put)| (Arc::from(p), put.then(|| (cid(rev as u8), keeps_bytes(p).then(|| Bytes::from_static(b"x"))))))
+                    .map(|(p, put)| {
+                        (Arc::from(p), put.then(|| (cid(rev as u8), keeps_bytes(p).then(|| Bytes::from_static(b"x")))))
+                    })
                     .collect(),
             ),
         }

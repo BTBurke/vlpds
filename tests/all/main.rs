@@ -135,8 +135,8 @@ mod signature_faults;
 mod smtp_mail;
 mod staged_import;
 mod subscribe_repos;
-mod sync11_property;
 mod sync;
+mod sync11_property;
 mod sync_list;
 mod takedown_routes;
 mod totp;
@@ -150,4 +150,3 @@ mod web_ui;
 #[cfg(feature = "bench-jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-

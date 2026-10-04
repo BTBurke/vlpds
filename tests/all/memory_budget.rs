@@ -28,13 +28,19 @@ async fn plan_and_pool_caches_are_exported() {
     let s = TestServer::spawn().await;
     s.create_account("membudget").await;
     let m = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
-    let part = |p: &str| gauge(&m, &format!("vlpds_memory_budget_bytes{{part=\"{p}\"}}")).unwrap_or_else(|| panic!("no {p}"));
-    let fixed: f64 = ["runtime", "in_memory_caches", "mst_node_cache", "firehose", "backfill", "exports", "import", "headroom"].iter().map(|p| part(p)).sum();
+    let part =
+        |p: &str| gauge(&m, &format!("vlpds_memory_budget_bytes{{part=\"{p}\"}}")).unwrap_or_else(|| panic!("no {p}"));
+    let fixed: f64 =
+        ["runtime", "in_memory_caches", "mst_node_cache", "firehose", "backfill", "exports", "import", "headroom"]
+            .iter()
+            .map(|p| part(p))
+            .sum();
     assert_eq!(fixed + part("pool"), part("budget"));
     // registration re-plans at once: the pool caches' gauges are there
     for c in ["meta", "block", "repo"] {
         for k in ["target", "capacity"] {
-            let v = gauge(&m, &format!("vlpds_memory_cache_bytes{{cache=\"{c}\",kind=\"{k}\"}}")).unwrap_or_else(|| panic!("{c} {k}"));
+            let v = gauge(&m, &format!("vlpds_memory_cache_bytes{{cache=\"{c}\",kind=\"{k}\"}}"))
+                .unwrap_or_else(|| panic!("{c} {k}"));
             // the metadata target is 0 until a shard has SSTs
             assert!(v > 0.0 || (c, k) == ("meta", "target"), "{c} {k}: {v}");
         }

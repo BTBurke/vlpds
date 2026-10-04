@@ -40,9 +40,18 @@ async fn ref_writes_to_another_repo_are_auth_required() {
     let follow = json!({"$type": "app.bsky.graph.follow", "subject": alice.did, "createdAt": now_iso()});
     let bobs = s.post(&bob, "bob's").await;
     for (nsid, body) in [
-        ("com.atproto.repo.putRecord", json!({"repo": bob.did, "collection": "app.bsky.graph.follow", "rkey": "3jzfcijpj2z2a", "record": follow})),
-        ("com.atproto.repo.createRecord", json!({"repo": bob.did, "collection": "app.bsky.graph.follow", "record": follow})),
-        ("com.atproto.repo.deleteRecord", json!({"repo": bob.did, "collection": "app.bsky.feed.post", "rkey": bobs.rkey()})),
+        (
+            "com.atproto.repo.putRecord",
+            json!({"repo": bob.did, "collection": "app.bsky.graph.follow", "rkey": "3jzfcijpj2z2a", "record": follow}),
+        ),
+        (
+            "com.atproto.repo.createRecord",
+            json!({"repo": bob.did, "collection": "app.bsky.graph.follow", "record": follow}),
+        ),
+        (
+            "com.atproto.repo.deleteRecord",
+            json!({"repo": bob.did, "collection": "app.bsky.feed.post", "rkey": bobs.rkey()}),
+        ),
         (
             "com.atproto.repo.applyWrites",
             json!({"repo": bob.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.graph.follow", "value": follow}]}),
@@ -53,7 +62,13 @@ async fn ref_writes_to_another_repo_are_auth_required() {
         assert!(r.text().contains("Authentication Required"), "{nsid}: {}", r.text());
     }
     // by handle too
-    let r = call(&s, "com.atproto.repo.createRecord", &alice, json!({"repo": bob.handle, "collection": "app.bsky.graph.follow", "record": follow})).await;
+    let r = call(
+        &s,
+        "com.atproto.repo.createRecord",
+        &alice,
+        json!({"repo": bob.handle, "collection": "app.bsky.graph.follow", "record": follow}),
+    )
+    .await;
     r.err(401, "AuthenticationRequired");
     // bob's repo is untouched
     s.get_record(&bob.did, "app.bsky.feed.post", bobs.rkey()).await.ok();
@@ -68,7 +83,14 @@ async fn ref_put_record_invalid_update_leaves_record() {
     let s = TestServer::spawn().await;
     let bob = s.create_account("bob").await;
     let good = json!({"$type": "app.bsky.actor.profile", "displayName": "Robert", "description": "Dog lover"});
-    call(&s, "com.atproto.repo.putRecord", &bob, json!({"repo": bob.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": good})).await.ok();
+    call(
+        &s,
+        "com.atproto.repo.putRecord",
+        &bob,
+        json!({"repo": bob.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": good}),
+    )
+    .await
+    .ok();
     // a float (not in the data model; vlpds's message doesn't name the field)
     let r = call(
         &s,
@@ -249,7 +271,14 @@ async fn ref_images_in_unknown_record_types_are_associated() {
     assert_eq!(g["value"]["$type"], json!("com.example.record"));
     assert_eq!(list_blobs(&s, &a.did).await, vec![link(&blob)]);
     assert_eq!(get_blob(&s, &a.did, &link(&blob)).await.status, 200);
-    call(&s, "com.atproto.repo.deleteRecord", &a, json!({"repo": a.did, "collection": "com.example.record", "rkey": rec.rkey()})).await.ok();
+    call(
+        &s,
+        "com.atproto.repo.deleteRecord",
+        &a,
+        json!({"repo": a.did, "collection": "com.example.record", "rkey": rec.rkey()}),
+    )
+    .await
+    .ok();
     assert!(list_blobs(&s, &a.did).await.is_empty());
 }
 
@@ -287,8 +316,10 @@ async fn ref_upload_client_abort() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     // 5 MB announced, ~1 MB sent, then the body stream fails
-    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
-        (0..16).map(|_| Ok(bytes::Bytes::from(vec![0u8; 64 * 1024]))).chain(std::iter::once(Err(std::io::Error::other("client aborted")))).collect();
+    let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..16)
+        .map(|_| Ok(bytes::Bytes::from(vec![0u8; 64 * 1024])))
+        .chain(std::iter::once(Err(std::io::Error::other("client aborted"))))
+        .collect();
     let body = reqwest::Body::wrap_stream(futures::stream::iter(chunks));
     let res = s
         .xrpc

@@ -8,7 +8,11 @@ const HOUR: Duration = Duration::from_secs(3600);
 
 async fn imported(s: &TestServer, a: &TestAccount) -> (u64, u64) {
     let st = s.xrpc.get("com.atproto.server.checkAccountStatus", &[], &a.auth()).await.ok();
-    let listed = futures::StreamExt::count(object_store::ObjectStore::list(&*s.app.store.raw, Some(&object_store::path::Path::from(format!("{}/blob/{}", s.app.store.prefix, a.did))))).await as u64;
+    let listed = futures::StreamExt::count(object_store::ObjectStore::list(
+        &*s.app.store.raw,
+        Some(&object_store::path::Path::from(format!("{}/blob/{}", s.app.store.prefix, a.did))),
+    ))
+    .await as u64;
     (st["importedBlobs"].as_u64().unwrap(), listed)
 }
 

@@ -34,11 +34,8 @@ impl std::fmt::Debug for TxtResolverRef {
 
 struct SystemTxt;
 
-static SYSTEM: LazyLock<Option<hickory_resolver::TokioResolver>> = LazyLock::new(|| {
-    hickory_resolver::TokioResolver::builder_tokio()
-        .ok()
-        .map(|b| b.build())
-});
+static SYSTEM: LazyLock<Option<hickory_resolver::TokioResolver>> =
+    LazyLock::new(|| hickory_resolver::TokioResolver::builder_tokio().ok().map(|b| b.build()));
 
 impl TxtResolver for SystemTxt {
     fn txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>, String>> {
@@ -48,12 +45,7 @@ impl TxtResolver for SystemTxt {
             Ok(lookup
                 .iter()
                 .take(MAX_TXT_RECORDS)
-                .map(|txt| {
-                    txt.txt_data()
-                        .iter()
-                        .map(|c| String::from_utf8_lossy(c).into_owned())
-                        .collect::<String>()
-                })
+                .map(|txt| txt.txt_data().iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect::<String>())
                 .collect())
         })
     }

@@ -61,19 +61,11 @@ impl Store {
                     .with_allow_http(cfg.endpoint.starts_with("http://")),
             )
             .build()?;
-        Ok(Store {
-            raw: Arc::new(s3),
-            prefix: prefix.trim_end_matches('/').to_string(),
-            latency,
-        })
+        Ok(Store { raw: Arc::new(s3), prefix: prefix.trim_end_matches('/').to_string(), latency })
     }
 
     pub fn memory(latency: Option<(f64, f64)>) -> Store {
-        Store {
-            raw: Arc::new(object_store::memory::InMemory::new()),
-            prefix: "vlpds".into(),
-            latency,
-        }
+        Store { raw: Arc::new(object_store::memory::InMemory::new()), prefix: "vlpds".into(), latency }
     }
 
     /// Wrap each underlying client once.

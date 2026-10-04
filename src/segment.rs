@@ -135,7 +135,14 @@ impl Default for SegmentBuilder {
 
 impl SegmentBuilder {
     pub fn new() -> Self {
-        SegmentBuilder { body: Vec::with_capacity(1 << 20), first_seq: 0, last_seq: 0, count: 0, header_room: 0, level: crate::version::active() }
+        SegmentBuilder {
+            body: Vec::with_capacity(1 << 20),
+            first_seq: 0,
+            last_seq: 0,
+            count: 0,
+            header_room: 0,
+            level: crate::version::active(),
+        }
     }
 
     /// A builder whose body starts with room for `log_id`'s header, so
@@ -191,7 +198,11 @@ impl SegmentBuilder {
         gen: u64,
     ) -> std::ops::Range<usize> {
         let stored = &muts[derived.min(muts.len())..];
-        let derived = if derived > 0 && derived <= muts.len() && derived < 1 << 15 && stored.len() < 1 << 16 { derived } else { 0 };
+        let derived = if derived > 0 && derived <= muts.len() && derived < 1 << 15 && stored.len() < 1 << 16 {
+            derived
+        } else {
+            0
+        };
         let stored = &muts[derived..];
         if self.count == 0 {
             self.first_seq = seq;
@@ -304,7 +315,10 @@ pub fn compress(obj: &[u8], level: i32) -> anyhow::Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     let Some((h, hl)) = parse_header(obj)? else { return Ok(None) };
-    anyhow::ensure!(h.codec == CODEC_NONE && hl + h.body_len as usize == obj.len(), "compress: not a sealed uncompressed segment");
+    anyhow::ensure!(
+        h.codec == CODEC_NONE && hl + h.body_len as usize == obj.len(),
+        "compress: not a sealed uncompressed segment"
+    );
     let body = &obj[hl..];
     let mut out = Vec::with_capacity(hl + zstd::zstd_safe::compress_bound(body.len()));
     out.extend_from_slice(&obj[..hl]);
@@ -337,7 +351,12 @@ pub fn decode(data: Bytes) -> anyhow::Result<Bytes> {
     let body_len = h.body_len as usize;
     match h.codec {
         CODEC_NONE => {
-            anyhow::ensure!(data.len() == hl + body_len, "segment {} body is {} bytes, header says {body_len}", h.ordinal, data.len() - hl);
+            anyhow::ensure!(
+                data.len() == hl + body_len,
+                "segment {} body is {} bytes, header says {body_len}",
+                h.ordinal,
+                data.len() - hl
+            );
             Ok(data)
         }
         CODEC_ZSTD => {
@@ -390,7 +409,10 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
         Some(_) => anyhow::bail!("truncated segment header"),
         None => {
             crate::version::format_error("segment");
-            anyhow::bail!("bad segment magic {:?} (not a level this build reads)", String::from_utf8_lossy(&data[..data.len().min(8)]))
+            anyhow::bail!(
+                "bad segment magic {:?} (not a level this build reads)",
+                String::from_utf8_lossy(&data[..data.len().min(8)])
+            )
         }
     };
     let idlen = u16::from_be_bytes(data[8..10].try_into()?) as usize;
@@ -399,7 +421,8 @@ pub fn parse_header(data: &[u8]) -> anyhow::Result<Option<(SegHeader, usize)>> {
     anyhow::ensure!(data.len() >= pos + tail, "truncated segment header");
     let rd8 = |p: usize| -> [u8; 8] { data[p..p + 8].try_into().unwrap() };
     // the test level's checksum sits between count and codec
-    let (checksum, c) = if has_checksum(level) { (Some(u64::from_be_bytes(rd8(pos + 36))), pos + 44) } else { (None, pos + 36) };
+    let (checksum, c) =
+        if has_checksum(level) { (Some(u64::from_be_bytes(rd8(pos + 36))), pos + 44) } else { (None, pos + 36) };
     let h = SegHeader {
         log_id: String::from_utf8(data[10..pos].to_vec())?,
         ordinal: u64::from_be_bytes(rd8(pos)),
@@ -425,7 +448,12 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
         return Ok(LogObject::Fence { by: String::from_utf8_lossy(&data[8..]).into_owned() });
     };
     if let Some(sum) = h.checksum {
-        anyhow::ensure!(body_checksum(&data[pos..]) == sum, "segment {} of {}: body checksum mismatch", h.ordinal, h.log_id);
+        anyhow::ensure!(
+            body_checksum(&data[pos..]) == sum,
+            "segment {} of {}: body checksum mismatch",
+            h.ordinal,
+            h.log_id
+        );
     }
     let need = |pos: usize, n: usize| -> anyhow::Result<()> {
         anyhow::ensure!(pos + n <= data.len(), "truncated segment");
@@ -446,7 +474,11 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
         pos += flen;
         let nm = u32::from_be_bytes(data[pos..pos + 4].try_into()?);
         pos += 4;
-        let (derived, nm) = if nm & DERIVED != 0 { (((nm & !DERIVED) >> 16) as usize, (nm & 0xffff) as usize) } else { (0, nm as usize) };
+        let (derived, nm) = if nm & DERIVED != 0 {
+            (((nm & !DERIVED) >> 16) as usize, (nm & 0xffff) as usize)
+        } else {
+            (0, nm as usize)
+        };
         let mut gen = 0u64;
         if derived > 0 {
             let mut shift = 0;
@@ -465,7 +497,8 @@ pub fn parse(data: Bytes, with_muts: bool, shard: Option<ShardId>) -> anyhow::Re
         let keep = shard.is_none_or(|s| s == sh);
         let mut muts = Vec::new();
         if derived > 0 && with_muts && keep {
-            muts = derive_commit_muts_n(&frame, derived, gen).map_err(|e| anyhow::anyhow!("segment entry {seq}: {e:#}"))?;
+            muts = derive_commit_muts_n(&frame, derived, gen)
+                .map_err(|e| anyhow::anyhow!("segment entry {seq}: {e:#}"))?;
         }
         for _ in 0..nm {
             need(pos, 2)?;
@@ -538,7 +571,13 @@ fn derive(frame: &[u8], want: Option<usize>, gen: u64) -> anyhow::Result<Vec<Mut
     let commit = link(body.get("commit")).ok_or_else(|| anyhow::anyhow!("#commit without commit"))?;
     let Some(Value::Bytes(car)) = body.get("blocks") else { anyhow::bail!("#commit without blocks") };
     let (_, blocks) = crate::car::read_car(car)?;
-    let block = |c: &Cid| blocks.iter().find(|(b, _)| b == c).map(|(_, d)| *d).ok_or_else(|| anyhow::anyhow!("#commit CAR lacks block {c}"));
+    let block = |c: &Cid| {
+        blocks
+            .iter()
+            .find(|(b, _)| b == c)
+            .map(|(_, d)| *d)
+            .ok_or_else(|| anyhow::anyhow!("#commit CAR lacks block {c}"))
+    };
     let Some(Value::Array(ops)) = body.get("ops") else { anyhow::bail!("#commit without ops") };
     let mut muts = Vec::with_capacity(ops.len() * 3 + 1);
     for op in ops {
@@ -561,12 +600,16 @@ fn derive(frame: &[u8], want: Option<usize>, gen: u64) -> anyhow::Result<Vec<Mut
             let coll = crate::worker::collection_of(path);
             if let Some(l) = crate::backlinks::link(coll, block(c)?) {
                 let rkey = path.split_once('/').map_or(path, |(_, r)| r);
-                muts.push(Mutation { key: state::backlink_key(did, gen, &l).into(), val: Some(Bytes::copy_from_slice(rkey.as_bytes())) });
+                muts.push(Mutation {
+                    key: state::backlink_key(did, gen, &l).into(),
+                    val: Some(Bytes::copy_from_slice(rkey.as_bytes())),
+                });
             }
         }
     }
     let commit_block = block(&commit)?;
-    let data = link(Value::decode(commit_block)?.get("data")).ok_or_else(|| anyhow::anyhow!("commit block without data"))?;
+    let data =
+        link(Value::decode(commit_block)?.get("data")).ok_or_else(|| anyhow::anyhow!("commit block without data"))?;
     let head = state::Head { commit, data, rev, commit_block: Bytes::copy_from_slice(commit_block) };
     muts.push(Mutation { key: state::head_key(did).into(), val: Some(head.encode()) });
     if want.is_some_and(|n| n > muts.len()) {
@@ -584,14 +627,20 @@ mod tests {
     #[test]
     fn roundtrip_and_filter() {
         let mut b = SegmentBuilder::new();
-        let m = |k: &str, v: Option<&str>| Mutation { key: Bytes::from(k.to_string()), val: v.map(|v| Bytes::from(v.to_string())) };
+        let m = |k: &str, v: Option<&str>| Mutation {
+            key: Bytes::from(k.to_string()),
+            val: v.map(|v| Bytes::from(v.to_string())),
+        };
         b.push(10, ShardId(3), 7, |o| o.extend_from_slice(b"frame-a"), &[m("k1", Some("v1"))]);
         b.push(11, ShardId(1 << 20), 1, |o| o.extend_from_slice(b"frame-b"), &[m("k2", None)]);
         b.push(12, ShardId(3), 7, |_| {}, &[m("k3", Some("v3"))]);
         let mut obj = b.sealed_header("node-a.1", 42, 39);
         obj.extend_from_slice(&b.body);
         let LogObject::Segment(h, all) = parse(Bytes::from(obj.clone()), true, None).unwrap() else { panic!() };
-        assert_eq!((h.log_id.as_str(), h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count), ("node-a.1", 42, 39, 10, 12, 3));
+        assert_eq!(
+            (h.log_id.as_str(), h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count),
+            ("node-a.1", 42, 39, 10, 12, 3)
+        );
         let (hh, len) = parse_header(&obj[..80]).unwrap().unwrap();
         assert_eq!((hh.ordinal, hh.prefix_end, len), (42, 39, b.header("node-a.1", 42).len()));
         assert!(parse_header(&fence_object("node-b")).unwrap().is_none());
@@ -601,7 +650,9 @@ mod tests {
         assert_eq!((all[1].shard, all[1].epoch), (ShardId(1 << 20), 1));
         let LogObject::Segment(_, only3) = parse(Bytes::from(obj), true, Some(ShardId(3))).unwrap() else { panic!() };
         assert_eq!(only3.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![10, 12]);
-        assert!(matches!(parse(fence_object("node-b"), false, None).unwrap(), LogObject::Fence { by } if by == "node-b"));
+        assert!(
+            matches!(parse(fence_object("node-b"), false, None).unwrap(), LogObject::Fence { by } if by == "node-b")
+        );
     }
 
     /// A builder made `for_log` seals in place (same bytes as prepending the
@@ -615,14 +666,23 @@ mod tests {
         let mut rec_block = Vec::new();
         rec_block.extend_from_slice(b"\xa1aa\x01");
         let mut commit_block = Vec::new();
-        crate::cbor::Value::Map(vec![("did".into(), crate::cbor::Value::Text(did.into())), ("data".into(), crate::cbor::Value::Link(rec))]).encode(&mut commit_block);
+        crate::cbor::Value::Map(vec![
+            ("did".into(), crate::cbor::Value::Text(did.into())),
+            ("data".into(), crate::cbor::Value::Link(rec)),
+        ])
+        .encode(&mut commit_block);
         let commit = Cid::dag_cbor(&commit_block);
         let mut car = Vec::new();
         crate::car::write_header(&mut car, &commit);
         crate::car::write_block(&mut car, &commit, &commit_block);
         crate::car::write_block(&mut car, &rec, &rec_block);
         let rev = crate::tid::Tid::parse("3l3qo2vutsw2b").unwrap();
-        let ops = [crate::events::RepoOp { action: "update", path: "app.bsky.feed.post/1", cid: Some(rec), prev: Some(commit) }];
+        let ops = [crate::events::RepoOp {
+            action: "update",
+            path: "app.bsky.feed.post/1",
+            cid: Some(rec),
+            prev: Some(commit),
+        }];
         let frame = crate::events::commit_frame(&crate::events::CommitFrame {
             repo: did,
             rev: &rev.to_string(),
@@ -640,7 +700,10 @@ mod tests {
         assert_eq!(keys, vec![b"c/" as &[u8], b"c/", b"R/", b"h/"]);
         assert_eq!(derived[2].val.as_deref(), Some(&crate::state::record_value(&rec, rev.0, &rec_block)[..]));
         let head = crate::state::Head::decode(derived[3].val.as_ref().unwrap()).unwrap();
-        assert_eq!((head.commit, head.data, head.rev.0, &head.commit_block[..]), (commit, rec, rev.0, &commit_block[..]));
+        assert_eq!(
+            (head.commit, head.data, head.rev.0, &head.commit_block[..]),
+            (commit, rec, rev.0, &commit_block[..])
+        );
 
         let extra = Mutation { key: Bytes::from_static(b"C/x"), val: Some(Bytes::new()) };
         let mut all = derived.clone();
@@ -667,7 +730,6 @@ mod tests {
         }
     }
 
-
     /// A compressed segment keeps its header readable on its own, decodes
     /// to exactly the bytes the writer sealed (so frame ranges from `push`
     /// address both), and parses like the uncompressed one.
@@ -676,19 +738,33 @@ mod tests {
         let mut b = SegmentBuilder::for_log("node-a.7");
         let mut ranges = Vec::new();
         for i in 0..200u32 {
-            let m = Mutation { key: Bytes::from(format!("R/did:plc:aaaa{}\0app.bsky.feed.like/{i:08}", i % 7)), val: Some(Bytes::from(vec![b'v'; 40])) };
-            ranges.push(b.push(1000 + i as i64, ShardId(70_000 + i % 3), 2, |o| o.extend_from_slice(format!("frame {i} {}", "x".repeat(64)).as_bytes()), &[m]));
+            let m = Mutation {
+                key: Bytes::from(format!("R/did:plc:aaaa{}\0app.bsky.feed.like/{i:08}", i % 7)),
+                val: Some(Bytes::from(vec![b'v'; 40])),
+            };
+            ranges.push(b.push(
+                1000 + i as i64,
+                ShardId(70_000 + i % 3),
+                2,
+                |o| o.extend_from_slice(format!("frame {i} {}", "x".repeat(64)).as_bytes()),
+                &[m],
+            ));
         }
         let sealed = b.seal("node-a.7", 5, 3);
         let stored = compress(&sealed, 1).unwrap().expect("compressible");
         assert!(stored.len() * 3 < sealed.len(), "{} -> {}", sealed.len(), stored.len());
         // header-only read of the stored object
         let (h, hl) = parse_header(&stored[..80]).unwrap().unwrap();
-        assert_eq!((h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count, h.codec), (5, 3, 1000, 1199, 200, CODEC_ZSTD));
+        assert_eq!(
+            (h.ordinal, h.prefix_end, h.first_seq, h.last_seq, h.count, h.codec),
+            (5, 3, 1000, 1199, 200, CODEC_ZSTD)
+        );
         assert_eq!((h.body_len as usize, hl), (sealed.len() - hl, header_len("node-a.7", h.level)));
         let decoded = decode(Bytes::from(stored.clone())).unwrap();
         assert_eq!(&decoded[..], &sealed[..]);
-        let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(ShardId(70_001))).unwrap() else { panic!() };
+        let LogObject::Segment(h2, entries) = parse(Bytes::from(stored), true, Some(ShardId(70_001))).unwrap() else {
+            panic!()
+        };
         assert_eq!(h2.codec, CODEC_NONE);
         assert_eq!(entries.len(), 67);
         for e in &entries {
@@ -732,7 +808,12 @@ mod tests {
             m.sort_by(|a, b| crate::cbor::key_cmp(&a.0, &b.0));
             Value::Map(m).to_cbor()
         };
-        let uri = |u: &str| Value::Map(vec![("cid".into(), Value::Text("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454".into())), ("uri".into(), Value::Text(u.into()))]);
+        let uri = |u: &str| {
+            Value::Map(vec![
+                ("cid".into(), Value::Text("bafyreie5cvv4h45feadgeuwhbcutmh6t2ceseocckahdoe6uat64zmz454".into())),
+                ("uri".into(), Value::Text(u.into())),
+            ])
+        };
         let long_did = format!("did:plc:{}", "a".repeat(2040));
         let longer_did = format!("did:plc:{}", "a".repeat(2041));
         let dids: Vec<(&str, bool)> = vec![
@@ -754,7 +835,10 @@ mod tests {
             ("DID:plc:abc", false),
         ];
         for (d, want) in &dids {
-            let got = crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.follow", Value::Text(d.to_string())));
+            let got = crate::backlinks::link(
+                "app.bsky.graph.follow",
+                &rec("app.bsky.graph.follow", Value::Text(d.to_string())),
+            );
             assert_eq!(got.is_some(), *want, "follow {d:?}");
         }
         let uris: Vec<(&str, bool)> = vec![
@@ -777,11 +861,23 @@ mod tests {
             assert_eq!(got.is_some(), *want, "like {u:?}");
         }
         // shape: wrong $type, non-string subject, a like's bare-string subject
-        assert!(crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.block", Value::Text("did:plc:abc".into()))).is_none());
+        assert!(crate::backlinks::link(
+            "app.bsky.graph.follow",
+            &rec("app.bsky.graph.block", Value::Text("did:plc:abc".into()))
+        )
+        .is_none());
         assert!(crate::backlinks::link("app.bsky.graph.follow", &rec("app.bsky.graph.follow", Value::Int(1))).is_none());
-        assert!(crate::backlinks::link("app.bsky.feed.like", &rec("app.bsky.feed.like", Value::Text("at://did:plc:abc".into()))).is_none());
+        assert!(crate::backlinks::link(
+            "app.bsky.feed.like",
+            &rec("app.bsky.feed.like", Value::Text("at://did:plc:abc".into()))
+        )
+        .is_none());
         assert_eq!(
-            crate::backlinks::link("app.bsky.feed.repost", &rec("app.bsky.feed.repost", uri("at://did:plc:abc/app.bsky.feed.post/3k"))).as_deref(),
+            crate::backlinks::link(
+                "app.bsky.feed.repost",
+                &rec("app.bsky.feed.repost", uri("at://did:plc:abc/app.bsky.feed.post/3k"))
+            )
+            .as_deref(),
             Some(&b"rat://did:plc:abc/app.bsky.feed.post/3k"[..])
         );
     }

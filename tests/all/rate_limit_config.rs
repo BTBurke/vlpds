@@ -39,7 +39,11 @@ async fn create(s: &TestServer, a: &TestAccount, i: usize) -> Resp {
 
 async fn update(s: &TestServer, config: J, if_version: u64) -> Resp {
     s.xrpc
-        .post("vlpds.admin.updateRateLimits", &json!({"config": config, "ifVersion": if_version, "actor": "it-test", "note": "integration"}), &Auth::Admin)
+        .post(
+            "vlpds.admin.updateRateLimits",
+            &json!({"config": config, "ifVersion": if_version, "actor": "it-test", "note": "integration"}),
+            &Auth::Admin,
+        )
         .await
 }
 
@@ -107,7 +111,8 @@ async fn limits_change_cluster_wide_and_overrides_exempt() {
     // an edit made against v0 is stale
     update(&a, v2.clone(), 0).await.err(409, "ConfigConflict");
     // and an invalid one is refused with every problem listed
-    let r = update(&a, json!({"limiters": {"nope": {}}, "routes": [{"nsid": "bad", "points": 1, "windowSecs": 1}]}), 1).await;
+    let r = update(&a, json!({"limiters": {"nope": {}}, "routes": [{"nsid": "bad", "points": 1, "windowSecs": 1}]}), 1)
+        .await;
     r.err(400, "InvalidConfig");
     assert!(r.text().contains("limiters.nope") && r.text().contains("routes[0].nsid"), "{}", r.text());
     let r = update(&a, v2, 1).await.ok();
@@ -131,9 +136,15 @@ async fn limits_change_cluster_wide_and_overrides_exempt() {
     assert_eq!(s["config"]["history"].as_array().unwrap().len(), 2);
     let nodes = s["nodes"].as_array().unwrap();
     assert_eq!(nodes.len(), 2);
-    assert!(nodes.iter().all(|n| n["reachable"] == true && n["configVersion"] == 2 && n["configError"].is_null()), "{s}");
+    assert!(
+        nodes.iter().all(|n| n["reachable"] == true && n["configVersion"] == 2 && n["configError"].is_null()),
+        "{s}"
+    );
     let g = s["limiters"].as_array().unwrap().iter().find(|l| l["name"] == "global-ip").unwrap().clone();
-    assert_eq!((g["points"].as_u64(), g["windowSecs"].as_u64(), g["default"]["points"].as_u64()), (Some(4), Some(120), Some(3000)));
+    assert_eq!(
+        (g["points"].as_u64(), g["windowSecs"].as_u64(), g["default"]["points"].as_u64()),
+        (Some(4), Some(120), Some(3000))
+    );
     let top = &s["top"]["global-ip"][0];
     assert_eq!(top["key"], "127.0.0.1");
     assert_eq!(top["used"], 10, "5 per node: {s}");
@@ -142,7 +153,10 @@ async fn limits_change_cluster_wide_and_overrides_exempt() {
     // the normal account is the top writer, over its limit; the exempt one
     // is never counted
     let writes = s["top"]["repo-write-hour"].as_array().unwrap();
-    assert_eq!((writes[0]["key"].as_str(), writes[0]["used"].as_u64(), writes[0]["limit"].as_u64()), (Some(normal.did.as_str()), Some(9), Some(6)));
+    assert_eq!(
+        (writes[0]["key"].as_str(), writes[0]["used"].as_u64(), writes[0]["limit"].as_u64()),
+        (Some(normal.did.as_str()), Some(9), Some(6))
+    );
     assert!(!writes.iter().any(|c| c["key"] == trusted.did.as_str()), "{writes:?}");
     let rej = s["rejections"].as_array().unwrap();
     let find = |l: &str, r: &str| rej.iter().find(|x| x["limiter"] == l && x["route"] == r).cloned();
@@ -156,10 +170,15 @@ async fn limits_change_cluster_wide_and_overrides_exempt() {
     // an invalid object written behind the API's back: both nodes keep v2
     // and report the error
     let path = vlpds::ratelimit::runtime::config_path(&a.app.store);
-    store.put(&path, br#"{"version": 9, "limiters": {"global-ip": {"points": "many"}}}"#.to_vec().into()).await.unwrap();
+    store
+        .put(&path, br#"{"version": 9, "limiters": {"global-ip": {"points": "many"}}}"#.to_vec().into())
+        .await
+        .unwrap();
     for s in [&a, &b] {
         // dev mode: the admin token doubles as the internal token
-        let rb = peer_client().post(format!("{}/internal/v1/ratelimits/reload", s.peer_url)).header("x-vlpds-internal", ADMIN_TOKEN);
+        let rb = peer_client()
+            .post(format!("{}/internal/v1/ratelimits/reload", s.peer_url))
+            .header("x-vlpds-internal", ADMIN_TOKEN);
         let r = s.xrpc.send(rb).await.ok();
         assert_eq!((r["configVersion"].as_u64(), r["configError"]["version"].as_u64()), (Some(2), Some(9)), "{r}");
     }
@@ -188,7 +207,9 @@ async fn late_joiner_loads_the_stored_config() {
     let a = node("rlj-a", &store).await;
     update(&a, json!({"limiters": {"global-ip": {"points": 77}}}), 0).await.ok();
     let b = node("rlj-b", &store).await;
-    eventually(Duration::from_secs(5), || async { (b.app.ratelimit.policy().version == 1).then_some(()) }).await.expect("late joiner picked up v1");
+    eventually(Duration::from_secs(5), || async { (b.app.ratelimit.policy().version == 1).then_some(()) })
+        .await
+        .expect("late joiner picked up v1");
     let r = b.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await;
     assert_eq!(limit_header(&r), Some(77));
 }

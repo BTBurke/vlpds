@@ -106,9 +106,8 @@ fn accept_encoding(client: Option<&header::HeaderValue>) -> Option<header::Heade
         if n == "*" {
             // `*` stands only for the codings not named explicitly
             // ("gzip, *;q=0" must not turn into "gzip, gzip;q=0")
-            let rest = ["gzip", "deflate", "br"]
-                .into_iter()
-                .filter(|c| !named.iter().any(|x| x.eq_ignore_ascii_case(c)));
+            let rest =
+                ["gzip", "deflate", "br"].into_iter().filter(|c| !named.iter().any(|x| x.eq_ignore_ascii_case(c)));
             out.extend(rest.map(|c| format!("{c}{params}")));
         } else if decodable(n) {
             out.push(part.trim().to_string());
@@ -271,9 +270,7 @@ impl Local {
 
 fn rev_time(rev: u64) -> String {
     let us = crate::tid::Tid(rev).micros() as i64;
-    chrono::DateTime::from_timestamp_micros(us)
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    chrono::DateTime::from_timestamp_micros(us).unwrap_or_default().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn record_json(bytes: &[u8]) -> Option<J> {
@@ -286,7 +283,8 @@ fn local_of(did: &str, recs: Vec<Rec>) -> Local {
     let mut l = Local::default();
     for r in recs {
         let Some(record) = r.bytes.as_deref().and_then(record_json) else { continue };
-        let d = Desc { uri: format!("at://{did}/{}", r.path), cid: r.cid.to_string(), indexed_at: rev_time(r.rev), record };
+        let d =
+            Desc { uri: format!("at://{did}/{}", r.path), cid: r.cid.to_string(), indexed_at: rev_time(r.rev), record };
         if &*r.path == recent_writes::PROFILE_PATH {
             l.profile = Some(d);
         } else if crate::worker::collection_of(&r.path) == recent_writes::POST {
@@ -492,7 +490,11 @@ impl Viewer<'_> {
     /// profile record (None: no account).
     async fn profile_basic(&self) -> M<Option<J>> {
         let Ok(acct) = self.app.account(self.did).await else { return Ok(None) };
-        let raw = self.app.record_value(self.did, Some(acct.repo_gen), recent_writes::PROFILE_PATH).await.map_err(|_| Abort)?;
+        let raw = self
+            .app
+            .record_value(self.did, Some(acct.repo_gen), recent_writes::PROFILE_PATH)
+            .await
+            .map_err(|_| Abort)?;
         let profile = match raw {
             Some(v) => state::decode_record_value(&v).ok().and_then(|(_, b)| record_json(&b)),
             None => None,
@@ -617,7 +619,13 @@ impl Viewer<'_> {
                 let data = self.appview(GET_POSTS, &[("uris", uri)]).await?;
                 data.pointer("/posts/0").map(|post| {
                     let mut v = json!({"$type": "app.bsky.embed.record#viewRecord"});
-                    for (from, to) in [("uri", "uri"), ("cid", "cid"), ("author", "author"), ("record", "value"), ("labels", "labels")] {
+                    for (from, to) in [
+                        ("uri", "uri"),
+                        ("cid", "cid"),
+                        ("author", "author"),
+                        ("record", "value"),
+                        ("labels", "labels"),
+                    ] {
                         if let Some(x) = post.get(from) {
                             v[to] = x.clone();
                         }
@@ -641,7 +649,8 @@ impl Viewer<'_> {
             }
             _ => None,
         };
-        let record = view.unwrap_or_else(|| json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true}));
+        let record = view
+            .unwrap_or_else(|| json!({"$type": "app.bsky.embed.record#viewNotFound", "uri": uri, "notFound": true}));
         Ok(json!({"$type": "app.bsky.embed.record#view", "record": record}))
     }
 }
@@ -682,11 +691,7 @@ async fn insert_posts_in_feed(viewer: &Viewer<'_>, feed: &mut Vec<J>, posts: &[D
     if posts.is_empty() {
         return Ok(());
     }
-    let last = feed
-        .last()
-        .and_then(|i| str_at(i, "/post/indexedAt"))
-        .unwrap_or("1970-01-01T00:00:00.000Z")
-        .to_string();
+    let last = feed.last().and_then(|i| str_at(i, "/post/indexedAt")).unwrap_or("1970-01-01T00:00:00.000Z").to_string();
     let newest_first: Vec<&Desc> = posts.iter().filter(|p| p.indexed_at.as_str() > last.as_str()).rev().collect();
     let views = viewer.posts(&newest_first).await?;
     for d in newest_first {
@@ -755,7 +760,9 @@ async fn add_posts_to_thread(viewer: &Viewer<'_>, thread: &mut J, posts: &[&Desc
     }
     let views = viewer.posts(&in_thread).await?;
     for d in in_thread {
-        let (Some(parent), Some(Some(post))) = (str_at(&d.record, "/reply/parent/uri"), views.get(&d.uri)) else { continue };
+        let (Some(parent), Some(Some(post))) = (str_at(&d.record, "/reply/parent/uri"), views.get(&d.uri)) else {
+            continue;
+        };
         insert_reply(thread, parent, &thread_view_post(post));
     }
     Ok(())
@@ -825,7 +832,13 @@ fn munged_response(body: &J, lag: Option<i64>) -> Response {
 
 /// Proxies `f` for `kind` with read-after-write (reference
 /// `pipethroughReadAfterWrite`). `f.iss` is the requester.
-pub(super) async fn proxy(app: &App, target: &Target<'_>, mut f: Forward<'_>, acct: &CachedAcct, kind: Kind) -> XResult<Response> {
+pub(super) async fn proxy(
+    app: &App,
+    target: &Target<'_>,
+    mut f: Forward<'_>,
+    acct: &CachedAcct,
+    kind: Kind,
+) -> XResult<Response> {
     let did = f.iss.expect("read-after-write needs the requester");
     let pq = f.path_and_query;
     check_accept_encoding(f.headers.get(header::ACCEPT_ENCODING))?;
@@ -862,9 +875,7 @@ pub(super) async fn proxy(app: &App, target: &Target<'_>, mut f: Forward<'_>, ac
         COUNTERS.unchanged.inc();
         return Ok(passthrough(parts, body)); // an encoding we can't read (we didn't ask for it)
     };
-    let raw = axum::body::to_bytes(body, MAX_RESPONSE_BYTES)
-        .await
-        .map_err(|e| upstream_failure(&e.to_string()))?;
+    let raw = axum::body::to_bytes(body, MAX_RESPONSE_BYTES).await.map_err(|e| upstream_failure(&e.to_string()))?;
     let original = |raw: Bytes| passthrough(parts.clone(), Body::from(raw));
     let inline = codings.is_empty() && raw.len() <= INLINE_BYTES;
     let r = raw.clone();
@@ -938,9 +949,8 @@ async fn thread_not_found(app: &App, acct: &CachedAcct, did: &str, pq: &str, hea
     let rest: Vec<&Desc> = local.posts.iter().filter(|p| p.uri != uri).collect();
     add_posts_to_thread(&viewer, &mut thread, &rest).await.ok()?;
     // reference getHighestParent: the post's own parent (it has no parent view yet)
-    let parent = Some(&found.record)
-        .filter(|r| is_type(r, recent_writes::POST))
-        .and_then(|r| str_at(r, "/reply/parent/uri"));
+    let parent =
+        Some(&found.record).filter(|r| is_type(r, recent_writes::POST)).and_then(|r| str_at(r, "/reply/parent/uri"));
     if let Some(parent) = parent {
         let mut q = vec![("uri", parent), ("depth", "0")];
         if let Some(h) = param("parentHeight") {
@@ -961,7 +971,10 @@ mod tests {
 
     #[test]
     fn util_format() {
-        assert_eq!(format_pattern("https://cdn/img/%s/plain/%s/%s@jpeg", &["avatar", "did:x", "bafy"]), "https://cdn/img/avatar/plain/did:x/bafy@jpeg");
+        assert_eq!(
+            format_pattern("https://cdn/img/%s/plain/%s/%s@jpeg", &["avatar", "did:x", "bafy"]),
+            "https://cdn/img/avatar/plain/did:x/bafy@jpeg"
+        );
         assert_eq!(format_pattern("%s%%", &["a", "b"]), "a% b");
     }
 
@@ -983,7 +996,9 @@ mod tests {
     fn accept_encoding_negotiation() {
         let hv = |s: &str| header::HeaderValue::from_str(s).unwrap();
         let check = |s: &str| check_accept_encoding(Some(&hv(s))).map_err(|e| (e.status.as_u16(), e.message));
-        for ok in ["identity", "gzip, *;q=0", "invalid", "br", "br, identity;q=0", "gzip;q=0.5, deflate", "GZIP;Q=1", "*"] {
+        for ok in
+            ["identity", "gzip, *;q=0", "invalid", "br", "br, identity;q=0", "gzip;q=0.5, deflate", "GZIP;Q=1", "*"]
+        {
             assert!(check(ok).is_ok(), "{ok}");
         }
         assert!(check_accept_encoding(None).is_ok());

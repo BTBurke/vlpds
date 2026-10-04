@@ -8,7 +8,12 @@ use vlpds::slots::ShardId;
 
 /// Cluster node `id` on `store` with `shards` shards and fast leases (1.5 s
 /// TTL, 100 ms renewals, 200 ms skew); `f` adjusts the config afterwards.
-pub async fn cluster_node(id: &str, store: Arc<dyn object_store::ObjectStore>, shards: u32, f: impl FnOnce(&mut vlpds::server::Config)) -> TestServer {
+pub async fn cluster_node(
+    id: &str,
+    store: Arc<dyn object_store::ObjectStore>,
+    shards: u32,
+    f: impl FnOnce(&mut vlpds::server::Config),
+) -> TestServer {
     let id = id.to_string();
     TestServer::spawn_with(move |c| {
         c.memory_store = Some(store);
@@ -121,7 +126,10 @@ pub fn ghost_lease(id: &str, addr: String) -> vlpds::cluster::NodeLease {
 
 /// Renews `lease` in `store` every 25 ms until aborted (a lease that goes
 /// quiet is presumed dead within a couple of renew intervals).
-pub fn spawn_ghost(store: Arc<dyn object_store::ObjectStore>, mut lease: vlpds::cluster::NodeLease) -> tokio::task::JoinHandle<()> {
+pub fn spawn_ghost(
+    store: Arc<dyn object_store::ObjectStore>,
+    mut lease: vlpds::cluster::NodeLease,
+) -> tokio::task::JoinHandle<()> {
     use object_store::ObjectStoreExt;
     tokio::spawn(async move {
         let path = object_store::path::Path::from(format!("vlpds/nodes/{}", lease.node_id));

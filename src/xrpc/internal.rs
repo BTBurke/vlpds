@@ -20,7 +20,10 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/cluster", get(cluster_status))
         .route("/internal/v1/cluster/nudge", post(cluster_nudge))
         .route("/internal/v1/cluster/hello", post(cluster_hello))
-        .route("/internal/v1/cluster/prewarm", post(cluster_prewarm).layer(axum::extract::DefaultBodyLimit::max(PREWARM_BODY_MAX)))
+        .route(
+            "/internal/v1/cluster/prewarm",
+            post(cluster_prewarm).layer(axum::extract::DefaultBodyLimit::max(PREWARM_BODY_MAX)),
+        )
         .route("/internal/v1/admin/searchAccounts", get(admin_search_accounts))
         .route("/internal/v1/admin/inviteCodes", get(admin_invite_codes))
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
@@ -36,7 +39,10 @@ async fn cluster_status(State(app): AppState, headers: HeaderMap) -> XResult<Jso
         Some(c) => (
             c.cfg.node_id.clone(),
             c.layout().shards.iter().map(|r| (r.id, c.owner_of(r.id).map(|(id, _)| id))).collect::<Vec<_>>(),
-            c.peers().into_iter().map(|l| json!({"node": l.node_id, "log": l.log_id, "addr": l.addr})).collect::<Vec<_>>(),
+            c.peers()
+                .into_iter()
+                .map(|l| json!({"node": l.node_id, "log": l.log_id, "addr": l.addr}))
+                .collect::<Vec<_>>(),
             c.lease_valid(),
         ),
         None => (String::new(), Vec::new(), Vec::new(), false),
@@ -68,7 +74,11 @@ struct NudgeIn {
 
 /// A peer handed us shards (adopt them now, no control-plane read) or
 /// released some / left the cluster (step now instead of on the next tick).
-async fn cluster_nudge(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<NudgeIn>) -> XResult<Json<J>> {
+async fn cluster_nudge(
+    State(app): AppState,
+    headers: HeaderMap,
+    axum::Json(inp): axum::Json<NudgeIn>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     if let Some(c) = &app.cluster {
         c.nudge(inp.handoffs);
@@ -96,7 +106,8 @@ pub struct PrewarmShard {
 /// the order `Node::warm_handoff` warms them in, so the cut is what the
 /// recipient would reach last.
 pub fn prewarm_request(shards: Vec<(crate::slots::ShardId, Vec<String>)>) -> Vec<PrewarmShard> {
-    let mut out: Vec<PrewarmShard> = shards.iter().map(|(s, _)| PrewarmShard { shard: *s, recent: Vec::new() }).collect();
+    let mut out: Vec<PrewarmShard> =
+        shards.iter().map(|(s, _)| PrewarmShard { shard: *s, recent: Vec::new() }).collect();
     let mut lists: Vec<std::vec::IntoIter<String>> = shards.into_iter().map(|(_, r)| r.into_iter()).collect();
     let mut left = PREWARM_RECENT_BYTES;
     loop {
@@ -126,7 +137,11 @@ struct PrewarmIn {
 /// A peer is about to hand us these shards: warm our caches from their
 /// state while it still serves them (`Node::warm_handoff`). Answers once
 /// done or out of time.
-async fn cluster_prewarm(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<PrewarmIn>) -> XResult<Json<J>> {
+async fn cluster_prewarm(
+    State(app): AppState,
+    headers: HeaderMap,
+    axum::Json(inp): axum::Json<PrewarmIn>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     app.node.warm_handoff(inp.shards).await;
     Ok(Json(json!({})))
@@ -180,14 +195,27 @@ struct HelloIn {
 fn note_peer_build(peer: &str, rev: &str, min: u32, max: u32, ours: crate::version::Window) {
     let window = (min, max);
     if window != (ours.min, ours.max) || rev != crate::version::build_rev() {
-        tracing::info!(peer, rev, min_level = window.0, max_level = window.1, our_rev = crate::version::build_rev(), our_min = ours.min, our_max = ours.max, "peer runs a different build");
+        tracing::info!(
+            peer,
+            rev,
+            min_level = window.0,
+            max_level = window.1,
+            our_rev = crate::version::build_rev(),
+            our_min = ours.min,
+            our_max = ours.max,
+            "peer runs a different build"
+        );
     }
 }
 
 /// A joiner greets us: learn its lease and follow its log now (see
 /// `Cluster::learn_peer`). 200 `{"ok": true, "floor": F}` once we do: we
 /// deliver every event of its log with seq > F to our merged firehose.
-async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<HelloIn>) -> XResult<Json<J>> {
+async fn cluster_hello(
+    State(app): AppState,
+    headers: HeaderMap,
+    axum::Json(inp): axum::Json<HelloIn>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let Some(c) = &app.cluster else {
         return Ok(Json(json!({"ok": false})));
@@ -203,9 +231,20 @@ async fn cluster_hello(State(app): AppState, headers: HeaderMap, axum::Json(inp)
 
 /// Per peer, the floor of its follower of our log, or None if it didn't
 /// confirm.
-pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &str, levels: crate::version::Window, addrs: Vec<String>) -> Vec<Option<i64>> {
+pub async fn hello_peers(
+    http: &crate::http::PeerClient,
+    token: &str,
+    node_id: &str,
+    levels: crate::version::Window,
+    addrs: Vec<String>,
+) -> Vec<Option<i64>> {
     let sends = addrs.into_iter().map(|addr| async move {
-        let hello = HelloIn { node_id: node_id.to_string(), rev: crate::version::build_rev().to_string(), min_level: levels.min, max_level: levels.max };
+        let hello = HelloIn {
+            node_id: node_id.to_string(),
+            rev: crate::version::build_rev().to_string(),
+            min_level: levels.min,
+            max_level: levels.max,
+        };
         let r = http
             .post(format!("{}/internal/v1/cluster/hello", addr.trim_end_matches('/')))
             .header(HDR, token)
@@ -218,7 +257,13 @@ pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &
             Ok(r) => {
                 let v = r.json::<J>().await.ok()?;
                 let level = |k: &str| v[k].as_u64().unwrap_or(0) as u32;
-                note_peer_build(&addr, v["rev"].as_str().unwrap_or_default(), level("minLevel"), level("maxLevel"), levels);
+                note_peer_build(
+                    &addr,
+                    v["rev"].as_str().unwrap_or_default(),
+                    level("minLevel"),
+                    level("maxLevel"),
+                    levels,
+                );
                 (v["ok"] == json!(true)).then(|| v["floor"].as_i64()).flatten()
             }
             Err(e) => {
@@ -231,7 +276,11 @@ pub async fn hello_peers(http: &crate::http::PeerClient, token: &str, node_id: &
 }
 
 /// Best effort: a peer that misses one finds its handoffs on its next step.
-pub async fn nudge_peers(http: &crate::http::PeerClient, token: &str, nudges: Vec<(String, Vec<crate::cluster::Handoff>)>) {
+pub async fn nudge_peers(
+    http: &crate::http::PeerClient,
+    token: &str,
+    nudges: Vec<(String, Vec<crate::cluster::Handoff>)>,
+) {
     let sends = nudges.into_iter().map(|(addr, handoffs)| async move {
         let r = http
             .post(format!("{}/internal/v1/cluster/nudge", addr.trim_end_matches('/')))
@@ -260,8 +309,7 @@ pub(super) fn check(app: &App, headers: &HeaderMap) -> XResult<()> {
 
 /// Dev mode also accepts the admin token.
 pub fn internal_token_ok(cfg: &crate::server::Config, t: &str) -> bool {
-    crate::auth::token_eq(&cfg.internal_token, t)
-        || (cfg.dev_mode && crate::auth::token_eq(&cfg.admin_token, t))
+    crate::auth::token_eq(&cfg.internal_token, t) || (cfg.dev_mode && crate::auth::token_eq(&cfg.admin_token, t))
 }
 
 #[derive(Deserialize)]
@@ -269,7 +317,12 @@ struct StreamQ {
     log: Option<String>,
 }
 
-async fn stream(State(app): AppState, headers: HeaderMap, Query(q): Query<StreamQ>, ws: WebSocketUpgrade) -> XResult<Response> {
+async fn stream(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<StreamQ>,
+    ws: WebSocketUpgrade,
+) -> XResult<Response> {
     check(&app, &headers)?;
     // A restarted node keeps its address: a peer still following its previous
     // log must not get the new log's batches under the old id (they would be
@@ -281,7 +334,11 @@ async fn stream(State(app): AppState, headers: HeaderMap, Query(q): Query<Stream
     }
     if app.log.closed.load(std::sync::atomic::Ordering::Acquire) {
         // fenced on shutdown: the follower drains it from S3
-        return Err(XrpcError { status: StatusCode::GONE, error: "LogClosed".into(), message: format!("log {} is fenced", app.log.log_id) });
+        return Err(XrpcError {
+            status: StatusCode::GONE,
+            error: "LogClosed".into(),
+            message: format!("log {} is fenced", app.log.log_id),
+        });
     }
     let log = app.log.clone();
     Ok(ws.on_upgrade(move |socket| crate::remote::serve_stream(socket, log)))
@@ -339,8 +396,10 @@ fn b64_opt(v: Option<String>) -> XResult<Option<Bytes>> {
 async fn private_cas(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<CasIn>) -> XResult<Json<J>> {
     use super::cas::{Cond, Op};
     check(&app, &headers)?;
-    let conds = inp.conds.into_iter().map(|(name, v)| Ok(Cond::Eq { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
-    let mut ops = inp.puts.into_iter().map(|(name, v)| Ok(Op::Put { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
+    let conds =
+        inp.conds.into_iter().map(|(name, v)| Ok(Cond::Eq { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
+    let mut ops =
+        inp.puts.into_iter().map(|(name, v)| Ok(Op::Put { name, val: b64_opt(v)? })).collect::<XResult<Vec<_>>>()?;
     ops.extend(inp.delete_prefixes.into_iter().map(|prefix| Op::DeletePrefix { prefix }));
     // must be local now (no forwarding loops)
     app.partition(&inp.routing)?;
@@ -359,7 +418,8 @@ pub async fn forward_private_cas(
 ) -> XResult<super::cas::Outcome> {
     use super::cas::{Cond, Op};
     let enc = |v: Option<Bytes>| v.map(|v| B64.encode(v));
-    let mut body = CasIn { routing: routing.to_string(), conds: Vec::new(), puts: Vec::new(), delete_prefixes: Vec::new() };
+    let mut body =
+        CasIn { routing: routing.to_string(), conds: Vec::new(), puts: Vec::new(), delete_prefixes: Vec::new() };
     for c in conds {
         let Cond::Eq { name, val } = c;
         body.conds.push((name, enc(val)));
@@ -370,7 +430,10 @@ pub async fn forward_private_cas(
             Op::DeletePrefix { prefix } => body.delete_prefixes.push(prefix),
         }
     }
-    let r = send(app.http.post(format!("{owner}/internal/v1/private/cas")).header(HDR, &app.config.internal_token).json(&body)).await?;
+    let r = send(
+        app.http.post(format!("{owner}/internal/v1/private/cas")).header(HDR, &app.config.internal_token).json(&body),
+    )
+    .await?;
     #[derive(Deserialize)]
     struct Out {
         applied: bool,
@@ -440,7 +503,11 @@ struct ReplayIn {
     transient: bool,
 }
 
-async fn claim_replay(State(app): AppState, headers: HeaderMap, axum::Json(inp): axum::Json<ReplayIn>) -> XResult<Json<J>> {
+async fn claim_replay(
+    State(app): AppState,
+    headers: HeaderMap,
+    axum::Json(inp): axum::Json<ReplayIn>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     app.partition(&inp.routing)?;
     if inp.release {
@@ -485,10 +552,7 @@ pub async fn scan_private_anywhere(app: &App, routing: &str, prefix: &str) -> XR
         rows: Vec<(String, String)>,
     }
     let rows: Rows = r.json().await.map_err(upstream)?;
-    rows.rows
-        .into_iter()
-        .map(|(n, v)| Ok((n, Bytes::from(B64.decode(v).map_err(upstream)?))))
-        .collect()
+    rows.rows.into_iter().map(|(n, v)| Ok((n, Bytes::from(B64.decode(v).map_err(upstream)?)))).collect()
 }
 
 pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
@@ -581,7 +645,8 @@ pub async fn forward_put_private(app: &App, owner: &str, routing: &str, muts: Ve
         routing: routing.to_string(),
         muts: muts.into_iter().map(|m| (B64.encode(&m.key), m.val.map(|v| B64.encode(v)))).collect(),
     };
-    send(app.http.post(format!("{owner}/internal/v1/private/put")).header(HDR, &app.config.internal_token).json(&body)).await?;
+    send(app.http.post(format!("{owner}/internal/v1/private/put")).header(HDR, &app.config.internal_token).json(&body))
+        .await?;
     Ok(())
 }
 
@@ -601,13 +666,21 @@ pub async fn forward_get_private(app: &App, owner: &str, routing: &str, name: &s
 /// unreachable).
 const GATHER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
-async fn admin_search_accounts(State(app): AppState, headers: HeaderMap, Query(q): Query<super::admin::SearchQ>) -> XResult<Json<J>> {
+async fn admin_search_accounts(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::admin::SearchQ>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let (hits, owned) = super::admin::search_accounts_local(&app, &q).await?;
     Ok(Json(json!({"owned": owned, "accounts": hits})))
 }
 
-async fn admin_invite_codes(State(app): AppState, headers: HeaderMap, Query(q): Query<super::admin::InviteCodesQ>) -> XResult<Json<J>> {
+async fn admin_invite_codes(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<super::admin::InviteCodesQ>,
+) -> XResult<Json<J>> {
     check(&app, &headers)?;
     let (codes, owned) = super::admin::invite_codes_local(&app, &q).await?;
     Ok(Json(json!({"owned": owned, "codes": codes})))
@@ -621,7 +694,11 @@ async fn sync_list_repos(State(app): AppState, headers: HeaderMap, Query(q): Que
     let limit = super::extract::limit_param(Some(q.limit), 500, 1, 1000)?;
     let (repos, next) = super::sync::list_repos_local(&app, pos, limit).await?;
     let page = super::sync::ReposPage::new(repos, next);
-    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], serde_json::to_vec(&page).map_err(XrpcError::from_err)?).into_response())
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_vec(&page).map_err(XrpcError::from_err)?,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]

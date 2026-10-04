@@ -8,8 +8,8 @@
 use crate::common::*;
 use axum::extract::{Query, State};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use vlpds::crypto::Keypair;
 use vlpds::plc::mock::MockPlc;
 
@@ -26,11 +26,17 @@ async fn stub_appview(handles: HashMap<String, String>) -> (String, Arc<AtomicUs
                 n.fetch_add(1, Ordering::SeqCst);
                 let handle = q.get("handle").cloned().unwrap_or_default();
                 if handle.starts_with("boom.") {
-                    return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": "InternalServerError"})));
+                    return (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "InternalServerError"})),
+                    );
                 }
                 match h.get(&handle) {
                     Some(did) => (axum::http::StatusCode::OK, axum::Json(json!({"did": did}))),
-                    None => (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "InvalidRequest", "message": "Unable to resolve handle"}))),
+                    None => (
+                        axum::http::StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"error": "InvalidRequest", "message": "Unable to resolve handle"})),
+                    ),
                 }
             }),
         )
@@ -175,7 +181,13 @@ async fn concurrent_signups_with_one_email() {
             let (s, email) = (s.clone(), email.clone());
             tasks.push(tokio::spawn(async move {
                 let h = format!("{}.{HANDLE_DOMAIN}", unique_name("dup"));
-                s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": h, "email": email, "password": PASSWORD}), &Auth::None).await
+                s.xrpc
+                    .post(
+                        "com.atproto.server.createAccount",
+                        &json!({"handle": h, "email": email, "password": PASSWORD}),
+                        &Auth::None,
+                    )
+                    .await
             }));
         }
         let mut ok = 0;
@@ -204,7 +216,9 @@ async fn stale_claims_are_taken_over_after_the_grace_period() {
     let email = format!("{}@example.com", unique_name("stale"));
     let put = |path: String| {
         let s = &s;
-        async move { s.app.store.raw.put(&object_store::path::Path::from(path), ghost.as_bytes().to_vec().into()).await.unwrap() }
+        async move {
+            s.app.store.raw.put(&object_store::path::Path::from(path), ghost.as_bytes().to_vec().into()).await.unwrap()
+        }
     };
     use object_store::ObjectStoreExt;
     use sha2::Digest;
@@ -218,7 +232,8 @@ async fn stale_claims_are_taken_over_after_the_grace_period() {
     let mut taken = body.clone();
     taken["handle"] = json!(a.handle);
     s.xrpc.post("com.atproto.server.createAccount", &taken, &Auth::None).await.err(400, "HandleNotAvailable");
-    let mut taken = json!({"handle": format!("{}.{HANDLE_DOMAIN}", unique_name("other")), "email": a.email, "password": PASSWORD});
+    let mut taken =
+        json!({"handle": format!("{}.{HANDLE_DOMAIN}", unique_name("other")), "email": a.email, "password": PASSWORD});
     s.xrpc.post("com.atproto.server.createAccount", &taken, &Auth::None).await.err(400, "InvalidRequest");
     // the ghost's are taken over
     let j = s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await.ok();
@@ -244,7 +259,9 @@ async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
         let mut tasks = Vec::new();
         for h in hs.clone() {
             let (s, a) = (s.clone(), a.clone());
-            tasks.push(tokio::spawn(async move { s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h}), &a.auth()).await }));
+            tasks.push(tokio::spawn(async move {
+                s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h}), &a.auth()).await
+            }));
         }
         for t in tasks {
             let r = t.await.unwrap();
@@ -260,7 +277,11 @@ async fn concurrent_handle_updates_leave_plc_and_account_agreeing() {
                 r.err(400, "HandleNotFound");
             }
         }
-        assert_eq!(s.app.resolve_handle(&local).await.ok().unwrap().as_deref(), Some(a.did.as_str()), "the current handle's claim is held");
+        assert_eq!(
+            s.app.resolve_handle(&local).await.ok().unwrap().as_deref(),
+            Some(a.did.as_str()),
+            "the current handle's claim is held"
+        );
     }
 }
 
@@ -275,7 +296,9 @@ async fn plc_ops_during_a_key_rotation() {
     let a = s.create_account("rk").await;
     s.xrpc.post_empty("com.atproto.identity.requestPlcOperationSignature", &a.auth()).await.ok();
     let token = s.mail_token(&a.email).await.unwrap();
-    let op = s.xrpc.post("com.atproto.identity.signPlcOperation", &json!({"token": token}), &a.auth()).await.ok()["operation"].clone();
+    let op = s.xrpc.post("com.atproto.identity.signPlcOperation", &json!({"token": token}), &a.auth()).await.ok()
+        ["operation"]
+        .clone();
 
     // a rotation stopped after its first step (pending)
     vlpds::xrpc::key_rotation::set_crash_hook(&a.did, Some(Arc::new(|p: &str| p == "begun")));
@@ -332,7 +355,8 @@ async fn signed_ops_make_the_directory_authoritative() {
     // submitted elsewhere (a new PDS would), never seen here
     let r = reqwest::Client::new().post(format!("{}/{}", plc.url, a.did)).json(&op).send().await.unwrap();
     assert!(r.status().is_success());
-    let doc = s.xrpc.get("com.atproto.identity.resolveDid", &[("did", &a.did)], &Auth::None).await.ok()["didDoc"].clone();
+    let doc =
+        s.xrpc.get("com.atproto.identity.resolveDid", &[("did", &a.did)], &Auth::None).await.ok()["didDoc"].clone();
     assert_eq!(doc["alsoKnownAs"], json!([format!("at://{other}")]), "the directory's document");
     // the directory down: the local document rather than an error
     plc.set_down(true);

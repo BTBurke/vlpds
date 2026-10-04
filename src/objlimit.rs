@@ -22,8 +22,8 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
-    PutOptions, PutPayload, PutResult, Result, UploadPart,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
 use prometheus::{Histogram, IntCounter, IntGauge};
 use std::sync::Arc;
@@ -140,7 +140,12 @@ struct Limited {
     reserve: Reserve,
 }
 
-pub fn limited(inner: Arc<dyn ObjectStore>, prefix: &str, client: &'static str, limits: Limits) -> Arc<dyn ObjectStore> {
+pub fn limited(
+    inner: Arc<dyn ObjectStore>,
+    prefix: &str,
+    client: &'static str,
+    limits: Limits,
+) -> Arc<dyn ObjectStore> {
     Arc::new(Limited {
         inner,
         prefix: prefix.trim_end_matches('/').to_string(),
@@ -166,7 +171,10 @@ impl std::fmt::Display for Limited {
     }
 }
 
-fn hold_until_end<T: Send + 'static>(mut s: BoxStream<'static, Result<T>>, permit: Permit) -> BoxStream<'static, Result<T>> {
+fn hold_until_end<T: Send + 'static>(
+    mut s: BoxStream<'static, Result<T>>,
+    permit: Permit,
+) -> BoxStream<'static, Result<T>> {
     let mut permit = Some(permit);
     futures::stream::poll_fn(move |cx| {
         let item = futures::ready!(s.poll_next_unpin(cx));
@@ -178,7 +186,10 @@ fn hold_until_end<T: Send + 'static>(mut s: BoxStream<'static, Result<T>>, permi
     .boxed()
 }
 
-fn hold_until_first<T: Send + 'static>(lane: Lane, make: impl FnOnce() -> BoxStream<'static, T> + Send + 'static) -> BoxStream<'static, T> {
+fn hold_until_first<T: Send + 'static>(
+    lane: Lane,
+    make: impl FnOnce() -> BoxStream<'static, T> + Send + 'static,
+) -> BoxStream<'static, T> {
     futures::stream::once(async move {
         let mut permit = Some(lane.acquire().await);
         make().inspect(move |_| {
@@ -373,7 +384,10 @@ mod tests {
         s.put(&a, PutPayload::from_static(b"a")).await.unwrap();
         s.put(&b, PutPayload::from_static(b"b")).await.unwrap();
         let held = s.get(&a).await.unwrap();
-        assert!(tokio::time::timeout(Duration::from_millis(50), s.get(&a)).await.is_err(), "the unread body holds the only permit");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), s.get(&a)).await.is_err(),
+            "the unread body holds the only permit"
+        );
         drop(held);
         // a blob body streams at its reader's pace: released at the head
         let blob = s.get(&b).await.unwrap();
@@ -401,7 +415,8 @@ mod tests {
     #[tokio::test]
     async fn reserved_lane_is_never_starved() {
         // reads stall for an hour; writes answer at once
-        let gauge = Gauge::with(Arc::new(object_store::memory::InMemory::new()), Duration::from_secs(3600), Duration::ZERO);
+        let gauge =
+            Gauge::with(Arc::new(object_store::memory::InMemory::new()), Duration::from_secs(3600), Duration::ZERO);
         let s = limited(gauge, "lim", "test_ctl", Limits::new(2).with_reserved(Reserve::LeaseWrites, 1));
         // the main lane is full, more requests queue behind it
         let stalled: Vec<_> = (0..4)

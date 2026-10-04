@@ -165,7 +165,9 @@ pub fn parse_overrides(v: &[String]) -> anyhow::Result<Vec<(Cache, usize)>> {
 
 /// Also returns the budget (None: [`DEFAULT_BUDGET_FRACTION`] of the memory limit).
 pub fn resolve(budget: Option<u64>, overrides: &[(Cache, usize)]) -> (Caps, u64) {
-    let budget = budget.unwrap_or_else(|| (crate::memory::limit_bytes().unwrap_or(FALLBACK_MEMORY) as f64 * DEFAULT_BUDGET_FRACTION) as u64);
+    let budget = budget.unwrap_or_else(|| {
+        (crate::memory::limit_bytes().unwrap_or(FALLBACK_MEMORY) as f64 * DEFAULT_BUDGET_FRACTION) as u64
+    });
     let mut caps = Caps::from_budget(budget);
     for (c, n) in overrides {
         caps.set(*c, *n);
@@ -221,7 +223,8 @@ pub fn track<T: Len + 'static>(kind: Cache, cache: Arc<T>) -> Arc<T> {
 
 /// Summed over each cache's live instances.
 pub fn entries() -> Caps {
-    let live: Vec<(Cache, Arc<dyn Len>)> = TRACKED.lock().iter().filter_map(|(c, w)| Some((*c, w.upgrade()?))).collect();
+    let live: Vec<(Cache, Arc<dyn Len>)> =
+        TRACKED.lock().iter().filter_map(|(c, w)| Some((*c, w.upgrade()?))).collect();
     let mut n = [0usize; N];
     for (c, l) in live {
         n[c.idx()] += l.len();
@@ -253,7 +256,8 @@ mod tests {
         assert!(caps.total_bytes() > (1 << 30) * 9 / 10, "{caps}");
         // tiny budgets keep a floor
         assert!(Cache::ALL.iter().all(|c| Caps::from_budget(0).get(*c) == MIN_ENTRIES));
-        let (c, b) = resolve(Some(64 << 20), &parse_overrides(&["proxy_accounts=5".into(), " did_docs = 7 ".into()]).unwrap());
+        let (c, b) =
+            resolve(Some(64 << 20), &parse_overrides(&["proxy_accounts=5".into(), " did_docs = 7 ".into()]).unwrap());
         assert_eq!(b, 64 << 20);
         assert_eq!((c.get(Cache::ProxyAccounts), c.get(Cache::DidDocs)), (5, 7));
         assert_eq!(c.get(Cache::SessionTokens), Caps::from_budget(64 << 20).get(Cache::SessionTokens));

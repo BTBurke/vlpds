@@ -9,13 +9,8 @@ use std::sync::LazyLock;
 
 const DOMAINS_TXT: &str = include_str!("email_policy/disposable_email_domains.txt");
 
-static DOMAINS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
-    DOMAINS_TXT
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect()
-});
+static DOMAINS: LazyLock<HashSet<&'static str>> =
+    LazyLock::new(|| DOMAINS_TXT.lines().map(str::trim).filter(|l| !l.is_empty()).collect());
 
 pub fn is_disposable_email(email: &str) -> bool {
     let domain = email.rsplit('@').next().unwrap_or(email);

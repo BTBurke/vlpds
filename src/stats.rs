@@ -46,8 +46,7 @@ pub static STATS: LazyLock<Stats> = LazyLock::new(|| Stats {
 impl Stats {
     pub fn record_put(&self, d: Duration, bytes: usize) {
         self.segments.fetch_add(1, Ordering::Relaxed);
-        self.segment_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
+        self.segment_bytes.fetch_add(bytes as u64, Ordering::Relaxed);
         let _ = self.put_us.lock().record(d.as_micros() as u64);
     }
 
@@ -62,11 +61,8 @@ impl Stats {
 
 fn pct(h: &Mutex<Histogram<u64>>) -> (f64, f64, f64) {
     let mut h = h.lock();
-    let r = (
-        h.value_at_quantile(0.5) as f64 / 1000.0,
-        h.value_at_quantile(0.99) as f64 / 1000.0,
-        h.max() as f64 / 1000.0,
-    );
+    let r =
+        (h.value_at_quantile(0.5) as f64 / 1000.0, h.value_at_quantile(0.99) as f64 / 1000.0, h.max() as f64 / 1000.0);
     h.reset();
     r
 }

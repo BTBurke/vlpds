@@ -33,7 +33,10 @@ use vlpds::cluster::if_match;
 use vlpds::store::{S3Config, Store};
 
 #[derive(Parser)]
-#[command(name = "vlpds-bucket-probe", about = "Check whether an S3-compatible bucket can host vlpds and measure its latency")]
+#[command(
+    name = "vlpds-bucket-probe",
+    about = "Check whether an S3-compatible bucket can host vlpds and measure its latency"
+)]
 struct Args {
     #[arg(long, env = "VLPDS_S3_ENDPOINT", default_value = "http://localhost:9000")]
     s3_endpoint: String,
@@ -202,7 +205,10 @@ impl Probe {
     /// Check 1: If-None-Match: * creates once; the second create is refused.
     async fn conditional_create(&self) -> Outcome {
         let p = self.path("checks/create/00000000000000000001.seg");
-        let first = tryf!(self.store.put_opts(&p, PutPayload::from_static(b"first"), opts(PutMode::Create)).await, "first create");
+        let first = tryf!(
+            self.store.put_opts(&p, PutPayload::from_static(b"first"), opts(PutMode::Create)).await,
+            "first create"
+        );
         match self.store.put_opts(&p, PutPayload::from_static(b"second"), opts(PutMode::Create)).await {
             Ok(_) => {
                 let (b, _) = tryf!(self.get_bytes(&p).await, "GET after second create");
@@ -228,7 +234,8 @@ impl Probe {
     /// response, as lease renewals use); stale and missing-key updates are refused.
     async fn compare_and_swap(&self) -> Outcome {
         let p = self.path("checks/cas/lease");
-        let created = tryf!(self.store.put_opts(&p, PutPayload::from_static(b"v1"), opts(PutMode::Create)).await, "create");
+        let created =
+            tryf!(self.store.put_opts(&p, PutPayload::from_static(b"v1"), opts(PutMode::Create)).await, "create");
         let (b, e1) = tryf!(self.get_bytes(&p).await, "GET v1");
         if &b[..] != b"v1" {
             fail!("read-after-create returned {:?}", String::from_utf8_lossy(&b));
@@ -268,7 +275,10 @@ impl Probe {
             None => notes.push("PUT responses carry no ETag (renewals will need a GET)".into()),
             Some(et) => match self.store.put_opts(&p, PutPayload::from_static(b"v3"), opts(if_match(Some(et)))).await {
                 Ok(_) => {}
-                Err(e) => fail!("CAS with the ETag returned by the previous PUT failed ({}): lease renewals would fail", kind(&e)),
+                Err(e) => fail!(
+                    "CAS with the ETag returned by the previous PUT failed ({}): lease renewals would fail",
+                    kind(&e)
+                ),
             },
         }
         let missing = self.path("checks/cas/missing");
@@ -277,7 +287,8 @@ impl Probe {
             Err(e) if is_conflict(&e) || matches!(e, object_store::Error::NotFound { .. }) => {}
             Err(e) => fail!("CAS on a missing key failed with {} instead of Precondition", kind(&e)),
         }
-        let detail = "current-ETag CAS ok, stale-ETag CAS refused, PUT-response ETag reusable, missing-key CAS refused".to_string();
+        let detail = "current-ETag CAS ok, stale-ETag CAS refused, PUT-response ETag reusable, missing-key CAS refused"
+            .to_string();
         if notes.is_empty() {
             Outcome::Ok(detail)
         } else {
@@ -291,7 +302,10 @@ impl Probe {
         for round in 0..rounds {
             let p = self.path(&format!("checks/race-{}/{round}", if use_cas { "cas" } else { "create" }));
             let mode = if use_cas {
-                tryf!(self.store.put_opts(&p, PutPayload::from_static(b"base"), opts(PutMode::Create)).await, "create base");
+                tryf!(
+                    self.store.put_opts(&p, PutPayload::from_static(b"base"), opts(PutMode::Create)).await,
+                    "create base"
+                );
                 let (_, e) = tryf!(self.get_bytes(&p).await, "GET base");
                 if_match(e)
             } else {
@@ -320,7 +334,10 @@ impl Probe {
                 fail!("round {round}: {} of {racers} writers won ({winners:?}); exactly one must", winners.len());
             }
             if !others.is_empty() {
-                fail!("round {round}: losers got non-conflict errors, so the outcome is ambiguous: {}", others.join("; "));
+                fail!(
+                    "round {round}: losers got non-conflict errors, so the outcome is ambiguous: {}",
+                    others.join("; ")
+                );
             }
             let (b, _) = tryf!(self.get_bytes(&p).await, "GET winner");
             let want = format!("racer-{}", winners[0]);
@@ -328,7 +345,9 @@ impl Probe {
                 fail!("round {round}: {want} won but the object holds {:?}", String::from_utf8_lossy(&b));
             }
         }
-        Outcome::Ok(format!("{rounds} keys x {racers} writers: one winner each, {conflicts} refused, final bytes = winner's"))
+        Outcome::Ok(format!(
+            "{rounds} keys x {racers} writers: one winner each, {conflicts} refused, final bytes = winner's"
+        ))
     }
 
     /// 4a. read/list-after-write, LIST order and offset, delete.
@@ -363,10 +382,11 @@ impl Probe {
             notes.push("LIST is not in lexicographic order".to_string());
         }
         let off = self.path(&format!("checks/list/{}", names[4]));
-        let after: Vec<String> = tryf!(self.store.list_with_offset(Some(&dir), &off).try_collect::<Vec<_>>().await, "LIST with offset")
-            .iter()
-            .filter_map(|m| m.location.filename().map(str::to_string))
-            .collect();
+        let after: Vec<String> =
+            tryf!(self.store.list_with_offset(Some(&dir), &off).try_collect::<Vec<_>>().await, "LIST with offset")
+                .iter()
+                .filter_map(|m| m.location.filename().map(str::to_string))
+                .collect();
         let mut after_sorted = after.clone();
         after_sorted.sort();
         if after_sorted != names[5..] {
@@ -393,9 +413,14 @@ impl Probe {
             Err(e) => fail!("GET of a deleted object failed with {} instead of NotFound", kind(&e)),
         }
         if let Err(e) = self.store.delete(&gone).await {
-            notes.push(format!("deleting a missing key errors ({}); retention retries assume idempotent deletes", kind(&e)));
+            notes.push(format!(
+                "deleting a missing key errors ({}); retention retries assume idempotent deletes",
+                kind(&e)
+            ));
         }
-        let detail = "PUT->LIST sees all 10 with sizes, start-after offset ok, HEAD ok, deletes visible to LIST and GET".to_string();
+        let detail =
+            "PUT->LIST sees all 10 with sizes, start-after offset ok, HEAD ok, deletes visible to LIST and GET"
+                .to_string();
         if notes.is_empty() {
             Outcome::Ok(detail)
         } else {
@@ -416,7 +441,10 @@ impl Probe {
         if meta.size != (part1 + 4096) as u64 {
             fail!("completed upload is {} bytes, wrote {}", meta.size, part1 + 4096);
         }
-        let r = tryf!(self.store.get_range(&p, (part1 as u64 - 16)..(part1 as u64 + 16)).await, "range GET across the part boundary");
+        let r = tryf!(
+            self.store.get_range(&p, (part1 as u64 - 16)..(part1 as u64 + 16)).await,
+            "range GET across the part boundary"
+        );
         let want = [&data(part1, 1)[part1 - 16..], &data(4096, 2)[..16]].concat();
         if r[..] != want[..] {
             fail!("bytes across the part boundary differ from what was uploaded");
@@ -430,7 +458,9 @@ impl Probe {
             Ok(_) => fail!("an aborted multipart upload left an object behind"),
             Err(e) => fail!("HEAD after abort failed with {}", kind(&e)),
         }
-        Outcome::Ok("5 MiB + 4 KiB upload completed with correct size and boundary bytes; aborted upload left nothing".into())
+        Outcome::Ok(
+            "5 MiB + 4 KiB upload completed with correct size and boundary bytes; aborted upload left nothing".into(),
+        )
     }
 
     /// Runs `ops` requests from `concurrency` workers; `f(worker, i)`.
@@ -593,7 +623,10 @@ impl Probe {
 }
 
 fn print_table(r: &Report) {
-    println!("vlpds-bucket-probe  endpoint={} bucket={} region={} prefix={}/", r.endpoint, r.bucket, r.region, r.prefix);
+    println!(
+        "vlpds-bucket-probe  endpoint={} bucket={} region={} prefix={}/",
+        r.endpoint, r.bucket, r.region, r.prefix
+    );
     println!();
     println!("Correctness");
     for c in &r.checks {
@@ -608,7 +641,10 @@ fn print_table(r: &Report) {
     if !r.latency.is_empty() {
         println!();
         println!("Latency ({} ops per row, {} in flight)", r.ops, r.concurrency);
-        println!("  {:<17} {:>8} {:>5} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8}", "op", "bytes", "n", "err", "p50 ms", "p90 ms", "p99 ms", "max ms", "ops/s");
+        println!(
+            "  {:<17} {:>8} {:>5} {:>4} {:>8} {:>8} {:>8} {:>8} {:>8}",
+            "op", "bytes", "n", "err", "p50 ms", "p90 ms", "p99 ms", "max ms", "ops/s"
+        );
         for l in &r.latency {
             println!(
                 "  {:<17} {:>8} {:>5} {:>4} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1}",
@@ -632,7 +668,9 @@ fn print_table(r: &Report) {
 
 async fn timed(name: &'static str, relied_on_by: &'static str, f: impl Future<Output = Outcome>) -> Check {
     let t = Instant::now();
-    let o = tokio::time::timeout(Duration::from_secs(300), f).await.unwrap_or_else(|_| Outcome::Fail("timed out after 300 s".into()));
+    let o = tokio::time::timeout(Duration::from_secs(300), f)
+        .await
+        .unwrap_or_else(|_| Outcome::Fail("timed out after 300 s".into()));
     let ms = t.elapsed().as_secs_f64() * 1000.0;
     let (status, detail) = match o {
         Outcome::Ok(d) => (Status::Pass, d),
@@ -681,13 +719,10 @@ async fn run(mut args: Args) -> anyhow::Result<bool> {
     let progress = !json_stdout;
 
     // reachability/auth, and never touch an existing prefix
-    let existing: Vec<_> = probe
-        .store
-        .list(Some(&Path::from(root.clone())))
-        .take(1)
-        .try_collect()
-        .await
-        .map_err(|e| anyhow::anyhow!("LIST {}/{root}/ failed (endpoint, credentials, bucket?): {}", args.s3_bucket, kind(&e)))?;
+    let existing: Vec<_> =
+        probe.store.list(Some(&Path::from(root.clone()))).take(1).try_collect().await.map_err(|e| {
+            anyhow::anyhow!("LIST {}/{root}/ failed (endpoint, credentials, bucket?): {}", args.s3_bucket, kind(&e))
+        })?;
     if !existing.is_empty() {
         anyhow::bail!("prefix {root}/ is not empty; give an empty --prefix (the probe deletes everything under it)");
     }
@@ -696,11 +731,41 @@ async fn run(mut args: Args) -> anyhow::Result<bool> {
     }
 
     let mut checks = vec![];
-    checks.push(timed("conditional_create", "segment PUTs, log fences, handle claims (If-None-Match: *)", probe.conditional_create()).await);
-    checks.push(timed("compare_and_swap", "node leases, shard assignments, layout, writer ids (If-Match)", probe.compare_and_swap()).await);
-    checks.push(timed("race_create", "fencing a zombie log: exactly one of fencer/zombie lands", probe.race(args.racers, args.race_rounds, false)).await);
-    checks.push(timed("race_cas", "lease/assignment takeovers: exactly one CAS from an ETag wins", probe.race(args.racers, args.race_rounds, true)).await);
-    checks.push(timed("list_read_delete", "fence scan (LIST + offset), replay, retention deletes", probe.list_delete()).await);
+    checks.push(
+        timed(
+            "conditional_create",
+            "segment PUTs, log fences, handle claims (If-None-Match: *)",
+            probe.conditional_create(),
+        )
+        .await,
+    );
+    checks.push(
+        timed(
+            "compare_and_swap",
+            "node leases, shard assignments, layout, writer ids (If-Match)",
+            probe.compare_and_swap(),
+        )
+        .await,
+    );
+    checks.push(
+        timed(
+            "race_create",
+            "fencing a zombie log: exactly one of fencer/zombie lands",
+            probe.race(args.racers, args.race_rounds, false),
+        )
+        .await,
+    );
+    checks.push(
+        timed(
+            "race_cas",
+            "lease/assignment takeovers: exactly one CAS from an ETag wins",
+            probe.race(args.racers, args.race_rounds, true),
+        )
+        .await,
+    );
+    checks.push(
+        timed("list_read_delete", "fence scan (LIST + offset), replay, retention deletes", probe.list_delete()).await,
+    );
     checks.push(timed("multipart", "large SSTs and blobs (multipart upload)", probe.multipart()).await);
 
     let mut notes = vec![];
@@ -724,7 +789,13 @@ async fn run(mut args: Args) -> anyhow::Result<bool> {
         }
         for r in &rows {
             if r.errors > 0 {
-                notes.push(format!("{}: {} of {} requests failed (first: {})", r.op, r.errors, args.ops, r.first_error.as_deref().unwrap_or("?")));
+                notes.push(format!(
+                    "{}: {} of {} requests failed (first: {})",
+                    r.op,
+                    r.errors,
+                    args.ops,
+                    r.first_error.as_deref().unwrap_or("?")
+                ));
             }
         }
         rows

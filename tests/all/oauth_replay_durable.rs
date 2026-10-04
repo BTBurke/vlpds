@@ -79,7 +79,10 @@ async fn claims_are_persisted_and_expired_ones_collected() {
     assert!(claim_replay_anywhere(app, routing, "dpop:k:1", now + 300).await.map_err(|e| e.message).unwrap());
     assert!(!claim_replay_anywhere(app, routing, "dpop:k:1", now + 300).await.map_err(|e| e.message).unwrap());
     vlpds::oauth::util::forget_replays(app);
-    assert!(!claim_replay_anywhere(app, routing, "dpop:k:1", now + 300).await.map_err(|e| e.message).unwrap(), "persisted");
+    assert!(
+        !claim_replay_anywhere(app, routing, "dpop:k:1", now + 300).await.map_err(|e| e.message).unwrap(),
+        "persisted"
+    );
     assert!(claim_replay_anywhere(app, routing, "dpop:k:2", now + 300).await.map_err(|e| e.message).unwrap());
     // a transient guard is memory only
     assert!(claim_transient_anywhere(app, routing, "cc:x", now + 60).await.map_err(|e| e.message).unwrap());

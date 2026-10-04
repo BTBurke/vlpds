@@ -7,12 +7,19 @@ use crate::common::*;
 #[track_caller]
 fn handle_taken(r: &Resp) {
     assert_eq!(r.status, 400, "{}", r.text());
-    let ok = r.error_name() == Some("HandleNotAvailable") || (r.error_name() == Some("InvalidRequest") && r.text().to_lowercase().contains("taken"));
+    let ok = r.error_name() == Some("HandleNotAvailable")
+        || (r.error_name() == Some("InvalidRequest") && r.text().to_lowercase().contains("taken"));
     assert!(ok, "expected handle-taken error, got {}", r.text());
 }
 
 async fn signup(s: &TestServer, handle: &str, email: &str) -> Resp {
-    s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": handle, "email": email, "password": "asdf"}), &Auth::None).await
+    s.xrpc
+        .post(
+            "com.atproto.server.createAccount",
+            &json!({"handle": handle, "email": email, "password": "asdf"}),
+            &Auth::None,
+        )
+        .await
 }
 
 async fn try_handle(s: &TestServer, handle: &str) -> Resp {
@@ -24,7 +31,9 @@ fn fresh_handle(prefix: &str) -> String {
 }
 
 async fn request_reset(s: &TestServer, email: &str) -> String {
-    let (token, r, _) = mailed(s, email, s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": email}), &Auth::None)).await;
+    let (token, r, _) =
+        mailed(s, email, s.xrpc.post("com.atproto.server.requestPasswordReset", &json!({"email": email}), &Auth::None))
+            .await;
     r.ok();
     token
 }
@@ -60,7 +69,11 @@ async fn creates_an_account_with_plc_shaped_did_and_did_doc() {
     assert_eq!(doc["id"], json!(a.did));
     assert!(doc["alsoKnownAs"].as_array().unwrap().contains(&json!(format!("at://{}", a.handle))));
     let svc = doc["service"].as_array().unwrap();
-    assert!(svc.iter().any(|x| x["id"].as_str().is_some_and(|i| i.ends_with("#atproto_pds")) && x["serviceEndpoint"] == json!(s.url)));
+    assert!(
+        svc.iter()
+            .any(|x| x["id"].as_str().is_some_and(|i| i.ends_with("#atproto_pds"))
+                && x["serviceEndpoint"] == json!(s.url))
+    );
     // signing key in the doc verifies the repo's commits
     let key = s.signing_key(&a.did).await;
     s.get_repo(&a.did).await.commit().verify(&key).unwrap();
@@ -159,7 +172,10 @@ async fn can_reset_account_password() {
     reset_password(&s, &token.to_lowercase(), &a.password).await.ok();
     s.create_session(&a.handle, alt).await.err(401, "AuthenticationRequired");
     s.create_session(&a.handle, &a.password).await.ok();
-    let r = s.xrpc.post_empty("com.atproto.server.refreshSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into())).await;
+    let r = s
+        .xrpc
+        .post_empty("com.atproto.server.refreshSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into()))
+        .await;
     assert_eq!(r.status, 400, "refresh with pre-reset token must fail: {}", r.text());
     assert!(matches!(r.error_name(), Some("ExpiredToken" | "InvalidToken")), "{}", r.text());
 }
@@ -176,7 +192,9 @@ async fn rejects_bogus_password_reset_token() {
 async fn allows_an_admin_to_update_password() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let update = |pw: &str, auth: Auth| s.xrpc.post_owned("com.atproto.admin.updateAccountPassword", json!({"did": a.did, "password": pw}), auth);
+    let update = |pw: &str, auth: Auth| {
+        s.xrpc.post_owned("com.atproto.admin.updateAccountPassword", json!({"did": a.did, "password": pw}), auth)
+    };
     update("new-admin-pass", Auth::None).await.err_status(401);
     update("new-admin-pass", a.auth()).await.client_err();
     update("new-admin-password", Auth::Admin).await.ok();
@@ -188,8 +206,9 @@ async fn allows_an_admin_to_update_password() {
 async fn allows_administrative_email_updates() {
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
-    let update =
-        |account: &str, email: &str, auth: Auth| s.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), auth);
+    let update = |account: &str, email: &str, auth: Auth| {
+        s.xrpc.post_owned("com.atproto.admin.updateAccountEmail", json!({"account": account, "email": email}), auth)
+    };
     update(&a.handle, "alIce-NEw@teST.com", Auth::Admin).await.ok();
     let info = s.account_info(&a.did).await.ok();
     assert_eq!(info["email"], json!("alice-new@test.com"));
@@ -208,8 +227,11 @@ async fn create_account_emits_identity_and_account_events() {
     let mut sub = s.subscribe(None).await;
     let a = s.create_account("fh").await;
     let did = a.did.clone();
-    let frames =
-        sub.until(FH_TIMEOUT, move |fs| ["#identity", "#account"].iter().all(|k| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == *k))).await;
+    let frames = sub
+        .until(FH_TIMEOUT, move |fs| {
+            ["#identity", "#account"].iter().all(|k| fs.iter().any(|f| f.did() == Some(did.as_str()) && f.kind() == *k))
+        })
+        .await;
     let mine: Vec<_> = frames.iter().filter(|f| f.did() == Some(a.did.as_str())).collect();
     let ident = mine.iter().find(|f| f.kind() == "#identity").expect("#identity event for new account");
     assert_eq!(ident.str("handle"), Some(a.handle.as_str()));
@@ -222,7 +244,9 @@ async fn create_account_emits_identity_and_account_events() {
 async fn requires_an_email() {
     let s = TestServer::spawn().await;
     let handle = fresh_handle("noemail");
-    for body in [json!({"handle": handle, "password": PASSWORD}), json!({"handle": handle, "password": PASSWORD, "email": ""})] {
+    for body in
+        [json!({"handle": handle, "password": PASSWORD}), json!({"handle": handle, "password": PASSWORD, "email": ""})]
+    {
         let r = s.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
         r.err(400, "InvalidRequest");
         assert!(r.text().contains("Email is required"), "{}", r.text());
@@ -246,12 +270,18 @@ async fn reserve_signing_key_reuse_and_expiry() {
     // once taken, the DID gets a fresh key
     let a = s.create_account("rsk").await;
     let k2 = reserve(json!({"did": a.did})).await;
-    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": k2}), &Auth::Admin).await.ok();
+    let r = s
+        .xrpc
+        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did, "signingKey": k2}), &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(r["signingKey"], json!(k2));
     assert_ne!(reserve(json!({"did": a.did})).await, k2);
 
     // expired reservations are swept and can't be installed
-    let swept = vlpds::xrpc::sweep_reserved_keys(&s.app, std::time::Duration::ZERO).await.unwrap_or_else(|e| panic!("{}", e.message));
+    let swept = vlpds::xrpc::sweep_reserved_keys(&s.app, std::time::Duration::ZERO)
+        .await
+        .unwrap_or_else(|e| panic!("{}", e.message));
     assert!(swept >= 5, "swept {swept}");
     assert_ne!(reserve(json!({"did": did})).await, k1, "expired reservation was reused");
     let body = json!({"did": a.did, "signingKey": k1});

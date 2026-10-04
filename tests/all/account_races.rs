@@ -7,8 +7,8 @@
 //!   commits chain on the stale state, then "rebuilt MST root != head data"
 //!   forever).
 use crate::common::*;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use vlpds::cluster::ShardHost;
 
 /// Hammers `nsid` as the account from 8 tasks while an admin takes it down;
@@ -106,7 +106,12 @@ async fn rejected_account_mutation_writes_nothing() {
 /// the close's marker names.
 async fn bounce(s: &TestServer, p: &vlpds::partition::Partition) {
     s.app.node.close(p.id).await.unwrap();
-    let ours = vlpds::nodelog::Span { log_id: s.app.log.log_id.to_string(), epoch: p.epoch, start: 0, end: Some(s.app.log.next_ordinal()) };
+    let ours = vlpds::nodelog::Span {
+        log_id: s.app.log.log_id.to_string(),
+        epoch: p.epoch,
+        start: 0,
+        end: Some(s.app.log.next_ordinal()),
+    };
     let opened = s.app.node.open_many(vec![(p.id, p.epoch, vec![ours])]).await;
     assert!(opened.iter().all(|(_, r)| r.is_ok()), "reopen failed");
 }
@@ -126,7 +131,11 @@ async fn load_straddling_shard_bounce_is_dropped() {
     bounce(&s, &old).await;
     assert!(!Arc::ptr_eq(&old, &s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message))));
     // ...and the load completes (ahead of the next write in the worker's queue)
-    s.app.workers.route(&a.did).send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Box::new(Ok(Some(stale))) }).unwrap();
+    s.app
+        .workers
+        .route(&a.did)
+        .send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Box::new(Ok(Some(stale))) })
+        .unwrap();
     let three = s.post(&a, "three").await;
     let rev3 = three.rev.clone().unwrap();
     let mut sub = s.subscribe(Some(0)).await;

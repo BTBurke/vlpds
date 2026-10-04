@@ -115,7 +115,13 @@ pub fn cert_info(der: &[u8]) -> Result<CertInfo> {
             }
         }
     }
-    Ok(CertInfo { node_id, not_after: c.validity().not_after.timestamp(), is_ca: c.is_ca(), hosts, subject: c.subject().to_string() })
+    Ok(CertInfo {
+        node_id,
+        not_after: c.validity().not_after.timestamp(),
+        is_ca: c.is_ca(),
+        hosts,
+        subject: c.subject().to_string(),
+    })
 }
 
 fn node_id_of(der: &[u8]) -> Option<String> {
@@ -154,26 +160,35 @@ impl Material {
             ca_not_after = ca_not_after.min(info.not_after);
             roots.add(c.clone()).context("adding a CA certificate")?;
         }
-        let chain: Vec<CertificateDer<'static>> =
-            CertificateDer::pem_slice_iter(cert_pem).collect::<Result<_, _>>().context("reading the node certificate (PEM)")?;
+        let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+            .collect::<Result<_, _>>()
+            .context("reading the node certificate (PEM)")?;
         ensure!(!chain.is_empty(), "no certificate in the node certificate file");
         let key = PrivateKeyDer::from_pem_slice(key_pem).context("reading the node key (PEM)")?;
-        let ck = CertifiedKey::from_der(chain.clone(), key, &p).context("the node key doesn't match its certificate")?;
+        let ck =
+            CertifiedKey::from_der(chain.clone(), key, &p).context("the node key doesn't match its certificate")?;
         let leaf = cert_info(&chain[0])?;
         let Some(node_id) = leaf.node_id else {
             bail!("the node certificate ({}) has no {NODE_URI_PREFIX}<node-id> URI SAN (issue it with `vlpds admin tls issue`)", leaf.subject);
         };
         let roots = Arc::new(roots);
-        let client_verifier = WebPkiClientVerifier::builder_with_provider(roots.clone(), p.clone())
-            .build()
-            .context("client verifier")?;
-        let server_verifier = WebPkiServerVerifier::builder_with_provider(roots, p).build().context("server verifier")?;
+        let client_verifier =
+            WebPkiClientVerifier::builder_with_provider(roots.clone(), p.clone()).build().context("client verifier")?;
+        let server_verifier =
+            WebPkiServerVerifier::builder_with_provider(roots, p).build().context("server verifier")?;
         // our cert is both our server and our client cert: it must chain to
         // the CA now (expiry included), or no peer would take it
         client_verifier
             .verify_client_cert(&chain[0], &chain[1..], UnixTime::now())
             .map_err(|e| anyhow::anyhow!("the node certificate doesn't verify against the cluster CA: {e}"))?;
-        Ok(Material { node_id, key: Arc::new(ck), client_verifier, server_verifier, cert_not_after: leaf.not_after, ca_not_after })
+        Ok(Material {
+            node_id,
+            key: Arc::new(ck),
+            client_verifier,
+            server_verifier,
+            cert_not_after: leaf.not_after,
+            ca_not_after,
+        })
     }
 }
 
@@ -188,11 +203,17 @@ type Stamp = Vec<Option<(std::time::SystemTime, u64)>>;
 
 impl Files {
     pub fn in_dir(dir: &Path, node_id: &str) -> Files {
-        Files { ca: dir.join("ca.crt"), cert: dir.join(format!("{node_id}.crt")), key: dir.join(format!("{node_id}.key")) }
+        Files {
+            ca: dir.join("ca.crt"),
+            cert: dir.join(format!("{node_id}.crt")),
+            key: dir.join(format!("{node_id}.key")),
+        }
     }
 
     fn read(&self) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-        let r = |p: &Path, what: &str| std::fs::read(p).with_context(|| format!("reading the peer TLS {what} {}", p.display()));
+        let r = |p: &Path, what: &str| {
+            std::fs::read(p).with_context(|| format!("reading the peer TLS {what} {}", p.display()))
+        };
         Ok((r(&self.ca, "CA")?, r(&self.cert, "certificate")?, r(&self.key, "key")?))
     }
 
@@ -232,7 +253,11 @@ impl PeerTls {
 
     fn with(files: Option<Files>, stamp: Stamp, m: Material) -> Arc<PeerTls> {
         init_metrics();
-        let t = Arc::new(PeerTls { files, stamp: parking_lot::Mutex::new(stamp), cur: parking_lot::RwLock::new(Arc::new(m)) });
+        let t = Arc::new(PeerTls {
+            files,
+            stamp: parking_lot::Mutex::new(stamp),
+            cur: parking_lot::RwLock::new(Arc::new(m)),
+        });
         t.export_expiry();
         t
     }
@@ -278,7 +303,11 @@ impl PeerTls {
                 self.export_expiry();
                 RELOADS.with_label_values(&["ok"]).inc();
                 let (cert, ca) = self.not_after();
-                tracing::info!(cert_not_after = cert, ca_not_after = ca, "peer TLS: reloaded the CA, certificate and key");
+                tracing::info!(
+                    cert_not_after = cert,
+                    ca_not_after = ca,
+                    "peer TLS: reloaded the CA, certificate and key"
+                );
                 Ok(true)
             }
             Err(e) => {
@@ -360,11 +389,19 @@ fn identity_refused() -> rustls::Error {
     rustls::Error::InvalidCertificate(CertificateError::ApplicationVerificationFailure)
 }
 
-fn verify12(message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+fn verify12(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
     rustls::crypto::verify_tls12_signature(message, cert, dss, &provider().signature_verification_algorithms)
 }
 
-fn verify13(message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+fn verify13(
+    message: &[u8],
+    cert: &CertificateDer<'_>,
+    dss: &DigitallySignedStruct,
+) -> Result<HandshakeSignatureValid, rustls::Error> {
     rustls::crypto::verify_tls13_signature(message, cert, dss, &provider().signature_verification_algorithms)
 }
 
@@ -388,7 +425,12 @@ impl ClientCertVerifier for ClientAuth {
         &[]
     }
 
-    fn verify_client_cert(&self, end_entity: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], now: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
         self.0.current().client_verifier.verify_client_cert(end_entity, intermediates, now)?;
         if node_id_of(end_entity).is_none() {
             tracing::warn!("peer TLS: refused a client certificate without a node identity");
@@ -397,11 +439,21 @@ impl ClientCertVerifier for ClientAuth {
         Ok(ClientCertVerified::assertion())
     }
 
-    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         verify12(message, cert, dss)
     }
 
-    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         verify13(message, cert, dss)
     }
 
@@ -430,7 +482,11 @@ impl ServerCertVerifier for ServerAuth {
             tracing::warn!(server = ?server_name, "peer TLS: refused the peer's certificate: {e}");
             e
         };
-        self.tls.current().server_verifier.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now).map_err(fail)?;
+        self.tls
+            .current()
+            .server_verifier
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .map_err(fail)?;
         let want = match &self.expect {
             Expect::Node(n) => Some(vec![n.clone()]),
             Expect::Lookup(f) => f(),
@@ -445,11 +501,21 @@ impl ServerCertVerifier for ServerAuth {
         }
     }
 
-    fn verify_tls12_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         verify12(message, cert, dss)
     }
 
-    fn verify_tls13_signature(&self, message: &[u8], cert: &CertificateDer<'_>, dss: &DigitallySignedStruct) -> Result<HandshakeSignatureValid, rustls::Error> {
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
         verify13(message, cert, dss)
     }
 
@@ -496,7 +562,11 @@ pub fn create_ca(name: &str, days: u32) -> Result<Issued> {
     p.distinguished_name.push(rcgen::DnType::CommonName, name);
     p.distinguished_name.push(rcgen::DnType::OrganizationName, "vlpds cluster");
     p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
-    p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign, rcgen::KeyUsagePurpose::DigitalSignature];
+    p.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+        rcgen::KeyUsagePurpose::DigitalSignature,
+    ];
     validity(&mut p, days);
     let cert = p.self_signed(&key)?;
     Ok(Issued { cert_pem: cert.pem(), key_pem: key.serialize_pem() })
@@ -514,7 +584,8 @@ pub fn issue_node(ca_cert_pem: &str, ca_key_pem: &str, node_id: &str, hosts: &[S
     p.distinguished_name.push(rcgen::DnType::OrganizationName, "vlpds cluster");
     p.is_ca = rcgen::IsCa::ExplicitNoCa;
     p.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
-    p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth, rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    p.extended_key_usages =
+        vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth, rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     p.use_authority_key_identifier_extension = true;
     validity(&mut p, days);
     let cert = p.signed_by(&key, &ca)?;
@@ -533,7 +604,12 @@ pub fn write_pair(dir: &Path, name: &str, issued: &Issued, force: bool) -> Resul
         // a new file with the mode from the start (no window at 0644 for
         // the key); then the mode again for a replaced one
         let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&tmp)
+            .with_context(|| format!("writing {}", tmp.display()))?;
         f.write_all(data.as_bytes())?;
         f.sync_all()?;
         std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(mode))?;
@@ -572,13 +648,19 @@ pub fn dev_files(dir: &Path, node_id: &str, hosts: &[String]) -> Result<Files> {
         let (ca, cert, key) = files.read()?;
         let m = Material::from_pem(&ca, &cert, &key)?;
         ensure!(m.node_id == node_id, "it names node {:?}", m.node_id);
-        ensure!(m.cert_not_after > chrono::Utc::now().timestamp() + DEV_RENEW_DAYS * 86400, "it expires within {DEV_RENEW_DAYS} days");
+        ensure!(
+            m.cert_not_after > chrono::Utc::now().timestamp() + DEV_RENEW_DAYS * 86400,
+            "it expires within {DEV_RENEW_DAYS} days"
+        );
         let have = cert_info(&CertificateDer::pem_slice_iter(&cert).next().context("no certificate")??)?.hosts;
         ensure!(hosts.iter().all(|h| have.contains(h)), "it isn't valid for all of {hosts:?}");
         Ok(())
     };
     if let Err(why) = current() {
-        let read = |p: &Path| std::fs::read_to_string(p).with_context(|| format!("dev mode: issuing a peer TLS certificate needs {}", p.display()));
+        let read = |p: &Path| {
+            std::fs::read_to_string(p)
+                .with_context(|| format!("dev mode: issuing a peer TLS certificate needs {}", p.display()))
+        };
         let n = issue_node(&read(&files.ca)?, &read(&dir.join("ca.key"))?, node_id, &hosts, DEV_DAYS)?;
         write_pair(dir, node_id, &n, true)?;
         tracing::info!(dir = %dir.display(), node_id, ?hosts, why = %format!("{why:#}"), "dev mode: issued this node's peer TLS certificate");
@@ -606,7 +688,8 @@ pub(crate) mod tests {
             TestCa { ca: create_ca("test CA", 30).unwrap() }
         }
         pub fn node(&self, id: &str) -> Arc<PeerTls> {
-            let n = issue_node(&self.ca.cert_pem, &self.ca.key_pem, id, &["127.0.0.1".into(), "localhost".into()], 30).unwrap();
+            let n = issue_node(&self.ca.cert_pem, &self.ca.key_pem, id, &["127.0.0.1".into(), "localhost".into()], 30)
+                .unwrap();
             PeerTls::from_pem(&self.ca.cert_pem, &n.cert_pem, &n.key_pem).unwrap()
         }
     }
@@ -667,14 +750,17 @@ pub(crate) mod tests {
         let hosts = vec!["10.0.0.5".to_string()];
         let files: Vec<Files> = std::thread::scope(|s| {
             let (dir, hosts) = (&dir, &hosts);
-            let hs: Vec<_> = (0..4).map(|i| s.spawn(move || dev_files(dir, &format!("n{i}"), hosts).unwrap())).collect();
+            let hs: Vec<_> =
+                (0..4).map(|i| s.spawn(move || dev_files(dir, &format!("n{i}"), hosts).unwrap())).collect();
             hs.into_iter().map(|h| h.join().unwrap()).collect()
         });
         let ca = std::fs::read(&files[0].ca).unwrap();
         for (i, f) in files.iter().enumerate() {
             let t = PeerTls::load(f.clone()).unwrap();
             assert_eq!(t.node_id(), format!("n{i}"));
-            let info = cert_info(&CertificateDer::pem_slice_iter(&std::fs::read(&f.cert).unwrap()).next().unwrap().unwrap()).unwrap();
+            let info =
+                cert_info(&CertificateDer::pem_slice_iter(&std::fs::read(&f.cert).unwrap()).next().unwrap().unwrap())
+                    .unwrap();
             for h in ["10.0.0.5", "127.0.0.1", "localhost"] {
                 assert!(info.hosts.iter().any(|x| x == h), "{:?}", info.hosts);
             }

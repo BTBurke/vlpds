@@ -66,24 +66,43 @@ async fn odd_cids_refused_at_xrpc_entry_points() {
         if in_url {
             let r = s
                 .xrpc
-                .get("com.atproto.repo.getRecord", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", rec.rkey()), ("cid", &bad)], &Auth::None)
+                .get(
+                    "com.atproto.repo.getRecord",
+                    &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", rec.rkey()), ("cid", &bad)],
+                    &Auth::None,
+                )
                 .await;
             r.client_err();
             assert!(r.json.get("value").is_none(), "{name}: getRecord answered");
             s.xrpc.get("com.atproto.sync.getBlob", &[("did", &a.did), ("cid", &bad)], &Auth::None).await.client_err();
-            s.xrpc.get_multi("com.atproto.sync.getBlocks", &[("did", a.did.clone()), ("cids", bad.clone())], &Auth::None).await.client_err();
+            s.xrpc
+                .get_multi("com.atproto.sync.getBlocks", &[("did", a.did.clone()), ("cids", bad.clone())], &Auth::None)
+                .await
+                .client_err();
         }
         let post = json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": now_iso()});
         let writes: [(&str, J); 6] = [
-            ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post, "swapCommit": bad})),
-            ("com.atproto.repo.putRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rec.rkey(), "record": post, "swapRecord": bad})),
-            ("com.atproto.repo.deleteRecord", json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rec.rkey(), "swapRecord": bad})),
+            (
+                "com.atproto.repo.createRecord",
+                json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post, "swapCommit": bad}),
+            ),
+            (
+                "com.atproto.repo.putRecord",
+                json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rec.rkey(), "record": post, "swapRecord": bad}),
+            ),
+            (
+                "com.atproto.repo.deleteRecord",
+                json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rec.rkey(), "swapRecord": bad}),
+            ),
             (
                 "com.atproto.repo.applyWrites",
                 json!({"repo": a.did, "writes": [{"$type": "com.atproto.repo.applyWrites#create", "collection": "app.bsky.feed.post", "value": post}], "swapCommit": bad}),
             ),
             // a link in record data, and a blob ref
-            ("com.atproto.repo.createRecord", json!({"repo": a.did, "collection": "com.example.links", "record": {"$type": "com.example.links", "l": {"$link": bad}}})),
+            (
+                "com.atproto.repo.createRecord",
+                json!({"repo": a.did, "collection": "com.example.links", "record": {"$type": "com.example.links", "l": {"$link": bad}}}),
+            ),
             (
                 "com.atproto.repo.createRecord",
                 json!({"repo": a.did, "collection": "com.example.links", "record": {"$type": "com.example.links", "b": {"$type": "blob", "ref": {"$link": bad}, "mimeType": "text/plain", "size": 10}}}),
@@ -97,7 +116,11 @@ async fn odd_cids_refused_at_xrpc_entry_points() {
     }
     // the record is untouched, and the well-formed forms still work
     s.xrpc
-        .get("com.atproto.repo.getRecord", &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", rec.rkey()), ("cid", &rec.cid)], &Auth::None)
+        .get(
+            "com.atproto.repo.getRecord",
+            &[("repo", &a.did), ("collection", "app.bsky.feed.post"), ("rkey", rec.rkey()), ("cid", &rec.cid)],
+            &Auth::None,
+        )
         .await
         .ok();
     s.xrpc.get("com.atproto.sync.getBlob", &[("did", &a.did), ("cid", &blob_cid)], &Auth::None).await.ok();
@@ -160,7 +183,8 @@ async fn odd_cids_refused_in_imported_cars() {
     let s = TestServer::spawn().await;
     let a = s.create_account("cidimp").await;
     let auth = a.auth();
-    let import = |car: Vec<u8>| s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &auth);
+    let import =
+        |car: Vec<u8>| s.xrpc.post_bytes("com.atproto.repo.importRepo", car, "application/vnd.ipld.car", &auth);
     let car_with = |link: &[u8], extra: Option<&[u8]>| car_with(&a.did, link, extra);
     let good = {
         let mut b = vec![0u8];

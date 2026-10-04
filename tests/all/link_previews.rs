@@ -49,12 +49,17 @@ async fn public_pages_have_link_preview_tags() {
     assert!(meta(&landing, "name", "robots").is_none());
 
     let migrate = get("/migrate").await;
-    assert!(migrate.header("content-security-policy").unwrap().contains("connect-src 'self' https:"), "migrate keeps its CSP");
+    assert!(
+        migrate.header("content-security-policy").unwrap().contains("connect-src 'self' https:"),
+        "migrate keeps its CSP"
+    );
     let migrate = body(&migrate);
     assert_eq!(meta(&migrate, "property", "og:title").unwrap(), format!("Move your Bluesky account to {host}"));
     assert_eq!(canonical(&migrate).unwrap(), format!("{origin}/migrate"));
 
-    for (path, noindex) in [("/account", true), ("/account/security", true), ("/admin", true), ("/admin/cluster", true), ("/", false)] {
+    for (path, noindex) in
+        [("/account", true), ("/account/security", true), ("/admin", true), ("/admin/cluster", true), ("/", false)]
+    {
         let html = body(&get(path).await);
         assert_eq!(meta(&html, "name", "robots").as_deref() == Some("noindex, nofollow"), noindex, "{path}");
     }
@@ -64,7 +69,13 @@ async fn public_pages_have_link_preview_tags() {
     let robots = get("/robots.txt").await;
     assert_eq!(robots.status, 200);
     let robots = body(&robots);
-    for l in ["Disallow: /admin", "Disallow: /account", "Disallow: /xrpc/", "Disallow: /oauth/", &format!("Sitemap: {origin}/sitemap.xml")] {
+    for l in [
+        "Disallow: /admin",
+        "Disallow: /account",
+        "Disallow: /xrpc/",
+        "Disallow: /oauth/",
+        &format!("Sitemap: {origin}/sitemap.xml"),
+    ] {
         assert!(robots.lines().any(|x| x == l), "robots.txt has {l:?}:\n{robots}");
     }
 
@@ -79,7 +90,9 @@ async fn public_pages_have_link_preview_tags() {
     assert_eq!(title(&doc).unwrap(), "Overview · vlpds docs");
     assert_eq!(canonical(&doc).unwrap(), format!("{origin}/docs/overview"));
     assert_eq!(meta(&doc, "property", "og:type").unwrap(), "article");
-    assert!(meta(&doc, "property", "og:description").unwrap().starts_with("An atproto PDS whose only durable storage is an object store."));
+    assert!(meta(&doc, "property", "og:description")
+        .unwrap()
+        .starts_with("An atproto PDS whose only durable storage is an object store."));
     assert_eq!(meta(&doc, "name", "twitter:card").unwrap(), "summary_large_image");
     assert_eq!(meta(&doc, "property", "og:image:width").unwrap(), "1200");
     assert_eq!(meta(&doc, "property", "og:image:height").unwrap(), "630");

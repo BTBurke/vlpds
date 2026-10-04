@@ -56,7 +56,14 @@ async fn workload(s: &TestServer) -> Vec<TestAccount> {
             .chain(refs.iter().skip(2).step_by(5).map(|r| json!({"$type": "com.atproto.repo.applyWrites#delete", "collection": r.collection(), "rkey": r.rkey()})))
             .collect();
         // validate:false: likes need TID rkeys under lexicon validation
-        s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "validate": false, "writes": writes}), &a.auth()).await.ok();
+        s.xrpc
+            .post(
+                "com.atproto.repo.applyWrites",
+                &json!({"repo": a.did, "validate": false, "writes": writes}),
+                &a.auth(),
+            )
+            .await
+            .ok();
     }
     // concurrent burst on one repo (coalesced commits)
     let hot = &accts[0];
@@ -96,7 +103,11 @@ async fn go_checker_accepts_firehose() {
     }
     let mut frames = sub
         .until(Duration::from_secs(60), |fs| {
-            want.iter().all(|(d, c)| fs.iter().any(|f| f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c)))
+            want.iter().all(|(d, c)| {
+                fs.iter().any(|f| {
+                    f.did() == Some(d.as_str()) && matches!(f.body.get("commit"), Some(Value::Link(x)) if x == c)
+                })
+            })
         })
         .await;
     // plus anything trailing (e.g. #account/#identity after the last commit)
@@ -113,7 +124,9 @@ async fn go_checker_accepts_firehose() {
 
     let out = tokio::time::timeout(
         Duration::from_secs(120),
-        tokio::process::Command::new(&bin).args(["-host", &s.url, "-cursor", "0", "-max-events", &n.to_string(), "-strict", "-quiet"]).output(),
+        tokio::process::Command::new(&bin)
+            .args(["-host", &s.url, "-cursor", "0", "-max-events", &n.to_string(), "-strict", "-quiet"])
+            .output(),
     )
     .await
     .expect("checker timed out")
@@ -121,7 +134,11 @@ async fn go_checker_accepts_firehose() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     eprintln!("checker stdout:\n{stdout}\nchecker stderr:\n{stderr}");
-    assert!(out.status.success(), "Go sync 1.1 checker reported failures (exit {:?}):\n{stdout}\n{stderr}", out.status.code());
+    assert!(
+        out.status.success(),
+        "Go sync 1.1 checker reported failures (exit {:?}):\n{stdout}\n{stderr}",
+        out.status.code()
+    );
     assert!(stdout.contains(&format!("max-events {n} reached")), "checker did not read all {n} events:\n{stdout}");
 }
 
@@ -157,7 +174,18 @@ async fn go_checker_accepts_key_rotation_resync() {
     let out = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::process::Command::new(&bin)
-            .args(["-host", &s.url, "-cursor", &cursor.to_string(), "-max-events", &n.to_string(), "-strict", "-quiet", "-workers", "1"])
+            .args([
+                "-host",
+                &s.url,
+                "-cursor",
+                &cursor.to_string(),
+                "-max-events",
+                &n.to_string(),
+                "-strict",
+                "-quiet",
+                "-workers",
+                "1",
+            ])
             .output(),
     )
     .await
@@ -165,7 +193,11 @@ async fn go_checker_accepts_key_rotation_resync() {
     .expect("run checker");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "Go checker rejected the rotation's events (exit {:?}):\n{stdout}\n{stderr}", out.status.code());
+    assert!(
+        out.status.success(),
+        "Go checker rejected the rotation's events (exit {:?}):\n{stdout}\n{stderr}",
+        out.status.code()
+    );
     assert!(stdout.contains(&format!("max-events {n} reached")), "{stdout}");
     let sync_line = stdout.lines().find(|l| l.trim_start().starts_with("#sync:")).unwrap_or_default();
     assert!(sync_line.contains("1 (1 verified clean)"), "{stdout}");

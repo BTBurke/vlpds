@@ -40,7 +40,11 @@ async fn a_shard_moving_between_node_calls_is_rerun_on_its_owner() {
 
     // the direct call: only the named shards it owns
     let first = *b_shards.iter().next().unwrap();
-    let j = b.xrpc.post("vlpds.admin.rewrapSecrets", &json!({"dryRun": true, "shards": [first, 9999]}), &Auth::Admin).await.ok();
+    let j = b
+        .xrpc
+        .post("vlpds.admin.rewrapSecrets", &json!({"dryRun": true, "shards": [first, 9999]}), &Auth::Admin)
+        .await
+        .ok();
     assert_eq!(j["scanned"], json!([first]), "{j}");
     assert!(j["layoutVersion"].as_u64().is_some(), "{j}");
 
@@ -59,7 +63,8 @@ async fn a_shard_moving_between_node_calls_is_rerun_on_its_owner() {
     vlpds::cli::admin::set_after_node_hook(None);
     r.unwrap_or_else(|e| panic!("{e:#}: {j}"));
     let rows = j.as_array().unwrap();
-    let row = |name: &str| rows.iter().find(|r| r["node"] == json!(name)).unwrap_or_else(|| panic!("no {name} row: {j}"));
+    let row =
+        |name: &str| rows.iter().find(|r| r["node"] == json!(name)).unwrap_or_else(|| panic!("no {name} row: {j}"));
     assert!(scanned(row(&na)).iter().all(|s| !b_shards.contains(s)), "a scanned only its own shards first: {j}");
     assert!(scanned(row(&nb)).is_empty(), "b had handed its shards away: {j}");
     let rerun: HashSet<u64> = scanned(row(&format!("{na} (rerun)"))).into_iter().collect();

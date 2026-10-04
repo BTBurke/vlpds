@@ -4,7 +4,13 @@ use crate::common::*;
 
 async fn try_create(s: &TestServer, handle: &str) -> Resp {
     let email = format!("{}@example.com", unique_name("e"));
-    s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": handle, "password": "pw-123456", "email": email}), &Auth::None).await
+    s.xrpc
+        .post(
+            "com.atproto.server.createAccount",
+            &json!({"handle": handle, "password": "pw-123456", "email": email}),
+            &Auth::None,
+        )
+        .await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -38,7 +44,9 @@ async fn rejects_handles_outside_service_domains() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rejects_bad_tlds() {
     let s = TestServer::spawn().await;
-    for handle in ["atproto.local", "atproto.arpa", "atproto.invalid", "atproto.localhost", "atproto.onion", "atproto.internal"] {
+    for handle in
+        ["atproto.local", "atproto.arpa", "atproto.invalid", "atproto.localhost", "atproto.onion", "atproto.internal"]
+    {
         try_create(&s, handle).await.client_err();
     }
 }
@@ -59,7 +67,15 @@ async fn validates_handle_length() {
 async fn rejects_invalid_handle_syntax() {
     let s = TestServer::spawn().await;
     let d = HANDLE_DOMAIN;
-    for bad in [format!("jo_hn.{d}"), format!("jo hn.{d}"), format!("-john.{d}"), format!("john-.{d}"), format!("{}.{d}", "a".repeat(64)), "did:plc:abc".to_string(), format!("john..{d}")] {
+    for bad in [
+        format!("jo_hn.{d}"),
+        format!("jo hn.{d}"),
+        format!("-john.{d}"),
+        format!("john-.{d}"),
+        format!("{}.{d}", "a".repeat(64)),
+        "did:plc:abc".to_string(),
+        format!("john..{d}"),
+    ] {
         let r = try_create(&s, &bad).await;
         assert_eq!(r.status, 400, "{bad}: {}", r.text());
         assert!(matches!(r.error_name(), Some("InvalidHandle") | Some("InvalidRequest")), "{bad}: {}", r.text());

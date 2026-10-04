@@ -247,10 +247,12 @@ impl Client {
 
     async fn send(&self, nsid: &str, rb: reqwest::RequestBuilder, admin: bool) -> Result<J> {
         let rb = if admin { rb.basic_auth("admin", Some(&self.token)) } else { rb };
-        let r = rb.timeout(Duration::from_secs(600)).send().await.with_context(|| format!("{nsid} at {}", self.base))?;
+        let r =
+            rb.timeout(Duration::from_secs(600)).send().await.with_context(|| format!("{nsid} at {}", self.base))?;
         let status = r.status();
         let body = r.text().await?;
-        let j: J = if body.trim().is_empty() { J::Null } else { serde_json::from_str(&body).unwrap_or(J::String(body)) };
+        let j: J =
+            if body.trim().is_empty() { J::Null } else { serde_json::from_str(&body).unwrap_or(J::String(body)) };
         if !status.is_success() {
             match (j["error"].as_str(), j["message"].as_str()) {
                 (Some(e), Some(m)) => bail!("{nsid}: {} {e}: {m}", status.as_u16()),
@@ -303,7 +305,8 @@ fn confirm(prompt: &str) -> Result<bool> {
 
 fn table(rows: &[Vec<String>]) -> String {
     let cols = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let widths: Vec<usize> = (0..cols).map(|i| rows.iter().filter_map(|r| r.get(i)).map(|c| c.chars().count()).max().unwrap_or(0)).collect();
+    let widths: Vec<usize> =
+        (0..cols).map(|i| rows.iter().filter_map(|r| r.get(i)).map(|c| c.chars().count()).max().unwrap_or(0)).collect();
     let mut out = String::new();
     for r in rows {
         let mut line = String::new();
@@ -342,9 +345,10 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
         Cmd::ShardSplit { shard, at, no_wait } => {
             pretty(out, &c.post("vlpds.admin.splitShard", &json!({"shard": shard, "at": at, "wait": !no_wait})).await?)
         }
-        Cmd::ShardMerge { left, right, no_wait } => {
-            pretty(out, &c.post("vlpds.admin.mergeShards", &json!({"left": left, "right": right, "wait": !no_wait})).await?)
-        }
+        Cmd::ShardMerge { left, right, no_wait } => pretty(
+            out,
+            &c.post("vlpds.admin.mergeShards", &json!({"left": left, "right": right, "wait": !no_wait})).await?,
+        ),
         Cmd::ReshardAbort => pretty(out, &c.post("vlpds.admin.abortReshard", &json!({})).await?),
         Cmd::Account(a) => account(&c, a, opts, out).await,
         Cmd::CreateInviteCode { uses, count, for_account } => {
@@ -372,7 +376,11 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
                 pretty(out, &r)?;
             } else {
                 for x in &results {
-                    let what = if x["ok"] == json!(true) { "ok".to_string() } else { format!("FAILED {} {}", s(&x["status"]), s(&x["error"])) };
+                    let what = if x["ok"] == json!(true) {
+                        "ok".to_string()
+                    } else {
+                        format!("FAILED {} {}", s(&x["status"]), s(&x["error"]))
+                    };
                     writeln!(out, "Requesting crawl of {} from {}: {what}", s(&r["hostname"]), s(&x["relay"]))?;
                 }
             }
@@ -465,9 +473,18 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
                 return pretty(out, &r);
             }
             writeln!(out, "Record count : {}", s(&r["records"]))?;
-            writeln!(out, "Nodes before : {} stored, {} expected", s(&r["before"]["nodes"]["stored"]), s(&r["before"]["nodes"]["expected"]))?;
+            writeln!(
+                out,
+                "Nodes before : {} stored, {} expected",
+                s(&r["before"]["nodes"]["stored"]),
+                s(&r["before"]["nodes"]["expected"])
+            )?;
             writeln!(out, "New commit   : {} (rev {})", s(&r["commit"]), s(&r["rev"]))?;
-            writeln!(out, "After        : {}", if r["after"]["ok"] == json!(true) { "ok".to_string() } else { s(&r["after"]["problems"]) })?;
+            writeln!(
+                out,
+                "After        : {}",
+                if r["after"]["ok"] == json!(true) { "ok".to_string() } else { s(&r["after"]["problems"]) }
+            )?;
             Ok(())
         }
         Cmd::Cluster(ClusterCmd::Status) => {
@@ -481,7 +498,12 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             let (st, active) = active_level(&c).await?;
             let level = level.unwrap_or(active + 1);
             if level > active && !yes {
-                let nodes: Vec<String> = st["nodes"].as_array().into_iter().flatten().map(|n| format!("{} (max {})", s(&n["node"]), s(&n["maxLevel"]))).collect();
+                let nodes: Vec<String> = st["nodes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|n| format!("{} (max {})", s(&n["node"]), s(&n["maxLevel"])))
+                    .collect();
                 eprintln!("Active level {active}; nodes: {}", nodes.join(", "));
                 if !confirm(&format!("Raise the cluster to feature level {level}? Builds that can't run it will no longer start (no rollback by redeploy)"))? {
                     bail!("aborted");
@@ -596,7 +618,12 @@ async fn account(c: &Client, cmd: AccountCmd, opts: &Opts, out: &mut dyn Write) 
                 "takedown": {"applied": true, "ref": reference},
             });
             c.post("com.atproto.admin.updateSubjectStatus", &body).await?;
-            done(out, opts, json!({"did": did, "takedown": {"applied": true, "ref": reference}}), &format!("{did} taken down (ref {reference})"))
+            done(
+                out,
+                opts,
+                json!({"did": did, "takedown": {"applied": true, "ref": reference}}),
+                &format!("{did} taken down (ref {reference})"),
+            )
         }
         AccountCmd::Untakedown { did } => {
             check_did(&did)?;
@@ -611,15 +638,17 @@ async fn account(c: &Client, cmd: AccountCmd, opts: &Opts, out: &mut dyn Write) 
             check_did(&did)?;
             let password = password.unwrap_or_else(generate_password);
             c.post("com.atproto.admin.updateAccountPassword", &json!({"did": did, "password": password})).await?;
-            done(out, opts, json!({"did": did, "password": password}), &format!("\nPassword reset for {did}\nNew password: {password}\n"))
+            done(
+                out,
+                opts,
+                json!({"did": did, "password": password}),
+                &format!("\nPassword reset for {did}\nNew password: {password}\n"),
+            )
         }
         AccountCmd::Info { did } => {
             check_did(&did)?;
             let r = c.get("com.atproto.admin.getAccountInfo", &[("did", &did)]).await?;
-            let st = c
-                .get("com.atproto.admin.getSubjectStatus", &[("did", &did)])
-                .await
-                .unwrap_or(J::Null);
+            let st = c.get("com.atproto.admin.getSubjectStatus", &[("did", &did)]).await.unwrap_or(J::Null);
             if opts.json {
                 return pretty(out, &json!({"account": r, "status": st}));
             }
@@ -715,8 +744,17 @@ const COVERAGE_ROUNDS: usize = 3;
 /// between two nodes' calls is in neither list, so the union is checked
 /// against the current layout and missing shards are rerun on their owners
 /// (`shards` in the body). Shards still missing after that fail the command.
-async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write, nsid: &str, body: J, cols: &[&str]) -> Result<()> {
-    let nodes = if node_only { vec![("this node".to_string(), c.base.clone(), None)] } else { cluster_nodes(c).await? };
+async fn per_node(
+    c: &Client,
+    node_only: bool,
+    opts: &Opts,
+    out: &mut dyn Write,
+    nsid: &str,
+    body: J,
+    cols: &[&str],
+) -> Result<()> {
+    let nodes =
+        if node_only { vec![("this node".to_string(), c.base.clone(), None)] } else { cluster_nodes(c).await? };
     let mut results = Vec::new();
     let mut covered = std::collections::HashSet::new();
     let call = |name: String, url: String, id: Option<String>, body: J| async move {
@@ -783,7 +821,8 @@ async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write,
     if opts.json {
         pretty(out, &J::Array(results.clone()))?;
     } else {
-        let mut rows = vec![std::iter::once("node".to_string()).chain(cols.iter().map(|c| c.to_string())).collect::<Vec<_>>()];
+        let mut rows =
+            vec![std::iter::once("node".to_string()).chain(cols.iter().map(|c| c.to_string())).collect::<Vec<_>>()];
         let mut totals = vec![0u64; cols.len()];
         for r in &results {
             let mut row = vec![s(&r["node"])];
@@ -811,7 +850,8 @@ async fn per_node(c: &Client, node_only: bool, opts: &Opts, out: &mut dyn Write,
         }
     }
     if !missing.is_empty() {
-        let ids: Vec<String> = missing.iter().map(|(id, owner)| format!("{id} (owner {})", owner.as_deref().unwrap_or("none"))).collect();
+        let ids: Vec<String> =
+            missing.iter().map(|(id, owner)| format!("{id} (owner {})", owner.as_deref().unwrap_or("none"))).collect();
         bail!("shards not scanned by any node: {}", ids.join(", "));
     }
     if failed > 0 {
@@ -824,11 +864,37 @@ fn write_check(out: &mut dyn Write, r: &J) -> Result<()> {
     let n = &r["nodes"];
     let ix = &r["indexes"];
     writeln!(out, "Repo         : {} ({})", s(&r["did"]), if r["ok"] == json!(true) { "ok" } else { "PROBLEMS" })?;
-    writeln!(out, "Head         : {} rev {} data {}", s(&r["head"]["commit"]), s(&r["head"]["rev"]), s(&r["head"]["data"]))?;
-    writeln!(out, "Commit       : cid {} data {} did {} signature {}", s(&r["commit"]["cidOk"]), s(&r["commit"]["dataOk"]), s(&r["commit"]["didOk"]), s(&r["commit"]["signatureOk"]))?;
+    writeln!(
+        out,
+        "Head         : {} rev {} data {}",
+        s(&r["head"]["commit"]),
+        s(&r["head"]["rev"]),
+        s(&r["head"]["data"])
+    )?;
+    writeln!(
+        out,
+        "Commit       : cid {} data {} did {} signature {}",
+        s(&r["commit"]["cidOk"]),
+        s(&r["commit"]["dataOk"]),
+        s(&r["commit"]["didOk"]),
+        s(&r["commit"]["signatureOk"])
+    )?;
     writeln!(out, "Records      : {} ({} bad)", s(&r["records"]["count"]), s(&r["records"]["badCount"]))?;
-    writeln!(out, "MST          : rebuilt root {} (matches head: {})", s(&r["mst"]["rebuiltRoot"]), s(&r["mst"]["matchesHead"]))?;
-    writeln!(out, "Stored nodes : {} stored, {} expected, {} missing, {} extra, {} corrupt", s(&n["stored"]), s(&n["expected"]), s(&n["missing"]), s(&n["extra"]), s(&n["corrupt"]))?;
+    writeln!(
+        out,
+        "MST          : rebuilt root {} (matches head: {})",
+        s(&r["mst"]["rebuiltRoot"]),
+        s(&r["mst"]["matchesHead"])
+    )?;
+    writeln!(
+        out,
+        "Stored nodes : {} stored, {} expected, {} missing, {} extra, {} corrupt",
+        s(&n["stored"]),
+        s(&n["expected"]),
+        s(&n["missing"]),
+        s(&n["extra"]),
+        s(&n["corrupt"])
+    )?;
     writeln!(
         out,
         "Indexes      : record-CID {} missing / {} stale, blob-ref {} missing / {} stale, collections missing {}",
@@ -848,20 +914,44 @@ fn write_cluster(out: &mut dyn Write, r: &J) -> Result<()> {
     let table_owners = r["table"].as_array().cloned().unwrap_or_default();
     let unowned = table_owners.iter().filter(|o| o.is_null()).count();
     writeln!(out, "Node         : {} (lease valid: {})", s(&r["node"]), s(&r["leaseValid"]))?;
-    writeln!(out, "Shards       : {} in layout v{}, {} owned here, {} unowned", s(&r["shards"]), s(&r["layout"]["version"]), r["owned"].as_array().map_or(0, Vec::len), unowned)?;
+    writeln!(
+        out,
+        "Shards       : {} in layout v{}, {} owned here, {} unowned",
+        s(&r["shards"]),
+        s(&r["layout"]["version"]),
+        r["owned"].as_array().map_or(0, Vec::len),
+        unowned
+    )?;
     if !r["layout"]["op"].is_null() {
         writeln!(out, "Reshard      : {}", r["layout"]["op"])?;
     }
-    writeln!(out, "Firehose     : last emitted {}, min watermark {}", s(&r["firehose"]["lastEmitted"]), s(&r["firehose"]["minWatermark"]))?;
+    writeln!(
+        out,
+        "Firehose     : last emitted {}, min watermark {}",
+        s(&r["firehose"]["lastEmitted"]),
+        s(&r["firehose"]["minWatermark"])
+    )?;
     let v = &r["version"];
     if !v.is_null() {
         let target = if v["target"].is_null() { String::new() } else { format!(", raising to {}", s(&v["target"])) };
-        writeln!(out, "Feature level: {} active{target} (this build {}..={}, rev {})", s(&v["active"]), s(&v["binary"]["min"]), s(&v["binary"]["max"]), s(&v["binary"]["rev"]))?;
+        writeln!(
+            out,
+            "Feature level: {} active{target} (this build {}..={}, rev {})",
+            s(&v["active"]),
+            s(&v["binary"]["min"]),
+            s(&v["binary"]["max"]),
+            s(&v["binary"]["rev"])
+        )?;
         if v["mixedBuilds"] == json!(true) {
             writeln!(out, "Builds       : mixed ({})", s(&v["revs"]))?;
         }
         if !v["finalizable"].is_null() {
-            writeln!(out, "Finalize     : every node can run level {}: `vlpds admin cluster finalize --level {}`", s(&v["finalizable"]), s(&v["finalizable"]))?;
+            writeln!(
+                out,
+                "Finalize     : every node can run level {}: `vlpds admin cluster finalize --level {}`",
+                s(&v["finalizable"]),
+                s(&v["finalizable"])
+            )?;
         }
         if !v["finalizedAt"].is_null() {
             writeln!(out, "Finalized    : at {} (older builds can no longer join)", s(&v["finalizedAt"]))?;
@@ -873,11 +963,23 @@ fn write_cluster(out: &mut dyn Write, r: &J) -> Result<()> {
     let nodes = r["nodes"].as_array().cloned().unwrap_or_default();
     if !nodes.is_empty() {
         writeln!(out)?;
-        let mut rows = vec![["node", "addr", "reachable", "lease", "owned", "durable", "writer", "rev", "levels"].map(String::from).to_vec()];
+        let mut rows = vec![["node", "addr", "reachable", "lease", "owned", "durable", "writer", "rev", "levels"]
+            .map(String::from)
+            .to_vec()];
         for n in &nodes {
             let name = if n["self"] == json!(true) { format!("{}*", s(&n["node"])) } else { s(&n["node"]) };
             let levels = format!("{}..={}", s(&n["minLevel"]), s(&n["maxLevel"]));
-            rows.push(vec![name, s(&n["addr"]), s(&n["reachable"]), s(&n["leaseValid"]), s(&n["owned"]), s(&n["logDurableOrdinal"]), s(&n["writer"]), s(&n["rev"]), levels]);
+            rows.push(vec![
+                name,
+                s(&n["addr"]),
+                s(&n["reachable"]),
+                s(&n["leaseValid"]),
+                s(&n["owned"]),
+                s(&n["logDurableOrdinal"]),
+                s(&n["writer"]),
+                s(&n["rev"]),
+                levels,
+            ]);
         }
         write!(out, "{}", table(&rows))?;
     }

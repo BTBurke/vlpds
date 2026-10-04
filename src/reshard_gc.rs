@@ -50,7 +50,14 @@ pub const FULL_PASS_EVERY: Duration = Duration::from_secs(3600);
 
 impl Default for Config {
     fn default() -> Self {
-        Config { interval: DEFAULT_INTERVAL, grace: Some(DEFAULT_GRACE), max_dirs: 8, detach_after: Some(DEFAULT_DETACH_AFTER), max_inflight: 1, full_every: None }
+        Config {
+            interval: DEFAULT_INTERVAL,
+            grace: Some(DEFAULT_GRACE),
+            max_dirs: 8,
+            detach_after: Some(DEFAULT_DETACH_AFTER),
+            max_inflight: 1,
+            full_every: None,
+        }
     }
 }
 
@@ -172,7 +179,13 @@ impl ReshardGc {
                     Ok(p) => {
                         metrics::RESHARD_GC_PASSES.with_label_values(&["ok"]).inc();
                         if p.deleted_dirs + p.deleted_assigns > 0 {
-                            tracing::info!(dirs = p.deleted_dirs, objects = p.deleted_objects, assigns = p.deleted_assigns, retired = p.retired, "reshard GC pass");
+                            tracing::info!(
+                                dirs = p.deleted_dirs,
+                                objects = p.deleted_objects,
+                                assigns = p.deleted_assigns,
+                                retired = p.retired,
+                                "reshard GC pass"
+                            );
                         }
                     }
                     Err(e) => {
@@ -216,7 +229,11 @@ impl ReshardGc {
             if let Some(r) = done {
                 metrics::FORCED_COMPACTIONS.with_label_values(&[kind.label(), r]).inc();
                 if r == "failed" {
-                    tracing::info!(shard = id.0, kind = kind.label(), "forced compaction failed (conflicted with another; retried)");
+                    tracing::info!(
+                        shard = id.0,
+                        kind = kind.label(),
+                        "forced compaction failed (conflicted with another; retried)"
+                    );
                 }
                 self.st.lock().inflight.remove(&id);
             }
@@ -230,7 +247,10 @@ impl ReshardGc {
                 let st = self.st.lock();
                 let busy = st.inflight.contains_key(&id) || st.inflight.len() >= self.cfg.max_inflight.max(1);
                 let seen = st.seen.get(&id).copied().unwrap_or(now);
-                let due_full = self.cfg.full_every.is_some_and(|every| now.duration_since(st.last_full.get(&id).copied().unwrap_or(seen)) >= every);
+                let due_full = self
+                    .cfg
+                    .full_every
+                    .is_some_and(|every| now.duration_since(st.last_full.get(&id).copied().unwrap_or(seen)) >= every);
                 (busy, seen, due_full)
             };
             // a deep L0 means compaction is busy (and would refuse ours)
@@ -312,7 +332,8 @@ impl ReshardGc {
         // An owner's in-memory manifest that still lists a parent's SSTs is
         // replaced only at its next manifest poll.
         let grace = if cfg!(test) { grace } else { grace.max(crate::partition::manifest_poll_interval() * 3) };
-        let layout = self.get_json::<Layout>(&Path::from(format!("{}/{}", self.store.prefix, crate::cluster::LAYOUT))).await;
+        let layout =
+            self.get_json::<Layout>(&Path::from(format!("{}/{}", self.store.prefix, crate::cluster::LAYOUT))).await;
         let started = Instant::now();
         {
             let mut st = self.st.lock();
@@ -357,13 +378,19 @@ impl ReshardGc {
             deletable.retain(|x| {
                 let r = referenced.contains(x);
                 if r {
-                    tracing::error!(shard = x.0, "retired state dir holds no checkpoint but a manifest lists its SSTs: kept");
+                    tracing::error!(
+                        shard = x.0,
+                        "retired state dir holds no checkpoint but a manifest lists its SSTs: kept"
+                    );
                     *pass.held.entry(Held::Referenced).or_default() += 1;
                 }
                 !r
             });
         }
-        for (state, n) in [("deletable", deletable.len())].into_iter().chain([Held::Checkpoint, Held::Grace, Held::Referenced, Held::Other].map(|h| (h.label(), pass.held.get(&h).copied().unwrap_or(0)))) {
+        for (state, n) in [("deletable", deletable.len())].into_iter().chain(
+            [Held::Checkpoint, Held::Grace, Held::Referenced, Held::Other]
+                .map(|h| (h.label(), pass.held.get(&h).copied().unwrap_or(0))),
+        ) {
             metrics::RESHARD_GC_RETIRED.with_label_values(&[state]).set(n as i64);
         }
         for x in deletable.into_iter().take(self.cfg.max_dirs.max(1)) {
@@ -384,7 +411,12 @@ impl ReshardGc {
         // assignments whose dir is gone (a pass that stopped between the
         // two deletes, an op aborted before its clone)
         let dirs = self.state_dirs().await?;
-        let orphans: Vec<ShardId> = self.assign_records().await?.into_iter().filter(|s| !live.contains(s) && *s < layout.next_id && !dirs.contains(s)).collect();
+        let orphans: Vec<ShardId> = self
+            .assign_records()
+            .await?
+            .into_iter()
+            .filter(|s| !live.contains(s) && *s < layout.next_id && !dirs.contains(s))
+            .collect();
         metrics::RESHARD_GC_ORPHAN_ASSIGNS.set(orphans.len() as i64);
         let idle = pass.retired == 0 && orphans.is_empty();
         for x in orphans.into_iter().take(self.cfg.max_dirs.max(1) * 4) {
@@ -426,7 +458,9 @@ impl ReshardGc {
             .filter_map(|m| async move { m.ok().map(|m| m.last_modified) })
             .fold(None, |a: Option<chrono::DateTime<chrono::Utc>>, t| async move { Some(a.map_or(t, |a| a.max(t))) })
             .await;
-        if newest.is_some_and(|t| t > now - chrono::Duration::from_std(grace).unwrap_or_else(|_| chrono::Duration::weeks(5200))) {
+        if newest.is_some_and(|t| {
+            t > now - chrono::Duration::from_std(grace).unwrap_or_else(|_| chrono::Duration::weeks(5200))
+        }) {
             return Ok(Err(Held::Grace));
         }
         Ok(Ok(()))
@@ -435,7 +469,8 @@ impl ReshardGc {
     /// Which of `xs` some other manifest under `state/` lists with SSTs it
     /// still reads.
     async fn referenced(&self, dirs: &BTreeSet<ShardId>, xs: &[ShardId]) -> anyhow::Result<HashSet<ShardId>> {
-        let paths: HashMap<String, ShardId> = xs.iter().map(|x| (crate::partition::db_path(&self.store, *x), *x)).collect();
+        let paths: HashMap<String, ShardId> =
+            xs.iter().map(|x| (crate::partition::db_path(&self.store, *x), *x)).collect();
         let lists: Vec<anyhow::Result<Vec<String>>> = futures::stream::iter(dirs.iter().copied())
             .map(|d| async move {
                 let Some(m) = self.admin(d).read_manifest(None).await? else { return Ok(Vec::new()) };
@@ -492,13 +527,19 @@ pub fn has_inherited(m: &VersionedManifest) -> bool {
 fn rewrite_spec(m: &VersionedManifest, full: bool) -> Option<CompactionSpec> {
     let inherited: Vec<_> = m.external_dbs().iter().flat_map(|e| e.sst_ids.iter()).collect();
     // logical order: L0 newest -> oldest, then sorted runs highest id -> 0
-    let mut sources: Vec<(SourceId, bool)> = m.l0().iter().map(|v| (SourceId::SstView(v.id), inherited.contains(&&v.sst.id))).collect();
-    sources.extend(m.compacted().iter().map(|sr| (SourceId::SortedRun(sr.id), sr.sst_views().iter().any(|v| inherited.contains(&&v.sst.id)))));
+    let mut sources: Vec<(SourceId, bool)> =
+        m.l0().iter().map(|v| (SourceId::SstView(v.id), inherited.contains(&&v.sst.id))).collect();
+    sources.extend(
+        m.compacted()
+            .iter()
+            .map(|sr| (SourceId::SortedRun(sr.id), sr.sst_views().iter().any(|v| inherited.contains(&&v.sst.id)))),
+    );
     let first = if full { (!sources.is_empty()).then_some(0)? } else { sources.iter().position(|(_, ext)| *ext)? };
     let srcs: Vec<SourceId> = sources[first..].iter().map(|(s, _)| *s).collect();
     // into the lowest sorted run among them; with none (L0 only, so no
     // sorted run exists at all) a new run 0
-    let dest = srcs.iter().filter_map(|s| if let SourceId::SortedRun(id) = s { Some(*id) } else { None }).min().unwrap_or(0);
+    let dest =
+        srcs.iter().filter_map(|s| if let SourceId::SortedRun(id) = s { Some(*id) } else { None }).min().unwrap_or(0);
     Some(CompactionSpec::new(srcs, dest))
 }
 
@@ -514,7 +555,11 @@ mod tests {
     }
 
     async fn put_json<T: serde::Serialize>(store: &Store, rel: &str, v: &T) {
-        store.raw.put(&Path::from(format!("{}/{rel}", store.prefix)), serde_json::to_vec(v).unwrap().into()).await.unwrap();
+        store
+            .raw
+            .put(&Path::from(format!("{}/{rel}", store.prefix)), serde_json::to_vec(v).unwrap().into())
+            .await
+            .unwrap();
     }
 
     fn layout(shards: &[(u32, u32, u32)], next_id: u32, op: Option<crate::slots::Reshard>) -> Layout {
@@ -527,13 +572,28 @@ mod tests {
         l
     }
 
-    fn gc(store: &Store, owned: OwnedDbs, grace: Duration, crash: Option<Arc<std::sync::atomic::AtomicBool>>) -> Arc<ReshardGc> {
-        let cfg = Config { interval: Duration::from_secs(3600), grace: Some(grace), max_dirs: 8, detach_after: Some(Duration::ZERO), max_inflight: 4, full_every: None };
+    fn gc(
+        store: &Store,
+        owned: OwnedDbs,
+        grace: Duration,
+        crash: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> Arc<ReshardGc> {
+        let cfg = Config {
+            interval: Duration::from_secs(3600),
+            grace: Some(grace),
+            max_dirs: 8,
+            detach_after: Some(Duration::ZERO),
+            max_inflight: 4,
+            full_every: None,
+        };
         let hooks = Hooks {
             leader: Box::new(|| true),
             lease_ok: Box::new(|| true),
             owned: Box::new(move || owned.lock().clone()),
-            crash_at: crash.map(|c| Box::new(move |p: &str| p == "deleted-dir" && c.swap(false, std::sync::atomic::Ordering::SeqCst)) as PhaseHook),
+            crash_at: crash.map(|c| {
+                Box::new(move |p: &str| p == "deleted-dir" && c.swap(false, std::sync::atomic::Ordering::SeqCst))
+                    as PhaseHook
+            }),
         };
         ReshardGc::new(store.clone(), cfg, hooks)
     }
@@ -596,10 +656,16 @@ mod tests {
         assert_eq!(spec.sources().len(), m.l0().len() + m.compacted().len(), "{spec}");
         // a write of its own on top: still the inherited suffix only
         c.put(k(5, "h/own"), "x").await.unwrap();
-        c.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable }).await.unwrap();
+        c.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+            .await
+            .unwrap();
         let m = c.manifest();
         let spec2 = rewrite_spec(&m, false).unwrap();
-        assert_eq!(spec2.sources().len(), m.l0().len() + m.compacted().len() - 1, "the newest (own) L0 is left out: {spec2}");
+        assert_eq!(
+            spec2.sources().len(),
+            m.l0().len() + m.compacted().len() - 1,
+            "the newest (own) L0 is left out: {spec2}"
+        );
         assert_eq!(rewrite_spec(&m, true).unwrap().sources().len(), m.l0().len() + m.compacted().len());
         c.close().await.unwrap();
     }
@@ -617,7 +683,13 @@ mod tests {
         let keys = parent(&store, ShardId(0), 400).await;
         put_json(&store, "assign/0000000000", &Assignment { frozen: Some(1), ..Default::default() }).await;
         // the op is still pending: nothing is touched
-        let op = crate::slots::Reshard { id: 1, parents: vec![ShardId(0)], children: vec![], driver: "n".into(), extra: Default::default() };
+        let op = crate::slots::Reshard {
+            id: 1,
+            parents: vec![ShardId(0)],
+            children: vec![],
+            driver: "n".into(),
+            extra: Default::default(),
+        };
         put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 3, Some(op))).await;
         clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
         clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
@@ -698,21 +770,37 @@ mod tests {
         put_json(&store, "assign/0000000007", &Assignment::default()).await;
         // shard 5 retired (out of the layout), held by a named checkpoint
         put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 8, None)).await;
-        let admin5 = slatedb::admin::AdminBuilder::new(crate::partition::db_path(&store, ShardId(5)), store.raw.clone()).build();
-        let cp = admin5.create_detached_checkpoint(&slatedb::config::CheckpointOptions { lifetime: Some(Duration::from_secs(3600)), name: Some("backup".into()), ..Default::default() }).await.unwrap();
+        let admin5 =
+            slatedb::admin::AdminBuilder::new(crate::partition::db_path(&store, ShardId(5)), store.raw.clone()).build();
+        let cp = admin5
+            .create_detached_checkpoint(&slatedb::config::CheckpointOptions {
+                lifetime: Some(Duration::from_secs(3600)),
+                name: Some("backup".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let g = gc(&store, Arc::new(Mutex::new(Vec::new())), Duration::from_secs(3600), None);
         // within the grace: everything kept
         let p = g.dir_pass().await.unwrap();
         assert_eq!((p.retired, p.deleted_dirs), (2, 0), "{p:?}");
         assert_eq!((p.held.get(&Held::Checkpoint), p.held.get(&Held::Grace)), (Some(&1), Some(&1)), "{p:?}");
-        let admin0 = slatedb::admin::AdminBuilder::new(crate::partition::db_path(&store, ShardId(0)), store.raw.clone()).build();
-        assert_eq!(admin0.list_checkpoints(None).await.unwrap().iter().filter(|c| c.expire_time.is_none()).count(), 1, "clone 7 pins 0");
+        let admin0 =
+            slatedb::admin::AdminBuilder::new(crate::partition::db_path(&store, ShardId(0)), store.raw.clone()).build();
+        assert_eq!(
+            admin0.list_checkpoints(None).await.unwrap().iter().filter(|c| c.expire_time.is_none()).count(),
+            1,
+            "clone 7 pins 0"
+        );
         // past the grace: the aborted clone goes (and unpins 0); 5 stays
         let g = gc(&store, Arc::new(Mutex::new(Vec::new())), Duration::ZERO, None);
         let p = g.dir_pass().await.unwrap();
         assert_eq!((p.deleted_dirs, p.deleted_assigns, p.held.get(&Held::Checkpoint)), (1, 1, Some(&1)), "{p:?}");
         assert_eq!(dirs(&store).await, vec![0, 5]);
-        assert!(admin0.list_checkpoints(None).await.unwrap().iter().all(|c| c.expire_time.is_some()), "0's pin went with the clone");
+        assert!(
+            admin0.list_checkpoints(None).await.unwrap().iter().all(|c| c.expire_time.is_some()),
+            "0's pin went with the clone"
+        );
         // the backup's checkpoint expires (deleted here): 5 goes too
         admin5.delete_checkpoint(cp.id).await.unwrap();
         let p = g.dir_pass().await.unwrap();
@@ -747,7 +835,12 @@ mod tests {
         // a delete of 1 that died half-way: marker written, manifests gone
         let dir1 = crate::partition::db_path(&store, ShardId(1));
         store.raw.put(&Path::from(format!("{dir1}/.deleting")), bytes::Bytes::new().into()).await.unwrap();
-        let manifests: Vec<Path> = store.raw.list(Some(&Path::from(format!("{dir1}/manifest")))).filter_map(|m| async move { m.ok().map(|m| m.location) }).collect().await;
+        let manifests: Vec<Path> = store
+            .raw
+            .list(Some(&Path::from(format!("{dir1}/manifest"))))
+            .filter_map(|m| async move { m.ok().map(|m| m.location) })
+            .collect()
+            .await;
         for m in manifests {
             store.raw.delete(&m).await.unwrap();
         }
@@ -755,13 +848,25 @@ mod tests {
         assert_eq!((p.deleted_dirs, p.deleted_assigns), (1, 2), "{p:?}");
         assert_eq!(dirs(&store).await, vec![2]);
         assert!(assigns(&store).await.is_empty());
-        let left: Vec<Path> = store.raw.list(Some(&Path::from(dir1))).filter_map(|m| async move { m.ok().map(|m| m.location) }).collect().await;
+        let left: Vec<Path> = store
+            .raw
+            .list(Some(&Path::from(dir1)))
+            .filter_map(|m| async move { m.ok().map(|m| m.location) })
+            .collect()
+            .await;
         assert!(left.is_empty(), "{left:?}");
         let db = open_db(&store, ShardId(2), None).await.unwrap();
         check_keys(&db, &keys, 0, 65536).await;
         db.close().await.unwrap();
         // nothing else to do, and a dir with neither manifest nor marker is left alone
-        store.raw.put(&Path::from(format!("{}/state/0000000001/stray", store.prefix)), bytes::Bytes::from_static(b"x").into()).await.unwrap();
+        store
+            .raw
+            .put(
+                &Path::from(format!("{}/state/0000000001/stray", store.prefix)),
+                bytes::Bytes::from_static(b"x").into(),
+            )
+            .await
+            .unwrap();
         let p = g.dir_pass().await.unwrap();
         assert_eq!((p.deleted_dirs, p.held.get(&Held::Other)), (0, Some(&1)), "{p:?}");
     }
@@ -790,20 +895,39 @@ mod tests {
 
     #[async_trait::async_trait]
     impl object_store::ObjectStore for Counting {
-        async fn put_opts(&self, location: &Path, payload: object_store::PutPayload, opts: object_store::PutOptions) -> object_store::Result<object_store::PutResult> {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
             self.inner.put_opts(location, payload, opts).await
         }
-        async fn put_multipart_opts(&self, location: &Path, opts: object_store::PutMultipartOptions) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn get_opts(&self, location: &Path, options: object_store::GetOptions) -> object_store::Result<object_store::GetResult> {
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
             self.gets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.get_opts(location, options).await
         }
-        fn delete_stream(&self, locations: futures::stream::BoxStream<'static, object_store::Result<Path>>) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
             self.inner.delete_stream(locations)
         }
-        fn list(&self, prefix: Option<&Path>) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list(prefix)
         }
@@ -811,13 +935,19 @@ mod tests {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy_opts(&self, from: &Path, to: &Path, options: object_store::CopyOptions) -> object_store::Result<()> {
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
         }
     }
 
     fn counting_store(prefix: &str) -> (Store, Arc<Counting>) {
-        let c = Arc::new(Counting { inner: Store::memory(None).raw, lists: Default::default(), gets: Default::default() });
+        let c =
+            Arc::new(Counting { inner: Store::memory(None).raw, lists: Default::default(), gets: Default::default() });
         (Store { prefix: prefix.into(), raw: c.clone(), ..Store::memory(None) }, c)
     }
 
@@ -888,7 +1018,13 @@ mod tests {
         assert!(!g.dir_pass().await.unwrap().skipped);
         assert!(g.dir_pass().await.unwrap().skipped);
         // the split is planned: nothing touched, nothing skipped
-        let op = crate::slots::Reshard { id: 1, parents: vec![ShardId(0)], children: vec![], driver: "n".into(), extra: Default::default() };
+        let op = crate::slots::Reshard {
+            id: 1,
+            parents: vec![ShardId(0)],
+            children: vec![],
+            driver: "n".into(),
+            extra: Default::default(),
+        };
         put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 2, Some(op))).await;
         let p = g.dir_pass().await.unwrap();
         assert!(p.op_pending && !p.skipped, "{p:?}");
@@ -902,7 +1038,11 @@ mod tests {
         n.take();
         for _ in 0..2 {
             let p = g.dir_pass().await.unwrap();
-            assert_eq!((p.skipped, p.retired, p.deleted_dirs, p.held.get(&Held::Grace)), (false, 1, 0, Some(&1)), "{p:?}");
+            assert_eq!(
+                (p.skipped, p.retired, p.deleted_dirs, p.held.get(&Held::Grace)),
+                (false, 1, 0, Some(&1)),
+                "{p:?}"
+            );
             assert!(n.take().0 >= 3, "a full pass");
         }
         wait_for("the parent deleted", 20, async || {

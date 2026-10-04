@@ -11,8 +11,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
-const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const CLIENT_ASSERTION_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 pub const AUTH_METHODS_SUPPORTED: [&str; 2] = ["none", "private_key_jwt"];
 
 const DAY: i64 = 86_400;
@@ -39,11 +38,7 @@ pub enum ClientAuth {
     #[serde(rename = "none")]
     None,
     #[serde(rename = "private_key_jwt")]
-    PrivateKeyJwt {
-        alg: String,
-        kid: String,
-        jkt: String,
-    },
+    PrivateKeyJwt { alg: String, kid: String, jkt: String },
 }
 
 #[derive(Clone, Debug)]
@@ -86,9 +81,7 @@ impl Client {
     }
 
     pub fn allows_redirect_uri(&self, uri: &str) -> bool {
-        self.redirect_uris
-            .iter()
-            .any(|a| compare_redirect_uri(a, uri))
+        self.redirect_uris.iter().any(|a| compare_redirect_uri(a, uri))
     }
 
     /// RFC 7523 §3. Returns the binding to store with the session and the
@@ -104,35 +97,28 @@ impl Client {
         match self.auth_method.as_str() {
             "none" => {
                 if creds.client_assertion.is_some() {
-                    return Err(OAuthError::invalid_client(
-                        "client authentication not expected for public clients",
-                    ));
+                    return Err(OAuthError::invalid_client("client authentication not expected for public clients"));
                 }
                 Ok((ClientAuth::None, None))
             }
             "private_key_jwt" => {
                 let Some(assertion) = &creds.client_assertion else {
-                    return Err(OAuthError::invalid_request("client authentication method \"private_key_jwt\" required a \"client_assertion\""));
+                    return Err(OAuthError::invalid_request(
+                        "client authentication method \"private_key_jwt\" required a \"client_assertion\"",
+                    ));
                 };
-                if creds.client_assertion_type.as_deref() != Some(CLIENT_ASSERTION_TYPE_JWT_BEARER)
-                {
+                if creds.client_assertion_type.as_deref() != Some(CLIENT_ASSERTION_TYPE_JWT_BEARER) {
                     return Err(OAuthError::invalid_client(&format!(
                         "Unsupported client_assertion_type \"{}\"",
                         creds.client_assertion_type.as_deref().unwrap_or("")
                     )));
                 }
-                let fail = |m: &str| {
-                    OAuthError::invalid_client(&format!(
-                        "Validation of \"client_assertion\" failed: {m}"
-                    ))
-                };
+                let fail =
+                    |m: &str| OAuthError::invalid_client(&format!("Validation of \"client_assertion\" failed: {m}"));
                 let jwt = DecodedJwt::decode(assertion).map_err(|e| fail(&e))?;
                 let alg = jwt.alg().to_string();
-                let expected_alg = self
-                    .metadata
-                    .get("token_endpoint_auth_signing_alg")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("ES256");
+                let expected_alg =
+                    self.metadata.get("token_endpoint_auth_signing_alg").and_then(|v| v.as_str()).unwrap_or("ES256");
                 if alg != "ES256" || alg != expected_alg {
                     return Err(fail("unsupported \"alg\""));
                 }
@@ -140,26 +126,16 @@ impl Client {
                     .header
                     .get("kid")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        OAuthError::invalid_client("\"kid\" required in client_assertion")
-                    })?;
+                    .ok_or_else(|| OAuthError::invalid_client("\"kid\" required in client_assertion"))?;
                 let jwk = self
                     .jwks
                     .iter()
                     .find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(kid))
                     .ok_or_else(|| fail("no applicable key found in the client JWKS"))?;
-                if jwk
-                    .get("use")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|u| u != "sig")
-                {
+                if jwk.get("use").and_then(|v| v.as_str()).is_some_and(|u| u != "sig") {
                     return Err(fail("key is not a signing key"));
                 }
-                if jwk
-                    .get("alg")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|a| a != alg)
-                {
+                if jwk.get("alg").and_then(|v| v.as_str()).is_some_and(|a| a != alg) {
                     return Err(fail("key \"alg\" mismatch"));
                 }
                 let key = jwk_to_key(jwk).map_err(|e| fail(&e))?;
@@ -176,9 +152,7 @@ impl Client {
                     return Err(fail("unexpected \"aud\" claim value"));
                 }
                 let now = now_secs();
-                let iat = jwt
-                    .claim_i64("iat")
-                    .ok_or_else(|| fail("missing \"iat\" claim"))?;
+                let iat = jwt.claim_i64("iat").ok_or_else(|| fail("missing \"iat\" claim"))?;
                 if iat > now + CLOCK_TOLERANCE || now - iat > CLIENT_ASSERTION_MAX_AGE {
                     return Err(fail("\"iat\" claim timestamp check failed"));
                 }
@@ -192,31 +166,17 @@ impl Client {
                         return Err(fail("\"nbf\" claim timestamp check failed"));
                     }
                 }
-                let jti = jwt
-                    .claim_str("jti")
-                    .filter(|j| !j.is_empty())
-                    .ok_or_else(|| fail("missing \"jti\" claim"))?;
+                let jti =
+                    jwt.claim_str("jti").filter(|j| !j.is_empty()).ok_or_else(|| fail("missing \"jti\" claim"))?;
                 // past iat + max age the assertion is refused anyway, so a
                 // far-future `exp` must not pin the claim
                 let until = iat + CLIENT_ASSERTION_MAX_AGE + CLOCK_TOLERANCE;
-                let replay = Replay {
-                    routing: client_routing(&self.id),
-                    key: format!("assert:{}\0{jti}", self.id),
-                    until,
-                };
+                let replay =
+                    Replay { routing: client_routing(&self.id), key: format!("assert:{}\0{jti}", self.id), until };
                 let jkt = jwk_thumbprint(jwk).map_err(|e| fail(&e))?;
-                Ok((
-                    ClientAuth::PrivateKeyJwt {
-                        alg,
-                        kid: kid.to_string(),
-                        jkt,
-                    },
-                    Some(replay),
-                ))
+                Ok((ClientAuth::PrivateKeyJwt { alg, kid: kid.to_string(), jkt }, Some(replay)))
             }
-            m => Err(OAuthError::invalid_client(&format!(
-                "Unsupported token_endpoint_auth_method \"{m}\""
-            ))),
+            m => Err(OAuthError::invalid_client(&format!("Unsupported token_endpoint_auth_method \"{m}\""))),
         }
     }
 
@@ -238,26 +198,18 @@ impl Client {
     /// and then `iss` / `aud` are optional but checked when present. The
     /// `jti` comes back as a [`Replay`] for the caller to claim.
     pub fn decode_request_object(&self, jar: &str, issuer: &str) -> Result<(J, Replay), OAuthError> {
-        let fail =
-            |m: &str| OAuthError::invalid_request(&format!("Invalid \"request\" object: {m}"));
+        let fail = |m: &str| OAuthError::invalid_request(&format!("Invalid \"request\" object: {m}"));
         let jwt = DecodedJwt::decode(jar).map_err(|e| fail(&e))?;
-        let registered = self
-            .metadata
-            .get("request_object_signing_alg")
-            .and_then(|v| v.as_str());
+        let registered = self.metadata.get("request_object_signing_alg").and_then(|v| v.as_str());
         let alg = jwt.alg();
         let unsecured = registered == Some("none");
         if unsecured {
             if !jwt.is_unsecured() {
-                return Err(fail(
-                    "expected an unsecured (\"alg\": \"none\") request object",
-                ));
+                return Err(fail("expected an unsecured (\"alg\": \"none\") request object"));
             }
         } else {
             if alg == "none" {
-                return Err(fail(
-                    "unsecured request objects are not allowed for this client",
-                ));
+                return Err(fail("unsecured request objects are not allowed for this client"));
             }
             if !super::jose::VERIFY_ALGS.contains(&alg) || registered.is_some_and(|r| r != alg) {
                 return Err(fail("unsupported \"alg\""));
@@ -267,23 +219,13 @@ impl Client {
                 .jwks
                 .iter()
                 .filter(|k| kid.is_none() || k.get("kid").and_then(|v| v.as_str()) == kid)
-                .filter(|k| {
-                    k.get("use")
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|u| u == "sig")
-                })
-                .filter(|k| {
-                    k.get("alg")
-                        .and_then(|v| v.as_str())
-                        .is_none_or(|a| a == alg)
-                })
+                .filter(|k| k.get("use").and_then(|v| v.as_str()).is_none_or(|u| u == "sig"))
+                .filter(|k| k.get("alg").and_then(|v| v.as_str()).is_none_or(|a| a == alg))
                 .collect();
             if candidates.is_empty() {
                 return Err(fail("no applicable key found in the client JWKS"));
             }
-            let verified = candidates
-                .iter()
-                .any(|k| jwk_to_key(k).is_ok_and(|key| jwt.verify_es256(&key)));
+            let verified = candidates.iter().any(|k| jwk_to_key(k).is_ok_and(|key| jwt.verify_es256(&key)));
             if !verified {
                 return Err(fail("signature verification failed"));
             }
@@ -297,33 +239,22 @@ impl Client {
             return Err(fail("unexpected \"aud\" claim value"));
         }
         let now = now_secs();
-        let iat = jwt
-            .claim_i64("iat")
-            .ok_or_else(|| fail("missing \"iat\" claim"))?;
+        let iat = jwt.claim_i64("iat").ok_or_else(|| fail("missing \"iat\" claim"))?;
         if iat > now + CLOCK_TOLERANCE || now - iat > JAR_MAX_AGE {
             return Err(fail("\"iat\" claim timestamp check failed"));
         }
         if jwt.claim_i64("exp").is_some_and(|exp| exp <= now) {
             return Err(fail("\"exp\" claim timestamp check failed"));
         }
-        if jwt
-            .claim_i64("nbf")
-            .is_some_and(|nbf| nbf > now + CLOCK_TOLERANCE)
-        {
+        if jwt.claim_i64("nbf").is_some_and(|nbf| nbf > now + CLOCK_TOLERANCE) {
             return Err(fail("\"nbf\" claim timestamp check failed"));
         }
         let jti = jwt
             .claim_str("jti")
             .filter(|j| !j.is_empty())
-            .ok_or_else(|| {
-                OAuthError::invalid_request("Request object payload must contain a \"jti\" claim")
-            })?;
+            .ok_or_else(|| OAuthError::invalid_request("Request object payload must contain a \"jti\" claim"))?;
         let until = iat.max(now) + JAR_MAX_AGE + CLOCK_TOLERANCE;
-        let replay = Replay {
-            routing: client_routing(&self.id),
-            key: format!("jar:{}\0{jti}", self.id),
-            until,
-        };
+        let replay = Replay { routing: client_routing(&self.id), key: format!("jar:{}\0{jti}", self.id), until };
         Ok((jwt.payload, replay))
     }
 }
@@ -370,10 +301,7 @@ fn is_local_hostname(h: &str) -> bool {
         return true;
     }
     let tld = parts.last().unwrap().to_ascii_lowercase();
-    matches!(
-        tld.as_str(),
-        "test" | "local" | "localhost" | "invalid" | "example"
-    )
+    matches!(tld.as_str(), "test" | "local" | "localhost" | "invalid" | "example")
 }
 
 /// Host as in a JS URL's `hostname` (IPv6 literals in brackets).
@@ -382,10 +310,7 @@ fn host_str(u: &reqwest::Url) -> String {
 }
 
 fn is_ip_host(h: &str) -> bool {
-    h.trim_start_matches('[')
-        .trim_end_matches(']')
-        .parse::<IpAddr>()
-        .is_ok()
+    h.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().is_ok()
 }
 
 /// RFC 8252 §8.4 / §7.3: loopback redirect URIs registered without a port
@@ -426,12 +351,9 @@ fn parse_redirect_uri(uri: &str) -> Result<reqwest::Url, OAuthError> {
         }
     };
     if !ok {
-        return Err(OAuthError::invalid_redirect_uri(&format!(
-            "Invalid redirect URI {uri}"
-        )));
+        return Err(OAuthError::invalid_redirect_uri(&format!("Invalid redirect URI {uri}")));
     }
-    reqwest::Url::parse(uri)
-        .map_err(|_| OAuthError::invalid_redirect_uri(&format!("Invalid redirect URI {uri}")))
+    reqwest::Url::parse(uri).map_err(|_| OAuthError::invalid_redirect_uri(&format!("Invalid redirect URI {uri}")))
 }
 
 /// RFC 8252 disallows "localhost".
@@ -439,9 +361,7 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
     if !uri.starts_with("http://") || uri.starts_with("http://localhost") {
         return false;
     }
-    reqwest::Url::parse(uri)
-        .map(|u| matches!(host_str(&u).as_str(), "127.0.0.1" | "[::1]"))
-        .unwrap_or(false)
+    reqwest::Url::parse(uri).map(|u| matches!(host_str(&u).as_str(), "127.0.0.1" | "[::1]")).unwrap_or(false)
 }
 
 enum ClientIdKind {
@@ -454,13 +374,10 @@ enum ClientIdKind {
 }
 
 fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError> {
-    let bad =
-        |m: &str| OAuthError::invalid_client_metadata(&format!("Invalid client ID \"{id}\": {m}"));
+    let bad = |m: &str| OAuthError::invalid_client_metadata(&format!("Invalid client ID \"{id}\": {m}"));
     const ORIGIN: &str = "http://localhost";
     if let Some(rest) = id.strip_prefix(ORIGIN) {
-        if rest.starts_with(':')
-            || (!rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('?'))
-        {
+        if rest.starts_with(':') || (!rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('?')) {
             // http://localhost:port or http://localhostfoo -> not a loopback client id
             if !dev_mode {
                 return Err(bad("Loopback client IDs must not contain a port"));
@@ -494,17 +411,12 @@ fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError>
             }
             let scope = scope.unwrap_or_else(|| "atproto".into());
             if !scope.split(' ').any(|s| s == "atproto") {
-                return Err(bad(
-                    "ATProto Loopback ClientID must include \"atproto\" scope",
-                ));
+                return Err(bad("ATProto Loopback ClientID must include \"atproto\" scope"));
             }
             if redirect_uris.is_empty() {
                 redirect_uris = vec!["http://127.0.0.1/".into(), "http://[::1]/".into()];
             }
-            return Ok(ClientIdKind::Loopback {
-                scope,
-                redirect_uris,
-            });
+            return Ok(ClientIdKind::Loopback { scope, redirect_uris });
         }
     }
     // discoverable: the metadata document's URL (dev mode: http too)
@@ -520,9 +432,7 @@ fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError>
         return Err(bad("ClientID must not contain a fragment"));
     }
     if url.path() == "/" {
-        return Err(bad(
-            "ClientID must contain a path component (e.g. \"/client-metadata.json\")",
-        ));
+        return Err(bad("ClientID must contain a path component (e.g. \"/client-metadata.json\")"));
     }
     if url.path().ends_with('/') {
         return Err(bad("ClientID path must not end with a trailing slash"));
@@ -550,10 +460,7 @@ fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError>
         p[..end].to_string()
     };
     if raw_path != url.path() {
-        return Err(bad(&format!(
-            "ClientID must be in canonical form (\"{}\")",
-            url.as_str()
-        )));
+        return Err(bad(&format!("ClientID must be in canonical form (\"{}\")", url.as_str())));
     }
     Ok(ClientIdKind::Discoverable(url))
 }
@@ -573,22 +480,12 @@ async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J, St
         return Err(format!("unexpected HTTP status {}", resp.status().as_u16()));
     }
     if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
-        let ct = ct
-            .to_str()
-            .unwrap_or("")
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let ct = ct.to_str().unwrap_or("").split(';').next().unwrap_or("").trim().to_ascii_lowercase();
         if ct != "application/json" && !(ct.starts_with("application/") && ct.ends_with("+json")) {
             return Err(format!("unexpected content-type \"{ct}\""));
         }
     }
-    if resp
-        .content_length()
-        .is_some_and(|l| l as usize > max_bytes)
-    {
+    if resp.content_length().is_some_and(|l| l as usize > max_bytes) {
         return Err("response too large".into());
     }
     let mut buf = Vec::new();
@@ -615,16 +512,10 @@ impl<T: Send> crate::caches::Len for Cache<T> {
 
 impl<T: Clone> Cache<T> {
     fn new() -> Self {
-        Cache {
-            map: parking_lot::Mutex::new(HashMap::new()),
-        }
+        Cache { map: parking_lot::Mutex::new(HashMap::new()) }
     }
     fn get(&self, k: &str) -> Option<T> {
-        self.map
-            .lock()
-            .get(k)
-            .filter(|(at, _)| at.elapsed() < CACHE_TTL)
-            .map(|(_, v)| v.clone())
+        self.map.lock().get(k).filter(|(at, _)| at.elapsed() < CACHE_TTL).map(|(_, v)| v.clone())
     }
     fn put(&self, k: &str, v: T) {
         let cap = crate::caches::cap(crate::caches::Cache::OAuthClients);
@@ -655,10 +546,7 @@ pub async fn get_client(client_id: &str, dev_mode: bool) -> Result<Arc<Client>, 
 
 async fn load_client(client_id: &str, dev_mode: bool) -> Result<Client, OAuthError> {
     let (metadata, loopback) = match parse_client_id(client_id, dev_mode)? {
-        ClientIdKind::Loopback {
-            scope,
-            redirect_uris,
-        } => (
+        ClientIdKind::Loopback { scope, redirect_uris } => (
             json!({
                 "client_id": client_id,
                 "scope": scope,
@@ -672,25 +560,21 @@ async fn load_client(client_id: &str, dev_mode: bool) -> Result<Client, OAuthErr
             true,
         ),
         ClientIdKind::Discoverable(url) => {
-            let md = fetch_json(url.as_str(), dev_mode, METADATA_MAX_BYTES)
-                .await
-                .map_err(|e| {
-                    OAuthError::invalid_client_metadata(&format!(
-                        "Unable to obtain client metadata for \"{client_id}\": {e}"
-                    ))
-                })?;
+            let md = fetch_json(url.as_str(), dev_mode, METADATA_MAX_BYTES).await.map_err(|e| {
+                OAuthError::invalid_client_metadata(&format!(
+                    "Unable to obtain client metadata for \"{client_id}\": {e}"
+                ))
+            })?;
             (md, false)
         }
     };
     let mut client = validate_metadata(client_id, metadata, loopback, dev_mode)?;
     if let Some(uri) = client.metadata.get("jwks_uri").and_then(|v| v.as_str()) {
-        let jwks = fetch_json(uri, dev_mode, METADATA_MAX_BYTES)
-            .await
-            .map_err(|e| {
-                OAuthError::invalid_client_metadata(&format!(
-                    "Unable to obtain jwks from \"{uri}\" for \"{client_id}\": {e}"
-                ))
-            })?;
+        let jwks = fetch_json(uri, dev_mode, METADATA_MAX_BYTES).await.map_err(|e| {
+            OAuthError::invalid_client_metadata(&format!(
+                "Unable to obtain jwks from \"{uri}\" for \"{client_id}\": {e}"
+            ))
+        })?;
         client.jwks = parse_jwks(&jwks)?;
     }
     if client.auth_method == "private_key_jwt" && client.jwks.is_empty() {
@@ -709,9 +593,7 @@ fn parse_jwks(jwks: &J) -> Result<Vec<J>, OAuthError> {
     let mut out = Vec::new();
     for k in keys {
         if k.get("d").is_some() {
-            return Err(OAuthError::invalid_client_metadata(
-                "JWKS must not contain private keys",
-            ));
+            return Err(OAuthError::invalid_client_metadata("JWKS must not contain private keys"));
         }
         // other keys are ignored, not refused
         if k.get("kid").and_then(|v| v.as_str()).is_some() && jwk_to_key(k).is_ok() {
@@ -727,45 +609,32 @@ fn str_list(md: &J, k: &str) -> Result<Option<Vec<String>>, OAuthError> {
         Some(J::Array(a)) => a
             .iter()
             .map(|v| {
-                v.as_str().map(String::from).ok_or_else(|| {
-                    OAuthError::invalid_client_metadata(&format!(
-                        "\"{k}\" must be an array of strings"
-                    ))
-                })
+                v.as_str()
+                    .map(String::from)
+                    .ok_or_else(|| OAuthError::invalid_client_metadata(&format!("\"{k}\" must be an array of strings")))
             })
             .collect::<Result<Vec<_>, _>>()
             .map(Some),
-        Some(_) => Err(OAuthError::invalid_client_metadata(&format!(
-            "\"{k}\" must be an array"
-        ))),
+        Some(_) => Err(OAuthError::invalid_client_metadata(&format!("\"{k}\" must be an array"))),
     }
 }
 
 fn has_dup(v: &[String]) -> Option<&String> {
-    v.iter()
-        .enumerate()
-        .find(|(i, x)| v[i + 1..].contains(x))
-        .map(|(_, x)| x)
+    v.iter().enumerate().find(|(i, x)| v[i + 1..].contains(x)).map(|(_, x)| x)
 }
 
 fn check_redirect_uri(r: &str, application_type: &str, loopback: bool, dev_mode: bool) -> Result<(), OAuthError> {
     let bad_uri = |m: &str| OAuthError::invalid_redirect_uri(m);
     let u = parse_redirect_uri(r)?;
     if !u.username().is_empty() || u.password().is_some() {
-        return Err(bad_uri(&format!(
-            "Redirect URI {r} must not contain credentials"
-        )));
+        return Err(bad_uri(&format!("Redirect URI {r} must not contain credentials")));
     }
     let host = host_str(&u);
     if host == "localhost" {
-        return Err(bad_uri(&format!(
-            "Loopback redirect URI {r} is not allowed (use explicit IPs instead)"
-        )));
+        return Err(bad_uri(&format!("Loopback redirect URI {r} is not allowed (use explicit IPs instead)")));
     } else if host == "127.0.0.1" || host == "[::1]" {
         if application_type != "native" {
-            return Err(bad_uri(
-                "Loopback redirect URIs are only allowed for native apps",
-            ));
+            return Err(bad_uri("Loopback redirect URIs are only allowed for native apps"));
         }
         if u.scheme() != "http" {
             return Err(bad_uri(&format!("Loopback redirect URI {r} must use HTTP")));
@@ -773,37 +642,23 @@ fn check_redirect_uri(r: &str, application_type: &str, loopback: bool, dev_mode:
     } else if u.scheme() == "http" {
         // dev mode: allow http redirect URIs of dev-mode http clients
         if !(dev_mode && !loopback) {
-            return Err(bad_uri(
-                "Only loopback redirect URIs are allowed to use the \"http\" scheme",
-            ));
+            return Err(bad_uri("Only loopback redirect URIs are allowed to use the \"http\" scheme"));
         }
     } else if u.scheme() == "https" {
         if is_local_hostname(&host) && !dev_mode {
-            return Err(bad_uri(&format!(
-                "Redirect URI \"{r}\"'s domain name must not be a local hostname"
-            )));
+            return Err(bad_uri(&format!("Redirect URI \"{r}\"'s domain name must not be a local hostname")));
         }
     } else if is_private_use_scheme(&u) {
         if application_type != "native" {
-            return Err(bad_uri(
-                "Private-Use URI Scheme redirect URI are only allowed for native apps",
-            ));
+            return Err(bad_uri("Private-Use URI Scheme redirect URI are only allowed for native apps"));
         }
     } else {
-        return Err(bad_uri(&format!(
-            "Invalid redirect URI scheme \"{}:\"",
-            u.scheme()
-        )));
+        return Err(bad_uri(&format!("Invalid redirect URI scheme \"{}:\"", u.scheme())));
     }
     Ok(())
 }
 
-fn validate_metadata(
-    client_id: &str,
-    md: J,
-    loopback: bool,
-    dev_mode: bool,
-) -> Result<Client, OAuthError> {
+fn validate_metadata(client_id: &str, md: J, loopback: bool, dev_mode: bool) -> Result<Client, OAuthError> {
     let bad = |m: &str| OAuthError::invalid_client_metadata(m);
     let bad_uri = |m: &str| OAuthError::invalid_redirect_uri(m);
     if !md.is_object() {
@@ -837,8 +692,7 @@ fn validate_metadata(
     if let Some(d) = has_dup(&scopes) {
         return Err(bad(&format!("Duplicate scope \"{d}\"")));
     }
-    let grant_types =
-        str_list(&md, "grant_types")?.unwrap_or_else(|| vec!["authorization_code".into()]);
+    let grant_types = str_list(&md, "grant_types")?.unwrap_or_else(|| vec!["authorization_code".into()]);
     if let Some(d) = has_dup(&grant_types) {
         return Err(bad(&format!("Duplicate grant type \"{d}\"")));
     }
@@ -858,9 +712,7 @@ fn validate_metadata(
         return Err(bad("Only \"public\" subject_type is supported"));
     }
     // OIDC default is client_secret_basic, which atproto does not support.
-    let auth_method = gs("token_endpoint_auth_method")
-        .unwrap_or("client_secret_basic")
-        .to_string();
+    let auth_method = gs("token_endpoint_auth_method").unwrap_or("client_secret_basic").to_string();
     let mut jwks = Vec::new();
     match auth_method.as_str() {
         "none" => {
@@ -900,17 +752,10 @@ fn validate_metadata(
             )))
         }
     }
-    if md
-        .get("authorization_encrypted_response_enc")
-        .is_some_and(|v| !v.is_null())
-    {
+    if md.get("authorization_encrypted_response_enc").is_some_and(|v| !v.is_null()) {
         return Err(bad("Encrypted authorization response is not supported"));
     }
-    if md
-        .get("tls_client_certificate_bound_access_tokens")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
+    if md.get("tls_client_certificate_bound_access_tokens").and_then(|v| v.as_bool()) == Some(true) {
         return Err(bad("Mutual-TLS bound access tokens are not supported"));
     }
     if md.get("dpop_bound_access_tokens").and_then(|v| v.as_bool()) != Some(true) {
@@ -935,9 +780,7 @@ fn validate_metadata(
         return Err(bad("At least one redirect_uri is required"));
     }
     if application_type == "native" && auth_method != "none" {
-        return Err(bad(
-            "Native clients must authenticate using \"none\" method",
-        ));
+        return Err(bad("Native clients must authenticate using \"none\" method"));
     }
     for r in &redirect_uris {
         check_redirect_uri(r, &application_type, loopback, dev_mode)?;
@@ -947,12 +790,12 @@ fn validate_metadata(
             return Err(bad("client_uri is not allowed for loopback clients"));
         }
         if application_type != "native" {
-            return Err(bad(
-                "Loopback clients must have application_type \"native\"",
-            ));
+            return Err(bad("Loopback clients must have application_type \"native\""));
         }
         if auth_method != "none" {
-            return Err(bad(&format!("Loopback clients are not allowed to use \"token_endpoint_auth_method\" {auth_method}")));
+            return Err(bad(&format!(
+                "Loopback clients are not allowed to use \"token_endpoint_auth_method\" {auth_method}"
+            )));
         }
     } else {
         if gs("client_id").is_none() {
@@ -965,11 +808,7 @@ fn validate_metadata(
                 return Err(bad("client_uri must have the same origin as the client_id"));
             }
             if id_url.path() != cu.path() {
-                let parent = if cu.path().ends_with('/') {
-                    cu.path().to_string()
-                } else {
-                    format!("{}/", cu.path())
-                };
+                let parent = if cu.path().ends_with('/') { cu.path().to_string() } else { format!("{}/", cu.path()) };
                 if !id_url.path().starts_with(&parent) {
                     return Err(bad("client_uri must be a parent URL of the client_id"));
                 }
@@ -978,11 +817,7 @@ fn validate_metadata(
         for r in &redirect_uris {
             let u = parse_redirect_uri(r)?;
             if is_private_use_scheme(&u) {
-                let expected: String = host_str(&id_url)
-                    .split('.')
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join(".");
+                let expected: String = host_str(&id_url).split('.').rev().collect::<Vec<_>>().join(".");
                 if u.scheme() != expected {
                     return Err(bad_uri(&format!(
                         "Private-Use URI Scheme redirect URI, for discoverable client metadata, must be the fully qualified domain name (FQDN) of the client_id, in reverse order ({expected}:)"
@@ -1010,15 +845,12 @@ mod tests {
 
     #[test]
     fn loopback_ids() {
-        assert!(matches!(
-            parse_client_id("http://localhost", false),
-            Ok(ClientIdKind::Loopback { .. })
-        ));
-        assert!(matches!(
-            parse_client_id("http://localhost/", false),
-            Ok(ClientIdKind::Loopback { .. })
-        ));
-        match parse_client_id("http://localhost?scope=atproto%20transition:generic&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcb", false) {
+        assert!(matches!(parse_client_id("http://localhost", false), Ok(ClientIdKind::Loopback { .. })));
+        assert!(matches!(parse_client_id("http://localhost/", false), Ok(ClientIdKind::Loopback { .. })));
+        match parse_client_id(
+            "http://localhost?scope=atproto%20transition:generic&redirect_uri=http%3A%2F%2F127.0.0.1%3A8080%2Fcb",
+            false,
+        ) {
             Ok(ClientIdKind::Loopback { scope, redirect_uris }) => {
                 assert_eq!(scope, "atproto transition:generic");
                 assert_eq!(redirect_uris, vec!["http://127.0.0.1:8080/cb"]);
@@ -1027,11 +859,7 @@ mod tests {
         }
         assert!(parse_client_id("http://localhost/path", false).is_err());
         assert!(parse_client_id("http://localhost?foo=bar", false).is_err());
-        assert!(parse_client_id(
-            "http://localhost?redirect_uri=http%3A%2F%2Flocalhost%2Fcb",
-            false
-        )
-        .is_err());
+        assert!(parse_client_id("http://localhost?redirect_uri=http%3A%2F%2Flocalhost%2Fcb", false).is_err());
         assert!(parse_client_id("http://localhost?scope=transition:generic", false).is_err());
     }
 
@@ -1051,26 +879,11 @@ mod tests {
 
     #[test]
     fn redirect_compare() {
-        assert!(compare_redirect_uri(
-            "http://127.0.0.1/cb",
-            "http://127.0.0.1:5000/cb"
-        ));
-        assert!(!compare_redirect_uri(
-            "http://127.0.0.1/cb",
-            "http://127.0.0.1:5000/other"
-        ));
-        assert!(!compare_redirect_uri(
-            "http://127.0.0.1:4000/cb",
-            "http://127.0.0.1:5000/cb"
-        ));
-        assert!(!compare_redirect_uri(
-            "https://app.example.com/cb",
-            "https://app.example.com/cb?x=1"
-        ));
-        assert!(compare_redirect_uri(
-            "https://app.example.com/cb",
-            "https://app.example.com/cb"
-        ));
+        assert!(compare_redirect_uri("http://127.0.0.1/cb", "http://127.0.0.1:5000/cb"));
+        assert!(!compare_redirect_uri("http://127.0.0.1/cb", "http://127.0.0.1:5000/other"));
+        assert!(!compare_redirect_uri("http://127.0.0.1:4000/cb", "http://127.0.0.1:5000/cb"));
+        assert!(!compare_redirect_uri("https://app.example.com/cb", "https://app.example.com/cb?x=1"));
+        assert!(compare_redirect_uri("https://app.example.com/cb", "https://app.example.com/cb"));
     }
 
     #[test]
@@ -1098,28 +911,16 @@ mod tests {
         assert!(validate_metadata(id, m, false, false).is_err());
         let mut m = base.clone();
         m["redirect_uris"] = json!(["com.example.app:/cb"]);
-        assert!(
-            validate_metadata(id, m.clone(), false, false).is_err(),
-            "private-use needs native"
-        );
+        assert!(validate_metadata(id, m.clone(), false, false).is_err(), "private-use needs native");
         m["application_type"] = json!("native");
         assert!(validate_metadata(id, m.clone(), false, false).is_ok());
         m["redirect_uris"] = json!(["com.example.other:/cb"]);
-        assert!(
-            validate_metadata(id, m.clone(), false, false).is_err(),
-            "scheme must be reversed client domain"
-        );
+        assert!(validate_metadata(id, m.clone(), false, false).is_err(), "scheme must be reversed client domain");
         let mut m = base.clone();
         m["token_endpoint_auth_method"] = json!("private_key_jwt");
-        assert!(
-            validate_metadata(id, m.clone(), false, false).is_err(),
-            "needs jwks"
-        );
+        assert!(validate_metadata(id, m.clone(), false, false).is_err(), "needs jwks");
         m["jwks_uri"] = json!("https://app.example.com/jwks.json");
-        assert!(
-            validate_metadata(id, m.clone(), false, false).is_err(),
-            "needs signing alg"
-        );
+        assert!(validate_metadata(id, m.clone(), false, false).is_err(), "needs signing alg");
         m["token_endpoint_auth_signing_alg"] = json!("ES256");
         assert!(validate_metadata(id, m, false, false).is_ok());
         let mut m = base.clone();
@@ -1132,8 +933,8 @@ mod tests {
     /// can't pin replay-cache entries (or persisted claim rows) for years.
     #[test]
     fn assertion_claim_is_bounded_by_iat_not_exp() {
-        use p256::ecdsa::signature::Signer;
         use super::super::util::b64u;
+        use p256::ecdsa::signature::Signer;
         let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
         let mut jwk = super::super::jose::key_to_jwk(sk.verifying_key());
         jwk["kid"] = json!("k1");
@@ -1154,7 +955,11 @@ mod tests {
             let header = json!({"alg": "ES256", "kid": "k1"});
             let now = now_secs();
             let payload = json!({"iss": id, "sub": id, "aud": issuer, "jti": "j1", "iat": now, "exp": exp});
-            let input = format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(&payload).unwrap()));
+            let input = format!(
+                "{}.{}",
+                b64u(serde_json::to_vec(&header).unwrap()),
+                b64u(serde_json::to_vec(&payload).unwrap())
+            );
             let sig: p256::ecdsa::Signature = sk.sign(input.as_bytes());
             format!("{input}.{}", b64u(sig.to_bytes()))
         };

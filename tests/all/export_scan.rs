@@ -37,7 +37,11 @@ async fn prefetch_splits_give_same_bytes() {
             kept.push((c, rkey));
         }
         live.extend(kept);
-        let r = s.xrpc.post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth()).await.ok();
+        let r = s
+            .xrpc
+            .post("com.atproto.repo.applyWrites", &json!({"repo": a.did, "writes": writes}), &a.auth())
+            .await
+            .ok();
         if batch == 12 {
             since = r["commit"]["rev"].as_str().unwrap().to_string();
         }

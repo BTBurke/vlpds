@@ -149,17 +149,15 @@ impl KekBytes {
     /// 64 hex chars or any base64 flavour.
     pub fn parse(s: &str) -> anyhow::Result<KekBytes> {
         let s = Zeroizing::new(s.trim().to_string());
-        let mut raw = Zeroizing::new(
-            if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
-                hex::decode(s.as_bytes())?
-            } else {
-                let b64 = s.trim_end_matches('=');
-                base64::engine::general_purpose::STANDARD_NO_PAD
-                    .decode(b64)
-                    .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
-                    .map_err(|_| anyhow::anyhow!("KEK must be 32 bytes as 64 hex chars or base64"))?
-            },
-        );
+        let mut raw = Zeroizing::new(if s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            hex::decode(s.as_bytes())?
+        } else {
+            let b64 = s.trim_end_matches('=');
+            base64::engine::general_purpose::STANDARD_NO_PAD
+                .decode(b64)
+                .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
+                .map_err(|_| anyhow::anyhow!("KEK must be 32 bytes as 64 hex chars or base64"))?
+        });
         anyhow::ensure!(raw.len() == 32, "KEK must be 32 bytes (got {})", raw.len());
         let mut k = [0u8; 32];
         k.copy_from_slice(&raw);
@@ -169,13 +167,16 @@ impl KekBytes {
 
     /// 32 raw bytes, or the text forms of [`parse`](Self::parse).
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<KekBytes> {
-        let b = Zeroizing::new(std::fs::read(path).map_err(|e| anyhow::anyhow!("reading KEK file {}: {e}", path.display()))?);
+        let b = Zeroizing::new(
+            std::fs::read(path).map_err(|e| anyhow::anyhow!("reading KEK file {}: {e}", path.display()))?,
+        );
         if b.len() == 32 {
             let mut k = [0u8; 32];
             k.copy_from_slice(&b);
             return Ok(KekBytes(k));
         }
-        let s = std::str::from_utf8(&b).map_err(|_| anyhow::anyhow!("KEK file {} is neither 32 raw bytes nor text", path.display()))?;
+        let s = std::str::from_utf8(&b)
+            .map_err(|_| anyhow::anyhow!("KEK file {} is neither 32 raw bytes nor text", path.display()))?;
         KekBytes::parse(s)
     }
 
@@ -270,7 +271,8 @@ impl std::fmt::Debug for GcpToken {
 impl GcpToken {
     /// `file`, else `GOOGLE_APPLICATION_CREDENTIALS`, else the metadata server.
     pub fn from_credentials(file: Option<&std::path::Path>) -> anyhow::Result<GcpToken> {
-        let env = std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
+        let env =
+            std::env::var_os("GOOGLE_APPLICATION_CREDENTIALS").filter(|v| !v.is_empty()).map(std::path::PathBuf::from);
         match file.map(std::path::Path::to_path_buf).or(env) {
             Some(p) => Ok(GcpToken::ServiceAccount(ServiceAccount::from_file(&p)?)),
             None => Ok(GcpToken::default()),
@@ -295,13 +297,18 @@ pub struct ServiceAccount {
 
 impl std::fmt::Debug for ServiceAccount {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServiceAccount").field("client_email", &self.client_email).field("token_uri", &self.token_uri).finish_non_exhaustive()
+        f.debug_struct("ServiceAccount")
+            .field("client_email", &self.client_email)
+            .field("token_uri", &self.token_uri)
+            .finish_non_exhaustive()
     }
 }
 
 impl ServiceAccount {
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<Arc<ServiceAccount>> {
-        let text = Zeroizing::new(std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("GCP credentials {}: {e}", path.display()))?);
+        let text = Zeroizing::new(
+            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("GCP credentials {}: {e}", path.display()))?,
+        );
         ServiceAccount::from_json(&text).map_err(|e| e.context(format!("GCP credentials {}", path.display())))
     }
 
@@ -321,13 +328,18 @@ impl ServiceAccount {
             "only service-account key files are supported (\"type\": \"service_account\"), not {:?}",
             f.kind.as_deref().unwrap_or("(none)")
         );
-        let client_email = f.client_email.filter(|e| !e.is_empty()).ok_or_else(|| anyhow::anyhow!("key file has no client_email"))?;
+        let client_email =
+            f.client_email.filter(|e| !e.is_empty()).ok_or_else(|| anyhow::anyhow!("key file has no client_email"))?;
         let pem = Zeroizing::new(f.private_key.ok_or_else(|| anyhow::anyhow!("key file has no private_key"))?);
-        let body: Zeroizing<String> = Zeroizing::new(pem.lines().filter(|l| !l.starts_with("-----")).map(str::trim).collect());
+        let body: Zeroizing<String> =
+            Zeroizing::new(pem.lines().filter(|l| !l.starts_with("-----")).map(str::trim).collect());
         let der = Zeroizing::new(
-            base64::engine::general_purpose::STANDARD.decode(body.as_bytes()).map_err(|e| anyhow::anyhow!("private_key is not PEM: {e}"))?,
+            base64::engine::general_purpose::STANDARD
+                .decode(body.as_bytes())
+                .map_err(|e| anyhow::anyhow!("private_key is not PEM: {e}"))?,
         );
-        let key = ring::signature::RsaKeyPair::from_pkcs8(&der).map_err(|e| anyhow::anyhow!("private_key is not a PKCS#8 RSA key: {e}"))?;
+        let key = ring::signature::RsaKeyPair::from_pkcs8(&der)
+            .map_err(|e| anyhow::anyhow!("private_key is not a PKCS#8 RSA key: {e}"))?;
         Ok(Arc::new(ServiceAccount {
             client_email,
             token_uri: f.token_uri.filter(|u| !u.is_empty()).unwrap_or_else(|| GOOGLE_TOKEN_URI.into()),
@@ -375,7 +387,11 @@ impl ServiceAccount {
         let status = r.status();
         if !status.is_success() {
             let text = r.text().await.unwrap_or_default();
-            return Err(SecretError::Unavailable(format!("service-account token ({}): HTTP {status}: {}", self.client_email, truncate(&text))));
+            return Err(SecretError::Unavailable(format!(
+                "service-account token ({}): HTTP {status}: {}",
+                self.client_email,
+                truncate(&text)
+            )));
         }
         let t: Tok = r.json().await.map_err(|e| SecretError::Unavailable(format!("service-account token: {e}")))?;
         Ok((t.access_token, t.expires_in))
@@ -389,7 +405,11 @@ struct Tok {
 }
 
 /// Kept until a minute before it expires.
-async fn cached_token<F>(cache: &tokio::sync::Mutex<Option<(String, Instant)>>, refresh: bool, fetch: F) -> Result<String, SecretError>
+async fn cached_token<F>(
+    cache: &tokio::sync::Mutex<Option<(String, Instant)>>,
+    refresh: bool,
+    fetch: F,
+) -> Result<String, SecretError>
 where
     F: std::future::Future<Output = Result<(String, u64), SecretError>>,
 {
@@ -491,7 +511,9 @@ impl GcpKms {
                 401 if attempt == 0 && !matches!(self.token, GcpToken::Static(_)) => continue,
                 // wrong AAD, corrupt ciphertext, or a ciphertext of another key
                 400 => return Err(SecretError::Rejected(format!("cloud kms {op}: {}", truncate(&text)))),
-                _ => return Err(SecretError::Unavailable(format!("cloud kms {op}: HTTP {status}: {}", truncate(&text)))),
+                _ => {
+                    return Err(SecretError::Unavailable(format!("cloud kms {op}: HTTP {status}: {}", truncate(&text))))
+                }
             }
         }
         Err(SecretError::Unavailable(format!("cloud kms {op}: unauthorized")))
@@ -541,7 +563,9 @@ impl KeyWrapper for GcpKms {
         if r.get("verifiedPlaintextCrc32c").and_then(|v| v.as_bool()) == Some(false) {
             return Err(SecretError::Unavailable("cloud kms encrypt: plaintext checksum not verified".into()));
         }
-        let ct = r["ciphertext"].as_str().ok_or_else(|| SecretError::Unavailable("cloud kms encrypt: no ciphertext".into()))?;
+        let ct = r["ciphertext"]
+            .as_str()
+            .ok_or_else(|| SecretError::Unavailable("cloud kms encrypt: no ciphertext".into()))?;
         base64::engine::general_purpose::STANDARD
             .decode(ct)
             .map_err(|_| SecretError::Unavailable("cloud kms encrypt: bad ciphertext".into()))
@@ -884,7 +908,10 @@ impl Secrets {
                 return Err(e);
             }
         };
-        let key = Arc::new(Keypair::from_bytes(&u.plaintext).map_err(|e| SecretError::Rejected(format!("signing key of {did}: {e}")))?);
+        let key = Arc::new(
+            Keypair::from_bytes(&u.plaintext)
+                .map_err(|e| SecretError::Rejected(format!("signing key of {did}: {e}")))?,
+        );
         // an empty expected key is refused too: an unchecked unwrap would let
         // a swapped wrapped key sign for the account
         if pubkey.is_empty() || key.public_multibase() != pubkey {
@@ -907,10 +934,9 @@ impl Secrets {
 fn parse_blob(blob: &str) -> Result<(&str, Vec<u8>), SecretError> {
     let mut it = blob.splitn(3, '.');
     match (it.next(), it.next(), it.next()) {
-        (Some(WRAP_VERSION), Some(kid), Some(b)) if !kid.is_empty() => Ok((
-            kid,
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b).map_err(|_| SecretError::Malformed)?,
-        )),
+        (Some(WRAP_VERSION), Some(kid), Some(b)) if !kid.is_empty() => {
+            Ok((kid, base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b).map_err(|_| SecretError::Malformed)?))
+        }
         _ => Err(SecretError::Malformed),
     }
 }
@@ -950,7 +976,10 @@ mod tests {
         let n = bad.len();
         bad[n - 3] = if bad[n - 3] == b'A' { b'B' } else { b'A' };
         assert!(s.unwrap(Purpose::SigningKey, "did:plc:a", std::str::from_utf8(&bad).unwrap()).await.is_err());
-        assert!(matches!(s.unwrap(Purpose::SigningKey, "did:plc:a", "hex-or-whatever").await, Err(SecretError::Malformed)));
+        assert!(matches!(
+            s.unwrap(Purpose::SigningKey, "did:plc:a", "hex-or-whatever").await,
+            Err(SecretError::Malformed)
+        ));
     }
 
     #[tokio::test]
@@ -990,7 +1019,10 @@ mod tests {
         s.keys.clear();
         let other = Keypair::generate().public_multibase();
         assert!(matches!(s.signing_key("did:plc:c", &w, &other).await, Err(SecretError::Rejected(_))));
-        assert!(matches!(s.signing_key("did:plc:c", &w, "").await, Err(SecretError::Rejected(_))), "no expected key: refused");
+        assert!(
+            matches!(s.signing_key("did:plc:c", &w, "").await, Err(SecretError::Rejected(_))),
+            "no expected key: refused"
+        );
         // a cached key isn't served for another public key (rotated)
         let _ = s.signing_key("did:plc:c", &w, &pk).await.unwrap();
         assert!(s.keys.get("did:plc:c", &other).is_none());
@@ -1000,7 +1032,10 @@ mod tests {
     fn kek_parsing_and_dev_check() {
         let k = KekBytes::random();
         assert_eq!(KekBytes::parse(&hex::encode(k.0)).unwrap(), k);
-        assert_eq!(KekBytes::parse(&format!(" {}\n", base64::engine::general_purpose::STANDARD.encode(k.0))).unwrap(), k);
+        assert_eq!(
+            KekBytes::parse(&format!(" {}\n", base64::engine::general_purpose::STANDARD.encode(k.0))).unwrap(),
+            k
+        );
         assert_eq!(KekBytes::parse(&base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(k.0)).unwrap(), k);
         assert!(KekBytes::parse("abcd").is_err());
         assert!(!format!("{k:?}").contains(&hex::encode(k.0)));
@@ -1061,7 +1096,8 @@ mod tests {
     }
 
     fn sa_json(token_uri: &str) -> String {
-        let pem = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gcp-test-sa-key.pem")).unwrap();
+        let pem =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/gcp-test-sa-key.pem")).unwrap();
         serde_json::json!({
             "type": "service_account",
             "project_id": "p",
@@ -1126,7 +1162,8 @@ mod tests {
             assert_eq!(form["grant_type"], "urn:ietf:params:oauth:grant-type:jwt-bearer");
             let jwt = &form["assertion"];
             let (msg, sig) = jwt.rsplit_once('.').unwrap();
-            let key = ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, pk.as_slice());
+            let key =
+                ring::signature::UnparsedPublicKey::new(&ring::signature::RSA_PKCS1_2048_8192_SHA256, pk.as_slice());
             if key.verify(msg.as_bytes(), &b64.decode(sig).unwrap()).is_err() {
                 return (StatusCode::BAD_REQUEST, "invalid_grant").into_response();
             }
@@ -1143,7 +1180,11 @@ mod tests {
             m.valid.store(n, Ordering::SeqCst);
             axum::Json(serde_json::json!({"access_token": format!("sa-token-{n}"), "expires_in": m.expires_in.load(Ordering::SeqCst), "token_type": "Bearer"})).into_response()
         }
-        async fn kms(State((m, _)): S, headers: HeaderMap, axum::Json(body): axum::Json<serde_json::Value>) -> axum::response::Response {
+        async fn kms(
+            State((m, _)): S,
+            headers: HeaderMap,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
             m.kms_calls.fetch_add(1, Ordering::SeqCst);
             let want = format!("Bearer sa-token-{}", m.valid.load(Ordering::SeqCst));
             if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(want.as_str()) {
@@ -1185,11 +1226,16 @@ mod tests {
         let secret = [9u8; 32];
         for i in 0..5 {
             let w = s.wrap(Purpose::SigningKey, &format!("did:plc:{i}"), &secret).await.unwrap();
-            assert_eq!(&s.unwrap(Purpose::SigningKey, &format!("did:plc:{i}"), &w).await.unwrap().plaintext[..], &secret);
+            assert_eq!(
+                &s.unwrap(Purpose::SigningKey, &format!("did:plc:{i}"), &w).await.unwrap().plaintext[..],
+                &secret
+            );
         }
         assert_eq!(m.tokens.load(Ordering::SeqCst), 1, "one token exchange for every call");
         // the old key's wrapper shares the account's token
-        let old = GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/b", &m.url, cfg.gcp_token.clone().unwrap()).unwrap();
+        let old =
+            GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/b", &m.url, cfg.gcp_token.clone().unwrap())
+                .unwrap();
         old.wrap(b"aad", &secret).await.unwrap();
         assert_eq!(m.tokens.load(Ordering::SeqCst), 1);
         // revoked upstream (KMS says 401): refreshed once, the call succeeds
@@ -1208,7 +1254,9 @@ mod tests {
         assert_eq!(m.kms_calls.load(Ordering::SeqCst), calls + 1, "no 401 round trip");
         // a token endpoint refusing the grant is a retryable outage, not a panic
         let bad = ServiceAccount::from_json(&sa_json(&format!("{}/nope", m.url))).unwrap();
-        let k = GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/c", &m.url, GcpToken::ServiceAccount(bad)).unwrap();
+        let k =
+            GcpKms::new("projects/p/locations/global/keyRings/r/cryptoKeys/c", &m.url, GcpToken::ServiceAccount(bad))
+                .unwrap();
         assert!(matches!(k.wrap(b"aad", &secret).await, Err(SecretError::Unavailable(_))));
     }
 

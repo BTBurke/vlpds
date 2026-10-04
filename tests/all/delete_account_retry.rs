@@ -16,7 +16,13 @@ async fn private(s: &TestServer, did: &str, name: &str) -> bool {
 }
 
 async fn recreate(s: &TestServer, a: &TestAccount) -> Resp {
-    s.xrpc.post("com.atproto.server.createAccount", &json!({"handle": a.handle, "password": PASSWORD, "email": a.email}), &Auth::None).await
+    s.xrpc
+        .post(
+            "com.atproto.server.createAccount",
+            &json!({"handle": a.handle, "password": PASSWORD, "email": a.email}),
+            &Auth::None,
+        )
+        .await
 }
 
 /// Fails the deletion once, right after the repo delete; checks what is
@@ -27,7 +33,11 @@ async fn fail_after_repo_delete(s: &TestServer, a: &TestAccount, delete: impl st
     vlpds::xrpc::set_delete_crash_hook(&a.did, None);
     r.err(500, "InternalServerError");
     assert!(s.app.account(&a.did).await.is_err(), "the account row is gone");
-    assert_eq!(s.app.resolve_handle(&a.handle).await.ok().unwrap().as_deref(), Some(a.did.as_str()), "handle claim left behind");
+    assert_eq!(
+        s.app.resolve_handle(&a.handle).await.ok().unwrap().as_deref(),
+        Some(a.did.as_str()),
+        "handle claim left behind"
+    );
     assert!(private(s, &a.did, "apppass/leftover").await, "private rows left behind");
     assert!(private(s, &a.did, "deleting").await);
     let r = recreate(s, a).await;

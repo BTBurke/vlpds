@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use vlpds::mail::{MAIL_MESSAGES, MAIL_RETRIES, SharedMailer, SmtpConfig, SmtpMailer};
+use vlpds::mail::{SharedMailer, SmtpConfig, SmtpMailer, MAIL_MESSAGES, MAIL_RETRIES};
 use vlpds::xrpc::{Mail, Mailer};
 
 #[derive(Debug)]
@@ -50,7 +50,8 @@ async fn fake_server(
     let (seen, auth_log) = (mail_froms.clone(), auths.clone());
     tokio::spawn(async move {
         while let Ok((sock, _)) = l.accept().await {
-            let (tx, replies, seen, auth_log, tls) = (tx.clone(), replies.clone(), seen.clone(), auth_log.clone(), tls.clone());
+            let (tx, replies, seen, auth_log, tls) =
+                (tx.clone(), replies.clone(), seen.clone(), auth_log.clone(), tls.clone());
             tokio::spawn(async move {
                 match tls {
                     Some(acc) => {
@@ -85,11 +86,18 @@ async fn session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
             return;
         }
         let up = line.to_ascii_uppercase();
-        let arg = |s: &str| s.split_once(':').map(|(_, v)| v.trim().trim_matches(['<', '>']).to_string()).unwrap_or_default();
+        let arg =
+            |s: &str| s.split_once(':').map(|(_, v)| v.trim().trim_matches(['<', '>']).to_string()).unwrap_or_default();
         let reply: String = if up.starts_with("EHLO") || up.starts_with("HELO") {
-            if auth_log.is_some() { "250-fake.test\r\n250 AUTH PLAIN LOGIN".into() } else { "250 fake.test".into() }
+            if auth_log.is_some() {
+                "250-fake.test\r\n250 AUTH PLAIN LOGIN".into()
+            } else {
+                "250 fake.test".into()
+            }
         } else if let (Some(log), true) = (&auth_log, up.starts_with("AUTH PLAIN ")) {
-            let raw = base64::engine::general_purpose::STANDARD.decode(&line.trim_end().as_bytes()["AUTH PLAIN ".len()..]).unwrap_or_default();
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(&line.trim_end().as_bytes()["AUTH PLAIN ".len()..])
+                .unwrap_or_default();
             log.lock().push(String::from_utf8_lossy(&raw).replace('\0', "|"));
             "235 2.7.0 ok".into()
         } else if up.starts_with("MAIL FROM") {
@@ -138,7 +146,10 @@ async fn session<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
 }
 
 fn cfg(addr: SocketAddr) -> SmtpConfig {
-    SmtpConfig { backoff: vec![Duration::from_millis(20); 3], ..SmtpConfig::new(format!("smtp://{addr}"), "vlpds <noreply@vlpds.test>") }
+    SmtpConfig {
+        backoff: vec![Duration::from_millis(20); 3],
+        ..SmtpConfig::new(format!("smtp://{addr}"), "vlpds <noreply@vlpds.test>")
+    }
 }
 
 fn mail(purpose: &str, to: &str) -> Mail {
@@ -154,7 +165,10 @@ fn mail(purpose: &str, to: &str) -> Mail {
 }
 
 async fn next(rx: &mut mpsc::UnboundedReceiver<Received>) -> Received {
-    tokio::time::timeout(Duration::from_secs(20), rx.recv()).await.expect("no mail within 20 s").expect("smtp server stopped")
+    tokio::time::timeout(Duration::from_secs(20), rx.recv())
+        .await
+        .expect("no mail within 20 s")
+        .expect("smtp server stopped")
 }
 
 fn count(result: &str, purpose: &str) -> u64 {
@@ -195,7 +209,10 @@ async fn password_reset_is_mailed_over_smtp() {
     assert!(html.contains("<title>Reset password</title>"), "{html}");
     assert!(html.contains(&format!(">@<!-- -->{}<!-- -->.</span>", a.handle)), "{html}");
     // and it resets the password
-    s.xrpc.post("com.atproto.server.resetPassword", &json!({"token": token, "password": "a-new-password-1"}), &Auth::None).await.ok();
+    s.xrpc
+        .post("com.atproto.server.resetPassword", &json!({"token": token, "password": "a-new-password-1"}), &Auth::None)
+        .await
+        .ok();
 }
 
 /// (content-type, decoded body) of each part of a multipart message as the
@@ -203,7 +220,10 @@ async fn password_reset_is_mailed_over_smtp() {
 fn parts(data: &str) -> Vec<(String, String)> {
     let data = data.replace("\r\n..", "\r\n.");
     let head = data.split("\r\n\r\n").next().unwrap();
-    assert!(head.to_ascii_lowercase().contains("content-type: multipart/alternative"), "not multipart/alternative: {head}");
+    assert!(
+        head.to_ascii_lowercase().contains("content-type: multipart/alternative"),
+        "not multipart/alternative: {head}"
+    );
     let b = head.split("boundary=\"").nth(1).and_then(|r| r.split('"').next()).expect("boundary");
     let sep = format!("--{b}");
     data.split(sep.as_str())
@@ -213,10 +233,15 @@ fn parts(data: &str) -> Vec<(String, String)> {
             let p = p.trim_start_matches("\r\n");
             let (h, body) = p.split_once("\r\n\r\n").unwrap();
             let hl = h.to_ascii_lowercase();
-            let header = |name: &str| hl.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string()).unwrap_or_default();
+            let header = |name: &str| {
+                hl.lines().find_map(|l| l.strip_prefix(name)).map(|v| v.trim().to_string()).unwrap_or_default()
+            };
             let body = body.trim_end_matches("\r\n");
             let decoded = match header("content-transfer-encoding:").as_str() {
-                "base64" => String::from_utf8(base64::engine::general_purpose::STANDARD.decode(body.replace("\r\n", "")).unwrap()).unwrap(),
+                "base64" => String::from_utf8(
+                    base64::engine::general_purpose::STANDARD.decode(body.replace("\r\n", "")).unwrap(),
+                )
+                .unwrap(),
                 "quoted-printable" => qp_decode(body),
                 _ => body.replace("\r\n", "\n"),
             };
@@ -264,7 +289,11 @@ const MOD_HTML: &str = "<p>Hello &amp; welcome</p><p>Your post was <b>removed</b
 async fn admin_send(s: &TestServer, did: &str, subject: &str) {
     let r = s
         .xrpc
-        .post("com.atproto.admin.sendEmail", &json!({"recipientDid": did, "content": MOD_HTML, "subject": subject, "senderDid": "did:plc:admin"}), &Auth::Admin)
+        .post(
+            "com.atproto.admin.sendEmail",
+            &json!({"recipientDid": did, "content": MOD_HTML, "subject": subject, "senderDid": "did:plc:admin"}),
+            &Auth::Admin,
+        )
         .await
         .ok();
     assert_eq!(r["sent"], json!(true));
@@ -383,7 +412,9 @@ async fn smtps_with_auth_and_a_private_ca() {
     use rustls_pki_types::pem::PemObject;
     let ca = vlpds::peer_tls::create_ca("smtp test CA", 1).unwrap();
     let leaf = vlpds::peer_tls::issue_node(&ca.cert_pem, &ca.key_pem, "smtp", &["localhost".into()], 1).unwrap();
-    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes()).collect::<Result<Vec<_>, _>>().unwrap();
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     let key = rustls_pki_types::PrivateKeyDer::from_pem_slice(leaf.key_pem.as_bytes()).unwrap();
     let server = rustls::ServerConfig::builder_with_provider(vlpds::peer_tls::provider())
         .with_safe_default_protocol_versions()
@@ -395,7 +426,9 @@ async fn smtps_with_auth_and_a_private_ca() {
     let url = format!("smtps://api_token:secret-token@localhost:{}", addr.port());
 
     // the webpki roots alone don't trust it: nothing is authenticated or sent
-    let m = SmtpMailer::start(SmtpConfig { backoff: vec![], ..SmtpConfig::new(url.clone(), "vlpds <noreply@vlpds.test>") }).unwrap();
+    let m =
+        SmtpMailer::start(SmtpConfig { backoff: vec![], ..SmtpConfig::new(url.clone(), "vlpds <noreply@vlpds.test>") })
+            .unwrap();
     m.send(&mail("test_smtps_untrusted", "erin@example.com"));
     for _ in 0..250 {
         if count("failed", "test_smtps_untrusted") == 1 {
@@ -406,7 +439,11 @@ async fn smtps_with_auth_and_a_private_ca() {
     assert_eq!(count("failed", "test_smtps_untrusted"), 1);
     assert!(auths.lock().is_empty());
 
-    let m = SmtpMailer::start(SmtpConfig { ca_pem: Some(ca.cert_pem.into_bytes()), ..SmtpConfig::new(url, "vlpds <noreply@vlpds.test>") }).unwrap();
+    let m = SmtpMailer::start(SmtpConfig {
+        ca_pem: Some(ca.cert_pem.into_bytes()),
+        ..SmtpConfig::new(url, "vlpds <noreply@vlpds.test>")
+    })
+    .unwrap();
     m.send(&mail("test_smtps", "erin@example.com"));
     let r = next(&mut rx).await;
     assert_eq!(r.rcpt, vec!["erin@example.com".to_string()]);

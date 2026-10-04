@@ -278,7 +278,14 @@ fn record_entry(prefix_len: usize, kv: &slatedb::KeyValue) -> Result<(Key, Cid)>
 }
 
 /// Scans `did`'s records strictly between `lo` and `hi`.
-async fn scan_records<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, lo: Option<&[u8]>, hi: Option<&[u8]>, out: &mut Vec<(Key, Cid)>) -> Result<()> {
+async fn scan_records<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<(Key, Cid)>,
+) -> Result<()> {
     let plen = state::record_prefix(did, gen).len();
     let mut it = state::BatchedScan::new(db.scan(record_range(did, gen, lo, hi)).await.map_err(store_err)?);
     while let Some(kv) = it.next().await.map_err(store_err)? {
@@ -289,7 +296,12 @@ async fn scan_records<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64,
 
 /// For scans read to their end.
 fn read_ahead_opts() -> slatedb::config::ScanOptions {
-    slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, cache_blocks: true, ..Default::default() }
+    slatedb::config::ScanOptions {
+        read_ahead_bytes: 1 << 20,
+        max_fetch_tasks: 2,
+        cache_blocks: true,
+        ..Default::default()
+    }
 }
 
 impl<R: DbReadOps + Sync + ?Sized> Source for DbSource<'_, R> {
@@ -333,10 +345,25 @@ pub struct ScanSource<'a, N: Source> {
 
 impl<'a, N: Source> ScanSource<'a, N> {
     /// Blocking.
-    pub fn open<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, nodes: N, rt: &'a tokio::runtime::Handle) -> Result<Self> {
+    pub fn open<R: DbReadOps + Sync + ?Sized>(
+        db: &R,
+        did: &str,
+        gen: u64,
+        nodes: N,
+        rt: &'a tokio::runtime::Handle,
+    ) -> Result<Self> {
         let prefix = state::record_prefix(did, gen);
-        let iter = rt.block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts())).map_err(store_err)?;
-        Ok(ScanSource { nodes, rt, prefix_len: prefix.len(), iter: RefCell::new(state::BatchedScan::new(iter)), peeked: RefCell::new(None), done: Cell::new(false) })
+        let iter = rt
+            .block_on(db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &read_ahead_opts()))
+            .map_err(store_err)?;
+        Ok(ScanSource {
+            nodes,
+            rt,
+            prefix_len: prefix.len(),
+            iter: RefCell::new(state::BatchedScan::new(iter)),
+            peeked: RefCell::new(None),
+            done: Cell::new(false),
+        })
     }
 
     fn next(&self) -> Result<Option<(Key, Cid)>> {
@@ -537,11 +564,15 @@ impl<N: Source> Source for FedSource<N> {
     }
 }
 
-
 /// One scan of `did`'s `M/` range, up to `max_bytes` (0 = none), instead of
 /// 7-11 dependent node reads. Also returns whether the range was read to its
 /// end.
-pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, max_bytes: usize) -> anyhow::Result<(Prefetched, bool)> {
+pub async fn prefetch<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    max_bytes: usize,
+) -> anyhow::Result<(Prefetched, bool)> {
     if max_bytes == 0 {
         return Ok((Prefetched::default(), false));
     }
@@ -614,7 +645,13 @@ async fn scan_nodes<R: DbReadOps + Sync + ?Sized>(
 /// `Tree::proof_blocks` of `key` on a lazy tree at `root`, without blocking
 /// and without touching the tree: unloaded children are read from `db` (a
 /// snapshot at the tree's version), each checked against its link.
-pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, gen: u64, key: &[u8]) -> Result<Vec<(Cid, Vec<u8>)>> {
+pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(
+    root: &Arc<Node>,
+    db: &R,
+    did: &str,
+    gen: u64,
+    key: &[u8],
+) -> Result<Vec<(Cid, Vec<u8>)>> {
     let mut out = Vec::new();
     walk_path(root, db, did, gen, key, &mut |n| {
         out.push((n.cid.ok_or(MstError::Invalid("unwritten node"))?, crate::mst_lazy::node_block(n)?));
@@ -625,7 +662,13 @@ pub async fn proof_blocks<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R
 }
 
 /// The leaf, or the node holding `key`.
-pub async fn path_end<R: DbReadOps + Sync + ?Sized>(root: &Arc<Node>, db: &R, did: &str, gen: u64, key: &[u8]) -> Result<Arc<Node>> {
+pub async fn path_end<R: DbReadOps + Sync + ?Sized>(
+    root: &Arc<Node>,
+    db: &R,
+    did: &str,
+    gen: u64,
+    key: &[u8],
+) -> Result<Arc<Node>> {
     walk_path(root, db, did, gen, key, &mut |_| Ok(())).await
 }
 
@@ -650,7 +693,9 @@ async fn walk_path<R: DbReadOps + Sync + ?Sized>(
             Entry::Child { node: None, cid: Some(c) } if n.height == 1 && NODE_CACHE.get(c).is_none() => {
                 load_leaves(db, did, gen, &n, lo.as_deref(), hi.as_deref(), i).await?
             }
-            Entry::Child { node: None, cid: Some(c) } => load_child(db, did, gen, c, n.height - 1, clo.as_deref(), chi.as_deref()).await?,
+            Entry::Child { node: None, cid: Some(c) } => {
+                load_child(db, did, gen, c, n.height - 1, clo.as_deref(), chi.as_deref()).await?
+            }
             _ => return Err(MstError::Partial),
         };
         (n, lo, hi) = (child, clo, chi);
@@ -662,7 +707,15 @@ async fn walk_path<R: DbReadOps + Sync + ?Sized>(
 /// record range rebuilds its unloaded siblings too (a range scan costs
 /// mostly its setup), and those that match their links are cached for
 /// nearby proofs and getBlocks.
-async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, n: &Node, lo: Option<&[u8]>, hi: Option<&[u8]>, want: usize) -> Result<Arc<Node>> {
+async fn load_leaves<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    n: &Node,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    want: usize,
+) -> Result<Arc<Node>> {
     metrics::LAZY_MST_READS.with_label_values(&["leaf"]).inc();
     let mut recs = Vec::new();
     scan_records(db, did, gen, lo, hi, &mut recs).await?;
@@ -678,7 +731,9 @@ async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, 
             }
             Entry::Child { node, cid: Some(c) } => {
                 let end = match n.entries.get(i + 1) {
-                    Some(Entry::Value { key, .. }) => recs[pos..].iter().position(|(k, _)| k[..] >= key[..]).map_or(recs.len(), |p| pos + p),
+                    Some(Entry::Value { key, .. }) => {
+                        recs[pos..].iter().position(|(k, _)| k[..] >= key[..]).map_or(recs.len(), |p| pos + p)
+                    }
                     _ => recs.len(),
                 };
                 let group = &recs[pos..end];
@@ -701,7 +756,15 @@ async fn load_leaves<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, 
 
 /// Interior nodes from `M/`; a leaf (or a missing interior node) rebuilt
 /// from its record range.
-async fn load_child<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
+async fn load_child<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    cid: &Cid,
+    height: i32,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> Result<Arc<Node>> {
     if let Some(n) = NODE_CACHE.get(cid).filter(|n| n.height == height) {
         return Ok(n);
     }
@@ -710,7 +773,15 @@ async fn load_child<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, c
     Ok(n)
 }
 
-async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen: u64, cid: &Cid, height: i32, lo: Option<&[u8]>, hi: Option<&[u8]>) -> Result<Arc<Node>> {
+async fn load_child_uncached<R: DbReadOps + Sync + ?Sized>(
+    db: &R,
+    did: &str,
+    gen: u64,
+    cid: &Cid,
+    height: i32,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> Result<Arc<Node>> {
     if height >= 1 {
         metrics::LAZY_MST_READS.with_label_values(&["node"]).inc();
         if let Some(b) = db.get(state::mst_node_key(did, gen, cid)).await.map_err(store_err)? {
@@ -752,7 +823,9 @@ mod tests {
     async fn prefetch_tree_splits_export_the_same_blocks() {
         let db = slatedb::Db::open("t", Arc::new(object_store::memory::InMemory::new())).await.unwrap();
         let did = "did:plc:prefetchtest";
-        let recs: Vec<(Key, Cid)> = (0..20_000u64).map(|i| (Arc::from(format!("app.x.y/{i:08}").as_bytes()), Cid::dag_cbor(&i.to_le_bytes()))).collect();
+        let recs: Vec<(Key, Cid)> = (0..20_000u64)
+            .map(|i| (Arc::from(format!("app.x.y/{i:08}").as_bytes()), Cid::dag_cbor(&i.to_le_bytes())))
+            .collect();
         let mut tree = build_tree(&recs).unwrap();
         let root = tree.root_cid().unwrap();
         let mut want = Vec::new();
@@ -795,7 +868,11 @@ mod tests {
             if cap >= peak {
                 assert_eq!((persist_min, reads), (1, 0), "cap {cap}");
             } else if cap == all / 2 {
-                assert_eq!((persist_min, held, reads), (2, nodes.len() - h1, 0), "cap {cap}: every node above height 1 held");
+                assert_eq!(
+                    (persist_min, held, reads),
+                    (2, nodes.len() - h1, 0),
+                    "cap {cap}: every node above height 1 held"
+                );
             } else {
                 assert_eq!(persist_min, 2, "cap {cap}");
             }

@@ -349,18 +349,11 @@ fn body_target(body: &[u8], admin: bool) -> Option<BodyTarget> {
     if let Some(i) = k.identifier.0.as_deref().filter(|s| s.contains('.') || s.contains('@')) {
         return Some(BodyTarget::Ident(i.to_string()));
     }
-    k.repo
-        .0
-        .as_deref()
-        .filter(|s| s.contains('.') && !s.contains('@'))
-        .map(|s| BodyTarget::Ident(s.to_string()))
+    k.repo.0.as_deref().filter(|s| s.contains('.') && !s.contains('@')).map(|s| BodyTarget::Ident(s.to_string()))
 }
 
-const BODY_ROUTED: [&str; 3] = [
-    "com.atproto.server.createSession",
-    "com.atproto.server.requestPasswordReset",
-    "com.atproto.server.resetPassword",
-];
+const BODY_ROUTED: [&str; 3] =
+    ["com.atproto.server.createSession", "com.atproto.server.requestPasswordReset", "com.atproto.server.resetPassword"];
 
 /// The server's decompression layer runs after this one, so routing decodes
 /// gzip / deflate itself (bounded; forwarded as sent). Any other encoding
@@ -390,11 +383,7 @@ fn take_forwarded(req: &mut Request, app: Option<&crate::xrpc::App>) -> bool {
     let Some(token) = req.headers_mut().remove(FORWARDED_HEADER) else {
         return false;
     };
-    app.is_some_and(|a| {
-        token
-            .to_str()
-            .is_ok_and(|t| crate::xrpc::internal::internal_token_ok(&a.config, t))
-    })
+    app.is_some_and(|a| token.to_str().is_ok_and(|t| crate::xrpc::internal::internal_token_ok(&a.config, t)))
 }
 
 #[allow(clippy::result_large_err)]
@@ -495,18 +484,11 @@ async fn xrpc_target(
 }
 
 #[allow(clippy::result_large_err)]
-async fn oauth_target(
-    app: Option<&crate::xrpc::App>,
-    req: Request,
-) -> Result<(Request, Option<String>), Response> {
+async fn oauth_target(app: Option<&crate::xrpc::App>, req: Request) -> Result<(Request, Option<String>), Response> {
     let Some(app) = app else {
         return Ok((req, None));
     };
-    let (req, body) = if req.method() == Method::POST {
-        buffer(req).await?
-    } else {
-        (req, bytes::Bytes::new())
-    };
+    let (req, body) = if req.method() == Method::POST { buffer(req).await? } else { (req, bytes::Bytes::new()) };
     let key = crate::xrpc::oauth::route_key(
         app,
         req.uri().path(),
@@ -518,7 +500,12 @@ async fn oauth_target(
     Ok((req, key))
 }
 
-pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut req: Request, next: axum::middleware::Next) -> Response {
+pub async fn route(
+    router: &dyn Router,
+    client: &crate::http::PeerClient,
+    mut req: Request,
+    next: axum::middleware::Next,
+) -> Response {
     let path = req.uri().path();
     let (xrpc, oauth) = (path.starts_with("/xrpc/"), path.starts_with("/oauth/"));
     if !xrpc && !oauth {
@@ -553,11 +540,7 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
         }
         return next.run(req).await;
     }
-    let target = if xrpc {
-        xrpc_target(router, app, req).await
-    } else {
-        oauth_target(app, req).await
-    };
+    let target = if xrpc { xrpc_target(router, app, req).await } else { oauth_target(app, req).await };
     let (req, key) = match target {
         Ok(t) => t,
         Err(r) => return r,
@@ -572,7 +555,13 @@ pub async fn route(router: &dyn Router, client: &crate::http::PeerClient, mut re
     forward_counted(client, &owner, req, token, ttfb).await
 }
 
-async fn forward_counted(client: &crate::http::PeerClient, owner: &str, req: Request, token: Option<&str>, ttfb: Duration) -> Response {
+async fn forward_counted(
+    client: &crate::http::PeerClient,
+    owner: &str,
+    req: Request,
+    token: Option<&str>,
+    ttfb: Duration,
+) -> Response {
     crate::metrics::FORWARDED.inc();
     let t = Instant::now();
     let resp = forward(client, owner, req, token, ttfb).await;
@@ -599,7 +588,8 @@ async fn with_retries(
         Err(r) => return r,
     };
     let ttfb = ttfb_for(&req);
-    let retries = if req.method() == Method::GET { &crate::metrics::READ_RETRIES } else { &crate::metrics::WRITE_RETRIES };
+    let retries =
+        if req.method() == Method::GET { &crate::metrics::READ_RETRIES } else { &crate::metrics::WRITE_RETRIES };
     let (parts, _) = req.into_parts();
     let rebuild = || {
         let mut req = Request::new(Body::from(body.clone()));
@@ -634,7 +624,9 @@ async fn with_retries(
         let not_sent = resp.extensions().get::<NotSent>().is_some();
         let (rp, rbody) = resp.into_parts();
         let bytes = axum::body::to_bytes(rbody, 64 << 10).await.unwrap_or_default();
-        let err = serde_json::from_slice::<serde_json::Value>(&bytes).ok().and_then(|v| v["error"].as_str().map(str::to_string));
+        let err = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(str::to_string));
         let (reason, pause) = match err.as_deref() {
             // the owner died: wait for a peer to take its shards over
             _ if not_sent => ("unreachable", Duration::from_millis(100)),
@@ -753,7 +745,11 @@ fn relay_to_node<'a>(
     Some(async move {
         let Some(addr) = addr else {
             let message = format!("no live node {node:?} in this cluster");
-            return (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({"error": "NodeNotFound", "message": message}))).into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(serde_json::json!({"error": "NodeNotFound", "message": message})),
+            )
+                .into_response();
         };
         // maintenance runs as long as it takes (the CLI waits 10 min)
         forward(client, &addr, req, token, FORWARD_MAX).await
@@ -778,15 +774,8 @@ async fn forward(
     ttfb: Duration,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let url = format!(
-        "{}{}",
-        owner.trim_end_matches('/'),
-        parts
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/")
-    );
+    let url =
+        format!("{}{}", owner.trim_end_matches('/'), parts.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/"));
     let mut rb = client.request(parts.method.clone(), &url).timeout(FORWARD_MAX);
     for (k, v) in parts.headers.iter() {
         if k != axum::http::header::HOST && k != axum::http::header::CONTENT_LENGTH {
@@ -794,9 +783,11 @@ async fn forward(
         }
     }
     rb = rb.header(FORWARDED_HEADER, internal_token.unwrap_or("-"));
-    let client = parts.extensions.get::<crate::ratelimit::ClientIp>().map(|c| c.0).or_else(|| {
-        parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip())
-    });
+    let client = parts
+        .extensions
+        .get::<crate::ratelimit::ClientIp>()
+        .map(|c| c.0)
+        .or_else(|| parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip()));
     if let Some(ip) = client {
         rb = rb.header(crate::ratelimit::CLIENT_IP_HEADER, ip.to_string());
     }
@@ -862,14 +853,8 @@ mod tests {
 
     #[test]
     fn query_parsing() {
-        assert_eq!(
-            query_target(Some("repo=did%3Aplc%3Aabc&collection=x"), false),
-            (Some("did:plc:abc".into()), None)
-        );
-        assert_eq!(
-            query_target(Some("did=did:web:example.com"), false),
-            (Some("did:web:example.com".into()), None)
-        );
+        assert_eq!(query_target(Some("repo=did%3Aplc%3Aabc&collection=x"), false), (Some("did:plc:abc".into()), None));
+        assert_eq!(query_target(Some("did=did:web:example.com"), false), (Some("did:web:example.com".into()), None));
         assert_eq!(query_target(Some("repo=alice.test"), false), (None, Some("alice.test".into())));
         assert_eq!(query_target(Some("flag&handle=bob.test"), false), (None, Some("bob.test".into())));
         assert_eq!(query_target(Some("cursor=a.b&limit=5"), false), (None, None));
@@ -883,10 +868,16 @@ mod tests {
     fn body_parsing() {
         let t = |s: &str, admin| body_target(s.as_bytes(), admin);
         let did = |d: &str| Some(BodyTarget::Did(d.into()));
-        assert_eq!(t(r#"{"repo":"did:plc:a","collection":"x","record":{"text":"hi","did":"did:plc:z"}}"#, false), did("did:plc:a"));
+        assert_eq!(
+            t(r#"{"repo":"did:plc:a","collection":"x","record":{"text":"hi","did":"did:plc:z"}}"#, false),
+            did("did:plc:a")
+        );
         assert_eq!(t(r#"{"record":{"repo":"did:plc:z"},"did":"did:plc:b"}"#, false), did("did:plc:b"));
         assert_eq!(t(r#"{"identifier":"did:plc:c","password":"p"}"#, false), did("did:plc:c"));
-        assert_eq!(t(r#"{"identifier":"Alice.Test","password":"p"}"#, false), Some(BodyTarget::Ident("Alice.Test".into())));
+        assert_eq!(
+            t(r#"{"identifier":"Alice.Test","password":"p"}"#, false),
+            Some(BodyTarget::Ident("Alice.Test".into()))
+        );
         assert_eq!(t(r#"{"identifier":"a@b.c"}"#, false), Some(BodyTarget::Ident("a@b.c".into())));
         assert_eq!(t(r#"{"repo":"alice.test"}"#, false), Some(BodyTarget::Ident("alice.test".into())));
         // escaped strings (owned), non-string fields, other shapes
@@ -895,7 +886,8 @@ mod tests {
         assert_eq!(t(r#"[1,2]"#, false), None);
         assert_eq!(t(r#"not json"#, false), None);
         // moderation subjects: admin calls only
-        let td = r#"{"subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:s"},"takedown":{"applied":true}}"#;
+        let td =
+            r#"{"subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:s"},"takedown":{"applied":true}}"#;
         assert_eq!(t(td, true), did("did:plc:s"));
         assert_eq!(t(td, false), None);
         let rec = r#"{"subject":{"$type":"com.atproto.repo.strongRef","uri":"at://did:plc:r/app.bsky.feed.post/1","cid":"bafy"}}"#;
@@ -903,7 +895,10 @@ mod tests {
         assert_eq!(t(r#"{"subject":"x"}"#, true), None);
         // admin account updates name the account as `account` / `recipientDid`
         assert_eq!(t(r#"{"account":"did:plc:e","email":"a@b.c"}"#, true), did("did:plc:e"));
-        assert_eq!(t(r#"{"account":"alice.test","email":"a@b.c"}"#, true), Some(BodyTarget::Ident("alice.test".into())));
+        assert_eq!(
+            t(r#"{"account":"alice.test","email":"a@b.c"}"#, true),
+            Some(BodyTarget::Ident("alice.test".into()))
+        );
         assert_eq!(t(r#"{"account":"did:plc:e"}"#, false), None);
         assert_eq!(t(r#"{"recipientDid":"did:plc:m","content":"hi"}"#, true), did("did:plc:m"));
     }
@@ -969,11 +964,15 @@ mod tests {
         // (Fixed(None): every DID is local, so the sub shortcut would apply)
         assert_eq!(target("POST", uri, body, true, Fixed(None)).await, victim);
         // no identifier in the body: no routing key, not the token's
-        let none = target("POST", "/xrpc/com.atproto.server.createSession", r#"{"password":"x"}"#, true, remote()).await;
+        let none =
+            target("POST", "/xrpc/com.atproto.server.createSession", r#"{"password":"x"}"#, true, remote()).await;
         assert_eq!(none, None);
         // other procedures: the body over the query, the token still routes
         let w = r#"{"repo":"did:plc:victim","collection":"a.b.c","record":{}}"#;
-        assert_eq!(target("POST", "/xrpc/com.atproto.repo.createRecord?repo=did:plc:x", w, false, remote()).await, victim);
+        assert_eq!(
+            target("POST", "/xrpc/com.atproto.repo.createRecord?repo=did:plc:x", w, false, remote()).await,
+            victim
+        );
         assert_eq!(
             target("POST", "/xrpc/com.atproto.repo.createRecord", w, true, Fixed(None)).await.as_deref(),
             Some("did:plc:local")
@@ -988,7 +987,8 @@ mod tests {
     #[tokio::test]
     async fn compressed_bodies_route() {
         use std::io::Write;
-        let json = br#"{"subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:s"},"takedown":{"applied":true}}"#;
+        let json =
+            br#"{"subject":{"$type":"com.atproto.admin.defs#repoRef","did":"did:plc:s"},"takedown":{"applied":true}}"#;
         let gz = {
             let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
             e.write_all(json).unwrap();
@@ -1044,7 +1044,8 @@ mod tests {
 
     /// The test cluster's CA (one per test binary).
     fn test_ca() -> &'static crate::peer_tls::tests::TestCa {
-        static CA: std::sync::LazyLock<crate::peer_tls::tests::TestCa> = std::sync::LazyLock::new(crate::peer_tls::tests::TestCa::new);
+        static CA: std::sync::LazyLock<crate::peer_tls::tests::TestCa> =
+            std::sync::LazyLock::new(crate::peer_tls::tests::TestCa::new);
         &CA
     }
 
@@ -1097,7 +1098,14 @@ mod tests {
             .body(Body::from(r#"{"repo":"did:plc:x"}"#))
             .unwrap();
         let t = Instant::now();
-        let r = forward(&crate::http::PeerClient::new(1, test_ca().node("n")), &owner, req, None, Duration::from_millis(300)).await;
+        let r = forward(
+            &crate::http::PeerClient::new(1, test_ca().node("n")),
+            &owner,
+            req,
+            None,
+            Duration::from_millis(300),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(r.headers().get("retry-after").unwrap(), "1");
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
@@ -1142,7 +1150,9 @@ mod tests {
             forward(&peers, &owner, req, None, TTFB_SLOW)
         };
         let read = |r: Response, within: Duration| async move {
-            tokio::time::timeout(within, axum::body::to_bytes(r.into_body(), usize::MAX)).await.map(|b| b.map(|b| b.len()).ok())
+            tokio::time::timeout(within, axum::body::to_bytes(r.into_body(), usize::MAX))
+                .await
+                .map(|b| b.map(|b| b.len()).ok())
         };
         // more unread exports than one connection's window holds
         let n = (crate::http::PEER_CONNECTION_WINDOW / crate::http::PEER_STREAM_WINDOW) as usize + 16;
@@ -1219,7 +1229,9 @@ mod tests {
         let t = Instant::now();
         for _ in 0..n {
             let v: serde_json::Value = serde_json::from_slice(body.as_bytes()).unwrap();
-            std::hint::black_box(["repo", "did", "identifier"].iter().find_map(|k| v.get(*k)?.as_str().map(String::from)));
+            std::hint::black_box(
+                ["repo", "did", "identifier"].iter().find_map(|k| v.get(*k)?.as_str().map(String::from)),
+            );
         }
         let value = t.elapsed() / n;
         let t = Instant::now();

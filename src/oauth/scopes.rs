@@ -5,12 +5,7 @@
 use super::util::{encode_uri_component, form_encode, parse_form, percent_decode_strict};
 use serde_json::Value as J;
 
-const STATIC_SCOPES: [&str; 4] = [
-    "atproto",
-    "transition:email",
-    "transition:generic",
-    "transition:chat.bsky",
-];
+const STATIC_SCOPES: [&str; 4] = ["atproto", "transition:email", "transition:generic", "transition:chat.bsky"];
 
 /// `isScopeStringFor`.
 fn is_scope_string_for(value: &str, prefix: &str) -> bool {
@@ -48,13 +43,7 @@ impl Syntax {
         let param_idx = scope.find('?');
         let colon_idx = scope.find(':');
         let prefix_end = match (param_idx, colon_idx) {
-            (None, None) => {
-                return Some(Syntax {
-                    prefix: scope.into(),
-                    positional: None,
-                    params: Params::None,
-                })
-            }
+            (None, None) => return Some(Syntax { prefix: scope.into(), positional: None, params: Params::None }),
             (Some(a), None) | (None, Some(a)) => a,
             (Some(a), Some(b)) => a.min(b),
         };
@@ -68,21 +57,13 @@ impl Syntax {
             Some(p) if p < scope.len() - 1 => Params::Query(parse_form(&scope[p + 1..])),
             _ => Params::None,
         };
-        Some(Syntax {
-            prefix,
-            positional,
-            params,
-        })
+        Some(Syntax { prefix, positional, params })
     }
 
     /// `LexPermissionSyntax`: a permission object from a permission-set lexicon.
     pub fn from_lex(perm: &serde_json::Map<String, J>) -> Option<Syntax> {
         let prefix = perm.get("resource")?.as_str()?.to_string();
-        Some(Syntax {
-            prefix,
-            positional: None,
-            params: Params::Lex(perm.clone()),
-        })
+        Some(Syntax { prefix, positional: None, params: Params::Lex(perm.clone()) })
     }
 
     fn keys(&self) -> Vec<String> {
@@ -97,11 +78,7 @@ impl Syntax {
                 }
                 out
             }
-            Params::Lex(m) => m
-                .keys()
-                .filter(|k| *k != "type" && *k != "resource")
-                .cloned()
-                .collect(),
+            Params::Lex(m) => m.keys().filter(|k| *k != "type" && *k != "resource").cloned().collect(),
         }
     }
 
@@ -109,11 +86,7 @@ impl Syntax {
         match &self.params {
             Params::None => Param::Absent,
             Params::Query(q) => {
-                let vals: Vec<J> = q
-                    .iter()
-                    .filter(|(k, _)| k == key)
-                    .map(|(_, v)| J::String(v.clone()))
-                    .collect();
+                let vals: Vec<J> = q.iter().filter(|(k, _)| k == key).map(|(_, v)| J::String(v.clone())).collect();
                 if vals.is_empty() {
                     Param::Absent
                 } else if !multiple && vals.len() > 1 {
@@ -194,9 +167,7 @@ struct Schema {
 type Values = Vec<(&'static str, Option<Vec<String>>)>;
 
 fn val<'a>(v: &'a Values, name: &str) -> Option<&'a Vec<String>> {
-    v.iter()
-        .find(|(k, _)| *k == name)
-        .and_then(|(_, v)| v.as_ref())
+    v.iter().find(|(k, _)| *k == name).and_then(|(_, v)| v.as_ref())
 }
 
 fn as_param_str(v: &J) -> Option<String> {
@@ -245,10 +216,7 @@ impl Schema {
                     } else if d.required {
                         return None;
                     } else {
-                        out.push((
-                            d.name,
-                            d.default.map(|d| d.iter().map(|s| s.to_string()).collect()),
-                        ));
+                        out.push((d.name, d.default.map(|d| d.iter().map(|s| s.to_string()).collect())));
                     }
                 }
             }
@@ -327,10 +295,7 @@ pub fn is_nsid(s: &str) -> bool {
         }
     }
     let nb = name.as_bytes();
-    !nb.is_empty()
-        && nb.len() <= 63
-        && nb[0].is_ascii_alphabetic()
-        && nb.iter().all(|c| c.is_ascii_alphanumeric())
+    !nb.is_empty() && nb.len() <= 63 && nb[0].is_ascii_alphabetic() && nb.iter().all(|c| c.is_ascii_alphanumeric())
 }
 
 /// Hostname-level did:web only, with a port only for localhost.
@@ -352,17 +317,13 @@ pub fn is_atproto_did(s: &str) -> bool {
                 return false;
             }
         }
-        return !h.is_empty()
-            && h.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+        return !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
     }
     false
 }
 
 fn is_fragment(s: &str) -> bool {
-    !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?%".contains(&b))
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?%".contains(&b))
 }
 
 fn is_did_ref_absolute(s: &str) -> bool {
@@ -431,11 +392,7 @@ fn n_collection(v: Vec<String>) -> Vec<String> {
     v
 }
 fn n_repo_action(v: Vec<String>) -> Vec<String> {
-    REPO_ACTIONS
-        .iter()
-        .filter(|a| v.iter().any(|x| x == *a))
-        .map(|s| s.to_string())
-        .collect()
+    REPO_ACTIONS.iter().filter(|a| v.iter().any(|x| x == *a)).map(|s| s.to_string()).collect()
 }
 fn n_lxm(v: Vec<String>) -> Vec<String> {
     if v.len() > 1 && v.iter().any(|x| x == "*") {
@@ -500,14 +457,7 @@ static RPC: Schema = Schema {
             validate: v_collection,
             normalize: Some(n_lxm),
         },
-        ParamDef {
-            name: "aud",
-            multiple: false,
-            required: true,
-            default: None,
-            validate: v_aud,
-            normalize: None,
-        },
+        ParamDef { name: "aud", multiple: false, required: true, default: None, validate: v_aud, normalize: None },
     ],
     positional: Some("lxm"),
 };
@@ -564,14 +514,7 @@ static IDENTITY: Schema = Schema {
 static INCLUDE: Schema = Schema {
     prefix: "include",
     params: &[
-        ParamDef {
-            name: "nsid",
-            multiple: false,
-            required: true,
-            default: None,
-            validate: is_nsid,
-            normalize: None,
-        },
+        ParamDef { name: "nsid", multiple: false, required: true, default: None, validate: is_nsid, normalize: None },
         ParamDef {
             name: "aud",
             multiple: false,
@@ -586,24 +529,11 @@ static INCLUDE: Schema = Schema {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Permission {
-    Repo {
-        collection: Vec<String>,
-        action: Vec<String>,
-    },
-    Rpc {
-        aud: String,
-        lxm: Vec<String>,
-    },
-    Blob {
-        accept: Vec<String>,
-    },
-    Account {
-        attr: String,
-        action: Vec<String>,
-    },
-    Identity {
-        attr: String,
-    },
+    Repo { collection: Vec<String>, action: Vec<String> },
+    Rpc { aud: String, lxm: Vec<String> },
+    Blob { accept: Vec<String> },
+    Account { attr: String, action: Vec<String> },
+    Identity { attr: String },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -613,9 +543,7 @@ pub struct IncludeScope {
 }
 
 fn first(v: &Values, k: &str) -> String {
-    val(v, k)
-        .and_then(|x| x.first().cloned())
-        .unwrap_or_default()
+    val(v, k).and_then(|x| x.first().cloned()).unwrap_or_default()
 }
 
 impl Permission {
@@ -640,22 +568,15 @@ impl Permission {
             }
             "blob" => {
                 let v = BLOB.parse(syn)?;
-                Some(Permission::Blob {
-                    accept: val(&v, "accept")?.clone(),
-                })
+                Some(Permission::Blob { accept: val(&v, "accept")?.clone() })
             }
             "account" => {
                 let v = ACCOUNT.parse(syn)?;
-                Some(Permission::Account {
-                    attr: first(&v, "attr"),
-                    action: val(&v, "action")?.clone(),
-                })
+                Some(Permission::Account { attr: first(&v, "attr"), action: val(&v, "action")?.clone() })
             }
             "identity" => {
                 let v = IDENTITY.parse(syn)?;
-                Some(Permission::Identity {
-                    attr: first(&v, "attr"),
-                })
+                Some(Permission::Identity { attr: first(&v, "attr") })
             }
             _ => None,
         }
@@ -672,22 +593,17 @@ impl Permission {
 
     pub fn to_scope_string(&self) -> String {
         match self {
-            Permission::Repo { collection, action } => REPO.format(&vec![
-                ("collection", Some(collection.clone())),
-                ("action", Some(action.clone())),
-            ]),
-            Permission::Rpc { aud, lxm } => RPC.format(&vec![
-                ("lxm", Some(lxm.clone())),
-                ("aud", Some(vec![aud.clone()])),
-            ]),
-            Permission::Blob { accept } => BLOB.format(&vec![("accept", Some(accept.clone()))]),
-            Permission::Account { attr, action } => ACCOUNT.format(&vec![
-                ("attr", Some(vec![attr.clone()])),
-                ("action", Some(action.clone())),
-            ]),
-            Permission::Identity { attr } => {
-                IDENTITY.format(&vec![("attr", Some(vec![attr.clone()]))])
+            Permission::Repo { collection, action } => {
+                REPO.format(&vec![("collection", Some(collection.clone())), ("action", Some(action.clone()))])
             }
+            Permission::Rpc { aud, lxm } => {
+                RPC.format(&vec![("lxm", Some(lxm.clone())), ("aud", Some(vec![aud.clone()]))])
+            }
+            Permission::Blob { accept } => BLOB.format(&vec![("accept", Some(accept.clone()))]),
+            Permission::Account { attr, action } => {
+                ACCOUNT.format(&vec![("attr", Some(vec![attr.clone()])), ("action", Some(action.clone()))])
+            }
+            Permission::Identity { attr } => IDENTITY.format(&vec![("attr", Some(vec![attr.clone()]))]),
         }
     }
 
@@ -717,17 +633,11 @@ impl IncludeScope {
             return None;
         }
         let v = INCLUDE.parse(&Syntax::from_string(scope)?)?;
-        Some(IncludeScope {
-            nsid: first(&v, "nsid"),
-            aud: val(&v, "aud").and_then(|a| a.first().cloned()),
-        })
+        Some(IncludeScope { nsid: first(&v, "nsid"), aud: val(&v, "aud").and_then(|a| a.first().cloned()) })
     }
 
     pub fn to_scope_string(&self) -> String {
-        INCLUDE.format(&vec![
-            ("nsid", Some(vec![self.nsid.clone()])),
-            ("aud", self.aud.clone().map(|a| vec![a])),
-        ])
+        INCLUDE.format(&vec![("nsid", Some(vec![self.nsid.clone()])), ("aud", self.aud.clone().map(|a| vec![a]))])
     }
 
     /// Same NSID group: everything up to the last '.'.
@@ -762,10 +672,7 @@ impl IncludeScope {
                         Some(J::String(a)) if a == "*" => {}
                         Some(_) => continue,
                     }
-                    if obj.get("inheritAud") == Some(&J::Bool(true))
-                        && obj.get("aud").is_none()
-                        && self.aud.is_some()
-                    {
+                    if obj.get("inheritAud") == Some(&J::Bool(true)) && obj.get("aud").is_none() && self.aud.is_some() {
                         let mut o = obj.clone();
                         o.remove("inheritAud");
                         o.insert("aud".into(), J::String(self.aud.clone().unwrap()));
@@ -782,9 +689,7 @@ impl IncludeScope {
             };
             let allowed = match &perm {
                 Permission::Rpc { lxm, .. } => lxm.iter().all(|l| self.is_parent_authority_of(l)),
-                Permission::Repo { collection, .. } => {
-                    collection.iter().all(|c| self.is_parent_authority_of(c))
-                }
+                Permission::Repo { collection, .. } => collection.iter().all(|c| self.is_parent_authority_of(c)),
                 _ => false,
             };
             if allowed {
@@ -825,11 +730,7 @@ pub struct ScopeSet {
 
 impl ScopeSet {
     pub fn new(scope: &str) -> ScopeSet {
-        let raw: Vec<String> = scope
-            .split(' ')
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .collect();
+        let raw: Vec<String> = scope.split(' ').filter(|s| !s.is_empty()).map(String::from).collect();
         let perms = raw.iter().filter_map(|s| Permission::parse(s)).collect();
         ScopeSet {
             generic: raw.iter().any(|s| s == "transition:generic"),
@@ -845,11 +746,7 @@ impl ScopeSet {
     }
 
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
-        self.generic
-            || self
-                .perms
-                .iter()
-                .any(|p| p.matches_repo(collection, action))
+        self.generic || self.perms.iter().any(|p| p.matches_repo(collection, action))
     }
 
     pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
@@ -888,10 +785,7 @@ mod tests {
 
     #[test]
     fn repo_parse_and_format() {
-        assert_eq!(
-            norm("repo:app.bsky.feed.post").unwrap(),
-            "repo:app.bsky.feed.post"
-        );
+        assert_eq!(norm("repo:app.bsky.feed.post").unwrap(), "repo:app.bsky.feed.post");
         assert_eq!(
             norm("repo:app.bsky.feed.post?action=create&action=update&action=delete").unwrap(),
             "repo:app.bsky.feed.post"
@@ -904,10 +798,7 @@ mod tests {
             norm("repo?collection=app.bsky.feed.post&collection=app.bsky.feed.like").unwrap(),
             "repo?collection=app.bsky.feed.like&collection=app.bsky.feed.post"
         );
-        assert_eq!(
-            norm("repo?collection=*&collection=app.bsky.feed.like").unwrap(),
-            "repo:*"
-        );
+        assert_eq!(norm("repo?collection=*&collection=app.bsky.feed.like").unwrap(), "repo:*");
         assert_eq!(norm("repo:*").unwrap(), "repo:*");
         assert!(norm("repo").is_none());
         assert!(norm("repo:not-an-nsid").is_none());
@@ -925,13 +816,8 @@ mod tests {
     #[test]
     fn rpc() {
         assert!(Permission::parse("rpc:*?aud=*").is_none());
-        assert!(
-            Permission::parse("rpc:app.bsky.feed.getFeed").is_none(),
-            "aud required"
-        );
-        let p =
-            Permission::parse("rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app%23bsky_appview")
-                .unwrap();
+        assert!(Permission::parse("rpc:app.bsky.feed.getFeed").is_none(), "aud required");
+        let p = Permission::parse("rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app%23bsky_appview").unwrap();
         assert!(p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app#bsky_appview"));
         assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:other.example#x"));
         // reference tests/proxied/proxy-oauth-aud.test.ts: the proxy checks
@@ -939,17 +825,9 @@ mod tests {
         // DID, does not match
         assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app#atproto_other"));
         assert!(!p.matches_rpc("app.bsky.feed.getFeed", "did:web:api.bsky.app"));
-        assert_eq!(
-            p.to_scope_string(),
-            "rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app%23bsky_appview"
-        );
-        let p =
-            Permission::parse("rpc?lxm=app.bsky.feed.getFeed&lxm=app.bsky.actor.getProfile&aud=*")
-                .unwrap();
-        assert_eq!(
-            p.to_scope_string(),
-            "rpc?lxm=app.bsky.actor.getProfile&lxm=app.bsky.feed.getFeed&aud=*"
-        );
+        assert_eq!(p.to_scope_string(), "rpc:app.bsky.feed.getFeed?aud=did:web:api.bsky.app%23bsky_appview");
+        let p = Permission::parse("rpc?lxm=app.bsky.feed.getFeed&lxm=app.bsky.actor.getProfile&aud=*").unwrap();
+        assert_eq!(p.to_scope_string(), "rpc?lxm=app.bsky.actor.getProfile&lxm=app.bsky.feed.getFeed&aud=*");
         assert!(p.matches_rpc("app.bsky.actor.getProfile", "did:web:x.com#y"));
     }
 
@@ -963,10 +841,7 @@ mod tests {
             norm("blob?accept=image/png&accept=image/*&accept=video/mp4").unwrap(),
             "blob?accept=image/*&accept=video/mp4"
         );
-        assert_eq!(
-            norm("blob?accept=image/png&accept=*/*").unwrap(),
-            "blob:*/*"
-        );
+        assert_eq!(norm("blob?accept=image/png&accept=*/*").unwrap(), "blob:*/*");
         assert!(norm("blob:image").is_none());
         assert!(norm("blob:*/png").is_none());
     }
@@ -981,28 +856,18 @@ mod tests {
         assert!(p.matches_account("repo", "read"));
         assert!(p.matches_account("repo", "manage"));
         assert!(Permission::parse("account:foo").is_none());
-        assert!(Permission::parse("identity:*")
-            .unwrap()
-            .matches_identity("handle"));
-        assert!(Permission::parse("identity:handle")
-            .unwrap()
-            .matches_identity("handle"));
-        assert!(!Permission::parse("identity:handle")
-            .unwrap()
-            .matches_identity("*"));
+        assert!(Permission::parse("identity:*").unwrap().matches_identity("handle"));
+        assert!(Permission::parse("identity:handle").unwrap().matches_identity("handle"));
+        assert!(!Permission::parse("identity:handle").unwrap().matches_identity("*"));
         assert!(Permission::parse("identity").is_none());
     }
 
     #[test]
     fn include() {
-        let i = IncludeScope::parse("include:com.example.authBasic?aud=did:web:example.com%23svc")
-            .unwrap();
+        let i = IncludeScope::parse("include:com.example.authBasic?aud=did:web:example.com%23svc").unwrap();
         assert_eq!(i.nsid, "com.example.authBasic");
         assert_eq!(i.aud.as_deref(), Some("did:web:example.com#svc"));
-        assert_eq!(
-            i.to_scope_string(),
-            "include:com.example.authBasic?aud=did:web:example.com%23svc"
-        );
+        assert_eq!(i.to_scope_string(), "include:com.example.authBasic?aud=did:web:example.com%23svc");
         assert!(i.is_parent_authority_of("com.example.foo"));
         assert!(i.is_parent_authority_of("com.example.foo.bar"));
         assert!(!i.is_parent_authority_of("com.other.foo"));
@@ -1018,11 +883,7 @@ mod tests {
                 {"type": "permission", "resource": "blob", "accept": ["*/*"]},
             ]
         });
-        let perms: Vec<String> = i
-            .to_permissions(&set)
-            .iter()
-            .map(|p| p.to_scope_string())
-            .collect();
+        let perms: Vec<String> = i.to_permissions(&set).iter().map(|p| p.to_scope_string()).collect();
         assert_eq!(
             perms,
             vec![
@@ -1040,20 +901,11 @@ mod tests {
         let s = ScopeSet::new("atproto transition:generic");
         assert!(s.allows_repo("app.bsky.feed.post", "create"));
         assert!(s.allows_blob("image/png"));
-        assert!(s.allows_rpc(
-            "app.bsky.feed.getTimeline",
-            "did:web:api.bsky.app#bsky_appview"
-        ));
-        assert!(!s.allows_rpc(
-            "chat.bsky.convo.listConvos",
-            "did:web:api.bsky.chat#bsky_chat"
-        ));
+        assert!(s.allows_rpc("app.bsky.feed.getTimeline", "did:web:api.bsky.app#bsky_appview"));
+        assert!(!s.allows_rpc("chat.bsky.convo.listConvos", "did:web:api.bsky.chat#bsky_chat"));
         assert!(!s.allows_account("email", "read"));
         let s = ScopeSet::new("atproto transition:chat.bsky transition:email");
-        assert!(s.allows_rpc(
-            "chat.bsky.convo.listConvos",
-            "did:web:api.bsky.chat#bsky_chat"
-        ));
+        assert!(s.allows_rpc("chat.bsky.convo.listConvos", "did:web:api.bsky.chat#bsky_chat"));
         assert!(s.allows_account("email", "read"));
         assert!(!s.allows_account("email", "manage"));
         let s = ScopeSet::new("atproto repo:app.bsky.feed.like");
@@ -1074,13 +926,7 @@ mod tests {
         ] {
             assert!(is_atproto_oauth_scope(s), "{s}");
         }
-        for s in [
-            "openid",
-            "repo",
-            "transition:foo",
-            "include:*",
-            "rpc:*?aud=*",
-        ] {
+        for s in ["openid", "repo", "transition:foo", "include:*", "rpc:*?aud=*"] {
             assert!(!is_atproto_oauth_scope(s), "{s}");
         }
         assert!(is_nsid("app.bsky.feed.post"));
@@ -1100,7 +946,8 @@ mod tests {
                 .is_some_and(|id| s.len() == 32 && id.bytes().all(|b| matches!(b, b'a'..=b'z' | b'2'..=b'7')))
         };
         let base = "abcdefghijklmnopqrstuvwx";
-        let mut cases: Vec<String> = vec![String::new(), "did:plc:".into(), format!("did:plc:{base}a"), format!("did:plc:{}", &base[1..])];
+        let mut cases: Vec<String> =
+            vec![String::new(), "did:plc:".into(), format!("did:plc:{base}a"), format!("did:plc:{}", &base[1..])];
         for i in 0..24 {
             for c in (0u8..=255).filter(|c| c.is_ascii()) {
                 let mut id = base.as_bytes().to_vec();

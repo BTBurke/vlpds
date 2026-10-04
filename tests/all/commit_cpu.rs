@@ -30,7 +30,9 @@ fn commit_signatures_match_k256_across_keys_and_lengths() {
         let (_, again) = vlpds::worker::sign_commit(did, "3lbcdefghij22", &data, &kp).unwrap();
         assert_ne!(block, again, "hedged signatures repeat");
         let unsigned = vlpds::events::encode_commit(did, "3lbcdefghij22", &data, None);
-        let Some(Value::Bytes(sig)) = Value::decode(&block).unwrap().get("sig").cloned() else { panic!("commit without sig") };
+        let Some(Value::Bytes(sig)) = Value::decode(&block).unwrap().get("sig").cloned() else {
+            panic!("commit without sig")
+        };
         let sig: [u8; 64] = sig[..].try_into().unwrap();
         assert_eq!(&block[..], &vlpds::events::encode_commit(did, "3lbcdefghij22", &data, Some(&sig))[..]);
         let theirs = k256::ecdsa::Signature::from_slice(&sig).unwrap();
@@ -71,7 +73,9 @@ async fn node_index_serves_deep_trees_across_commits() {
         }
     };
     // pseudo-random TID-shaped rkeys, so inserts land all over the tree
-    let rkey = |i: u64| vlpds::tid::Tid::from_parts(1_700_000_000_000_000 + (i * 2_654_435_761) % 100_000_000_000, i % 1024).to_string();
+    let rkey = |i: u64| {
+        vlpds::tid::Tid::from_parts(1_700_000_000_000_000 + (i * 2_654_435_761) % 100_000_000_000, i % 1024).to_string()
+    };
     for batch in 0..8u64 {
         s.apply_writes(&a, (0..150).map(|j| write(rkey(batch * 150 + j), false)).collect()).await.ok();
     }

@@ -82,7 +82,8 @@ impl MergedBatch {
             payload.push(buf.len() - f.len());
         }
         let wire = Bytes::from(buf);
-        let events: Vec<(i64, Bytes)> = events.iter().zip(payload).map(|((seq, f), at)| (*seq, wire.slice(at..at + f.len()))).collect();
+        let events: Vec<(i64, Bytes)> =
+            events.iter().zip(payload).map(|((seq, f), at)| (*seq, wire.slice(at..at + f.len()))).collect();
         MergedBatch {
             first: events[0].0,
             last: events[events.len() - 1].0,
@@ -487,7 +488,17 @@ impl Firehose {
                 let mut bound = w;
                 if let Some(store) = &store {
                     let more;
-                    (bound, more) = read_back(store, &mut logs, w, (max / 16).max(1), emitted, fh.start_floor, &mut total, &mut late).await;
+                    (bound, more) = read_back(
+                        store,
+                        &mut logs,
+                        w,
+                        (max / 16).max(1),
+                        emitted,
+                        fh.start_floor,
+                        &mut total,
+                        &mut late,
+                    )
+                    .await;
                     behind |= more;
                 }
                 if late > 0 {
@@ -508,7 +519,9 @@ impl Firehose {
                 // forget logs that are gone and fully emitted
                 {
                     let s = fh.sources.read();
-                    logs.retain(|id, lq| !lq.q.is_empty() || s.contains_key(id) || lq.spill.as_ref().is_some_and(|sp| !sp.end));
+                    logs.retain(|id, lq| {
+                        !lq.q.is_empty() || s.contains_key(id) || lq.spill.as_ref().is_some_and(|sp| !sp.end)
+                    });
                 }
                 fh.queued_bytes.store(total, Ordering::Relaxed);
                 metrics::FIREHOSE_MERGE_QUEUE_BYTES.set(total as i64);
@@ -521,7 +534,8 @@ impl Firehose {
                 STATS.firehose_events.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 metrics::FIREHOSE_EVENTS.inc_by(batch.events.len() as u64);
                 metrics::FIREHOSE_BATCH.observe(batch.events.len() as f64);
-                metrics::FIREHOSE_EMIT_DELAY.observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
+                metrics::FIREHOSE_EMIT_DELAY
+                    .observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
                 fh.push(batch);
             }
         }));
@@ -530,14 +544,12 @@ impl Firehose {
     fn push(&self, batch: Arc<MergedBatch>) {
         {
             let mut ring = self.ring.write();
-            self.ring_bytes
-                .fetch_add(batch.bytes as i64, Ordering::Relaxed);
+            self.ring_bytes.fetch_add(batch.bytes as i64, Ordering::Relaxed);
             ring.push_back(batch.clone());
             while self.ring_bytes.load(Ordering::Relaxed) > self.max_ring_bytes && ring.len() > 1 {
                 let old = ring.pop_front().unwrap();
                 self.ring_floor.fetch_max(old.last, Ordering::AcqRel);
-                self.ring_bytes
-                    .fetch_sub(old.bytes as i64, Ordering::Relaxed);
+                self.ring_bytes.fetch_sub(old.bytes as i64, Ordering::Relaxed);
             }
         }
         metrics::FIREHOSE_RING_BYTES.set(self.ring_bytes.load(Ordering::Relaxed));
@@ -573,7 +585,13 @@ impl Firehose {
     /// `client` (the trusted-proxy-resolved client address): at most
     /// `Options::max_per_ip` connections per address (IPv6: per /64), 429
     /// past it.
-    pub fn upgrade(self: &Arc<Self>, mut req: axum::extract::Request, cursor: Option<i64>, shard: Option<SlotRange>, client: Option<std::net::IpAddr>) -> Response {
+    pub fn upgrade(
+        self: &Arc<Self>,
+        mut req: axum::extract::Request,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        client: Option<std::net::IpAddr>,
+    ) -> Response {
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
@@ -598,7 +616,11 @@ impl Firehose {
         });
         (
             StatusCode::SWITCHING_PROTOCOLS,
-            [(header::CONNECTION, "upgrade".to_string()), (header::UPGRADE, "websocket".to_string()), (header::SEC_WEBSOCKET_ACCEPT, accept)],
+            [
+                (header::CONNECTION, "upgrade".to_string()),
+                (header::UPGRADE, "websocket".to_string()),
+                (header::SEC_WEBSOCKET_ACCEPT, accept),
+            ],
         )
             .into_response()
     }
@@ -640,7 +662,9 @@ impl Firehose {
                 }
             },
             Err(up) => {
-                tracing::debug!("subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO");
+                tracing::debug!(
+                    "subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO"
+                );
                 let (r, w) = tokio::io::split(TokioIo::new(up));
                 self.serve_conn(r, w, cursor, shard).await
             }
@@ -665,7 +689,12 @@ impl Firehose {
         reason
     }
 
-    async fn stream<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, cursor: Option<i64>, shard: Option<SlotRange>) -> Result<(), &'static str> {
+    async fn stream<W: AsyncWrite + Unpin>(
+        &self,
+        out: &mut Out<W>,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+    ) -> Result<(), &'static str> {
         let mut head = self.head.subscribe();
         let mut last = match cursor {
             Some(c) => c,
@@ -721,7 +750,8 @@ impl Firehose {
                 }
                 continue;
             }
-            let allowance = *allowance.get_or_insert_with(|| self.max_lag_bytes.max(self.head.borrow().saturating_sub(batches[0].start())));
+            let allowance = *allowance
+                .get_or_insert_with(|| self.max_lag_bytes.max(self.head.borrow().saturating_sub(batches[0].start())));
             for b in &batches {
                 let i = b.events.partition_point(|(seq, _)| *seq <= last);
                 if i == b.events.len() {
@@ -756,7 +786,12 @@ impl Firehose {
     /// Streams (`last`, ring floor] from the S3 segments until the ring
     /// reaches back to `last` (the floor moves while it backfills); history
     /// that's gone is skipped with an `OutdatedCursor` info.
-    async fn catch_up<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<(), &'static str> {
+    async fn catch_up<W: AsyncWrite + Unpin>(
+        &self,
+        out: &mut Out<W>,
+        last: &mut i64,
+        shard: Option<SlotRange>,
+    ) -> Result<(), &'static str> {
         loop {
             if !self.backfill_to_ring(out, last, shard).await? {
                 out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
@@ -772,7 +807,12 @@ impl Firehose {
     /// durable up to the floor. Ok(false) = there's no store (nothing older
     /// than the ring exists): the caller skips to the ring. A backfill that
     /// keeps failing disconnects the subscriber.
-    async fn backfill_to_ring<W: AsyncWrite + Unpin>(&self, out: &mut Out<W>, last: &mut i64, shard: Option<SlotRange>) -> Result<bool, &'static str> {
+    async fn backfill_to_ring<W: AsyncWrite + Unpin>(
+        &self,
+        out: &mut Out<W>,
+        last: &mut i64,
+        shard: Option<SlotRange>,
+    ) -> Result<bool, &'static str> {
         let Some(store) = self.store.read().clone() else { return Ok(false) };
         let reader = Reader { store, cache: self.backfill_cache.clone(), readahead_bytes: self.readahead_bytes, shard };
         let (mut overtaken, mut failures) = (0u32, 0u32);
@@ -814,7 +854,8 @@ impl Firehose {
             }
             let (tx, mut rx) = mpsc::channel(BACKFILL_CHANNEL);
             let (r, from) = (reader.clone(), *last);
-            let mut job = AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
+            let mut job =
+                AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
             let mut chunk = Vec::with_capacity(1024);
             let mut buf = Vec::new();
             while rx.recv_many(&mut chunk, 1024).await > 0 {
@@ -932,7 +973,9 @@ impl Drop for IpSlot {
 /// The IPv4 address, or the IPv6 /64 (one host's usual allocation).
 fn ip_key(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip.to_canonical() {
-        std::net::IpAddr::V6(v6) => std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1))),
+        std::net::IpAddr::V6(v6) => {
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(u128::from(v6) & !((1u128 << 64) - 1)))
+        }
         v4 => v4,
     }
 }
@@ -1101,7 +1144,9 @@ fn push_message(out: &mut Vec<u8>, op: u8, payload: &[u8]) {
 /// Returns the Sec-WebSocket-Accept value.
 fn handshake(h: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
     let has = |name: header::HeaderName, token: &str| {
-        h.get_all(name).iter().any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))))
+        h.get_all(name)
+            .iter()
+            .any(|v| v.to_str().is_ok_and(|v| v.split(',').any(|t| t.trim().eq_ignore_ascii_case(token))))
     };
     if !has(header::CONNECTION, "upgrade") || !has(header::UPGRADE, "websocket") {
         return Err((StatusCode::BAD_REQUEST, "expected a websocket upgrade"));
@@ -1202,7 +1247,13 @@ impl<W: AsyncWrite + Unpin> Out<W> {
     /// `allowance` bytes behind the head the subscriber is dropped with
     /// ConsumerTooSlow, so a stalled reader holds nothing but its place in
     /// the shared ring and can't slow anyone else.
-    async fn send_live(&mut self, data: &mut [std::io::IoSlice<'_>], head: &mut watch::Receiver<u64>, pos: u64, allowance: u64) -> Result<(), &'static str> {
+    async fn send_live(
+        &mut self,
+        data: &mut [std::io::IoSlice<'_>],
+        head: &mut watch::Receiver<u64>,
+        pos: u64,
+        allowance: u64,
+    ) -> Result<(), &'static str> {
         let len: usize = data.iter().map(|d| d.len()).sum();
         let too_slow = {
             let mut write = std::pin::pin!(write_all_vectored(&mut self.w, data));
@@ -1233,7 +1284,11 @@ impl<W: AsyncWrite + Unpin> Out<W> {
         };
         metrics::FIREHOSE_SENT_BYTES.inc_by(len as u64);
         if too_slow {
-            self.finish(&events::error_frame("ConsumerTooSlow", "fell too far behind the stream; reconnect with a cursor")).await;
+            self.finish(&events::error_frame(
+                "ConsumerTooSlow",
+                "fell too far behind the stream; reconnect with a cursor",
+            ))
+            .await;
             return Err("too_slow");
         }
         Ok(())
@@ -1288,7 +1343,10 @@ const MAX_IOV: usize = 1024;
 
 /// `write_all` over several slices: one writev per call where the socket
 /// supports it (a single slice is a plain write).
-async fn write_all_vectored<W: AsyncWrite + Unpin>(w: &mut W, mut bufs: &mut [std::io::IoSlice<'_>]) -> std::io::Result<()> {
+async fn write_all_vectored<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    mut bufs: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
     std::io::IoSlice::advance_slices(&mut bufs, 0);
     while !bufs.is_empty() {
         let n = w.write_vectored(&bufs[..bufs.len().min(MAX_IOV)]).await?;
@@ -1343,7 +1401,12 @@ mod tests {
                 0 => {
                     let ops = [
                         events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
-                        events::RepoOp { action: "update", path: "app.bsky.feed.like/3j", cid: Some(cid), prev: Some(cid) },
+                        events::RepoOp {
+                            action: "update",
+                            path: "app.bsky.feed.like/3j",
+                            cid: Some(cid),
+                            prev: Some(cid),
+                        },
                     ];
                     events::commit_frame(&events::CommitFrame {
                         repo: did,
@@ -1377,7 +1440,8 @@ mod tests {
                 for from in [0, 17] {
                     let (runs, count) = batch.wire_runs(from, &range);
                     let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
-                    let want: Vec<(i64, Bytes)> = evs[from..].iter().filter(|(_, f)| range.contains(event_slot(f))).cloned().collect();
+                    let want: Vec<(i64, Bytes)> =
+                        evs[from..].iter().filter(|(_, f)| range.contains(event_slot(f))).cloned().collect();
                     let mut buf = Vec::new();
                     for (_, f) in &want {
                         push_message(&mut buf, OP_BINARY, f);
@@ -1396,7 +1460,8 @@ mod tests {
     #[ignore]
     fn sharded_filter_cost() {
         let cid = crate::cid::Cid::dag_cbor(b"x");
-        let ops = [events::RepoOp { action: "create", path: "app.bsky.feed.post/3kabcdefghij2", cid: Some(cid), prev: None }];
+        let ops =
+            [events::RepoOp { action: "create", path: "app.bsky.feed.post/3kabcdefghij2", cid: Some(cid), prev: None }];
         let evs: Vec<(i64, Bytes)> = (0..2000u64)
             .map(|i| {
                 let did = crate::state::bulk_did(i);
@@ -1429,7 +1494,11 @@ mod tests {
             runs_t += t.elapsed();
         }
         let per = |d: Duration| d.as_nanos() as f64 / (rounds * evs.len()) as f64;
-        eprintln!("slots: {:.0} ns/event once per batch; runs for 16 sharded subscribers: {:.0} ns/event total", per(slots_t), per(runs_t));
+        eprintln!(
+            "slots: {:.0} ns/event once per batch; runs for 16 sharded subscribers: {:.0} ns/event total",
+            per(slots_t),
+            per(runs_t)
+        );
     }
 
     /// The next emitted batches after `last` (advanced past them).

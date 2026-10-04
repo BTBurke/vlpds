@@ -33,7 +33,12 @@ const PREFIX: &str = "vlpds";
 async fn node(id: &str, store: &Arc<object_store::memory::InMemory>) -> TestServer {
     cluster_node(id, store.clone(), SHARDS, |c| {
         // reports every 100 ms; nothing is old enough to prune
-        c.log_retention = Some(vlpds::retention::Config { window: Duration::from_secs(3600), interval: Duration::from_millis(100), max_deletes: 100, fence_retention: None });
+        c.log_retention = Some(vlpds::retention::Config {
+            window: Duration::from_secs(3600),
+            interval: Duration::from_millis(100),
+            max_deletes: 100,
+            fence_retention: None,
+        });
     })
     .await
 }
@@ -49,7 +54,8 @@ async fn stop(n: TestServer) {
 async fn objects(store: &object_store::memory::InMemory) -> Vec<(String, bytes::Bytes)> {
     use futures::StreamExt;
     use object_store::{ObjectStore, ObjectStoreExt};
-    let metas: Vec<_> = store.list(Some(&object_store::path::Path::from(PREFIX))).map(|m| m.unwrap().location).collect().await;
+    let metas: Vec<_> =
+        store.list(Some(&object_store::path::Path::from(PREFIX))).map(|m| m.unwrap().location).collect().await;
     let mut out = Vec::new();
     for p in metas {
         let Ok(r) = store.get(&p).await else { continue }; // deleted meanwhile
@@ -85,8 +91,15 @@ async fn scan(store: &object_store::memory::InMemory, at_most: Option<u32>) -> S
     use vlpds::segment;
     let mut s = Scan::default();
     // fields the fixtures leave out because they were None (or 0) there
-    let optional: BTreeMap<&str, &[&str]> =
-        [("assign", &["frozen", "applied_epoch"][..]), ("layout", &["op"][..]), ("version", &["target"][..]), ("nodes", &[][..]), ("writers", &[][..]), ("retain", &[][..])].into();
+    let optional: BTreeMap<&str, &[&str]> = [
+        ("assign", &["frozen", "applied_epoch"][..]),
+        ("layout", &["op"][..]),
+        ("version", &["target"][..]),
+        ("nodes", &[][..]),
+        ("writers", &[][..]),
+        ("retain", &[][..]),
+    ]
+    .into();
     let keys = |fixture: &str, family: &str, l: u32| -> BTreeSet<String> {
         let mut k = fixture_keys(l, fixture);
         k.extend(optional[family].iter().map(|s| s.to_string()));
@@ -97,7 +110,8 @@ async fn scan(store: &object_store::memory::InMemory, at_most: Option<u32>) -> S
         let check_json = |fixture: &str, fam: &str| {
             let Some(l) = at_most else { return };
             let j: J = serde_json::from_slice(&b).unwrap_or_else(|e| panic!("{path}: {e}"));
-            let extra: Vec<&String> = j.as_object().unwrap().keys().filter(|k| !keys(fixture, fam, l).contains(*k)).collect();
+            let extra: Vec<&String> =
+                j.as_object().unwrap().keys().filter(|k| !keys(fixture, fam, l).contains(*k)).collect();
             assert!(extra.is_empty(), "{path} has fields of a level above {l}: {extra:?}: {j}");
         };
         match family {
@@ -105,7 +119,11 @@ async fn scan(store: &object_store::memory::InMemory, at_most: Option<u32>) -> S
                 None => s.fences += 1,
                 Some((h, _)) => {
                     if let Some(l) = at_most {
-                        assert!(h.level <= l && &b[..8] == version::segment_magic(h.level), "{path}: segment of level {} at most {l} expected", h.level);
+                        assert!(
+                            h.level <= l && &b[..8] == version::segment_magic(h.level),
+                            "{path}: segment of level {} at most {l} expected",
+                            h.level
+                        );
                         assert!(h.checksum.is_none() || h.level >= version::TEST_LEVEL, "{path}");
                     }
                     // and the whole object parses (the test level's checksum verifies)
@@ -173,7 +191,8 @@ async fn verify(nodes: &[&TestServer], acked: &[(String, RecordRef)]) {
         let mut sub = n.subscribe(Some(0)).await;
         let frames = sub
             .until(Duration::from_secs(30), |fs| {
-                let seen: HashSet<(String, String)> = fs.iter().filter_map(|f| f.commit()).map(|c| (c.repo, c.rev)).collect();
+                let seen: HashSet<(String, String)> =
+                    fs.iter().filter_map(|f| f.commit()).map(|c| (c.repo, c.rev)).collect();
                 want.is_subset(&seen)
             })
             .await;
@@ -187,7 +206,12 @@ async fn verify(nodes: &[&TestServer], acked: &[(String, RecordRef)]) {
             }
         }
         let got: HashSet<(String, String)> = seen.into_iter().collect();
-        assert!(want.is_subset(&got), "{}: {} acked commits missing from the firehose", n.url, want.difference(&got).count());
+        assert!(
+            want.is_subset(&got),
+            "{}: {} acked commits missing from the firehose",
+            n.url,
+            want.difference(&got).count()
+        );
     }
 }
 
@@ -202,7 +226,13 @@ async fn one_level_below_max_writes_nothing_new() {
     {
         use object_store::ObjectStoreExt;
         let v = version::ClusterVersion::new(below, "test");
-        store.put(&object_store::path::Path::from(format!("{PREFIX}/{}", version::OBJECT)), serde_json::to_vec(&v).unwrap().into()).await.unwrap();
+        store
+            .put(
+                &object_store::path::Path::from(format!("{PREFIX}/{}", version::OBJECT)),
+                serde_json::to_vec(&v).unwrap().into(),
+            )
+            .await
+            .unwrap();
     }
     let a = node("lg-a", &store).await;
     let b = node("lg-b", &store).await;
@@ -242,10 +272,16 @@ async fn one_level_below_max_writes_nothing_new() {
     // a persistent level is never lowered; finalize raises to the test level
     let v = b.xrpc.post("vlpds.admin.setFeatureLevel", &json!({"level": version::MAX_LEVEL}), &Auth::Admin).await.ok();
     assert_eq!(v["active"].as_u64(), Some(version::MAX_LEVEL as u64), "{v}");
-    a.xrpc.post("vlpds.admin.setFeatureLevel", &json!({"level": below, "lower": true}), &Auth::Admin).await.err(400, "InvalidRequest");
+    a.xrpc
+        .post("vlpds.admin.setFeatureLevel", &json!({"level": below, "lower": true}), &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
     // every node observes it within a TTL; writers switch at their next segment
     for n in [&a, &b, &c] {
-        wait_until("nodes observing the raise", Duration::from_secs(10), || cluster(n).own_lease().seen_level == version::MAX_LEVEL).await;
+        wait_until("nodes observing the raise", Duration::from_secs(10), || {
+            cluster(n).own_lease().seen_level == version::MAX_LEVEL
+        })
+        .await;
     }
     write(&[&a, &b, &c], &accts, 3, "finalized", &mut acked).await;
     retry("test-level segments and reports", || async {

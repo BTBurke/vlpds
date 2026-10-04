@@ -1,9 +1,7 @@
 //! ES256 JWKs and JWTs, RFC 7638 thumbprints, DPoP proofs (RFC 9449) and
 //! server-issued DPoP nonces.
 
-use super::util::{
-    b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay,
-};
+use super::util::{b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::EncodedPoint;
@@ -18,24 +16,15 @@ const DPOP_CLOCK_TOLERANCE: i64 = 180;
 
 /// Rejects private keys.
 pub fn jwk_to_key(jwk: &J) -> Result<VerifyingKey, String> {
-    if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC")
-        || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
+    if jwk.get("kty").and_then(|v| v.as_str()) != Some("EC") || jwk.get("crv").and_then(|v| v.as_str()) != Some("P-256")
     {
         return Err("unsupported JWK (expected EC P-256)".into());
     }
     if jwk.get("d").is_some() {
         return Err("JWK must be a public key".into());
     }
-    let x = jwk
-        .get("x")
-        .and_then(|v| v.as_str())
-        .and_then(b64u_decode)
-        .ok_or("JWK missing x")?;
-    let y = jwk
-        .get("y")
-        .and_then(|v| v.as_str())
-        .and_then(b64u_decode)
-        .ok_or("JWK missing y")?;
+    let x = jwk.get("x").and_then(|v| v.as_str()).and_then(b64u_decode).ok_or("JWK missing x")?;
+    let y = jwk.get("y").and_then(|v| v.as_str()).and_then(b64u_decode).ok_or("JWK missing y")?;
     if x.len() != 32 || y.len() != 32 {
         return Err("invalid JWK coordinates".into());
     }
@@ -82,19 +71,11 @@ impl DecodedJwt {
             return Err("malformed JWT".into());
         }
         let sig = b64u_decode(s).ok_or("malformed JWT signature")?;
-        Ok(DecodedJwt {
-            header,
-            payload,
-            signing_input: format!("{h}.{p}"),
-            sig,
-        })
+        Ok(DecodedJwt { header, payload, signing_input: format!("{h}.{p}"), sig })
     }
 
     pub fn alg(&self) -> &str {
-        self.header
-            .get("alg")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
+        self.header.get("alg").and_then(|v| v.as_str()).unwrap_or("")
     }
 
     pub fn verify_es256(&self, key: &VerifyingKey) -> bool {
@@ -116,9 +97,7 @@ impl DecodedJwt {
     }
 
     pub fn claim_i64(&self, k: &str) -> Option<i64> {
-        self.payload
-            .get(k)
-            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+        self.payload.get(k).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
     }
 }
 
@@ -156,11 +135,8 @@ impl ServerKey {
         use crate::crypto::{fault, record_fault, Purpose, SignatureFault};
         use p256::ecdsa::signature::RandomizedSigner;
         let header = json!({"alg": "ES256", "typ": typ, "kid": self.kid});
-        let input = format!(
-            "{}.{}",
-            b64u(serde_json::to_vec(&header).unwrap()),
-            b64u(serde_json::to_vec(payload).unwrap())
-        );
+        let input =
+            format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(payload).unwrap()));
         let vk = self.sk.verifying_key();
         for _ in 0..2 {
             let sig: Signature = self.sk.sign_with_rng(&mut rand::thread_rng(), input.as_bytes());
@@ -201,9 +177,7 @@ const NONCE_ROTATION_SECS: i64 = 60;
 
 impl DpopNonces {
     pub fn new(server_secret: &str) -> DpopNonces {
-        DpopNonces {
-            secret: derive_secret(server_secret, "dpop-nonce"),
-        }
+        DpopNonces { secret: derive_secret(server_secret, "dpop-nonce") }
     }
 
     fn compute(&self, counter: i64) -> String {
@@ -247,10 +221,7 @@ impl DpopProof {
 /// Origin + path: no query or fragment.
 pub fn normalize_htu(u: &str) -> Option<String> {
     let url = reqwest::Url::parse(u).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
+    if !matches!(url.scheme(), "http" | "https") || !url.username().is_empty() || url.password().is_some() {
         return None;
     }
     let origin = url.origin().ascii_serialization();
@@ -268,42 +239,31 @@ pub fn check_proof(
     nonces: &DpopNonces,
 ) -> Result<DpopProof, DpopError> {
     let inv = |m: &str| DpopError::Invalid(m.to_string());
-    let jwt = DecodedJwt::decode(proof)
-        .map_err(|e| DpopError::Invalid(format!("Failed to verify DPoP proof: {e}")))?;
+    let jwt = DecodedJwt::decode(proof).map_err(|e| DpopError::Invalid(format!("Failed to verify DPoP proof: {e}")))?;
     if jwt.header.get("typ").and_then(|v| v.as_str()) != Some("dpop+jwt") {
-        return Err(inv(
-            "Failed to verify DPoP proof: unexpected \"typ\" JWT header value",
-        ));
+        return Err(inv("Failed to verify DPoP proof: unexpected \"typ\" JWT header value"));
     }
     if !VERIFY_ALGS.contains(&jwt.alg()) {
         return Err(inv("Failed to verify DPoP proof: unsupported \"alg\""));
     }
-    let jwk = jwt
-        .header
-        .get("jwk")
-        .ok_or_else(|| inv("Failed to verify DPoP proof: missing \"jwk\" header"))?;
-    let key = jwk_to_key(jwk)
-        .map_err(|e| DpopError::Invalid(format!("Failed to verify DPoP proof: {e}")))?;
+    let jwk = jwt.header.get("jwk").ok_or_else(|| inv("Failed to verify DPoP proof: missing \"jwk\" header"))?;
+    let key = jwk_to_key(jwk).map_err(|e| DpopError::Invalid(format!("Failed to verify DPoP proof: {e}")))?;
     if !jwt.verify_es256(&key) {
-        return Err(inv(
-            "Failed to verify DPoP proof: signature verification failed",
-        ));
+        return Err(inv("Failed to verify DPoP proof: signature verification failed"));
     }
     let now = now_secs();
-    let iat = jwt
-        .claim_i64("iat")
-        .ok_or_else(|| inv("Failed to verify DPoP proof: missing \"iat\" claim"))?;
+    let iat = jwt.claim_i64("iat").ok_or_else(|| inv("Failed to verify DPoP proof: missing \"iat\" claim"))?;
     if iat > now + DPOP_CLOCK_TOLERANCE {
-        return Err(inv("Failed to verify DPoP proof: \"iat\" claim timestamp check failed (it should be in the past)"));
+        return Err(inv(
+            "Failed to verify DPoP proof: \"iat\" claim timestamp check failed (it should be in the past)",
+        ));
     }
     if iat < now - DPOP_MAX_AGE - DPOP_CLOCK_TOLERANCE {
         return Err(inv("Failed to verify DPoP proof: \"iat\" claim timestamp check failed (too far in the past)"));
     }
     if let Some(exp) = jwt.claim_i64("exp") {
         if exp < now - DPOP_CLOCK_TOLERANCE {
-            return Err(inv(
-                "Failed to verify DPoP proof: \"exp\" claim timestamp check failed",
-            ));
+            return Err(inv("Failed to verify DPoP proof: \"exp\" claim timestamp check failed"));
         }
     }
     let nonce = match jwt.payload.get("nonce") {
@@ -319,22 +279,14 @@ pub fn check_proof(
     if jwt.claim_str("htm") != Some(htm) {
         return Err(inv("DPoP \"htm\" mismatch"));
     }
-    let htu = jwt
-        .claim_str("htu")
-        .ok_or_else(|| inv("Invalid DPoP \"htu\" type"))?;
+    let htu = jwt.claim_str("htu").ok_or_else(|| inv("Invalid DPoP \"htu\" type"))?;
     let htu_norm = normalize_htu(htu).ok_or_else(|| inv("DPoP \"htu\" is not a valid URL"))?;
     if htu_norm != expected_htu {
         return Err(inv("DPoP \"htu\" mismatch"));
     }
     match &nonce {
-        None => {
-            return Err(DpopError::UseNonce(
-                "Authorization server requires nonce in DPoP proof".into(),
-            ))
-        }
-        Some(n) if !nonces.check(n) => {
-            return Err(DpopError::UseNonce("DPoP \"nonce\" mismatch".into()))
-        }
+        None => return Err(DpopError::UseNonce("Authorization server requires nonce in DPoP proof".into())),
+        Some(n) if !nonces.check(n) => return Err(DpopError::UseNonce("DPoP \"nonce\" mismatch".into())),
         _ => {}
     }
     let ath = jwt.claim_str("ath");
@@ -350,13 +302,8 @@ pub fn check_proof(
             }
         }
     }
-    let jkt = jwk_thumbprint(jwk)
-        .map_err(|e| DpopError::Invalid(format!("Failed to calculate jkt: {e}")))?;
-    Ok(DpopProof {
-        jkt,
-        jti,
-        until: now + DPOP_MAX_AGE + 2 * DPOP_CLOCK_TOLERANCE,
-    })
+    let jkt = jwk_thumbprint(jwk).map_err(|e| DpopError::Invalid(format!("Failed to calculate jkt: {e}")))?;
+    Ok(DpopProof { jkt, jti, until: now + DPOP_MAX_AGE + 2 * DPOP_CLOCK_TOLERANCE })
 }
 
 #[cfg(test)]
@@ -364,27 +311,19 @@ mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
 
-    fn proof(
-        sk: &SigningKey,
-        htm: &str,
-        htu: &str,
-        nonce: Option<&str>,
-        ath: Option<&str>,
-    ) -> String {
+    fn proof(sk: &SigningKey, htm: &str, htu: &str, nonce: Option<&str>, ath: Option<&str>) -> String {
         let jwk = key_to_jwk(sk.verifying_key());
         let header = json!({"typ": "dpop+jwt", "alg": "ES256", "jwk": jwk});
-        let mut payload = json!({"jti": super::super::util::random_id("", 12), "htm": htm, "htu": htu, "iat": now_secs()});
+        let mut payload =
+            json!({"jti": super::super::util::random_id("", 12), "htm": htm, "htu": htu, "iat": now_secs()});
         if let Some(n) = nonce {
             payload["nonce"] = J::String(n.into());
         }
         if let Some(a) = ath {
             payload["ath"] = J::String(sha256_b64u(a));
         }
-        let input = format!(
-            "{}.{}",
-            b64u(serde_json::to_vec(&header).unwrap()),
-            b64u(serde_json::to_vec(&payload).unwrap())
-        );
+        let input =
+            format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(&payload).unwrap()));
         let sig: Signature = sk.sign(input.as_bytes());
         format!("{input}.{}", b64u(sig.to_bytes()))
     }
@@ -395,23 +334,11 @@ mod tests {
         let sk = SigningKey::random(&mut rand::rngs::OsRng);
         let htu = "https://pds.example/xrpc/foo";
         let p = proof(&sk, "POST", htu, None, None);
-        assert!(matches!(
-            check_proof(&p, "POST", htu, None, &nonces),
-            Err(DpopError::UseNonce(_))
-        ));
+        assert!(matches!(check_proof(&p, "POST", htu, None, &nonces), Err(DpopError::UseNonce(_))));
         let n = nonces.next();
-        let p = proof(
-            &sk,
-            "POST",
-            "https://pds.example/xrpc/foo?x=1",
-            Some(&n),
-            Some("tok"),
-        );
+        let p = proof(&sk, "POST", "https://pds.example/xrpc/foo?x=1", Some(&n), Some("tok"));
         let ok = check_proof(&p, "POST", htu, Some("tok"), &nonces).unwrap();
-        assert_eq!(
-            ok.jkt,
-            jwk_thumbprint(&key_to_jwk(sk.verifying_key())).unwrap()
-        );
+        assert_eq!(ok.jkt, jwk_thumbprint(&key_to_jwk(sk.verifying_key())).unwrap());
         // single use is claimed by the caller, at the routing key's owner
         let r = ok.replay("did:plc:x".into());
         let c = super::super::util::ReplayCache::new(10, 10);
@@ -422,10 +349,7 @@ mod tests {
         let p = proof(&sk, "POST", htu, Some(&n), Some("other"));
         assert!(check_proof(&p, "POST", htu, Some("tok"), &nonces).is_err());
         let p = proof(&sk, "POST", htu, Some("bogus"), None);
-        assert!(matches!(
-            check_proof(&p, "POST", htu, None, &nonces),
-            Err(DpopError::UseNonce(_))
-        ));
+        assert!(matches!(check_proof(&p, "POST", htu, None, &nonces), Err(DpopError::UseNonce(_))));
     }
 
     #[test]

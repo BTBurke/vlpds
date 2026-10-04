@@ -192,8 +192,10 @@ pub fn op_type(op: &J, signed: bool) -> Result<OpType, PlcError> {
     }
     match m.get("type").and_then(J::as_str) {
         Some("plc_operation") => {
-            let ok = only_keys(m, &with(&["type", "rotationKeys", "verificationMethods", "alsoKnownAs", "services", "prev"]))
-                && str_array(m.get("rotationKeys"))
+            let ok = only_keys(
+                m,
+                &with(&["type", "rotationKeys", "verificationMethods", "alsoKnownAs", "services", "prev"]),
+            ) && str_array(m.get("rotationKeys"))
                 && str_array(m.get("alsoKnownAs"))
                 && matches!(m.get("verificationMethods"), Some(J::Object(v)) if v.values().all(J::is_string))
                 && matches!(m.get("services"), Some(J::Object(s)) if s.values().all(|s| {
@@ -202,7 +204,9 @@ pub fn op_type(op: &J, signed: bool) -> Result<OpType, PlcError> {
                 && matches!(m.get("prev"), Some(J::String(_) | J::Null));
             ok.then_some(OpType::Operation).ok_or_else(bad)
         }
-        Some("plc_tombstone") => (only_keys(m, &with(&["type", "prev"])) && is_str(m.get("prev"))).then_some(OpType::Tombstone).ok_or_else(bad),
+        Some("plc_tombstone") => (only_keys(m, &with(&["type", "prev"])) && is_str(m.get("prev")))
+            .then_some(OpType::Tombstone)
+            .ok_or_else(bad),
         Some("create") => {
             let ok = only_keys(m, &with(&["type", "signingKey", "recoveryKey", "handle", "service", "prev"]))
                 && ["signingKey", "recoveryKey", "handle", "service"].iter().all(|k| is_str(m.get(*k)))
@@ -233,7 +237,10 @@ pub fn normalize(op: &J) -> J {
 }
 
 pub fn rotation_keys(op: &J) -> Vec<String> {
-    normalize(op)["rotationKeys"].as_array().map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect()).unwrap_or_default()
+    normalize(op)["rotationKeys"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|k| k.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
 }
 
 pub fn ensure_http_prefix(s: &str) -> String {
@@ -254,7 +261,13 @@ pub fn ensure_atproto_prefix(s: &str) -> String {
 }
 
 /// `formatAtprotoOp`.
-pub fn format_atproto_op(signing_key: &str, handle: &str, pds: &str, rotation_keys: &[String], prev: Option<&str>) -> J {
+pub fn format_atproto_op(
+    signing_key: &str,
+    handle: &str,
+    pds: &str,
+    rotation_keys: &[String],
+    prev: Option<&str>,
+) -> J {
     json!({
         "type": "plc_operation",
         "verificationMethods": {"atproto": signing_key},
@@ -451,7 +464,9 @@ impl PlcLog {
                     }
                     let lapsed = at_ms - first.created_at_ms;
                     if lapsed > RECOVERY_WINDOW_MS {
-                        return Err(invalid(format!("Recovery operation occurred outside of the allowed 72 hr recovery window ({lapsed} ms)")));
+                        return Err(invalid(format!(
+                            "Recovery operation occurred outside of the allowed 72 hr recovery window ({lapsed} ms)"
+                        )));
                     }
                     for &i in nullified {
                         self.entries[i].nullified = true;
@@ -488,7 +503,8 @@ fn op_to_data(did: &str, op: &J) -> Option<J> {
 /// `formatDidDoc`.
 pub fn format_did_doc(data: &J) -> J {
     let did = data["did"].as_str().unwrap_or("");
-    let mut context = vec!["https://www.w3.org/ns/did/v1".to_string(), "https://w3id.org/security/multikey/v1".to_string()];
+    let mut context =
+        vec!["https://www.w3.org/ns/did/v1".to_string(), "https://w3id.org/security/multikey/v1".to_string()];
     let mut vms = Vec::new();
     for (id, key) in data["verificationMethods"].as_object().into_iter().flatten() {
         let key = key.as_str().unwrap_or("");
@@ -546,11 +562,24 @@ impl PlcClient {
     /// `json`: parse a 2xx body (the GETs). An accepted `POST /{did}` gets a
     /// text/plain "OK" (did-method-plc `res.sendStatus(200)`), so POST bodies
     /// are ignored: any 2xx means the op was applied.
-    async fn call(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool) -> Result<Option<J>, PlcError> {
+    async fn call(
+        &self,
+        op: &'static str,
+        rb: reqwest::RequestBuilder,
+        did: &str,
+        json: bool,
+    ) -> Result<Option<J>, PlcError> {
         self.call_capped(op, rb, did, json, MAX_RESPONSE_BYTES).await
     }
 
-    async fn call_capped(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool, cap: usize) -> Result<Option<J>, PlcError> {
+    async fn call_capped(
+        &self,
+        op: &'static str,
+        rb: reqwest::RequestBuilder,
+        did: &str,
+        json: bool,
+        cap: usize,
+    ) -> Result<Option<J>, PlcError> {
         let t = Instant::now();
         let r = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let r = rb.send().await.map_err(|e| PlcError::Unavailable(format!("{e}")))?;
@@ -560,7 +589,9 @@ impl PlcClient {
                 if body.is_empty() || !json {
                     return Ok(None);
                 }
-                return serde_json::from_slice(&body).map(Some).map_err(|e| PlcError::Unavailable(format!("bad response: {e}")));
+                return serde_json::from_slice(&body)
+                    .map(Some)
+                    .map_err(|e| PlcError::Unavailable(format!("bad response: {e}")));
             }
             let message = serde_json::from_slice::<J>(&body)
                 .ok()
@@ -592,12 +623,16 @@ impl PlcClient {
 
     pub async fn last_op(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/log/last")?;
-        self.call("get_last_op", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
+        self.call("get_last_op", self.http.get(url), did, true)
+            .await?
+            .ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
     pub async fn document_data(&self, did: &str) -> Result<J, PlcError> {
         let url = self.did_url(did, "/data")?;
-        self.call("get_data", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
+        self.call("get_data", self.http.get(url), did, true)
+            .await?
+            .ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
     /// Every op with its CID, `nullified` and `createdAt`, oldest first.
@@ -673,7 +708,8 @@ impl RotationKey {
     /// A `vw1.` wrapped blob, or 64 hex chars (a mounted secret).
     pub fn from_file(path: &std::path::Path) -> anyhow::Result<RotationKey> {
         let s = zeroize::Zeroizing::new(
-            std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading PLC rotation key file {}: {e}", path.display()))?,
+            std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading PLC rotation key file {}: {e}", path.display()))?,
         );
         let t = s.trim();
         if t.starts_with("vw1.") {
@@ -691,7 +727,9 @@ impl RotationKey {
         let key = match self {
             RotationKey::Key(k) => return Ok(k.clone()),
             RotationKey::Hex(h) => {
-                let raw = zeroize::Zeroizing::new(hex::decode(h.trim()).map_err(|_| anyhow::anyhow!("PLC rotation key must be 64 hex chars"))?);
+                let raw = zeroize::Zeroizing::new(
+                    hex::decode(h.trim()).map_err(|_| anyhow::anyhow!("PLC rotation key must be 64 hex chars"))?,
+                );
                 anyhow::ensure!(raw.len() == 32, "PLC rotation key must be 32 bytes (64 hex chars)");
                 Keypair::from_bytes(&raw)?
             }
@@ -709,7 +747,10 @@ impl RotationKey {
 }
 
 /// The `--plc-rotation-key-file` form.
-pub async fn wrap_rotation_key(secrets: &crate::secrets::Secrets, key: &Keypair) -> Result<String, crate::secrets::SecretError> {
+pub async fn wrap_rotation_key(
+    secrets: &crate::secrets::Secrets,
+    key: &Keypair,
+) -> Result<String, crate::secrets::SecretError> {
     secrets.wrap(crate::secrets::Purpose::PlcRotationKey, ROTATION_KEY_SUBJECT, &key.to_bytes()).await
 }
 
@@ -805,7 +846,11 @@ pub struct RecoveryKeyChange {
 }
 
 /// `keys` with `recovery` inserted just ahead of the first server key.
-pub fn with_recovery_key(keys: &[String], recovery: &str, is_server_key: impl Fn(&str) -> bool) -> (RecoveryKeyOutcome, Vec<String>) {
+pub fn with_recovery_key(
+    keys: &[String],
+    recovery: &str,
+    is_server_key: impl Fn(&str) -> bool,
+) -> (RecoveryKeyOutcome, Vec<String>) {
     if keys.iter().any(|k| k == recovery) {
         return (RecoveryKeyOutcome::Present, keys.to_vec());
     }
@@ -829,7 +874,14 @@ impl std::fmt::Debug for Plc {
 impl Plc {
     pub fn new(plc_url: &str, key: Arc<Keypair>, recovery_did_key: Option<String>) -> Plc {
         let did_key = key.did_key();
-        Plc { client: PlcClient::new(plc_url), key, did_key, recovery_did_key, old: Vec::new(), locks: Default::default() }
+        Plc {
+            client: PlcClient::new(plc_url),
+            key,
+            did_key,
+            recovery_did_key,
+            old: Vec::new(),
+            locks: Default::default(),
+        }
     }
 
     async fn lock(&self, did: &str) -> tokio::sync::OwnedMutexGuard<()> {
@@ -855,7 +907,12 @@ impl Plc {
     /// meanwhile (a same-key fork is refused), it is rebuilt on the new last
     /// op, so concurrent updates of different fields both land. Ok(false):
     /// nothing submitted.
-    async fn update(&self, did: &str, label: &'static str, build: impl Fn(&J) -> Result<Option<J>, PlcError>) -> Result<bool, PlcError> {
+    async fn update(
+        &self,
+        did: &str,
+        label: &'static str,
+        build: impl Fn(&J) -> Result<Option<J>, PlcError>,
+    ) -> Result<bool, PlcError> {
         let _g = self.lock(did).await;
         let mut attempt = 0;
         loop {
@@ -910,12 +967,17 @@ impl Plc {
         match cfg.effective_mode() {
             PlcMode::Unregistered => {
                 if !dev_mode {
-                    tracing::warn!("PLC registration is off outside dev mode: new accounts' DIDs exist only on this server");
+                    tracing::warn!(
+                        "PLC registration is off outside dev mode: new accounts' DIDs exist only on this server"
+                    );
                 }
                 Ok(None)
             }
             _ => {
-                let src = cfg.rotation_key.as_ref().ok_or_else(|| anyhow::anyhow!("--plc-mode directory needs a PLC rotation key"))?;
+                let src = cfg
+                    .rotation_key
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("--plc-mode directory needs a PLC rotation key"))?;
                 let mut plc = Plc::new(plc_url, src.load(secrets).await?, cfg.recovery_did_key.clone());
                 for k in &cfg.old_rotation_keys {
                     let k = k.load(secrets).await?;
@@ -925,7 +987,12 @@ impl Plc {
                     }
                 }
                 touch_metrics();
-                tracing::info!(plc_url, rotation_key = plc.did_key, retired_keys = plc.old.len(), "PLC registration on");
+                tracing::info!(
+                    plc_url,
+                    rotation_key = plc.did_key,
+                    retired_keys = plc.old.len(),
+                    "PLC registration on"
+                );
                 Ok(Some(Arc::new(plc)))
             }
         }
@@ -950,9 +1017,19 @@ impl Plc {
     }
 
     /// Reference `formatDidAndPlcOp`, including its rotation key order.
-    pub fn genesis(&self, signing_did_key: &str, handle: &str, pds: &str, user_recovery_key: Option<&str>) -> Result<(String, J), PlcError> {
-        let rotation_keys: Vec<String> =
-            user_recovery_key.map(str::to_string).into_iter().chain(self.recovery_did_key.clone()).chain([self.did_key.clone()]).collect();
+    pub fn genesis(
+        &self,
+        signing_did_key: &str,
+        handle: &str,
+        pds: &str,
+        user_recovery_key: Option<&str>,
+    ) -> Result<(String, J), PlcError> {
+        let rotation_keys: Vec<String> = user_recovery_key
+            .map(str::to_string)
+            .into_iter()
+            .chain(self.recovery_did_key.clone())
+            .chain([self.did_key.clone()])
+            .collect();
         let op = sign(format_atproto_op(signing_did_key, handle, pds, &rotation_keys, None), &self.key)?;
         Ok((did_for_genesis(&op)?, op))
     }
@@ -960,7 +1037,11 @@ impl Plc {
     /// `createUpdateOp`: `f` edits `last` normalized without `sig`/`prev`.
     /// If `last` lists only a retired server key, that key signs, and the op
     /// lists the current key in its place.
-    pub fn update_op(&self, last: &J, f: impl FnOnce(&mut Map<String, J>) -> Result<(), PlcError>) -> Result<J, PlcError> {
+    pub fn update_op(
+        &self,
+        last: &J,
+        f: impl FnOnce(&mut Map<String, J>) -> Result<(), PlcError>,
+    ) -> Result<J, PlcError> {
         match op_type(last, true)? {
             OpType::Tombstone => return Err(PlcError::Tombstoned),
             OpType::Operation | OpType::LegacyCreate => {}
@@ -1017,7 +1098,10 @@ impl Plc {
     /// account would have it: just ahead of the server key, behind any keys
     /// the user added (which keep their higher priority).
     pub async fn ensure_recovery_key(&self, did: &str, dry: bool) -> Result<RecoveryKeyChange, PlcError> {
-        let recovery = self.recovery_did_key.clone().ok_or_else(|| invalid("no operator recovery key configured (--plc-recovery-did-key)"))?;
+        let recovery = self
+            .recovery_did_key
+            .clone()
+            .ok_or_else(|| invalid("no operator recovery key configured (--plc-recovery-did-key)"))?;
         let last = self.last_op(did).await?;
         let before = rotation_keys(&last);
         let (outcome, after) = with_recovery_key(&before, &recovery, |k| self.is_server_key(k));
@@ -1128,13 +1212,19 @@ mod tests {
         ("empty_rotation_keys", include_str!("../../testdata/plc/valid/log_empty_rotation_keys.json")),
         ("legacy_dholms", include_str!("../../testdata/plc/valid/log_legacy_dholms.json")),
         ("nullification", include_str!("../../testdata/plc/valid/log_nullification.json")),
-        ("nullification_at_exactly_72h", include_str!("../../testdata/plc/valid/log_nullification_at_exactly_72h.json")),
+        (
+            "nullification_at_exactly_72h",
+            include_str!("../../testdata/plc/valid/log_nullification_at_exactly_72h.json"),
+        ),
         ("nullification_nontrivial", include_str!("../../testdata/plc/valid/log_nullification_nontrivial.json")),
         ("nullified_tombstone", include_str!("../../testdata/plc/valid/log_nullified_tombstone.json")),
         ("tombstone", include_str!("../../testdata/plc/valid/log_tombstone.json")),
     ];
     const INVALID: &[(&str, &str)] = &[
-        ("nullification_reused_key", include_str!("../../testdata/plc/invalid/log_invalid_nullification_reused_key.json")),
+        (
+            "nullification_reused_key",
+            include_str!("../../testdata/plc/invalid/log_invalid_nullification_reused_key.json"),
+        ),
         ("nullification_too_slow", include_str!("../../testdata/plc/invalid/log_invalid_nullification_too_slow.json")),
         ("sig_b64_newline", include_str!("../../testdata/plc/invalid/log_invalid_sig_b64_newline.json")),
         ("sig_b64_padding_bits", include_str!("../../testdata/plc/invalid/log_invalid_sig_b64_padding_bits.json")),
@@ -1246,17 +1336,22 @@ mod tests {
         // reference ordering: user recovery key, server recovery key, server rotation key
         assert_eq!(rotation_keys(&op), vec![user.clone(), recovery.clone(), rot.did_key()]);
         assert_eq!(op["alsoKnownAs"], json!(["at://alice.test"]));
-        assert_eq!(op["services"]["atproto_pds"], json!({"type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example"}));
+        assert_eq!(
+            op["services"]["atproto_pds"],
+            json!({"type": "AtprotoPersonalDataServer", "endpoint": "https://pds.example"})
+        );
         assert_eq!(op["prev"], J::Null);
         assert_eq!(plc.recommended_rotation_keys(), vec![recovery, rot.did_key()]);
         // low-S compact base64url signature by the server key
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(op["sig"].as_str().unwrap()).unwrap();
         assert_eq!(sig.len(), 64);
-        assert!(secp256k1::ecdsa::Signature::from_compact(&sig).map(|s| {
-            let mut n = s;
-            n.normalize_s();
-            n == s
-        }).unwrap());
+        assert!(secp256k1::ecdsa::Signature::from_compact(&sig)
+            .map(|s| {
+                let mut n = s;
+                n.normalize_s();
+                n == s
+            })
+            .unwrap());
         assert_eq!(verify_sig(&rotation_keys(&op), &op).unwrap(), rot.did_key());
         assert_valid_incoming(&op).unwrap();
         let mut log = PlcLog::new(&did);
@@ -1325,7 +1420,8 @@ mod tests {
         assert!(c(PlcMode::Directory, key()).check(false, "ftp://x").is_err());
         let bad = PlcConfig { recovery_did_key: Some("did:key:nope".into()), ..c(PlcMode::Auto, key()) };
         assert!(bad.check(false, DEFAULT_PLC_URL).is_err());
-        assert!(!format!("{:?}", c(PlcMode::Auto, Some(RotationKey::Hex(zeroize::Zeroizing::new("ab".repeat(32)))))).contains("abab"));
+        assert!(!format!("{:?}", c(PlcMode::Auto, Some(RotationKey::Hex(zeroize::Zeroizing::new("ab".repeat(32))))))
+            .contains("abab"));
     }
 
     #[tokio::test]

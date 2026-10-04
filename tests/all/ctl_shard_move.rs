@@ -84,7 +84,10 @@ async fn moves_under_load(read_latency: Duration) {
     // a second session, ended, and the record taken down: just before the moves
     let sess = a.create_session(&victim.handle, PASSWORD).await.ok();
     let revoked = sess["accessJwt"].as_str().unwrap().to_string();
-    a.xrpc.post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into())).await.ok();
+    a.xrpc
+        .post_empty("com.atproto.server.deleteSession", &Auth::Bearer(sess["refreshJwt"].as_str().unwrap().into()))
+        .await
+        .ok();
     b.xrpc
         .post(
             "com.atproto.admin.updateSubjectStatus",
@@ -159,7 +162,10 @@ async fn moves_under_load(read_latency: Duration) {
         settled - moves,
         unavailable.len()
     );
-    for l in vlpds::metrics::render().lines().filter(|l| l.starts_with("vlpds_security_ctl_loads_total") || l.starts_with("vlpds_write_retries_total")) {
+    for l in vlpds::metrics::render()
+        .lines()
+        .filter(|l| l.starts_with("vlpds_security_ctl_loads_total") || l.starts_with("vlpds_write_retries_total"))
+    {
         eprintln!("  {l}");
     }
     for s in unavailable.iter().take(20) {
@@ -178,7 +184,12 @@ async fn moves_under_load(read_latency: Duration) {
     assert!(failed_writes.is_empty(), "writes failed during the moves: {failed_writes:?}");
     // reads may still find the account itself mid-move, only while shards move
     for s in &unavailable {
-        assert!(s.at >= moves && s.at <= settled + Duration::from_millis(500), "503 outside the moves (+{:?}): {}", since(s), s.error);
+        assert!(
+            s.at >= moves && s.at <= settled + Duration::from_millis(500),
+            "503 outside the moves (+{:?}): {}",
+            since(s),
+            s.error
+        );
     }
 
     // right after: enforced on every node, the new owners reading their

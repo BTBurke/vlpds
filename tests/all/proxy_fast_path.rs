@@ -68,11 +68,7 @@ async fn rotated_signing_key_stops_service_jwt_reuse() {
     assert!(verifies(&t1, &k1));
     assert_eq!(timeline().await, t1, "the minted token is reused");
 
-    let r = s
-        .xrpc
-        .post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin)
-        .await
-        .ok();
+    let r = s.xrpc.post("com.atproto.admin.updateAccountSigningKey", &json!({"did": a.did}), &Auth::Admin).await.ok();
     assert!(r["signingKey"].is_string(), "{r}");
     let k2 = repo_key(&s, &a.did).await;
     assert_ne!(k1, k2);
@@ -114,7 +110,8 @@ async fn upstream_connections_are_reused() {
     let router = axum::Router::new().fallback(|req: Request| async move {
         // `close=1`: the upstream drops this connection after answering
         let close = req.uri().query().is_some_and(|q| q.contains("close=1"));
-        let mut r = axum::response::IntoResponse::into_response(axum::Json(json!({"feed": [], "pad": "x".repeat(3000)})));
+        let mut r =
+            axum::response::IntoResponse::into_response(axum::Json(json!({"feed": [], "pad": "x".repeat(3000)})));
         if close {
             r.headers_mut().insert("connection", "close".parse().unwrap());
         }
@@ -317,7 +314,12 @@ async fn unread_proxied_responses_free_upstream_connections() {
     let wait = |what: &str, ok: &dyn Fn() -> bool| {
         let t = Instant::now();
         while !ok() {
-            assert!(t.elapsed() < Duration::from_secs(10), "{what}: open {} idle {}", host.open_connections(), host.idle_connections());
+            assert!(
+                t.elapsed() < Duration::from_secs(10),
+                "{what}: open {} idle {}",
+                host.open_connections(),
+                host.idle_connections()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     };

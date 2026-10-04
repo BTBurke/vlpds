@@ -25,7 +25,11 @@ fn write(root: &Path, rel: &str, data: &[u8]) {
 fn fake_ui() -> (Dir, PathBuf) {
     let base = std::env::temp_dir().join(unique_name("vlpds-ui"));
     let ui = base.join("ui");
-    write(&ui, "index.html", b"<!doctype html><html><head><title>shell</title></head><body><div id=root></div></body></html>");
+    write(
+        &ui,
+        "index.html",
+        b"<!doctype html><html><head><title>shell</title></head><body><div id=root></div></body></html>",
+    );
     write(
         &ui,
         "og/manifest.json",
@@ -46,7 +50,9 @@ fn fake_ui() -> (Dir, PathBuf) {
 /// before sending.
 async fn raw_get(addr: std::net::SocketAddr, target: &str) -> (u16, String) {
     let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
-    c.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    c.write_all(format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
     let mut out = Vec::new();
     c.read_to_end(&mut out).await.unwrap();
     let out = String::from_utf8_lossy(&out).into_owned();

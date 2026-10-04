@@ -49,11 +49,7 @@ impl<V: Clone> TokenCache<V> {
     }
 
     fn build(kind: crate::caches::Cache, fixed_cap: Option<usize>) -> Self {
-        TokenCache {
-            shards: (0..TOKEN_CACHE_SHARDS).map(|_| Default::default()).collect(),
-            kind,
-            fixed_cap,
-        }
+        TokenCache { shards: (0..TOKEN_CACHE_SHARDS).map(|_| Default::default()).collect(), kind, fixed_cap }
     }
 
     fn cap_per_shard(&self) -> usize {
@@ -65,7 +61,8 @@ impl<V: Clone> TokenCache<V> {
     fn slot<'t>(&self, token: &'t str) -> (&TokenShard<V>, &'t str) {
         let sig = token.rsplit_once('.').map_or(token, |(_, s)| s);
         let b = sig.as_bytes();
-        let tail = b[b.len().saturating_sub(4)..].iter().fold(0usize, |h, &x| h.wrapping_mul(131).wrapping_add(x as usize));
+        let tail =
+            b[b.len().saturating_sub(4)..].iter().fold(0usize, |h, &x| h.wrapping_mul(131).wrapping_add(x as usize));
         (&self.shards[tail % self.shards.len()], sig)
     }
 
@@ -119,14 +116,7 @@ impl Jwt {
         Hmac::<Sha256>::new_from_slice(&self.secret).unwrap()
     }
 
-    pub fn issue_with_jti(
-        &self,
-        did: &str,
-        scope: &str,
-        ttl_secs: u64,
-        typ: &str,
-        jti: Option<&str>,
-    ) -> String {
+    pub fn issue_with_jti(&self, did: &str, scope: &str, ttl_secs: u64, typ: &str, jti: Option<&str>) -> String {
         let now = crate::tid::now_micros() / 1_000_000;
         let header = B64.encode(format!(r#"{{"alg":"HS256","typ":"{typ}"}}"#));
         let claims = Claims {
@@ -141,10 +131,7 @@ impl Jwt {
         let signing_input = format!("{header}.{payload}");
         let mut mac = self.mac();
         mac.update(signing_input.as_bytes());
-        format!(
-            "{signing_input}.{}",
-            B64.encode(mac.finalize().into_bytes())
-        )
+        format!("{signing_input}.{}", B64.encode(mac.finalize().into_bytes()))
     }
 
     pub fn access(&self, did: &str) -> String {
@@ -215,13 +202,8 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// `b64` is the `Authorization: Basic` value after the scheme.
 pub fn basic_admin_ok(b64: &str, admin_token: &str) -> bool {
-    let dec = base64::engine::general_purpose::STANDARD
-        .decode(b64.trim())
-        .unwrap_or_default();
-    std::str::from_utf8(&dec)
-        .ok()
-        .and_then(|s| s.strip_prefix("admin:"))
-        .is_some_and(|tok| token_eq(admin_token, tok))
+    let dec = base64::engine::general_purpose::STANDARD.decode(b64.trim()).unwrap_or_default();
+    std::str::from_utf8(&dec).ok().and_then(|s| s.strip_prefix("admin:")).is_some_and(|tok| token_eq(admin_token, tok))
 }
 
 #[cfg(test)]
@@ -252,7 +234,8 @@ mod tests {
         let other = Jwt::new("other secret", "did:web:pds.test");
         assert!(other.verify_signature_cached(&tok).is_none(), "cached per secret");
         let (input, _) = tok.rsplit_once('.').unwrap();
-        let (_, sig) = other.access("did:plc:abc").rsplit_once('.').map(|(a, b)| (a.to_string(), b.to_string())).unwrap();
+        let (_, sig) =
+            other.access("did:plc:abc").rsplit_once('.').map(|(a, b)| (a.to_string(), b.to_string())).unwrap();
         assert!(jwt.verify_signature_cached(&format!("{input}.{sig}")).is_none());
     }
 

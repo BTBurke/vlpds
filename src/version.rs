@@ -79,7 +79,10 @@ pub fn check_lower(table: &[Level], active: u32, to: u32) -> Result<(), String> 
         match table.iter().find(|x| x.level == l) {
             None => return Err(format!("level {l} is unknown to this build")),
             Some(x) if x.persistent => {
-                return Err(format!("level {l} ({}) is persistent: it wrote new formats to the bucket, so it is never lowered", x.name));
+                return Err(format!(
+                    "level {l} ({}) is persistent: it wrote new formats to the bucket, so it is never lowered",
+                    x.name
+                ));
             }
             Some(_) => {}
         }
@@ -105,7 +108,10 @@ impl Window {
     /// Err = why not (for the exit-7 log line).
     pub fn check(&self, v: &ClusterVersion) -> Result<(), String> {
         if !self.contains(v.active) {
-            return Err(format!("cluster level {} is outside this build's levels {}..={}", v.active, self.min, self.max));
+            return Err(format!(
+                "cluster level {} is outside this build's levels {}..={}",
+                v.active, self.min, self.max
+            ));
         }
         if let Some(t) = v.target.filter(|t| *t > self.max) {
             return Err(format!("cluster is raising its level to {t}, past this build's max level {}", self.max));
@@ -145,7 +151,12 @@ impl ClusterVersion {
 
 impl Change {
     pub fn new(level: u32, by: &str) -> Change {
-        Change { level, at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true), by: by.into(), extra: Default::default() }
+        Change {
+            level,
+            at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            by: by.into(),
+            extra: Default::default(),
+        }
     }
 }
 
@@ -173,7 +184,10 @@ pub fn segment_magic(level: u32) -> &'static [u8; 8] {
 }
 
 pub fn segment_magics() -> impl Iterator<Item = (&'static [u8; 8], u32)> {
-    LEVELS.iter().filter(|l| l.level >= MIN_LEVEL && l.level <= MAX_LEVEL).filter_map(|l| l.segment_magic.map(|m| (m, l.level)))
+    LEVELS
+        .iter()
+        .filter(|l| l.level >= MIN_LEVEL && l.level <= MAX_LEVEL)
+        .filter_map(|l| l.segment_magic.map(|m| (m, l.level)))
 }
 
 pub fn segment_level(magic: &[u8]) -> Option<u32> {
@@ -249,9 +263,16 @@ mod tests {
         assert_eq!(MAX_LEVEL as usize, LEVELS.len());
         assert_eq!(segment_magic(REAL_MAX), crate::segment::MAGIC);
         if cfg!(feature = "test-level") {
-            assert_eq!((MAX_LEVEL, segment_magic(MAX_LEVEL), segment_level(TEST_SEGMENT_MAGIC)), (TEST_LEVEL, TEST_SEGMENT_MAGIC, Some(TEST_LEVEL)));
+            assert_eq!(
+                (MAX_LEVEL, segment_magic(MAX_LEVEL), segment_level(TEST_SEGMENT_MAGIC)),
+                (TEST_LEVEL, TEST_SEGMENT_MAGIC, Some(TEST_LEVEL))
+            );
         } else {
-            assert_eq!((MAX_LEVEL, segment_level(TEST_SEGMENT_MAGIC)), (REAL_MAX, None), "the test level is not in this build");
+            assert_eq!(
+                (MAX_LEVEL, segment_level(TEST_SEGMENT_MAGIC)),
+                (REAL_MAX, None),
+                "the test level is not in this build"
+            );
         }
         // a level above every table entry writes the newest magic
         assert_eq!(segment_magic(MAX_LEVEL + 5), segment_magic(MAX_LEVEL));

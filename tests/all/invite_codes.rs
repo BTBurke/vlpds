@@ -12,7 +12,10 @@ async fn create_invite(s: &TestServer, uses: u32, for_account: Option<&str>) -> 
     if let Some(d) = for_account {
         body["forAccount"] = json!(d);
     }
-    s.xrpc.post("com.atproto.server.createInviteCode", &body, &Auth::Admin).await.ok()["code"].as_str().expect("code").to_string()
+    s.xrpc.post("com.atproto.server.createInviteCode", &body, &Auth::Admin).await.ok()["code"]
+        .as_str()
+        .expect("code")
+        .to_string()
 }
 
 async fn signup(s: &TestServer, code: Option<&str>) -> Resp {
@@ -112,7 +115,10 @@ async fn prevents_use_of_disabled_codes() {
     let first = create_invite(&s, 1, None).await;
     let acct = signup_ok(&s, &create_invite(&s, 1, None).await).await;
     let second = create_invite(&s, 1, Some(&acct.did)).await;
-    s.xrpc.post("com.atproto.admin.disableInviteCodes", &json!({"codes": [first], "accounts": [acct.did]}), &Auth::Admin).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.disableInviteCodes", &json!({"codes": [first], "accounts": [acct.did]}), &Auth::Admin)
+        .await
+        .ok();
     signup(&s, Some(&first)).await.err(400, "InvalidInviteCode");
     signup(&s, Some(&second)).await.err(400, "InvalidInviteCode");
 }
@@ -168,7 +174,10 @@ async fn invite_admin_endpoints_require_admin() {
 async fn get_invite_codes_validates_limit() {
     let s = server().await;
     for bad in ["0", "501"] {
-        s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", bad)], &Auth::Admin).await.err(400, "InvalidRequest");
+        s.xrpc
+            .get("com.atproto.admin.getInviteCodes", &[("limit", bad)], &Auth::Admin)
+            .await
+            .err(400, "InvalidRequest");
     }
     s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
 }
@@ -261,7 +270,8 @@ async fn ref_creates_disabled_codes_for_a_disabled_account() {
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert_eq!(account_codes(&s, &carol, &[]).await.len(), 0);
     let all = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
-    let hers: Vec<&J> = all["codes"].as_array().unwrap().iter().filter(|c| c["forAccount"] == json!(carol.did)).collect();
+    let hers: Vec<&J> =
+        all["codes"].as_array().unwrap().iter().filter(|c| c["forAccount"] == json!(carol.did)).collect();
     assert_eq!(hers.len(), 5, "{all}");
     assert!(hers.iter().all(|c| c["disabled"] == json!(true) && c["createdBy"] == json!(carol.did)), "{hers:?}");
     // vlpds's enableAccountInvites re-enables the account's codes (the
