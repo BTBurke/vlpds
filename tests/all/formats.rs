@@ -254,6 +254,7 @@ fn lease() -> vlpds::cluster::NodeLease {
         min_level: 1,
         max_level: 1,
         seen_level: 1,
+        pending_age_ms: None,
     }
 }
 

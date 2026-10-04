@@ -53,6 +53,11 @@ pub struct NodeLease {
     pub max_level: u32,
     /// 0 = not read yet.
     pub seen_level: u32,
+    /// How long this node's oldest log append had waited to be durable at
+    /// the renewal, on its own clock (`ShardHost::pending_age`): peers judge
+    /// a slow log without comparing clocks. Absent unless the host says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -254,6 +259,10 @@ pub trait ShardHost: Send + Sync + 'static {
     /// peers can't reach it yet would take shards only to give them up).
     fn may_join(&self) -> bool {
         true
+    }
+    /// Published in our lease as `pending_age_ms`. None: not published.
+    fn pending_age(&self) -> Option<Duration> {
+        None
     }
 }
 
@@ -508,6 +517,7 @@ impl Cluster {
                 min_level: cfg.levels.min,
                 max_level: cfg.levels.max,
                 seen_level: 0,
+                pending_age_ms: None,
             }),
             expires_local_ms: AtomicU64::new(0),
             valid_until: RwLock::new(Instant::now()),
@@ -1705,6 +1715,7 @@ impl Cluster {
         {
             let mut l = self.lease.write();
             l.next_ordinal = host.next_ordinal();
+            l.pending_age_ms = host.pending_age().map(|a| a.as_millis() as u64);
             l.follows = host.follow_floors();
         }
         let etag = self.lease_etag.read().clone();
@@ -2965,6 +2976,7 @@ mod tests {
             min_level: 1,
             max_level: 1,
             seen_level: 1,
+            pending_age_ms: None,
         };
         a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
         let b = join(cfg(&id), store.clone()).await.unwrap();
