@@ -696,6 +696,8 @@ fn raise_nofile_limit() {
         tracing::warn!("getrlimit(RLIMIT_NOFILE) failed: {}", std::io::Error::last_os_error());
         return;
     }
+    // only macOS lowers it (kern.maxfilesperproc)
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut want = r.max;
     #[cfg(target_os = "macos")]
     {
