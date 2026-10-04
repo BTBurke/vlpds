@@ -26,37 +26,39 @@ facts:
   - { value: "exit 7", label: an old build after finalize, note: "refuses before reading or writing anything", tone: rust }
 ```
 
-Upgrading vlpds is restarting each node on a new image, one at a time. Because every format a node
+
+Upgrading vlpds means restarting each node on a new image, one at a time. Every format a node
 persists or sends belongs to a **feature level**, and every node writes the cluster's active level
-whatever its build can do, mixed versions are safe and rolling back is a redeploy until you finalize.
-This page covers the restart, the levels, and how to test an upgrade before shipping it.
+no matter what its build can do. So mixed versions are safe, and rolling back is just a redeploy
+until you finalize.
 
 > [!NOTE]
-> Today every release runs level 1 only (`baseline`): there has been no level to finalize yet. The
-> machinery (the `cluster/version` object, the startup check, finalize and lower) is built and tested
-> with a test-only level 2.
+> Today every release runs level 1 only (`baseline`), so there hasn't been a level to finalize yet.
+> The machinery (the `cluster/version` object, the startup check, finalize and lower) is built and
+> tested with a test-only level 2.
 
 ## Rolling deploy
 
 ```steps
 - title: SIGTERM one node
-  body: "Never SIGKILL. It marks its lease `draining`, closes each shard with one barrier segment and a checkpoint, hands it straight to a settled peer, waits up to 10 s for its log to quiesce, fences its own log, deletes its lease and exits 0."
+  body: "Never SIGKILL. The node marks its lease `draining` and closes each shard with one barrier segment and a checkpoint. It hands each shard straight to a settled peer and waits up to 10 s for its log to quiesce. Then it fences its own log, deletes its lease and exits 0."
 - title: Wait for the stop
-  body: "Give the supervisor a stop timeout of **at least 60 s**. A timeout that ends in SIGKILL turns a handoff into a crash: peers fence and replay instead. Exit 8 means it couldn't fence its own log; peers or the restart do it."
+  body: "Give the supervisor a stop timeout of at least 60 s. If the timeout ends in SIGKILL, the handoff turns into a crash and peers fence and replay instead. Exit 8 means the node couldn't fence its own log, and peers or the restart will do it."
 - title: Start the new image with the same `--node-id`
-  body: "Same bucket, prefix, tokens and `--advertise-url`. It greets its peers, and they hand back its fair share at their next step."
+  body: "Use the same bucket, prefix, tokens and `--advertise-url`. The node greets its peers, and they hand back its fair share at their next step."
 - title: Check before the next node
-  body: "`sum(vlpds_owned_partitions)` equals `vlpds_shard_layout_shards`; the node owns about shards ÷ nodes; `vlpds_last_exit_reason_info{reason=\"clean\"}`; every lease valid; `vlpds_build_info{rev}` is the new rev; commit p99 and `vlpds_write_retries_total` back to baseline."
+  body: "`sum(vlpds_owned_partitions)` should equal `vlpds_shard_layout_shards`, and the node should own about shards ÷ nodes. Look for `vlpds_last_exit_reason_info{reason=\"clean\"}`, every lease valid and `vlpds_build_info{rev}` on the new rev. Commit p99 and `vlpds_write_retries_total` should be back to baseline."
 ```
 
-Clients see almost nothing: a forward in flight at the moment of exit can fail (a handful of errors
-per restart), and writes that hit a shard in motion get a retryable 503 that the entry node resends
-for up to 20 s. Expect a burst of resends and some cold repo loads on the moved shards.
+Clients see almost nothing. A forward that's in flight at the moment of exit can fail (a handful of
+errors per restart). Writes that hit a shard in motion get a retryable 503, and the entry node
+resends them for up to 20 s. Expect a burst of resends and some cold repo loads on the moved shards.
 
-**A single node is different**: every restart is a short outage. A graceful restart is ~1 s to the
-first write in an idle test, and roughly 5–30 s of Caddy 502s and dropped firehose connections in
-practice (relays reconnect with their cursor). Pick a quiet time. The Ansible role does this with
-`--tags vlpds-deploy,vlpds-verify` after you set the new image tag; see [Deploy](deploy.md).
+A single node is different, because every restart is a short outage. A graceful restart takes ~1 s
+to the first write in an idle test. On a real server expect roughly 5–30 s of Caddy 502s and dropped
+firehose connections (relays reconnect with their cursor), so pick a quiet time. The Ansible role
+does this with `--tags vlpds-deploy,vlpds-verify` after you set the new image tag (see
+[Deploy](deploy.md)).
 
 ## Feature levels
 
@@ -74,83 +76,83 @@ edges:
   - { from: n2.r, to: out.l70, label: write active, labelAt: [28.5, 9.4] }
 ```
 
-- **A level is an integer** in `src/version.rs`. Each persisted or wire format change gets the next
-  one; a level is either **persistent** (it puts new bytes in the bucket) or wire-only.
-- **A build runs `MIN_LEVEL..=MAX_LEVEL`.** It reads everything in that window and writes the active
-  level. A new build at level L therefore writes exactly what the old one writes.
-- **`cluster/version`** holds the active level, a `target` while a raise is running, and the history.
+- A level is an integer in `src/version.rs`. Each persisted or wire format change gets the next
+  one. A level is either persistent (it puts new bytes in the bucket) or wire-only.
+- A build runs `MIN_LEVEL..=MAX_LEVEL`. It reads everything in that window and writes the active
+  level, so a new build at level L writes exactly what the old one writes.
+- `cluster/version` holds the active level, a `target` while a raise is running, and the history.
   A fresh prefix starts at its first node's highest level. Only `vlpds admin cluster finalize` and
-  `cluster lower` change it; never edit it by hand.
-- **The startup gate.** A node reads `cluster/version` before it touches anything, again right after
-  writing its lease, and once per lease TTL while running. A build whose window doesn't contain the
-  active level (or a running raise's target) exits **7 `incompatible_level`**.
-- **Leases advertise** each node's `rev`, `min_level`, `max_level` and the level it last saw, so every
-  node knows the whole cluster's window. `vlpds admin cluster status` and the console's Cluster page
-  show it, with a "finalize available" banner when every node can run the next level.
+  `cluster lower` change it, so never edit it by hand.
+- The startup gate. A node reads `cluster/version` before it touches anything, again right after
+  writing its lease, and once per lease TTL while running. A build whose window doesn't contain
+  the active level (or a running raise's target) exits 7 `incompatible_level`.
+- Leases advertise each node's `rev`, `min_level`, `max_level` and the level it last saw, so every
+  node knows the whole cluster's window. `vlpds admin cluster status` and the console's Cluster
+  page show it, with a "finalize available" banner when every node can run the next level.
 
 ## Rolling upgrade, finalize, rollback
 
 ```steps
 - title: Pre-flight
-  body: "`vlpds admin cluster status`: every node healthy, `Feature level: L active`. The new build's `MIN_LEVEL` (in `src/version.rs`, with which levels are persistent) must be ≤ L."
+  body: "Run `vlpds admin cluster status`. Every node should be healthy, with `Feature level: L active`. The new build's `MIN_LEVEL` must be ≤ L (it's in `src/version.rs`, along with which levels are persistent)."
 - title: Roll the new build
-  body: "Exactly as a rolling deploy. Also check each restarted node's row shows the new rev and a window reaching L+1, and that `vlpds_format_errors_total` stays flat."
+  body: "Do it exactly like a rolling deploy. Also check that each restarted node's row shows the new rev and a window reaching L+1, and that `vlpds_format_errors_total` stays flat."
 - title: Soak at level L
-  body: "Default 24 h with the whole fleet on the new build. **Rollback is a plain redeploy** of the previous image, node by node, in any order: no byte of level L+1 exists yet."
+  body: "The default is 24 h with the whole fleet on the new build. Rollback is a plain redeploy of the previous image, node by node, in any order, since no byte of level L+1 exists yet."
 - title: Finalize
-  body: "`vlpds admin cluster finalize --level L+1` (asks first; `--yes` off a terminal). It writes a raise target, checks every live lease's window, then sets active = L+1, or refuses with 409 `IncompatibleNodes` and changes nothing. Watch format errors, commit p99 and firehose lag for one TTL."
+  body: "Run `vlpds admin cluster finalize --level L+1`. It asks first (pass `--yes` off a terminal). It writes a raise target and checks every live lease's window. Then it either sets active = L+1, or refuses with 409 `IncompatibleNodes` and changes nothing. Watch format errors, commit p99 and firehose lag for one TTL."
 - title: After finalize, forward-fix only
-  body: "An old build exits 7 at startup. Ship a fixed build. A **wire-only** level can be lowered when its new behaviour is the bug (`vlpds admin cluster lower --level L`); a persistent level never is."
+  body: "An old build exits 7 at startup, so ship a fixed build. A wire-only level can be lowered when its new behaviour is the bug (`vlpds admin cluster lower --level L`), but a persistent level never can."
 ```
 
 | Alert | Means |
 |---|---|
-| `VlpdsMixedVersions` | more than one `rev` for over an hour: finish or roll back the deploy |
-| `VlpdsIncompatibleNode` | a node exited 7: deploy a build whose window contains the active level |
-| `VlpdsFeatureLevelUnfinalized` | every node could run a higher level for 14 days: finalize or roll back |
-| `VlpdsFormatErrors` | a node met a format marker it doesn't know (pages: should never happen) |
+| `VlpdsMixedVersions` | more than one `rev` for over an hour. Finish or roll back the deploy |
+| `VlpdsIncompatibleNode` | a node exited 7. Deploy a build whose window contains the active level |
+| `VlpdsFeatureLevelUnfinalized` | every node could run a higher level for 14 days. Finalize or roll back |
+| `VlpdsFormatErrors` | a node met a format marker it doesn't know (it pages, and should never happen) |
 
-A raise that a dying node left half-done shows as "raising to N" in `cluster status`; clear it with
-`vlpds admin cluster finalize --level <active> --yes`. The full procedure: RUNBOOK
-[Rolling upgrade, finalize, rollback](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#rolling-upgrade-finalize-rollback).
+A raise that a dying node left half-done shows up as "raising to N" in `cluster status`. Clear it
+with `vlpds admin cluster finalize --level <active> --yes`. The full procedure is in the RUNBOOK
+under [Rolling upgrade, finalize, rollback](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#rolling-upgrade-finalize-rollback).
 
 ## Compatibility contract
 
 ```facts
-- { value: "readers", label: accept every level in their window, note: "unknown segment magics, stream messages or markers are errors, never guessed" }
-- { value: "writers", label: emit the active level only, note: "a segment is one level; a change takes effect at the next one", tone: accent }
+- { value: "readers", label: accept every level in their window, note: "unknown segment magics, stream messages or markers are errors and are never guessed" }
+- { value: "writers", label: emit the active level only, note: "each segment is one level, so a change takes effect at the next one", tone: accent }
 - { value: "objects", label: tolerant both ways, note: "shared control objects keep fields an older node doesn't know", tone: blue }
 ```
 
-What every release promises, so that a rolling upgrade and a rollback are always safe:
+Every release keeps these promises, so a rolling upgrade and a rollback are always safe.
 
-- **Upgrade one window at a time.** A build starts only if the active level is inside its window.
-  Skipping releases is fine whenever that holds. A build drops support for level L (raises
+- Upgrade one window at a time. A build only starts if the active level is inside its window, and
+  skipping releases is fine whenever that holds. A build drops support for level L (raises
   `MIN_LEVEL`) only once data at L can no longer exist.
-- **Control objects survive older nodes.** Assignments, the layout and `cluster/version` are
-  read-modify-CAS'd by whichever node acts, so they keep unknown fields (`serde(flatten)`) and default
-  missing ones. A field an old node must *honour* is still level-gated.
-- **Peer protocols are additive.** Paths stay `/v1`; a new endpoint or message is used only once the
-  peer's lease advertises a level that has it. A 404 from a peer reads as "unsupported", and the log
-  stream skips message types it doesn't know.
-- **SlateDB is a format.** A SlateDB version bump, or a flag that changes stored bytes (log or SST
-  compression codec), is a level: what the new version writes must open under the old one until the
+- Control objects survive older nodes. Whichever node acts does a read-modify-CAS on assignments,
+  the layout and `cluster/version`, so they keep unknown fields (`serde(flatten)`) and default
+  missing ones. A field that an old node has to honour is still level-gated.
+- Peer protocols are additive. Paths stay `/v1`, and a new endpoint or message is only used once
+  the peer's lease advertises a level that has it. A 404 from a peer reads as "unsupported", and
+  the log stream skips message types it doesn't know.
+- SlateDB is a format. A SlateDB version bump, or a flag that changes stored bytes (log or SST
+  compression codec), is a level. What the new version writes must open under the old one until the
   level is raised.
-- **Client tokens are a format too.** A session JWT or OAuth token that the old build can't verify
-  turns a rollback into a forced logout, so a change to them belongs to a level.
+- Client tokens are a format too. If the old build can't verify a session JWT or OAuth token, a
+  rollback turns into a forced logout, so a change to them belongs to a level.
 
-The format inventory (every persisted and wire format, and how it is versioned) is DESIGN.md
+The format inventory (every persisted and wire format, and how it's versioned) is in DESIGN.md under
 "Rolling upgrades and format versioning".
 
 ## Testing an upgrade
 
 ```steps
 - title: "`just upgrade-ci`"
-  body: "Before any release with a new level: format fixtures and the MANIFEST freeze (`testdata/formats/L1/`), the level-gating test, and the two-build `upgrade-rolling` HA scenario against the previous release, on a throwaway MinIO."
+  body: "Run it before any release with a new level. It runs the format fixtures and the MANIFEST freeze (`testdata/formats/L1/`), the level-gating test, and the two-build `upgrade-rolling` HA scenario against the previous release, on a throwaway MinIO."
 - title: "`just upgrade-ha`"
   body: "Every `upgrade-*` scenario (`bench/ha/upgrade.sh`): rolling upgrade, rollback before finalize, old-node refusal after it, and a node starting during a raise."
 - title: Never deploy a test build
-  body: "The scenarios use the cargo feature `test-level`, which adds a fake level 2 with a different segment format. Such a build logs `TEST BUILD` at startup."
+  body: "The scenarios use the cargo feature `test-level`, which adds a fake level 2 with a different segment format. A build like that logs `TEST BUILD` at startup."
 ```
 
 Results of the last two-build run are in `bench/ha/RESULTS.md` ("Two-build upgrade scenarios").

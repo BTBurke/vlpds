@@ -33,15 +33,16 @@ facts:
   - { value: "2", unit: keys, label: to copy offline, note: "the KEK and the PLC rotation key; durability is the bucket's own", tone: rust }
 ```
 
+
 These pages are for whoever runs a vlpds server, from a personal PDS on a small VM to a cluster.
-Read [Deploy](deploy.md) first, then [Monitoring](monitoring.md) and the
+Read [Deploy](deploy.md) first, then read [Monitoring](monitoring.md) and the
 [Runbook](runbook.md) before you need them. The [Overview](../overview.md) explains the design in
 one screen.
 
-Two things set vlpds apart from the reference PDS operationally. **The bucket is the database**: a
-node's disk is a cache, so losing a host costs nothing but warm caches. And **a node that can't be
-sure it may write exits**: restarts with exit codes 2 to 9 are the safety mechanism, and the
-supervisor must restart the process on any of them.
+Operationally, two things set vlpds apart from the reference PDS. First, the bucket is the
+database. A node's disk is a cache, so losing a host only costs you warm caches. Second, a node
+exits when it can't be sure it's allowed to write. Restarts with exit codes 2 to 9 are the safety
+mechanism, so the supervisor must restart the process on any of them.
 
 ```pages
 {}
