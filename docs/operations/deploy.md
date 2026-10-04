@@ -37,8 +37,8 @@ facts:
   - { value: "5–30 s", label: of 502s per upgrade, note: one node means every restart is a short outage, tone: rust }
 ```
 
-This page deploys one vlpds node with the Ansible role in `deploy/ansible/roles/vlpds`, using a
-single small VPS serving `pds.example.com` as the worked example. One node owns every shard, so the
+This page deploys one vlpds node with the Ansible kit in [`deploy/ansible/`](https://github.com/jazware/vlpds/tree/main/deploy/ansible) (playbooks, the
+`vlpds`, `common`, `caddy` and `alloy` roles and an example inventory), using a single small VPS serving `pds.example.com` as the worked example. One node owns every shard, so the
 setup is simple and cheap. The node keeps nothing on its disk that it can't rebuild, so moving to
 more nodes later is a matter of starting another one on the same bucket and prefix. For that, see
 [Scaling and clustering](scaling-and-clustering.md#with-the-ansible-role).
@@ -74,8 +74,8 @@ network (Tailscale here) that also reaches your monitoring stack. Four roles set
   body: "Alloy scrapes `127.0.0.1:9583` every 10 s as `job=\"vlpds\"` with the node's name as `instance`, and ships journal and container logs to your Prometheus-compatible / Loki stack (`alloy_monitoring_url`) over the private network. It runs as the plain `alloy` user and reaches Docker only through a filtered read-only proxy, so it can read neither the secrets nor the containers' environment."
 ```
 
-Put the host in its own inventory, e.g. `inventories/<name>/` with a `hosts.yml` and
-`group_vars/all/`. The role README has the exact commands. These are the choices the example makes:
+Copy `inventories/example/` to `inventories/<name>/` (a `hosts.yml`, `group_vars/vlpds.yml`,
+`group_vars/all/` and the sops secrets). The kit's `README.md` has the exact commands. These are the choices the example makes:
 
 | Setting | Example | Why |
 |---|---|---|

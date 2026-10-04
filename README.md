@@ -10,6 +10,10 @@ vlpds speaks the same XRPC, OAuth and sync 1.1 firehose as the reference PDS, so
 AppViews talk to it like any other PDS. It runs a personal server on one small VM and a cluster on
 as many nodes as you give it.
 
+**Example instance:** [vlpds.jazco.dev](https://vlpds.jazco.dev) is a small single-node deployment
+(one 4-vCPU VPS, data on Cloudflare R2). It serves these docs at
+[vlpds.jazco.dev/docs](https://vlpds.jazco.dev/docs).
+
 ## Highlights
 
 - **The bucket is the only durable state.** Writes are group-committed into log segments with
@@ -47,7 +51,8 @@ just seed    # in another shell: 3 accounts with 200 records each (password: hun
 Open <http://127.0.0.1:2620> for the account pages, <http://127.0.0.1:2620/admin> for the console
 (dev admin token `dev-admin-token`) and <http://127.0.0.1:2620/docs> for the docs. The in-memory
 store keeps nothing: `just minio` starts a local MinIO to point a node at, and
-[Deploy](docs/operations/deploy.md) walks through a real server.
+[Deploy](docs/operations/deploy.md) walks through a real server with the Ansible kit in
+[`deploy/ansible/`](deploy/ansible/README.md).
 
 ## Documentation
 
