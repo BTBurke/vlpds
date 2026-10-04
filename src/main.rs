@@ -445,6 +445,11 @@ struct Args {
     /// File holding --email-smtp-url (it may carry SMTP credentials).
     #[arg(long, env = "VLPDS_EMAIL_SMTP_URL_FILE", conflicts_with = "email_smtp_url")]
     email_smtp_url_file: Option<std::path::PathBuf>,
+    /// PEM CA certificate(s) to trust for the SMTP server(s), in addition to
+    /// the public webpki roots: a relay with a private CA, or a local test
+    /// server. Applies to the moderation mailer too.
+    #[arg(long, env = "VLPDS_EMAIL_SMTP_CA_FILE")]
+    email_smtp_ca_file: Option<std::path::PathBuf>,
     /// From address for email ("addr@host" or "Name <addr@host>"); falls
     /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
     #[arg(long, env = "VLPDS_EMAIL_FROM_ADDRESS")]
@@ -1146,10 +1151,15 @@ async fn run(args: Args) -> anyhow::Result<()> {
         dev_mode: args.dev_mode,
         allow_bulk_create: args.allow_bulk_create,
         kek: kek_config(&args)?,
-        mailer: vlpds::mail::from_flags(args.email_smtp_url.clone(), args.email_from_address.clone())?,
+        mailer: vlpds::mail::from_flags(
+            args.email_smtp_url.clone(),
+            args.email_from_address.clone(),
+            args.email_smtp_ca_file.as_deref(),
+        )?,
         moderation_mailer: vlpds::mail::moderation_from_flags(
             args.moderation_email_smtp_url.clone(),
             args.moderation_email_address.clone(),
+            args.email_smtp_ca_file.as_deref(),
         )?,
         email_branding: vlpds::mail::Branding::from_flags(
             args.email_brand_name.clone(),

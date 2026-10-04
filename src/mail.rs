@@ -10,12 +10,14 @@ pub use templates::{html_to_text, Branding, Email};
 
 use crate::xrpc::{Mail, Mailer};
 use lettre::message::{header::ContentType, Mailbox, MultiPart};
+use lettre::transport::smtp::client::{Certificate, Tls, TlsParameters};
 use lettre::transport::smtp::PoolConfig;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use prometheus::{
     exponential_buckets, register_histogram, register_int_counter, register_int_counter_vec,
     register_int_gauge, Histogram, IntCounter, IntCounterVec, IntGauge,
 };
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, Semaphore};
@@ -74,6 +76,9 @@ pub struct SmtpConfig {
     /// Also the SMTP connection pool's size.
     pub concurrency: usize,
     pub backoff: Vec<Duration>,
+    /// PEM CA certificate(s) trusted for the server's certificate on top of
+    /// the webpki roots (a relay with a private CA).
+    pub ca_pem: Option<Vec<u8>>,
 }
 
 /// Redacts the URL's password.
@@ -93,6 +98,7 @@ impl std::fmt::Debug for SmtpConfig {
             .field("queue", &self.queue)
             .field("concurrency", &self.concurrency)
             .field("backoff", &self.backoff)
+            .field("ca_pem", &self.ca_pem.is_some())
             .finish()
     }
 }
@@ -105,16 +111,18 @@ impl SmtpConfig {
             queue: DEFAULT_QUEUE,
             concurrency: DEFAULT_CONCURRENCY,
             backoff: DEFAULT_BACKOFF.to_vec(),
+            ca_pem: None,
         }
     }
 }
 
 /// None: log-only. Setting only one of the two is an error, as in the
 /// reference PDS. Must run inside the tokio runtime.
-pub fn from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<Option<SharedMailer>> {
+pub fn from_flags(url: Option<String>, from: Option<String>, ca_file: Option<&Path>) -> anyhow::Result<Option<SharedMailer>> {
     let m = start_if_set(
         (url, "PDS_EMAIL_SMTP_URL"),
         (from, "PDS_EMAIL_FROM_ADDRESS"),
+        ca_file,
         "email config: set both --email-smtp-url and --email-from-address",
     )?;
     if m.is_none() {
@@ -125,10 +133,11 @@ pub fn from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<O
 
 /// The reference's ModerationMailer, for admin sendEmail. None: it falls
 /// back to the main mailer (DESIGN.md "Email").
-pub fn moderation_from_flags(url: Option<String>, from: Option<String>) -> anyhow::Result<Option<SharedMailer>> {
+pub fn moderation_from_flags(url: Option<String>, from: Option<String>, ca_file: Option<&Path>) -> anyhow::Result<Option<SharedMailer>> {
     let m = start_if_set(
         (url, "PDS_MODERATION_EMAIL_SMTP_URL"),
         (from, "PDS_MODERATION_EMAIL_ADDRESS"),
+        ca_file,
         "moderation email config: set both --moderation-email-smtp-url and --moderation-email-address",
     )?;
     if m.is_some() {
@@ -141,11 +150,18 @@ pub fn moderation_from_flags(url: Option<String>, from: Option<String>) -> anyho
 fn start_if_set(
     (url, url_env): (Option<String>, &str),
     (from, from_env): (Option<String>, &str),
+    ca_file: Option<&Path>,
     what: &str,
 ) -> anyhow::Result<Option<SharedMailer>> {
     match (pick(url, url_env), pick(from, from_env)) {
         (None, None) => Ok(None),
-        (Some(url), Some(from)) => Ok(Some(SharedMailer(Arc::new(SmtpMailer::start(SmtpConfig::new(url, from))?)))),
+        (Some(url), Some(from)) => {
+            let ca_pem = match ca_file {
+                Some(p) => Some(std::fs::read(p).map_err(|e| anyhow::anyhow!("--email-smtp-ca-file {}: {e}", p.display()))?),
+                None => None,
+            };
+            Ok(Some(SharedMailer(Arc::new(SmtpMailer::start(SmtpConfig { ca_pem, ..SmtpConfig::new(url, from) })?))))
+        }
         _ => anyhow::bail!("partial {what} (or neither)"),
     }
 }
@@ -221,12 +237,36 @@ fn transport(cfg: &SmtpConfig) -> anyhow::Result<(AsyncSmtpTransport<Tokio1Execu
         .and_then(|r| r.split(['/', '?']).next())
         .map(|r| r.rsplit('@').next().unwrap_or(r).to_string())
         .unwrap_or_default();
-    let t = AsyncSmtpTransport::<Tokio1Executor>::from_url(&url)
-        .map_err(|e| anyhow::anyhow!("--email-smtp-url (host {host:?}): {e}"))?
+    let mut b = AsyncSmtpTransport::<Tokio1Executor>::from_url(&url)
+        .map_err(|e| anyhow::anyhow!("--email-smtp-url (host {host:?}): {e}"))?;
+    if let Some(pem) = &cfg.ca_pem {
+        b = b.tls(with_ca(&url, pem)?);
+    }
+    let t = b
         .timeout(Some(CONNECT_TIMEOUT))
         .pool_config(PoolConfig::new().max_size(cfg.concurrency.max(1) as u32))
         .build();
     Ok((t, host))
+}
+
+/// The TLS mode `from_url` picked for the normalized `url`, re-made with
+/// `pem`'s certificates added to the trusted roots.
+fn with_ca(url: &str, pem: &[u8]) -> anyhow::Result<Tls> {
+    let u = reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("--email-smtp-url: {e}"))?;
+    let domain = u.host_str().unwrap_or_default().trim_matches(['[', ']']).to_string();
+    let mode = u.query_pairs().find(|(k, _)| k == "tls").map(|(_, v)| v.into_owned());
+    let wrap: fn(TlsParameters) -> Tls = match (u.scheme(), mode.as_deref()) {
+        ("smtps", _) => Tls::Wrapper,
+        (_, Some("required")) => Tls::Required,
+        (_, Some("opportunistic")) => Tls::Opportunistic,
+        _ => return Ok(Tls::None),
+    };
+    let cert = Certificate::from_pem(pem).map_err(|e| anyhow::anyhow!("--email-smtp-ca-file: {e}"))?;
+    let params = TlsParameters::builder(domain)
+        .add_root_certificate(cert)
+        .build_rustls()
+        .map_err(|e| anyhow::anyhow!("--email-smtp-ca-file: {e}"))?;
+    Ok(wrap(params))
 }
 
 async fn run(
@@ -250,7 +290,10 @@ async fn run(
 
 fn message(from: &Mailbox, m: &Mail) -> anyhow::Result<Message> {
     let to: Mailbox = m.to.parse().map_err(|e| anyhow::anyhow!("recipient: {e}"))?;
-    let b = Message::builder().from(from.clone()).to(to).subject(m.subject.as_str());
+    // lettre sets no Message-ID, and some receivers (Gmail) refuse or junk
+    // mail without one; the sender's domain, not the container's hostname
+    let id = format!("<{}@{}>", hex::encode(rand::random::<[u8; 16]>()), from.email.domain());
+    let b = Message::builder().from(from.clone()).to(to).subject(m.subject.as_str()).message_id(Some(id));
     Ok(match &m.html {
         // multipart/alternative: text/plain first, text/html preferred
         Some(html) => b.multipart(MultiPart::alternative_plain_html(m.body.clone(), html.clone()))?,
@@ -315,7 +358,7 @@ mod tests {
 
     #[tokio::test]
     async fn partial_config_is_an_error() {
-        assert!(from_flags(Some("smtp://h".into()), Some(String::new())).is_err() || std::env::var("PDS_EMAIL_FROM_ADDRESS").is_ok());
+        assert!(from_flags(Some("smtp://h".into()), Some(String::new()), None).is_err() || std::env::var("PDS_EMAIL_FROM_ADDRESS").is_ok());
         assert!(SmtpMailer::start(SmtpConfig::new("smtp://h", "not an address")).is_err());
         let (_, host) = transport(&SmtpConfig::new("smtps://user:secret@mail.example.com:465/ehlo", "a@b.c")).unwrap();
         assert_eq!(host, "mail.example.com:465");

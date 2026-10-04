@@ -298,8 +298,9 @@ async fn asset(uri: axum::http::Uri) -> Response {
     let Some(f) = Assets::get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    // hashed bundle files and cards never change; fonts and the icon keep stable names
-    let hashed = path.starts_with("assets/") || (path.starts_with("og/") && path.ends_with(".png"));
+    // hashed bundle files and cards never change; fonts, the icon and the email logo keep stable names
+    let hashed = path.starts_with("assets/")
+        || (path.starts_with("og/") && path.ends_with(".png") && path != "og/email-logo.png");
     let cache = if hashed { "public, max-age=31536000, immutable" } else { "public, max-age=86400" };
     let mime = f.metadata.mimetype().to_string();
     (

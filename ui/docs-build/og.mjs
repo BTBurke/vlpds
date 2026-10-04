@@ -136,6 +136,17 @@ export function renderPng(svg) {
   return r.render().asPng()
 }
 
+/**
+ * The email logo (header and footer mark, `--email-logo-url`): favicon.svg
+ * as a PNG, since mail clients don't render SVG. Not content-hashed: mail
+ * already sent keeps pointing at this name.
+ */
+export function emailLogoPng() {
+  const s = 240
+  const svg = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '../public/favicon.svg'), 'utf8')
+  return new Resvg(svg, { fitTo: { mode: 'width', value: s } }).render().asPng()
+}
+
 const hash = (buf) => crypto.createHash('sha256').update(buf).digest('hex').slice(0, 10)
 
 /**
@@ -171,6 +182,7 @@ export function buildCards(pages) {
     const c = card(name, { kicker: p.section, title: p.title, summary: p.summary, foot: `/docs/${p.slug}`, where: 'docs' }, `${p.title}: vlpds documentation`)
     manifest.docs[p.slug] = { title: p.title, summary: p.summary, section: p.section, status: p.status, ...c }
   }
+  files.push({ fileName: 'og/email-logo.png', source: emailLogoPng() })
   files.push({ fileName: 'og/manifest.json', source: JSON.stringify(manifest) })
   return files
 }

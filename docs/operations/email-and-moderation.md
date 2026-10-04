@@ -57,29 +57,89 @@ edges:
 |---|---|---|
 | `--email-smtp-url` | `PDS_EMAIL_SMTP_URL` | `smtp://user:pass@host:587` (STARTTLS when offered; `?tls=required` insists) or `smtps://…:465`. Has credentials: use `--email-smtp-url-file` |
 | `--email-from-address` | `PDS_EMAIL_FROM_ADDRESS` | required with the URL; `addr@host` or `Name <addr@host>` |
+| `--email-smtp-ca-file` | | PEM CA certificate(s) trusted for the SMTP server(s) on top of the public roots: a relay with a private CA, or a local test server |
 | `--moderation-email-smtp-url` | `PDS_MODERATION_EMAIL_SMTP_URL` | admin `sendEmail` only; unset, moderation mail goes through the main mailer |
 | `--moderation-email-address` | `PDS_MODERATION_EMAIL_ADDRESS` | required with the moderation URL |
 | `--email-brand-name` | `PDS_SERVICE_NAME` | default "{hostname} PDS" |
 | `--email-home-url` | `PDS_HOME_URL` | footer link; default https://bsky.app |
-| `--email-logo-url` | `PDS_LOGO_URL` | default the Bluesky logo |
+| `--email-logo-url` | `PDS_LOGO_URL` | header logo and footer mark; default the Bluesky logo. vlpds serves its own as a PNG at `/og/email-logo.png` (mail clients don't render SVG) |
 | `--email-primary-color` | `PDS_PRIMARY_COLOR` | default `#067df7` |
 | `--email-disable-confirmation-link` | `PDS_EMAIL_DISABLE_CONFIRMATION_LINK` | drops the bsky.app "click here" link |
 
-- **What is mailed:** the reference's six account mails (password reset, account deletion, email
-  confirmation, email update, PLC operation, sign-in code) with its subjects and wording, as plain
-  text plus HTML, and admin `sendEmail` from a moderator.
 - **A URL without its address**, or the reverse, fails startup. With neither, mail is logged
   (recipient, subject, purpose) and not sent: sign-up still works but nobody receives codes. In
   `--dev-mode` every mail is also kept in the node's dev mailbox, which the console's account page
-  shows.
+  shows. The Ansible role refuses to deploy without a URL unless `vlpds_email_required: false`, and
+  passes the URL as a secret file (`VLPDS_EMAIL_SMTP_URL_FILE`), never in the container's
+  environment.
 - **Unlike the reference**, admin `sendEmail` without a moderation mailer goes through the main
   mailer, so a single-SMTP deployment still delivers moderation mail. (The reference logs it and
   answers `sent: true`.)
 - **Deliverability is your provider's job:** send from a domain with SPF, DKIM and DMARC for that
-  sender. vlpds speaks SMTP only, with no HTTP mail API.
+  sender. vlpds speaks SMTP only, with no HTTP mail API. Each message carries a `Message-ID` on the
+  From address's domain.
 - **If mail isn't arriving:** `vlpds_mail_messages_total{result="failed"|"dropped"}` (by `purpose`;
-  `admin` is moderation mail), `vlpds_mail_queue_depth`, and the `mail not sent` / `mail dropped`
-  warnings, which name the recipient and purpose but never the token. 5xx rejections aren't retried.
+  `admin` is moderation mail), `vlpds_mail_queue_depth`, `vlpds_mail_suppressed_total` (the
+  budgets below), and the `mail not sent` / `mail dropped` warnings, which name the recipient and
+  purpose but never the token. 5xx rejections aren't retried.
+
+### What is mailed
+
+The reference's six account mails with its subjects and wording, each as plain text plus HTML
+(`multipart/alternative`), and admin `sendEmail` from a moderator. `purpose` is the metrics label.
+
+| Mail | Subject | `purpose` | Sent by |
+|---|---|---|---|
+| Email confirmation | Email Confirmation | `confirm_email` | `requestEmailConfirmation` |
+| Email update | Email Update Requested | `update_email` | `requestEmailUpdate` (confirmed address only); turning email 2FA off |
+| Password reset | Password Reset Requested | `reset_password` | `requestPasswordReset` |
+| Sign-in code | Sign-in Confirmation | `auth_factor` | signing in to an account with email 2FA on |
+| Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
+| PLC operation | PLC Update Operation Requested | `plc_operation` | `requestPlcOperationSignature` |
+| Moderation | the moderator's subject | `admin` | admin `sendEmail` |
+
+### Mail budgets
+
+Besides each endpoint's own rate limit, every account mail spends two budgets before its code is
+minted, so no path mails around them. They protect recipients and the sender's reputation rather
+than the server: the bypass key, internal token, admin auth and IP overrides don't lift them; a DID
+override (console, Rate limits) does, and `--no-rate-limits` turns them off with everything else.
+Admin `sendEmail` is exempt.
+
+| Bucket | Default | Keyed by | Over it |
+|---|---|---|---|
+| `mail-recipient-hour` / `-day` | 10 / hour, 30 / day | the recipient account's DID | 429 `RateLimitExceeded`; `vlpds_mail_suppressed_total{reason="recipient_limit"}` |
+| `mail-node-hour` | 500 / hour | the node | 429; `reason="node_limit"`; alert `VlpdsMailNodeBudgetExhausted` |
+| `password-reset-account-hour` / `-day` | 5 / hour, 15 / day | the account, from any IP | answered OK but not mailed (no account probing); `reason="account_limit"` |
+| `requestPlcOperationSignature` | 5 / hour, 15 / day | DID | 429 (the reference has no limit here) |
+| sign-in code de-dup | one new code per 60 s | DID | no new mail, the live code still works; `reason="dedup"` |
+
+The other mailing endpoints keep the reference's limits: `requestEmailConfirmation`,
+`requestEmailUpdate` and `requestAccountDelete` 5 / hour and 15 / day per DID,
+`requestPasswordReset` 15 / hour and 50 / day per IP. Keep the node budget under your provider's
+daily quota: a whole day at 500 / hour is 12,000 mails per node.
+
+### Example: Cloudflare Email Service
+
+Cloudflare's Email Sending relay speaks SMTP with an API token as the password.
+
+```steps
+- title: Onboard the sending domain
+  body: "In the dashboard (Email Service, Email Sending) add the domain you send from, e.g. `pds.example.com`. Cloudflare publishes its records (a bounce subdomain's MX and SPF, a DKIM key) when the zone is on Cloudflare; add a DMARC record (`_dmarc.pds.example.com`). Mail from a domain that isn't onboarded is refused."
+- title: Create an API token
+  body: "An account API token with **Email Sending: Edit**. It is the SMTP password; the username is the literal `api_token`."
+- title: Configure vlpds
+  body: "`--email-smtp-url-file` holding `smtps://api_token:<token>@smtp.mx.cloudflare.net:465` (implicit TLS), `--email-from-address \"pds.example.com <noreply@pds.example.com>\"`, and the branding flags. The relay's certificate is publicly trusted: no `--email-smtp-ca-file`."
+- title: Test
+  body: "Request an email confirmation for an account whose address you read. In the received headers look for `spf=pass`, `dkim=pass` and `dmarc=pass`; on the node, `vlpds_mail_messages_total{result=\"sent\"}`."
+```
+
+The relay's limits, which vlpds stays inside: 50 recipients per message (vlpds sends one), 5 MiB
+per message, 30 s to authenticate and 300 s for DATA, and an account daily quota that starts
+conservative on new accounts and grows with sending history (Cloudflare's limit-increase form raises
+it). A recipient on the account's **suppression list** (after a hard bounce or complaint) gets the
+whole message rejected unless the domain's "drop suppressed recipients" setting is on; vlpds sees a
+5xx, counts the mail `failed` and doesn't retry.
 
 Procedure: RUNBOOK
 [Email](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#email-smtp-moderation-mail-branding).
