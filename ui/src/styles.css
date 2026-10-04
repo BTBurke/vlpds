@@ -2641,6 +2641,8 @@ table.data.rl-side-table td {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
 /* ------------------------------------------------------------ moderation */
 
 .toolbar.mod-lookup input[type='search'] {
