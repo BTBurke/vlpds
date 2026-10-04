@@ -1992,6 +1992,47 @@ mod clone_tests {
         }
     }
 
+    /// Open: a families clone gives the child each parent L0 SST once per
+    /// family (a view per projection, the stages' after the parent's), not
+    /// newest first. Once the child's compactor takes some, its writer's
+    /// next flush fails SlateDB's L0 ULID cutoff (`InvalidClockTick`). The
+    /// likely cause is `LsmTreeState::merge_writer_and_compactor`, which keeps
+    /// the writer's L0 up to the first view matching the compactor's last
+    /// compacted view or SST id: with one SST in several places that's the
+    /// wrong cut. vlRelay clones `0x01` alone until this is fixed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn family_child_flushes_through_compaction() {
+        let three = tagged(0x03);
+        let store = Store { prefix: "probe".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        for r in 0..12 {
+            for i in 0..20 {
+                db.put(k(10 + i, &format!("d/{r}")), "r").await.unwrap();
+                db.put(three(10 + i, &format!("{r}")), "s").await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        db.put(b"meta/applied/x", b"m").await.unwrap();
+        db.close().await.unwrap();
+        clone_db_families(&store, ShardId(1), &[(ShardId(0), 0, 32768)], FAMILIES).await.unwrap();
+        let c = open_db(&store, ShardId(1), None).await.unwrap();
+        for i in 0..80 {
+            c.put(k(11, &format!("d/new{i}")), "x").await.unwrap();
+            let r = c
+                .flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await;
+            if let Err(e) = r {
+                panic!("flush {i}: {e} (L0s {})", c.manifest().l0().len());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        c.close().await.unwrap();
+    }
+
     /// A merge whose sources have no SSTs of their own (split halves that
     /// took no writes) names neither in the clone's manifest, only their
     /// common ancestor: a retried clone still finds itself done (SlateDB's
