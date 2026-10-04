@@ -1,4 +1,4 @@
-//! Operator moderation (DESIGN.md "Operator moderation"): takedowns and
+//! Operator moderation (docs/operations/email-and-moderation.md): takedowns and
 //! restores with a reason and an audit trail, blob quarantine, a case queue
 //! and subject lookup for the console's Moderation page.
 //!
@@ -454,7 +454,8 @@ async fn edit_case(app: &App, id: &str, f: impl Fn(&mut Case) -> XResult<()>) ->
 }
 
 /// Records the action on the case, adds the subject, and moves an open case
-/// to actioned (takedown) or an actioned one to restored (restore).
+/// (or a restored one) to actioned on a takedown, an actioned one to restored
+/// on a restore.
 async fn link_case(app: &App, id: &str, s: &SubjectRef, e: &AuditEntry) -> XResult<()> {
     edit_case(app, id, |c| {
         if !c.subjects.iter().any(|x| x.same(s)) {
@@ -471,7 +472,7 @@ async fn link_case(app: &App, id: &str, s: &SubjectRef, e: &AuditEntry) -> XResu
             });
         }
         match (e.action.as_str(), c.status.as_str()) {
-            ("takedown", "open") => c.status = "actioned".into(),
+            ("takedown", "open" | "restored") => c.status = "actioned".into(),
             ("restore", "actioned") => c.status = "restored".into(),
             _ => {}
         }

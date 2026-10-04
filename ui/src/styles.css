@@ -2641,4 +2641,134 @@ table.data.rl-side-table td {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+/* ------------------------------------------------------------ moderation */
+
+.toolbar.mod-lookup input[type='search'] {
+  max-width: 720px;
+  flex: 1;
+  min-width: 0;
+}
+.mod-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: 16px;
+  align-items: start;
+}
+@media (max-width: 1000px) {
+  .mod-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.mod-sub {
+  font-size: 14px;
+  margin: 16px 0 8px;
+}
+.mod-blobs {
+  display: grid;
+  gap: 12px;
+}
+.mod-blob {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 14px;
+  align-items: start;
+}
+.mod-blob-meta {
+  display: grid;
+  gap: 6px;
+  justify-items: start;
+}
+@media (max-width: 560px) {
+  .mod-blob {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+.mod-preview {
+  position: relative;
+  display: block;
+  width: 180px;
+  max-width: 100%;
+  aspect-ratio: 1;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--sunk);
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+.mod-preview.empty {
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 10px;
+  text-align: center;
+  cursor: default;
+}
+.mod-preview img,
+.mod-preview video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #000;
+}
+.mod-preview.blurred img,
+.mod-preview.blurred video {
+  filter: blur(28px) saturate(0.4);
+  transform: scale(1.15);
+}
+.mod-reveal {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(10, 15, 20, 0.35);
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+}
+.mod-meter {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--sunk);
+  margin-top: 6px;
+  overflow: hidden;
+  max-width: 240px;
+}
+.mod-meter > div {
+  height: 100%;
+  background: var(--accent);
+}
+.mod-meter > div.over {
+  background: var(--danger);
+}
+.mod-list {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: grid;
+  gap: 8px;
+}
+.mod-notes {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 12px;
+  display: grid;
+  gap: 10px;
+}
+.mod-note {
+  white-space: pre-wrap;
+}
+dialog.modal.mod-dialog {
+  width: min(560px, calc(100vw - 32px));
+}
+.mod-dialog select,
+.mod-dialog textarea {
+  width: 100%;
 }

@@ -131,6 +131,11 @@ export function Landing() {
         <a href="/.well-known/oauth-authorization-server">OAuth metadata</a>
         {info?.links?.privacyPolicy && <a href={info.links.privacyPolicy}>Privacy</a>}
         {info?.links?.termsOfService && <a href={info.links.termsOfService}>Terms</a>}
+        {info?.contact?.email && (
+          <span>
+            Report abuse: <a href={`mailto:${info.contact.email}`}>{info.contact.email}</a>
+          </span>
+        )}
       </footer>
     </>
   )
