@@ -382,7 +382,12 @@ pub fn init_counters() {
             for r in ["sent", "failed", "dropped"] {
                 crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
             }
+            for reason in ["recipient_limit", "node_limit"] {
+                crate::mail::MAIL_SUPPRESSED.with_label_values(&[purpose, reason]);
+            }
         }
+        crate::mail::MAIL_SUPPRESSED.with_label_values(&["reset_password", "account_limit"]);
+        crate::mail::MAIL_SUPPRESSED.with_label_values(&["auth_factor", "dedup"]);
     });
 }
 

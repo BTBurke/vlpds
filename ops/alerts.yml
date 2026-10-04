@@ -448,6 +448,17 @@ groups:
           summary: "{{ $labels.instance }} is refusing {{ $value | humanize }} proxied requests/s at the per-account in-flight cap"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsproxyaccountcapsustained"
 
+      # Account mail refused because the node's mail-node-hour budget (500/h
+      # by default) is spent: users aren't getting confirmation, reset or
+      # sign-in codes. Any refusal is worth a look.
+      - alert: VlpdsMailNodeBudgetExhausted
+        expr: sum by (instance) (increase(vlpds_mail_suppressed_total{job="vlpds",reason="node_limit"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} refused {{ $value | humanize }} account mails in 15m: its mail-node-hour budget is spent"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmailnodebudgetexhausted"
+
       - alert: VlpdsWriteInternalErrors
         expr: sum by (instance, kind) (rate(vlpds_write_errors_total{job="vlpds",kind=~"internal|unavailable"}[5m])) > 0.5
         for: 10m

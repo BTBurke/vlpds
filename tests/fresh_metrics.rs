@@ -94,6 +94,10 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_imports{state="running"}"#,
     "vlpds_import_reserved_bytes",
     r#"vlpds_mail_messages_total{purpose="reset_password",result="failed"}"#,
+    r#"vlpds_mail_suppressed_total{purpose="auth_factor",reason="recipient_limit"}"#,
+    r#"vlpds_mail_suppressed_total{purpose="confirm_email",reason="node_limit"}"#,
+    r#"vlpds_mail_suppressed_total{purpose="reset_password",reason="account_limit"}"#,
+    r#"vlpds_mail_suppressed_total{purpose="auth_factor",reason="dedup"}"#,
 ];
 
 /// Exported from the start; startup itself may move them.

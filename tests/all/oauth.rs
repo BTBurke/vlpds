@@ -1212,6 +1212,31 @@ async fn sign_in_rate_limited() {
     assert!(html.contains("Too many sign-in attempts"), "{html}");
 }
 
+/// The email factor over its recipient's mail budget: rate_limited, not a
+/// prompt for a code that never comes (nor a wrong-code strike).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn email_code_over_mail_budget_is_rate_limited() {
+    let s = spawn().await;
+    let acct = create_account(&s, "emil").await;
+    let email = "emil@example.com";
+    s.bearer(&acct.jwt, "com.atproto.server.requestEmailConfirmation", true, Some(json!({}))).await;
+    let tok = dev_mail_token(&s, email, "confirm_email").await;
+    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.confirmEmail", true, Some(json!({"email": email, "token": tok}))).await;
+    assert_eq!(st, 200, "{j}");
+    let (st, j) = s.bearer(&acct.jwt, "com.atproto.server.updateEmail", true, Some(json!({"email": email, "emailAuthFactor": true}))).await;
+    assert_eq!(st, 200, "{j}");
+    // the confirmation mail spent the hour's budget
+    let d: vlpds::ratelimit::config::Doc = serde_json::from_value(json!({"limiters": {"mail-recipient-hour": {"points": 1}}})).unwrap();
+    s.app.ratelimit.install(vlpds::ratelimit::config::compile(Some(&d)).unwrap());
+
+    let mut b = Browser::default();
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let form = [("csrf", csrf_of(&html)), ("identifier", acct.handle.clone()), ("password", PASSWORD.to_string())];
+    let form: Vec<(&str, &str)> = form.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let (_, h, _) = b.post(&s, "/oauth/account/sign-in", &form).await;
+    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=rate_limited");
+}
+
 // ---------- JAR, response modes, prompt=create, scope narrowing, GC ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

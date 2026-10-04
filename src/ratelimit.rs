@@ -23,6 +23,13 @@
 //! one node serves, keyed by the client address the entry node resolved
 //! ([`ClientIp`]), so a client spreading requests across N nodes can get up
 //! to N times the per-IP budget.
+//!
+//! Mail (vlpds additions): besides each mailing endpoint's own buckets,
+//! every account mail spends its recipient's budget (`mail-recipient-*`,
+//! keyed by DID, so counted on its owner) and the node's (`mail-node-hour`)
+//! before its token is minted: `xrpc::server::deliver` takes the permit
+//! that spending yields, so no path can mail without it. Admin sendEmail
+//! is exempt.
 
 pub mod config;
 pub mod runtime;
@@ -108,8 +115,15 @@ limit!(SIGN_IN_ACCOUNT, 21, "sign-in-account", Did, "server.createSession; OAuth
 limit!(OAUTH_IP, 22, "oauth-ip", Ip, "OAuth /oauth/par, /oauth/token, /oauth/revoke", 5 * MINUTE, 3000);
 limit!(RESERVE_SIGNING_KEY_IP, 23, "com.atproto.server.reserveSigningKey-0", Ip, "server.reserveSigningKey", HOUR, 100);
 limit!(RESERVE_SIGNING_KEY_NODE, 24, "reserve-signing-key-node", Node, "server.reserveSigningKey calls that reserve a new key (one KMS wrap each)", DAY, 5000);
+limit!(REQUEST_PLC_OPERATION_SIGNATURE_DAY, 25, "com.atproto.identity.requestPlcOperationSignature-0", Did, "identity.requestPlcOperationSignature", DAY, 15);
+limit!(REQUEST_PLC_OPERATION_SIGNATURE_HOUR, 26, "com.atproto.identity.requestPlcOperationSignature-1", Did, "identity.requestPlcOperationSignature", HOUR, 5);
+limit!(PASSWORD_RESET_ACCOUNT_DAY, 27, "password-reset-account-day", Did, "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)", DAY, 15);
+limit!(PASSWORD_RESET_ACCOUNT_HOUR, 28, "password-reset-account-hour", Did, "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)", HOUR, 5);
+limit!(MAIL_RECIPIENT_DAY, 29, "mail-recipient-day", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", DAY, 30);
+limit!(MAIL_RECIPIENT_HOUR, 30, "mail-recipient-hour", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", HOUR, 10);
+limit!(MAIL_NODE_HOUR, 31, "mail-node-hour", Node, "every account mail this node sends; admin sendEmail exempt", HOUR, 500);
 
-pub const BUILTIN: [&Limit; 25] = [
+pub const BUILTIN: [&Limit; 32] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -135,6 +149,13 @@ pub const BUILTIN: [&Limit; 25] = [
     &OAUTH_IP,
     &RESERVE_SIGNING_KEY_IP,
     &RESERVE_SIGNING_KEY_NODE,
+    &REQUEST_PLC_OPERATION_SIGNATURE_DAY,
+    &REQUEST_PLC_OPERATION_SIGNATURE_HOUR,
+    &PASSWORD_RESET_ACCOUNT_DAY,
+    &PASSWORD_RESET_ACCOUNT_HOUR,
+    &MAIL_RECIPIENT_DAY,
+    &MAIL_RECIPIENT_HOUR,
+    &MAIL_NODE_HOUR,
 ];
 
 /// A confidential client's backend calls these for all of its users from
@@ -819,6 +840,46 @@ impl Limiter {
         }
         false
     }
+
+    /// For mail budgets, which protect the recipient rather than the
+    /// server: the request's bypasses (internal token, bypass key, admin
+    /// auth) and IP overrides don't lift them; a DID override does. Off
+    /// with `--no-rate-limits` or the config's global switch, like every
+    /// bucket. `report`: give the response these buckets' RateLimit-*
+    /// headers (never where they would tell the caller whether an address
+    /// has an account).
+    pub fn consume_unbypassable(&self, limits: &[&'static Limit], key: &str, route: &str, report: bool) -> Result<(), XrpcError> {
+        let policy = self.policy();
+        if !self.enabled_by_flag || !policy.enabled {
+            return Ok(());
+        }
+        let now = now_ms();
+        let mut exceeded = false;
+        for l in limits {
+            let spec = policy.builtin(l);
+            if !spec.enabled {
+                continue;
+            }
+            let limit = match policy.override_for(&spec.name, key, &[]) {
+                Some(Action::Exempt) => continue,
+                Some(Action::Points(p)) => p,
+                None => spec.points,
+            };
+            let s = self.counters.consume_spec(spec, limit, key, 1, now);
+            if s.exceeded {
+                exceeded = true;
+                self.rejections.record(&spec.name, route, now);
+            }
+            if report {
+                let _ = CTX.try_with(|c| c.borrow_mut().record(s));
+            }
+        }
+        if exceeded {
+            crate::metrics::RATE_LIMITED.inc();
+            return Err(exceeded_error());
+        }
+        Ok(())
+    }
 }
 
 struct Ctx {
@@ -1181,6 +1242,28 @@ mod tests {
         let spec = p.builtin(&GLOBAL_IP).clone();
         assert_eq!(p.limit_for_key(&spec, "2001:db8:1:2::/64"), None);
         assert_eq!(p.limit_for_key(&spec, "2001:db8:2:2::/64"), Some(3000));
+    }
+
+    #[test]
+    fn unbypassable_honours_did_overrides_and_the_switches() {
+        let cfg = crate::server::Config::default();
+        let l = Limiter::new(&cfg);
+        let spend = |l: &Limiter, key: &str| l.consume_unbypassable(&[&MAIL_RECIPIENT_HOUR], key, "mail:t", false);
+        for _ in 0..MAIL_RECIPIENT_HOUR.points {
+            assert!(spend(&l, "did:plc:a").is_ok());
+        }
+        assert!(spend(&l, "did:plc:a").is_err_and(|e| e.error == "RateLimitExceeded"));
+        assert!(spend(&l, "did:plc:b").is_ok());
+        let mut p = Policy::default();
+        p.did_ov.insert("did:plc:a".into(), vec![Ov { limiters: vec!["mail-recipient-hour".into()], action: Action::Exempt }]);
+        l.install(p);
+        assert!(spend(&l, "did:plc:a").is_ok());
+        l.install(Policy { enabled: false, ..Policy::default() });
+        assert!(spend(&l, "did:plc:a").is_ok());
+        let off = Limiter::new(&crate::server::Config { rate_limits_enabled: false, ..cfg });
+        for _ in 0..=MAIL_RECIPIENT_HOUR.points {
+            assert!(spend(&off, "did:plc:a").is_ok());
+        }
     }
 
     /// A forwarding peer's [`ClientIp`] wins over the TCP peer (the

@@ -3,12 +3,18 @@
 //! When TOTP is also enabled, TOTP alone is asked for: the weaker factor
 //! never stands in for the stronger one.
 
-use super::server::{assert_email_token, create_email_token, delete_email_tokens, deliver, invalid_request, to_json_bytes};
+use super::server::{
+    assert_email_token, create_email_token, delete_email_tokens, deliver, email_token_age_ms, invalid_request, mail_permit, to_json_bytes,
+};
 use super::*;
 
 /// RFC 3339; absent = off.
 pub(super) const FLAG: &str = "emailAuthFactorAt";
 pub(super) const PURPOSE: &str = "auth_factor";
+/// A sign-in without a code mails none while the last one is younger:
+/// retries, double submits and a password-holding attacker can't flood
+/// the inbox, and the code already sent still works.
+pub(super) const RESEND_AFTER_MS: u64 = 60_000;
 const LOCKOUT_NAME: &str = "eotp_lock";
 
 pub(super) fn enabled(a: &Account) -> bool {
@@ -110,8 +116,13 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
         }
         let Some(code) = code else {
             let Some(email) = email else { return Ok(()) };
+            if email_token_age_ms(app, did, PURPOSE).await?.is_some_and(|age| age < RESEND_AFTER_MS) {
+                crate::mail::MAIL_SUPPRESSED.with_label_values(&[PURPOSE, "dedup"]).inc();
+                return Err(factor_required());
+            }
+            let permit = mail_permit(app, Some(did), email, PURPOSE, true)?;
             let token = create_email_token(app, did, PURPOSE).await?;
-            deliver(app, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
+            deliver(app, permit, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
             return Err(factor_required());
         };
         let token_raw = app.get_private(did, &token_name).await?;
@@ -160,8 +171,13 @@ pub(super) async fn disable(app: &App, acct: &Account, token: Option<&str>) -> X
     let did = acct.did.as_str();
     let email = acct.email.clone().ok_or_else(|| XrpcError::internal("account has no email address"))?;
     let Some(token) = token.map(str::trim).filter(|t| !t.is_empty()) else {
+        {
+            use crate::ratelimit::*;
+            check(&[&REQUEST_EMAIL_UPDATE_DAY, &REQUEST_EMAIL_UPDATE_HOUR], did, 1)?;
+        }
+        let permit = mail_permit(app, Some(did), &email, "update_email", true)?;
         let otp = create_email_token(app, did, "update_email").await?;
-        deliver(app, &email, crate::mail::Email::UpdateEmail { token: &otp });
+        deliver(app, permit, &email, crate::mail::Email::UpdateEmail { token: &otp });
         return Err(XrpcError::bad("TokenRequired", "confirmation token required"));
     };
     assert_email_token(app, did, "update_email", token).await?;

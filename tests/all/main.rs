@@ -79,6 +79,7 @@ mod lexicons;
 mod list_repos_scale;
 mod log_pipeline;
 mod log_retention;
+mod mail_limits;
 mod maintenance_coverage;
 mod memory_budget;
 mod migration;

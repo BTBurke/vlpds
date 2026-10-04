@@ -770,6 +770,28 @@ latency; whether `vlpds_http_stalled_bodies_total` grows alongside.
 **Do:** a misbehaving client: rate limit or take it down per policy. A slow
 upstream: follow the upstream's health; nothing to tune here.
 
+### VlpdsMailNodeBudgetExhausted
+
+**Means:** this node refused account mail (confirmation, update, reset, delete,
+PLC operation, sign-in codes) because its `mail-node-hour` bucket (500 per hour
+per node by default) is spent: `vlpds_mail_suppressed_total{reason="node_limit"}`
+and the warning `mail not sent: this node's mail budget (mail-node-hour) is
+spent`. Users get 429 `RateLimitExceeded` ("Too many emails sent to this
+account"); password-reset requests are answered OK but not mailed. Admin
+`sendEmail` is exempt. The budget guards the sender's reputation against a
+flood that the per-recipient budget doesn't catch (many accounts at once).
+
+**Confirm:** `vlpds_mail_messages_total{result="sent"}` by `purpose` on the node
+for which kind is surging; the console's Rate limits tab (top consumers of
+`mail-recipient-hour`, rejections by `mail:<purpose>` route); a signup wave in
+`vlpds_signups_total`.
+
+**Do:** a burst of real users (signups, a migration wave): raise `mail-node-hour`
+`points` in the console's Rate limits tab (live, no restart), within what the
+SMTP provider allows. Abuse (many fresh accounts asking for mail): find the
+accounts in the top consumers and take them down, or tighten the endpoint's
+buckets.
+
 ### VlpdsWriteInternalErrors
 
 **Means:** writes failing with `internal` or `unavailable` (other kinds such as
@@ -1951,6 +1973,33 @@ not arriving, check `vlpds_mail_messages_total{result="failed"|"dropped"}` and
 the `mail not sent` / `mail dropped` warnings (they log the recipient and
 purpose, never the token). `purpose="admin"` is moderation mail. Dev mode
 keeps every mail, with its HTML, in `vlpds.admin.getDevMail`.
+
+**Mail rate limits** (DESIGN "Rate limits", mail budgets). All are buckets in
+the console's Rate limits tab, editable live; per-DID ones are counted on the
+account's owner, so they hold cluster-wide.
+
+| Mail | Endpoint buckets | Shared budgets |
+|---|---|---|
+| confirm_email (requestEmailConfirmation) | 5/h, 15/day per DID | recipient + node |
+| update_email (requestEmailUpdate; updateEmail turning the email factor off without a token) | 5/h, 15/day per DID, shared | recipient + node |
+| delete_account (requestAccountDelete) | 5/h, 15/day per DID | recipient + node |
+| plc_operation (requestPlcOperationSignature) | 5/h, 15/day per DID | recipient + node |
+| reset_password (requestPasswordReset) | 15/h, 50/day per IP; `password-reset-account-*` 5/h, 15/day per account | recipient + node |
+| auth_factor (createSession / OAuth sign-in with the email factor) | sign-in buckets; no new code while the last is under a minute old | recipient + node |
+| admin (admin `sendEmail`) | moderator auth only | exempt |
+
+`mail-recipient-hour` / `-day` (10 / 30 per recipient, every kind together)
+and `mail-node-hour` (500 per node) apply even to bypassed requests (bypass
+key, admin auth, internal token); a DID override lifts a recipient's.
+`--no-rate-limits` turns them off with the rest. Over a budget a user gets 429
+`RateLimitExceeded` "Too many emails sent to this account" (the sign-in page:
+"Too many sign-in attempts"); the request mints no token, so the last code
+mailed still works. requestPasswordReset over any of its account or mail
+budgets answers 200 as if mailed. Mail not sent for a budget is counted in
+`vlpds_mail_suppressed_total{purpose,reason}` (`recipient_limit`,
+`node_limit`, `account_limit`, `dedup`). A user who says the code never came:
+check that counter and the account in the tab's top consumers; a DID override
+(or waiting out the hour) fixes it.
 
 ### Moderation service, earned invites, external handles
 

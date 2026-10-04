@@ -597,7 +597,42 @@ impl Mailer for LogMailer {
     }
 }
 
-pub(super) fn deliver(app: &App, to: &str, email: crate::mail::Email<'_>) {
+/// What [`deliver`] needs: the recipient's and the node's mail budgets
+/// spent ([`mail_permit`]).
+#[must_use]
+pub(super) struct MailPermit(&'static str);
+
+const MAIL_LIMITED: &str = "Too many emails sent to this account; try again later";
+
+pub(crate) fn is_mail_limited(e: &XrpcError) -> bool {
+    e.status == StatusCode::TOO_MANY_REQUESTS && e.message == MAIL_LIMITED
+}
+
+/// Taken before the token is minted, so a refused request leaves the last
+/// mailed token working. The recipient is the account `did`, else the
+/// normalized address. `report`: see `Limiter::consume_unbypassable`.
+pub(super) fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose: &'static str, report: bool) -> XResult<MailPermit> {
+    use crate::ratelimit::{MAIL_NODE_HOUR, MAIL_RECIPIENT_DAY, MAIL_RECIPIENT_HOUR, NODE_KEY};
+    let key = match did {
+        Some(d) => d.to_string(),
+        None => format!("mailto:{}", to.trim().to_ascii_lowercase()),
+    };
+    let route = format!("mail:{purpose}");
+    let limited = |reason: &str| {
+        crate::mail::MAIL_SUPPRESSED.with_label_values(&[purpose, reason]).inc();
+        XrpcError { status: StatusCode::TOO_MANY_REQUESTS, error: "RateLimitExceeded".into(), message: MAIL_LIMITED.into() }
+    };
+    let rl = &app.ratelimit;
+    rl.consume_unbypassable(&[&MAIL_RECIPIENT_DAY, &MAIL_RECIPIENT_HOUR], &key, &route, report).map_err(|_| limited("recipient_limit"))?;
+    rl.consume_unbypassable(&[&MAIL_NODE_HOUR], NODE_KEY, &route, report).map_err(|_| {
+        tracing::warn!(purpose, "mail not sent: this node's mail budget (mail-node-hour) is spent");
+        limited("node_limit")
+    })?;
+    Ok(MailPermit(purpose))
+}
+
+pub(super) fn deliver(app: &App, permit: MailPermit, to: &str, email: crate::mail::Email<'_>) {
+    debug_assert_eq!(permit.0, email.purpose());
     let r = email.render(&app.config.email_branding, &app.public_url);
     let mail = Mail {
         to: to.to_string(),
@@ -689,6 +724,12 @@ pub(super) async fn assert_email_token(app: &App, did: &str, purpose: &str, toke
         return Err(expired_token("Token is expired"));
     }
     Ok(())
+}
+
+/// How long ago the live token for `purpose` was minted, if there is one.
+pub(super) async fn email_token_age_ms(app: &App, did: &str, purpose: &str) -> XResult<Option<u64>> {
+    let rec: Option<EmailToken> = get_json(app, did, &format!("etok/{purpose}")).await?;
+    Ok(rec.map(|r| now_ms().saturating_sub(r.requested_at)).filter(|age| *age <= EMAIL_TOKEN_TTL_MS))
 }
 
 pub(super) async fn delete_email_tokens(app: &App, did: &str, purposes: &[&str]) -> XResult<()> {
@@ -1938,8 +1979,9 @@ async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XRes
         check(&[&REQUEST_ACCOUNT_DELETE_DAY, &REQUEST_ACCOUNT_DELETE_HOUR], &did, 1)?;
     }
     let (_, email) = mailable_account(&app, &did).await?;
+    let permit = mail_permit(&app, Some(&did), &email, "delete_account", true)?;
     let token = create_email_token(&app, &did, "delete_account").await?;
-    deliver(&app, &email, crate::mail::Email::DeleteAccount { token: &token });
+    deliver(&app, permit, &email, crate::mail::Email::DeleteAccount { token: &token });
     Ok(StatusCode::OK)
 }
 
@@ -2182,8 +2224,9 @@ async fn request_email_confirmation(State(app): AppState, Auth(creds): Auth) -> 
         check(&[&REQUEST_EMAIL_CONFIRMATION_DAY, &REQUEST_EMAIL_CONFIRMATION_HOUR], &did, 1)?;
     }
     let (_, email) = mailable_account(&app, &did).await?;
+    let permit = mail_permit(&app, Some(&did), &email, "confirm_email", true)?;
     let token = create_email_token(&app, &did, "confirm_email").await?;
-    deliver(&app, &email, crate::mail::Email::ConfirmEmail { token: &token });
+    deliver(&app, permit, &email, crate::mail::Email::ConfirmEmail { token: &token });
     Ok(StatusCode::OK)
 }
 
@@ -2222,8 +2265,9 @@ async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResul
     let (acct, email) = mailable_account(&app, &did).await?;
     let token_required = acct.email_confirmed;
     if token_required {
+        let permit = mail_permit(&app, Some(&did), &email, "update_email", true)?;
         let token = create_email_token(&app, &did, "update_email").await?;
-        deliver(&app, &email, crate::mail::Email::UpdateEmail { token: &token });
+        deliver(&app, permit, &email, crate::mail::Email::UpdateEmail { token: &token });
     }
     Ok(Json(json!({"tokenRequired": token_required})))
 }
@@ -2331,8 +2375,19 @@ async fn request_password_reset(State(app): AppState, Json(inp): Json<RequestPas
     let Some(acct) = acct else {
         return Err(invalid_request("account does not have an email address"));
     };
+    // Over a budget it answers exactly as a mailed request does (no headers
+    // from these buckets either): the caller is unauthenticated, and an
+    // account's mail budget is nobody else's business.
+    let acct_limits: [&'static crate::ratelimit::Limit; 2] = [&crate::ratelimit::PASSWORD_RESET_ACCOUNT_DAY, &crate::ratelimit::PASSWORD_RESET_ACCOUNT_HOUR];
+    if app.ratelimit.consume_unbypassable(&acct_limits, &acct.did, "mail:reset_password", false).is_err() {
+        crate::mail::MAIL_SUPPRESSED.with_label_values(&["reset_password", "account_limit"]).inc();
+        return Ok(StatusCode::OK);
+    }
+    let Ok(permit) = mail_permit(&app, Some(&acct.did), &email, "reset_password", false) else {
+        return Ok(StatusCode::OK);
+    };
     let token = create_email_token(&app, &acct.did, "reset_password").await?;
-    deliver(&app, &email, crate::mail::Email::ResetPassword { handle: &acct.handle, token: &token });
+    deliver(&app, permit, &email, crate::mail::Email::ResetPassword { handle: &acct.handle, token: &token });
     crate::metrics::PASSWORD_RESETS.with_label_values(&["requested"]).inc();
     Ok(StatusCode::OK)
 }

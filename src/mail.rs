@@ -39,6 +39,7 @@ macro_rules! lazy {
     };
 }
 lazy!(MAIL_MESSAGES: IntCounterVec = register_int_counter_vec!("vlpds_mail_messages_total", "Outbound mail by result (sent; failed: permanent rejection or retries exhausted; dropped: queue full or mailer stopped) and purpose", &["result", "purpose"]));
+lazy!(MAIL_SUPPRESSED: IntCounterVec = register_int_counter_vec!("vlpds_mail_suppressed_total", "Account mails not sent, by purpose and reason (recipient_limit: mail-recipient-*; node_limit: mail-node-hour; account_limit: password-reset-account-*, answered OK; dedup: an email sign-in code under a minute old is still live)", &["purpose", "reason"]));
 lazy!(MAIL_RETRIES: IntCounter = register_int_counter!("vlpds_mail_retries_total", "SMTP send attempts retried after a transient failure (4xx, connection error, timeout)"));
 lazy!(MAIL_QUEUE: IntGauge = register_int_gauge!("vlpds_mail_queue_depth", "Mails queued or being sent (all of this process's SMTP mailers)"));
 lazy!(MAIL_SEND_SECONDS: Histogram = register_histogram!("vlpds_mail_send_seconds", "One successful SMTP send, enqueue to accepted (incl. retries)", exponential_buckets(0.01, 2.0, 14).unwrap()));

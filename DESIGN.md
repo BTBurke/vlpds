@@ -3675,6 +3675,37 @@ for it.
   address, so raise or exempt it with an IP override if it hits this.
 - Key kinds now include `node`: one counter for the whole node.
 
+**Mail budgets (vlpds additions).** Every mail to a user is limited by its
+endpoint and by two shared budgets (RUNBOOK "Mail rate limits" has the
+table):
+- `com.atproto.identity.requestPlcOperationSignature-0/-1` (15/day, 5/h per
+  DID), the values of its sibling mail endpoints; the reference has none.
+  Turning the email factor off through updateEmail without a token mails an
+  update code, and now spends requestEmailUpdate's buckets (it spent none).
+- `mail-recipient-hour` / `mail-recipient-day` (10 / 30) count every account
+  mail to one recipient, all kinds together, keyed by DID (by the normalized
+  address if a mail ever has no account). `mail-node-hour` (500) counts
+  everything a node mails, to protect the sender's reputation. Admin
+  `sendEmail` is exempt from both.
+- Enforced where mail is sent: `deliver` takes a `MailPermit`, which only
+  `mail_permit` makes, by spending the two budgets. Handlers take it before
+  minting the token, so a refused request leaves the last mailed token
+  valid. These buckets ignore the request's bypasses (internal token, bypass
+  key, admin auth) and IP overrides; a DID override lifts a recipient's.
+  They count on the DID's owner, like other per-DID buckets.
+- requestPasswordReset is unauthenticated and keyed by IP, so a distributed
+  sender could flood one inbox. `password-reset-account-hour` / `-day` (5 /
+  15 per account) cap it, and keep it from spending the whole recipient
+  budget. Over those or the mail budgets it answers 200 and mails nothing,
+  without these buckets' headers: identical to a mailed request. An unknown
+  address still gets the reference's 400 `InvalidRequest`.
+- The email sign-in factor mails no new code while the live one is under a
+  minute old, and still answers `AuthFactorTokenRequired`. Over the mail
+  budget, createSession gets 429 and the OAuth sign-in page shows
+  `rate_limited`, rather than prompting for a code that was never sent.
+- `vlpds_mail_suppressed_total{purpose,reason}` counts mail not sent;
+  `VlpdsMailNodeBudgetExhausted` fires when the node budget refuses any.
+
 Request bodies are decompressed after routing (the decompression layer
 sits inside the forwarding one). Routing therefore decodes a `gzip` or
 `deflate` JSON body itself, bounded at 4 MiB decoded, and forwards the
@@ -4214,7 +4245,9 @@ offers; vlpds's TOTP (`vlpds.server.*Totp`) stays as a second option.
 - **Sign-in** (createSession and the OAuth sign-in page; app passwords
   bypass it, as in the reference): without `authFactorToken` a fresh
   `auth_factor` code is mailed ("Sign-in Confirmation") and the call fails
-  401 `AuthFactorTokenRequired`; the code is an email token like the others
+  401 `AuthFactorTokenRequired` (no new code while the live one is under a
+  minute old, and none over the mail budgets: "Rate limits", mail
+  budgets); the code is an email token like the others
   (15 min, single use, newest replaces older, keyed digest at rest), wrong
   400 `InvalidToken`, stale 400 `ExpiredToken`. The OAuth page shows the
   code step with the obfuscated address (`a***e@e***m`), like the

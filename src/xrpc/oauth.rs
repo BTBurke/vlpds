@@ -1503,6 +1503,8 @@ async fn sign_in_inner(
             return Ok(SignIn::NeedTotp(acct.handle, email_hint(fe.factor)));
         }
         Err(fe) if fe.err.status.is_server_error() => return Err(fe.err.into()),
+        // no code could be mailed: not a wrong code
+        Err(fe) if super::server::is_mail_limited(&fe.err) => return Ok(SignIn::Failed(ident, LoginError::RateLimited)),
         Err(fe) => {
             let (e, hint) = (fe.err, email_hint(fe.factor));
             // a password step starts a new pending sign-in

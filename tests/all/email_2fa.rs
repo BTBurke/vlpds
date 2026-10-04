@@ -153,8 +153,9 @@ async fn sign_in_with_emailed_code() {
     // single use
     s.login(&a.handle, &a.password, Some(&code)).await.err(400, "InvalidToken");
 
-    // a newer code replaces the older one
+    // a newer code (a minute on) replaces the older one
     let old = request_code(&s, &a).await;
+    age_email_token(&s, &a.did, "auth_factor", 61_000).await;
     let new = request_code(&s, &a).await;
     assert_ne!(old, new);
     s.login(&a.handle, &a.password, Some(&old)).await.err(400, "InvalidToken");
@@ -203,6 +204,27 @@ async fn code_without_a_factor_is_still_checked() {
     s.login(&a.handle, &ap, Some("AAAAA-AAAAA")).await.err(400, "InvalidToken");
     s.login(&a.handle, &ap, Some(&code)).await.ok();
     s.login(&a.handle, &a.password, Some(&code)).await.err(400, "InvalidToken");
+}
+
+/// A sign-in within a minute of the last code mails none (rate limits on or
+/// off) and still asks for the code, which still works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_code_is_not_resent_within_a_minute() {
+    let s = TestServer::spawn().await;
+    let a = confirmed_account(&s, "kit").await;
+    enable(&s, &a).await;
+    let code = request_code(&s, &a).await;
+    for ident in [&a.handle, &a.email] {
+        let (r, _) = mailed_n(&s, &a.email, 0, s.login(ident, &a.password, None)).await;
+        r.err(401, "AuthFactorTokenRequired");
+    }
+    // a minute on, a fresh one goes out and replaces it
+    age_email_token(&s, &a.did, "auth_factor", 61_000).await;
+    let new = request_code(&s, &a).await;
+    s.login(&a.handle, &a.password, Some(&code)).await.err(400, "InvalidToken");
+    s.login(&a.handle, &a.password, Some(&new)).await.ok();
+    // once used, the next sign-in mails a code at once
+    request_code(&s, &a).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
