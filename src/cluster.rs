@@ -212,6 +212,11 @@ pub trait ShardHost: Send + Sync + 'static {
     async fn refused(&self, _addr: &str) -> bool {
         false
     }
+    /// Joiner with live peers: false holds the join (a host that knows its
+    /// peers can't reach it yet would take shards only to give them up).
+    fn may_join(&self) -> bool {
+        true
+    }
 }
 
 /// What we last saw of a peer's lease, timed on our monotonic clock.
@@ -1445,6 +1450,10 @@ impl Cluster {
         if !peers.is_empty() && !self.spawned.load(Ordering::Acquire) {
             return false;
         }
+        if !peers.is_empty() && !host.may_join() {
+            tracing::info!("not joining yet: the host holds the join");
+            return false;
+        }
         let confirmed =
             |l: &NodeLease, c: &HashMap<String, i64>| l.follows.get(&self.log_id).or_else(|| c.get(&l.log_id)).copied();
         let mut floor = self.join_floor.load(Ordering::Acquire);
@@ -2647,6 +2656,8 @@ mod tests {
         unheard: std::sync::atomic::AtomicBool,
         /// peer logs our "firehose" follows (published in our lease)
         follows: Mutex<BTreeMap<String, i64>>,
+        /// `ShardHost::may_join` answers false
+        hold_join: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2701,6 +2712,9 @@ mod tests {
         }
         fn follow_floors(&self) -> BTreeMap<String, i64> {
             self.follows.lock().clone()
+        }
+        fn may_join(&self) -> bool {
+            !self.hold_join.load(Ordering::SeqCst)
         }
     }
 
@@ -2997,6 +3011,26 @@ mod tests {
         assert!(b.joined(), "confirmed through a's lease");
         a.step(&ha_dyn).await.unwrap();
         assert_eq!(ha.closed.lock().len(), 1, "a hands b its share at once");
+    }
+
+    /// A host that holds its join (`may_join`) stays out while it has peers.
+    #[tokio::test]
+    async fn joiner_waits_while_its_host_holds_the_join() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (_ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        hb.hold_join.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            b.step(&hb_dyn).await.unwrap();
+            a.step(&ha_dyn).await.unwrap();
+        }
+        assert!(!b.joined() && b.owned().is_empty());
+        hb.hold_join.store(false, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap();
+        assert!(b.joined());
     }
 
     /// A joiner's seqs must pass every floor before it joins: here its
