@@ -95,8 +95,8 @@ const TRIM_SPANS: usize = 8;
 /// only a crash loop that never once opens the shard cleanly gets here.
 const MAX_SPANS: usize = 1024;
 
-fn trim_history(history: &mut Vec<Span>, applied: u64) {
-    if history.len() > TRIM_SPANS {
+fn trim_history(history: &mut Vec<Span>, applied: u64, keep: usize) {
+    if history.len() > keep {
         history.retain(|sp| sp.epoch >= applied);
     }
 }
@@ -328,6 +328,8 @@ pub struct Cluster {
     /// Tests: list every step even when alone (a unit-test host's greetings
     /// never reach its peers' `learn_peer`).
     pub(crate) list_every_step: AtomicBool,
+    /// `TRIM_SPANS` unless the host set its own (`set_trim_spans`).
+    trim_spans: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -493,6 +495,7 @@ impl Cluster {
             contact: AtomicBool::new(false),
             nodes_listed: parking_lot::Mutex::new((None, 0)),
             list_every_step: AtomicBool::new(false),
+            trim_spans: std::sync::atomic::AtomicUsize::new(TRIM_SPANS),
             cfg,
         };
         let v = c.ensure_version().await?;
@@ -862,6 +865,17 @@ impl Cluster {
 
     pub fn set_reshard_policy(&self, p: crate::reshard::Policy) {
         *self.policy.write() = p;
+    }
+
+    /// Histories longer than `n` spans drop the spans a checkpoint made
+    /// redundant (`ShardHost::checkpointed`). A host whose opens pay per
+    /// span (a relay replays each earlier owner's log) wants 1.
+    pub fn set_trim_spans(&self, n: usize) {
+        self.trim_spans.store(n.max(1), Ordering::Release);
+    }
+
+    fn trim_at(&self) -> usize {
+        self.trim_spans.load(Ordering::Acquire)
     }
 
     pub fn layout(&self) -> Arc<Layout> {
@@ -2044,7 +2058,7 @@ impl Cluster {
             let mut next = history.clone();
             next.push(Span { log_id: self.log_id.clone(), epoch, start: host.next_ordinal(), end: None });
             // never drop a span to make room: an unreplayed one holds acked writes
-            trim_history(&mut next, cur.applied_epoch);
+            trim_history(&mut next, cur.applied_epoch, self.trim_at());
             if next.len() > MAX_SPANS {
                 tracing::error!(shard = s.0, spans = next.len(), applied_epoch = cur.applied_epoch, "shard history at its cap with no clean open to trim it: not taking it (spans are never dropped unreplayed)");
                 crate::metrics::LEASE_EVENTS.with_label_values(&["history_full"]).inc();
@@ -2297,7 +2311,7 @@ impl Cluster {
                 }
             }
             if frozen.is_none() {
-                trim_history(&mut a.history, a.applied_epoch);
+                trim_history(&mut a.history, a.applied_epoch, self.trim_at());
             }
             match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
@@ -2348,7 +2362,7 @@ impl Cluster {
         Ok(false)
     }
 
-    /// Trims our histories past TRIM_SPANS (a crash loop, many takeovers)
+    /// Trims our histories past `trim_at` (a crash loop, many takeovers)
     /// that a durable checkpoint inside our own span made redundant. Best
     /// effort.
     async fn trim_owned(&self, host: &Arc<dyn ShardHost>) {
@@ -2363,7 +2377,7 @@ impl Cluster {
                     (ours
                         && e.is_some()
                         && a.frozen.is_none()
-                        && a.history.len() > TRIM_SPANS
+                        && a.history.len() > self.trim_at()
                         && a.history.iter().any(|sp| sp.epoch < a.epoch))
                     .then(|| (s, a.clone(), e.clone()))
                 })
@@ -2372,7 +2386,7 @@ impl Cluster {
         };
         for (s, mut a, etag) in cands {
             a.applied_epoch = a.applied_epoch.max(a.epoch);
-            trim_history(&mut a.history, a.applied_epoch);
+            trim_history(&mut a.history, a.applied_epoch, self.trim_at());
             let path = self.path(&format!("assign/{}", s.key()));
             match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
@@ -3053,6 +3067,31 @@ mod tests {
             None,
             "the dead log is no longer needed"
         );
+    }
+
+    /// With `set_trim_spans(1)` one checkpointed takeover is enough: the
+    /// dead owner's span leaves the history as soon as ours is checkpointed.
+    #[tokio::test]
+    async fn trim_spans_one_trims_after_a_single_takeover() {
+        let store = Store::memory(None);
+        let d = dead_owner(&store, 3).await;
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        b.set_trim_spans(1);
+        let (hb, hb_dyn) = host();
+        let t = Instant::now();
+        while b.owned().len() < 8 {
+            b.step(&hb_dyn).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(t.elapsed() < Duration::from_secs(3), "never took over");
+        }
+        b.step(&hb_dyn).await.unwrap();
+        assert_eq!(read_assign(&store, ShardId(0)).await.history.len(), 2, "not checkpointed yet: nothing dropped");
+        hb.checkpointed.store(true, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap();
+        let s0 = read_assign(&store, ShardId(0)).await;
+        assert_eq!((s0.history.len(), s0.applied_epoch), (1, s0.epoch), "{s0:?}");
+        assert_eq!(s0.history[0].log_id, b.log_id);
+        assert!(s0.history.iter().all(|sp| sp.log_id != d.log_id));
     }
 
     /// A same-id restart before peers presumed the old incarnation dead: b1
