@@ -891,6 +891,19 @@ mod tests {
             use std::sync::atomic::Ordering::Relaxed;
             (self.lists.swap(0, Relaxed), self.gets.swap(0, Relaxed))
         }
+
+        /// Waits until nothing has touched the store for 200 ms, then resets the
+        /// counts: a closed SlateDB can still have requests in flight on a slow
+        /// machine, and they'd be counted against the next pass.
+        async fn settle(&self) {
+            loop {
+                self.take();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if self.take() == (0, 0) {
+                    return;
+                }
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -963,7 +976,7 @@ mod tests {
         // id 1 was handed out (an aborted op's child, long gone)
         put_json(&store, "assign/layout", &layout(&[(0, 0, 65536)], 2, None)).await;
         let g = gc(&store, Arc::new(Mutex::new(Vec::new())), Duration::ZERO, None);
-        n.take();
+        n.settle().await;
         let p = g.dir_pass().await.unwrap();
         assert!(!p.skipped && p.retired == 0, "{p:?}");
         assert_eq!(n.take(), (3, 1), "a full pass: LIST state/ twice, LIST assign/, the layout GET");
