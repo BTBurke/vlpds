@@ -312,9 +312,10 @@ pub enum WorkerMsg {
     /// Forget cached repos of a partition this node no longer owns; replies
     /// once no repo state referencing it remains in this worker.
     DropPartition(crate::slots::ShardId, oneshot::Sender<()>),
+    /// Boxed: a RepoState is ~900 bytes, and every message is that size otherwise.
     Loaded {
         did: Arc<str>,
-        res: anyhow::Result<Option<RepoState>>,
+        res: Box<anyhow::Result<Option<RepoState>>>,
     },
     /// Sent when the last [`Workers`] handle drops: each worker holds a
     /// sender to its own channel, so the channel alone never disconnects.
@@ -740,7 +741,7 @@ impl Worker {
     fn handle_control(&mut self, m: WorkerMsg, order: &mut Vec<Arc<str>>, groups: &mut HashMap<Arc<str>, Vec<Queued>>) {
         match m {
             WorkerMsg::Write(_) | WorkerMsg::Account(_) | WorkerMsg::Snapshot(_) => unreachable!(),
-            WorkerMsg::Loaded { did, res } => self.loaded(did, res, order, groups),
+            WorkerMsg::Loaded { did, res } => self.loaded(did, *res, order, groups),
             WorkerMsg::Fetched { did, res } => self.fetched(did, res, order, groups),
             WorkerMsg::CreateRepo(req) => self.create_repo(req),
             WorkerMsg::Shutdown => self.stop = true,
@@ -936,7 +937,7 @@ impl Worker {
         metrics::LOADING_REPOS.inc();
         let (me, fallbacks) = (self.me.clone(), self.fallbacks.clone());
         let Some(partition) = (self.partitions)(&did) else {
-            let _ = me.send(WorkerMsg::Loaded { did, res: Err(anyhow::anyhow!("partition not owned by this node")) });
+            let _ = me.send(WorkerMsg::Loaded { did, res: Box::new(Err(anyhow::anyhow!("partition not owned by this node"))) });
             return;
         };
         let db = preload.then(|| partition.db.clone());
@@ -958,7 +959,7 @@ impl Worker {
             metrics::REPO_LOAD_DURATION.observe(t.elapsed().as_secs_f64());
             metrics::LOADING_REPOS.dec();
             let found = matches!(res, Ok(Some(_)));
-            let _ = me.send(WorkerMsg::Loaded { did: did.clone(), res });
+            let _ = me.send(WorkerMsg::Loaded { did: did.clone(), res: Box::new(res) });
             if let Some(db) = db.filter(|_| found) {
                 let _ = warm_security(&*db, &did).await;
             }

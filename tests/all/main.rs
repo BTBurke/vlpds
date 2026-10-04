@@ -2,6 +2,8 @@
 //! suite). Filter by module: `cargo test --test all crud::` (see
 //! tests/STATUS.md).
 
+#![allow(clippy::type_complexity)]
+
 mod account;
 mod account_counts;
 mod account_deactivation;

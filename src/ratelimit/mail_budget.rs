@@ -239,7 +239,7 @@ mod tests {
         assert_eq!(a.spend(&store, 6, DAY, t).await.unwrap(), Spend::Spent(6));
         assert_eq!(b.spend(&store, 6, DAY, 11 * DAY).await.unwrap(), Spend::Spent(1));
         // a new window length starts afresh
-        assert_eq!(a.spend(&store, 6, 3600_000, 11 * DAY).await.unwrap(), Spend::Spent(1));
+        assert_eq!(a.spend(&store, 6, 3_600_000, 11 * DAY).await.unwrap(), Spend::Spent(1));
         // an operator deleting the object resets it, even for a node that
         // last saw it exhausted
         let c = Budget::default();

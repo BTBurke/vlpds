@@ -451,7 +451,7 @@ fn validate_stream(frames: &[Frame], keys: &HashMap<String, k256::ecdsa::Verifyi
 }
 
 fn seed() -> u64 {
-    std::env::var("VLPDS_PROP_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x5eed_1_1)
+    std::env::var("VLPDS_PROP_SEED").ok().and_then(|s| s.parse().ok()).unwrap_or(0x005e_ed11)
 }
 
 fn scale() -> usize {

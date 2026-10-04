@@ -1,8 +1,8 @@
 //! Argon2 overload shedding: with every Argon2 permit taken (a login flood),
 //! request-path password checks and hashes answer 503 after
 //! `state::ARGON2_MAX_WAIT` instead of queueing behind the flood: XRPC
-//! `Overloaded` + Retry-After on createSession/createAccount, and a 503 page
-//! + Retry-After on the OAuth sign-in form. Once the permits free up, the
+//! `Overloaded` + Retry-After on createSession/createAccount, and a 503 page +
+//! Retry-After on the OAuth sign-in form. Once the permits free up, the
 //! same calls succeed (createAccount's handle/email claims were released).
 //!
 //! Its own binary because the Argon2 permits are process-wide: saturating

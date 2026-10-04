@@ -122,7 +122,7 @@ async fn handles_invalid_rejected_by_create_account() {
         // Some invalid handles become valid with a suffix (e.g. a bare TLD); only
         // flag success for strings that are invalid in any position.
         let still_invalid =
-            h.contains(' ') || h.contains("..") || h.starts_with('.') || h.starts_with('-') || h.contains("_") || h.chars().any(|c| !c.is_ascii());
+            h.contains(' ') || h.contains("..") || h.starts_with('.') || h.starts_with('-') || h.contains("_") || !h.is_ascii();
         if still_invalid && r.status != 400 {
             bad.push(format!("createAccount accepted handle {} -> {}", short(&under), r.text()));
         }

@@ -245,7 +245,7 @@ fn cbor_random_values_and_mutations() {
     // MST nodes and commits too
     let mut t = Tree::new();
     for i in 0..300u32 {
-        t.insert_no_proof(format!("app.bsky.feed.post/{}", tid::Tid(1 << 40 | i as u64 * 7919)).as_bytes(), rand_cid(&mut rng))
+        t.insert_no_proof(format!("app.bsky.feed.post/{}", tid::Tid((1 << 40) | (i as u64 * 7919))).as_bytes(), rand_cid(&mut rng))
             .unwrap();
     }
     t.root_cid().unwrap();

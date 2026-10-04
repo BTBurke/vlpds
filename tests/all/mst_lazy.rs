@@ -96,10 +96,13 @@ impl Lockstep {
         let mut ref_blocks = Vec::new();
         let ref_root = self.reference.write_diff_blocks(&mut ref_blocks).unwrap();
 
-        if cold || self.lazy.is_none() {
-            self.lazy = Some(LazyTree::open(self.root, self.pm, &self.store).unwrap());
-        } else if rng.gen_bool(0.3) {
-            self.lazy.as_mut().unwrap().unload(rng.gen_range(0..4));
+        match self.lazy.as_mut() {
+            Some(lazy) if !cold => {
+                if rng.gen_bool(0.3) {
+                    lazy.unload(rng.gen_range(0..4));
+                }
+            }
+            _ => self.lazy = Some(LazyTree::open(self.root, self.pm, &self.store).unwrap()),
         }
         let lazy = self.lazy.as_mut().unwrap();
         // the store still holds the previous commit's records during the batch
@@ -153,7 +156,7 @@ impl Lockstep {
     }
 }
 
-fn random_ops(rng: &mut StdRng, live: &mut Vec<Vec<u8>>, n: usize) -> Vec<Op> {
+fn random_ops(rng: &mut StdRng, live: &mut [Vec<u8>], n: usize) -> Vec<Op> {
     (0..n)
         .map(|_| match rng.gen_range(0..10) {
             0..=4 => Op::Put(small_key(rng), rand_cid(rng)),

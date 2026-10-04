@@ -191,6 +191,9 @@ pub fn current() -> Caps {
 
 pub trait Len: Send + Sync {
     fn len(&self) -> usize;
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 impl<K: Send, V: Send> Len for parking_lot::Mutex<std::collections::HashMap<K, V>> {

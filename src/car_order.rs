@@ -38,6 +38,7 @@ impl Walk {
         Walk { root: Some(root), stack: Vec::new() }
     }
 
+    #[allow(clippy::should_implement_trait)] // yields Next, not Option: not an Iterator
     pub fn next(&mut self) -> Next {
         if let Some(r) = self.root.take() {
             return Next::Node(r);

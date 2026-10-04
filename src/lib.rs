@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 pub mod auth;
 pub mod backfill;
 pub mod backlinks;

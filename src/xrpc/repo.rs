@@ -686,7 +686,7 @@ async fn list_records_at(app: &App, did: &str, gen: u64, q: &ListRecordsQ, limit
         slatedb::IterationOrder::Descending
     };
     let opts = slatedb::config::ScanOptions::default().with_order(order);
-    let takedowns = super::server::ctl(&app, &did).await?;
+    let takedowns = super::server::ctl(app, did).await?;
     let mut iter =
         p.db.scan_with_options(lo..hi, &opts)
             .await
@@ -702,7 +702,7 @@ async fn list_records_at(app: &App, did: &str, gen: u64, q: &ListRecordsQ, limit
         }
         for kv in rows {
             let rkey = String::from_utf8_lossy(&kv.key[prefix.len()..]).to_string();
-            let rec_uri = uri(&did, &format!("{}/{}", q.collection, rkey));
+            let rec_uri = uri(did, &format!("{}/{}", q.collection, rkey));
             if takedowns.has_takedown(&format!("rec/{}/{rkey}", q.collection)) {
                 last_rkey = Some(rkey);
                 continue;

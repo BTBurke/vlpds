@@ -96,8 +96,7 @@ async fn rejected_account_mutation_writes_nothing() {
             Err(vlpds::xrpc::XrpcError::bad("Precondition", "no"))
         })
         .await
-        .err()
-        .expect("rejected");
+        .expect_err("rejected");
     assert_eq!(e.error, "Precondition");
     assert_eq!(s.app.account(&a.did).await.ok().unwrap().handle, a.handle);
     assert_eq!(s.current_seq().await, seq, "no events");
@@ -127,7 +126,7 @@ async fn load_straddling_shard_bounce_is_dropped() {
     bounce(&s, &old).await;
     assert!(!Arc::ptr_eq(&old, &s.app.partition(&a.did).unwrap_or_else(|e| panic!("{}", e.message))));
     // ...and the load completes (ahead of the next write in the worker's queue)
-    s.app.workers.route(&a.did).send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Ok(Some(stale)) }).unwrap();
+    s.app.workers.route(&a.did).send(vlpds::worker::WorkerMsg::Loaded { did: a.did.as_str().into(), res: Box::new(Ok(Some(stale))) }).unwrap();
     let three = s.post(&a, "three").await;
     let rev3 = three.rev.clone().unwrap();
     let mut sub = s.subscribe(Some(0)).await;

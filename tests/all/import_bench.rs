@@ -122,7 +122,7 @@ async fn import_bench() {
                 pr.fetch_max(rs.saturating_sub(bucket), Ordering::Relaxed);
                 pb.fetch_max(bucket, Ordering::Relaxed);
                 i += 1;
-                if trace && i % 125 == 0 {
+                if trace && i.is_multiple_of(125) {
                     let mut g = String::new();
                     for mf in prometheus::gather() {
                         let n = mf.name();
