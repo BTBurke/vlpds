@@ -1656,9 +1656,12 @@ refuses to start without one. Every node of a cluster needs the same KEK set.
   `--vault-approle-role-id-file` + `--vault-approle-secret-id-file`, or
   `--vault-k8s-role`. `--vault-ca-file` for a private CA. The node refuses to
   start if Vault doesn't enforce `associated_data` (Vault before 1.13, an RSA or
-  derived key). Use the same `--vault-addr` host name on every node, since it's
-  part of the kid. Details and the full policy: docs "KEK and key rotation",
-  "Vault Transit".
+  derived key), or if Vault answers its startup check with a 403/404 or refuses
+  the login. The error names the path and the likely cause (a missing key, a
+  policy without `encrypt` or `decrypt`, a wrong role or secret ID). A Vault that
+  doesn't answer (down, sealed) doesn't stop the start. The kid doesn't include
+  the address, so changing `--vault-addr` needs no rewrap. Details and the full
+  policy: docs "KEK and key rotation", "Vault Transit".
 - Local KEK. `openssl rand -out kek.bin 32` (raw 32 bytes, and 64 hex chars or
   base64 also work). Distribute it like the other secrets (sops / Ansible Vault),
   mode 0400. Pass `--kek-file /path/kek.bin` (`VLPDS_KEK_FILE`) or the value in
@@ -1716,7 +1719,12 @@ configured for unwrap.
    nodes, the `key service unavailable` log (HTTP status or timeout), Google
    Cloud status, and IAM (a 403 from a removed role looks the same). On Vault,
    also check `vault status` (sealed is a 503), the policy, and the auth method
-   (a revoked secret ID or a broken Agent shows as a failed login). Clients
+   (a revoked secret ID or a broken Agent shows as a failed login). A node
+   started while Vault was down or sealed logs `key service check deferred to
+   first use` and checks again on its first wrap or unwrap. A node started
+   while Vault answers with a 403/404 refuses to start instead, so a crash loop
+   with `is unusable` in the log is a setup problem (policy, key name, role),
+   not an outage. Clients
    retry 503s. After a failure, a node fails cold unwraps fast for 1 s before it
    tries KMS again.
 2. **Don't restart nodes and don't move shards** (no rolling deploys, splits or

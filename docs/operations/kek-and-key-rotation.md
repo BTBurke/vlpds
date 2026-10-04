@@ -97,8 +97,14 @@ that parameter in 1.13. Older Vaults accept it and drop it with only a warning, 
 another account's row would unwrap there. So a node checks before it uses the current key. It wraps a
 random value under one AAD and requires the decrypt under another AAD to fail. A Vault that drops the AAD,
 or a key that can't take it (RSA or a derived key), stops the node at startup with an
-error naming the key. If Vault is unreachable at startup, the node starts anyway and runs the check before
-its first wrap or unwrap. Every Transit response is also checked for the "ignored parameters" warning.
+error naming the key. Every Transit response is also checked for the "ignored parameters" warning.
+
+The check also catches setup mistakes. If Vault answers it with a 403 or 404 (a key that doesn't exist, a
+policy missing `encrypt` or `decrypt`, a mount name typo) or refuses the login (a wrong role or secret ID),
+the node refuses to start and names the path and the likely cause. If Vault doesn't answer (a connection
+error, a timeout, a sealed Vault's 503), the node starts anyway and runs the check before its first wrap or
+unwrap. So a Vault restart can't crash-loop vlpds. Once a node is running, the same 403s count as an
+outage (503) and never stop it.
 
 ```steps
 - title: Create the key
@@ -110,7 +116,7 @@ its first wrap or unwrap. Every Transit response is also checked for the "ignore
 - title: Point the nodes at it
   body: "`--vault-addr https://vault.example:8200 --vault-transit-key transit/vlpds`, the auth flags, and `--vault-ca-file` if Vault's certificate comes from a private CA. Add `--vault-namespace` on Vault Enterprise or OpenBao namespaces."
 - title: Check
-  body: "The `vault transit key` startup line maps the kid to the key (`kid=V… key=vault:vault.example/transit/vlpds`), and `secrets at rest` shows `kek=V…`. Both must match on every node."
+  body: "The `vault transit key` startup line maps the kid to the key and the address (`kid=V… key=vault:transit/vlpds addr=https://vault.example:8200`), and `secrets at rest` shows `kek=V…`. The kid must match on every node."
 ```
 
 ```hcl
@@ -129,10 +135,11 @@ path "auth/token/renew-self" { capabilities = ["update"] }
 The login endpoints (`auth/approle/login`, `auth/kubernetes/login`) need no policy. While you move to another
 key, also grant `update` on the old key's `decrypt` path.
 
-The kid is a hash of Vault's host name, namespace, mount and key name. It has no version in it, so
-Transit's `rotate` keeps it. Use the same `--vault-addr` host name on every node and keep it stable (a DNS
-name you control). A node that reaches the same Vault by another name sees another kid, and its
-stored blobs fail as `wrapped under unknown key-encryption key`.
+The kid is a hash of the namespace, mount and key name. It has no version in it, so Transit's `rotate`
+keeps it. It has no address in it either, so you can move `--vault-addr` to a new host name, a load
+balancer or a restored cluster with no rewrap, and nodes may reach Vault by different names. The flip side
+is that the key's identity is only its name. Two Vault clusters with a `transit/vlpds` each look like one
+key to vlpds, so point every node at the cluster that holds the real key.
 
 ### Auth methods
 
@@ -180,7 +187,8 @@ key as current and the old one unwrap-only, then rewrap without `--check-version
 A Vault outage plays out exactly like a [Cloud KMS outage](#key-service-outage). Warm accounts keep
 writing, cold writes get 503 `KeyUnavailable`, and a node fails cold unwraps fast for 1 s after a failure.
 Timeouts, connection errors, 5xx (a sealed Vault is 503), 429s, failed logins and a 403 that survives a
-re-login all count as unavailable. A 400 from Transit counts as rejected and fires `VlpdsSecretUnwrapRejected`.
+re-login all count as unavailable. Only the startup check treats a 403, a 404 or a refused login as fatal
+(above), and a running node never stops for one. A 400 from Transit counts as rejected and fires `VlpdsSecretUnwrapRejected`.
 That's a wrong AAD, a ciphertext of another key, or a version below `min_decryption_version`. The metrics
 carry `backend="vault"`, and calls share `--kms-concurrency` with 5 s each like Cloud KMS.
 
