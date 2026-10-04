@@ -50,6 +50,27 @@ impl Source {
     }
 }
 
+/// Stream seqs other than the log keys, for vlRelay (opt-in through
+/// [`Firehose::set_renumber`]; vlpds's own firehose sends the keys). Logs and
+/// the merger stay in keys. Each emitted event gets the next seq of a dense
+/// counter, spliced into its frame once per node, and cursors, the ring,
+/// `last_emitted` and `ConnStats::last_seq` are in those seqs.
+pub trait Renumber: Send + Sync + 'static {
+    /// The seq of the merged stream's last event with key <= `key`. Asked
+    /// once, for the start floor, after every log is durable up to it.
+    fn anchor(&self, key: i64) -> futures::future::BoxFuture<'static, anyhow::Result<i64>>;
+    /// Where to read the bucket from to serve the events after seq `after`:
+    /// (key, seq of the last event with key <= it). The seq is <= `after`
+    /// unless what's in between was pruned (then the caller sends
+    /// OutdatedCursor and resumes from there).
+    fn locate(&self, after: i64) -> futures::future::BoxFuture<'static, anyhow::Result<(i64, i64)>>;
+    /// Writes `frame` with `seq` in place of the seq it carries.
+    fn splice(&self, frame: &[u8], seq: i64, out: &mut Vec<u8>);
+    /// The merger emitted `keys` as seqs `first`, `first + 1`, ..., and
+    /// every event with key <= `bound` has been emitted.
+    fn emitted(&self, keys: &[i64], first: i64, bound: i64);
+}
+
 pub struct MergedBatch {
     pub first: i64,
     pub last: i64,
@@ -68,6 +89,8 @@ pub struct MergedBatch {
     offs: Vec<usize>,
     /// Computed by the first sharded subscriber to read the batch.
     slots: OnceLock<Vec<u16>>,
+    /// Each event's log key when renumbered (empty: the seqs are the keys).
+    keys: Vec<i64>,
 }
 
 impl MergedBatch {
@@ -75,15 +98,39 @@ impl MergedBatch {
     fn new(events: Vec<(i64, Bytes)>, emitted: u64) -> MergedBatch {
         let mut buf = Vec::with_capacity(events.iter().map(|(_, f)| f.len() + 10).sum());
         let mut offs = Vec::with_capacity(events.len());
-        let mut payload = Vec::with_capacity(events.len());
-        for (_, f) in &events {
+        let mut seqs = Vec::with_capacity(events.len());
+        for (seq, f) in &events {
             offs.push(buf.len());
             push_message(&mut buf, OP_BINARY, f);
-            payload.push(buf.len() - f.len());
+            seqs.push((*seq, buf.len() - f.len()));
         }
+        Self::build(buf, offs, seqs, Vec::new(), emitted)
+    }
+
+    /// `events` in key order, as seqs `first`, `first + 1`, ...
+    fn renumbered(events: Vec<(i64, Bytes)>, first: i64, r: &dyn Renumber, emitted: u64) -> MergedBatch {
+        let mut buf = Vec::with_capacity(events.iter().map(|(_, f)| f.len() + 16).sum());
+        let mut offs = Vec::with_capacity(events.len());
+        let mut seqs = Vec::with_capacity(events.len());
+        let mut keys = Vec::with_capacity(events.len());
+        let mut frame = Vec::new();
+        for (i, (key, f)) in events.iter().enumerate() {
+            frame.clear();
+            r.splice(f, first + i as i64, &mut frame);
+            offs.push(buf.len());
+            push_message(&mut buf, OP_BINARY, &frame);
+            seqs.push((first + i as i64, buf.len() - frame.len()));
+            keys.push(*key);
+        }
+        Self::build(buf, offs, seqs, keys, emitted)
+    }
+
+    /// `seqs`: each event's seq and where its payload starts in `buf`.
+    fn build(buf: Vec<u8>, offs: Vec<usize>, seqs: Vec<(i64, usize)>, keys: Vec<i64>, emitted: u64) -> MergedBatch {
         let wire = Bytes::from(buf);
+        let end = |j: usize| offs.get(j + 1).copied().unwrap_or(wire.len());
         let events: Vec<(i64, Bytes)> =
-            events.iter().zip(payload).map(|((seq, f), at)| (*seq, wire.slice(at..at + f.len()))).collect();
+            seqs.iter().enumerate().map(|(j, (seq, at))| (*seq, wire.slice(*at..end(j)))).collect();
         MergedBatch {
             first: events[0].0,
             last: events[events.len() - 1].0,
@@ -93,7 +140,17 @@ impl MergedBatch {
             wire,
             offs,
             slots: OnceLock::new(),
+            keys,
         }
+    }
+
+    /// Event `i`'s log key (its seq unless renumbered).
+    pub fn key(&self, i: usize) -> i64 {
+        self.keys.get(i).copied().unwrap_or(self.events[i].0)
+    }
+
+    fn last_key(&self) -> i64 {
+        self.key(self.events.len() - 1)
     }
 
     fn start(&self) -> u64 {
@@ -284,6 +341,12 @@ pub struct Firehose {
     /// The ring holds every event with seq > ring_floor (the start floor
     /// until the ring evicts). Older cursors are backfilled from S3.
     ring_floor: AtomicI64,
+    /// `ring_floor` as a log key (the same unless renumbered). Both change
+    /// under the ring's write lock.
+    ring_floor_key: AtomicI64,
+    renumber: OnceLock<Arc<dyn Renumber>>,
+    /// False while renumbered and not anchored yet: nothing is served.
+    ready: watch::Sender<bool>,
     /// The merged stream's start floor F: events <= F are only served by the
     /// S3 backfill.
     start_floor: i64,
@@ -320,6 +383,9 @@ impl Firehose {
             last_emitted: AtomicI64::new(0),
             sources: RwLock::new(HashMap::new()),
             ring_floor: AtomicI64::new(floor),
+            ring_floor_key: AtomicI64::new(floor),
+            renumber: OnceLock::new(),
+            ready: watch::channel(true).0,
             start_floor: floor,
             settled: AtomicI64::new(i64::MIN),
             store: RwLock::new(None),
@@ -396,6 +462,37 @@ impl Firehose {
         self.frozen.store(true, Ordering::Release);
     }
 
+    /// Serves renumbered seqs (see [`Renumber`]). Set before `spawn_merger`.
+    pub fn set_renumber(&self, r: Arc<dyn Renumber>) {
+        if self.renumber.set(r).is_ok() {
+            self.ready.send_replace(false);
+        }
+    }
+
+    pub fn renumbered(&self) -> bool {
+        self.renumber.get().is_some()
+    }
+
+    /// (ring floor, its key), read together.
+    fn ring_floors(&self) -> (i64, i64) {
+        let _ring = self.ring.read();
+        (self.ring_floor.load(Ordering::Acquire), self.ring_floor_key.load(Ordering::Acquire))
+    }
+
+    /// The log key of the event with seq `seq` if it's in the ring, else
+    /// the ring floor's key if it's older (None: newer than the head).
+    pub fn key_at(&self, seq: i64) -> Option<i64> {
+        let ring = self.ring.read();
+        let i = ring.partition_point(|b| b.last < seq);
+        match ring.get(i) {
+            Some(b) if b.first <= seq => {
+                Some(b.key(b.events.partition_point(|(s, _)| *s < seq).min(b.events.len() - 1)))
+            }
+            Some(_) => Some(self.ring_floor_key.load(Ordering::Acquire)),
+            None => None,
+        }
+    }
+
     /// Over this many queued bytes, logs are spilled (see `spawn_merger`).
     pub fn set_max_queue_bytes(&self, n: usize) {
         self.max_queue_bytes.store(n, Ordering::Relaxed);
@@ -428,6 +525,11 @@ impl Firehose {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut behind = false;
             let mut pushed = 0u64;
+            let renumber = fh.renumber.get().cloned();
+            // the seq of the last event emitted, once anchored
+            let mut seq: Option<i64> = None;
+            let mut anchoring: Option<tokio::task::JoinHandle<anyhow::Result<i64>>> = None;
+            let mut anchor_retry = tokio::time::Instant::now();
             loop {
                 if !behind {
                     tick.tick().await;
@@ -504,6 +606,35 @@ impl Firehose {
                 if late > 0 {
                     tracing::warn!(late, emitted, "firehose merger: dropped late events below the emitted watermark");
                 }
+                if let Some(r) = renumber.as_ref().filter(|_| seq.is_none()) {
+                    if anchoring.is_none()
+                        && fh.settled.load(Ordering::Acquire) >= fh.start_floor
+                        && tokio::time::Instant::now() >= anchor_retry
+                    {
+                        anchoring = Some(tokio::spawn(r.anchor(fh.start_floor)));
+                    }
+                    if anchoring.as_ref().is_some_and(|j| j.is_finished()) {
+                        match anchoring.take().expect("checked").await {
+                            Ok(Ok(n)) => {
+                                tracing::info!(key = fh.start_floor, seq = n, "firehose: stream seqs anchored");
+                                seq = Some(n);
+                                {
+                                    let _ring = fh.ring.write();
+                                    fh.ring_floor.store(n, Ordering::Release);
+                                }
+                                fh.last_emitted.store(n, Ordering::Release);
+                                fh.ready.send_replace(true);
+                            }
+                            Ok(Err(e)) => tracing::warn!("firehose: anchoring stream seqs failed, retrying: {e:#}"),
+                            Err(e) => tracing::warn!("firehose: anchoring stream seqs failed, retrying: {e}"),
+                        }
+                        anchor_retry = tokio::time::Instant::now() + Duration::from_millis(500);
+                    }
+                    // nothing leaves the queues until seqs can be numbered
+                    if seq.is_none() {
+                        bound = bound.min(fh.start_floor);
+                    }
+                }
                 let mut out = Vec::new();
                 for lq in logs.values_mut() {
                     while let Some((seq, f)) = lq.q.front() {
@@ -526,16 +657,28 @@ impl Firehose {
                 fh.queued_bytes.store(total, Ordering::Relaxed);
                 metrics::FIREHOSE_MERGE_QUEUE_BYTES.set(total as i64);
                 if out.is_empty() {
+                    if let (Some(r), Some(n)) = (&renumber, seq) {
+                        r.emitted(&[], n + 1, emitted);
+                    }
                     continue;
                 }
                 out.sort_unstable_by_key(|(s, _)| *s);
-                let batch = Arc::new(MergedBatch::new(out, pushed));
+                let batch = match (&renumber, seq) {
+                    (Some(r), Some(n)) => {
+                        let b = MergedBatch::renumbered(out, n + 1, r.as_ref(), pushed);
+                        seq = Some(b.last);
+                        r.emitted(&b.keys, b.first, emitted);
+                        b
+                    }
+                    _ => MergedBatch::new(out, pushed),
+                };
+                let batch = Arc::new(batch);
                 pushed = batch.end;
                 STATS.firehose_events.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 metrics::FIREHOSE_EVENTS.inc_by(batch.events.len() as u64);
                 metrics::FIREHOSE_BATCH.observe(batch.events.len() as f64);
                 metrics::FIREHOSE_EMIT_DELAY
-                    .observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
+                    .observe(crate::tid::now_micros().saturating_sub((batch.key(0) >> 8) as u64) as f64 / 1e6);
                 fh.push(batch);
             }
         }));
@@ -549,6 +692,7 @@ impl Firehose {
             while self.ring_bytes.load(Ordering::Relaxed) > self.max_ring_bytes && ring.len() > 1 {
                 let old = ring.pop_front().unwrap();
                 self.ring_floor.fetch_max(old.last, Ordering::AcqRel);
+                self.ring_floor_key.fetch_max(old.last_key(), Ordering::AcqRel);
                 self.ring_bytes.fetch_sub(old.bytes as i64, Ordering::Relaxed);
             }
         }
@@ -732,6 +876,13 @@ impl Firehose {
         shard: Option<SlotRange>,
     ) -> Result<(), &'static str> {
         let mut head = self.head.subscribe();
+        let mut ready = self.ready.subscribe();
+        while !*ready.borrow_and_update() {
+            tokio::select! {
+                r = ready.changed() => if r.is_err() { return Ok(()) },
+                c = out.ctl.recv() => out.control(c).await?,
+            }
+        }
         let mut last = match cursor {
             Some(c) => c,
             // the ring holds everything above its floor
@@ -739,9 +890,24 @@ impl Firehose {
         };
         if let Some(c) = cursor {
             // seqs are time-based: a cursor beyond both the stream head and the
-            // current clock can't have been issued by us
-            let now = crate::nodelog::seq_floor(crate::tid::now_micros()) | 0xff;
-            if c > self.last_emitted.load(Ordering::Acquire).max(now) {
+            // current clock can't have been issued by us. Renumbered seqs
+            // aren't: another node's stream may just be ahead of ours (an
+            // edge trails the cores), so give ours a moment to get there.
+            let future = if self.renumbered() {
+                let deadline = tokio::time::Instant::now() + FUTURE_CURSOR_GRACE;
+                while c > self.last_emitted.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+                    tokio::select! {
+                        _ = head.changed() => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                        c = out.ctl.recv() => out.control(c).await?,
+                    }
+                }
+                c > self.last_emitted.load(Ordering::Acquire)
+            } else {
+                let now = crate::nodelog::seq_floor(crate::tid::now_micros()) | 0xff;
+                c > self.last_emitted.load(Ordering::Acquire).max(now)
+            };
+            if future {
                 out.finish(&events::error_frame("FutureCursor", "cursor in the future")).await;
                 return Err("future_cursor");
             }
@@ -868,8 +1034,9 @@ impl Firehose {
         let (mut overtaken, mut failures) = (0u32, 0u32);
         // a running-backfill slot, taken once there is something to read
         let mut slot: Option<BackfillSlot> = None;
+        let renumber = self.renumber.get().cloned();
         loop {
-            let floor = self.ring_floor.load(Ordering::Acquire);
+            let (floor, floor_key) = self.ring_floors();
             if *last >= floor {
                 return Ok(true);
             }
@@ -877,10 +1044,10 @@ impl Firehose {
             // watermark: its events <= F may not be in S3 yet. Wait for the
             // merger to settle past it, answering the client meanwhile (and
             // noticing it leave).
-            if self.settled.load(Ordering::Acquire) < floor {
+            if self.settled.load(Ordering::Acquire) < floor_key {
                 let mut settled = self.settled_tx.subscribe();
                 tokio::select! {
-                    _ = async { settled.wait_for(|s| *s >= floor).await.is_ok() } => {}
+                    _ = async { settled.wait_for(|s| *s >= floor_key).await.is_ok() } => {}
                     c = out.ctl.recv() => out.control(c).await?,
                     // the floor moves as the ring evicts: look again
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -891,40 +1058,107 @@ impl Firehose {
                 slot = Some(self.backfill_slot(out).await?);
                 continue; // the floor moved while it waited
             }
-            // older than what log retention deleted: OutdatedCursor, then the
-            // oldest events left (retention.rs raises this before deleting)
-            match crate::retention::retained_floor(&reader.store).await {
-                Ok(pruned) if *last < pruned => {
-                    out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
-                    *last = pruned;
-                    continue;
+            // Where to read from, in keys, and the seq of the last event at
+            // or below it (renumbered: the next event read is `seq + 1`).
+            let (from, mut seq) = match &renumber {
+                None => {
+                    // older than what log retention deleted: OutdatedCursor, then the
+                    // oldest events left (retention.rs raises this before deleting)
+                    match crate::retention::retained_floor(&reader.store).await {
+                        Ok(pruned) if *last < pruned => {
+                            out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
+                            *last = pruned;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
+                    }
+                    (*last, *last)
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
-            }
+                Some(r) => match r.locate(*last).await {
+                    Ok((key, seq)) if seq > *last => {
+                        out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
+                        *last = seq;
+                        if seq >= floor {
+                            // what's left starts in the ring
+                            continue;
+                        }
+                        (key, seq)
+                    }
+                    Ok(v) => v,
+                    Err(e) => {
+                        failures += 1;
+                        if failures >= BACKFILL_ATTEMPTS {
+                            tracing::warn!(
+                                after = *last,
+                                "firehose backfill: locating the cursor failed, disconnecting: {e:#}"
+                            );
+                            out.close(1011).await;
+                            return Err("backfill_failed");
+                        }
+                        tracing::warn!(after = *last, "firehose backfill: locating the cursor failed, retrying: {e:#}");
+                        tokio::time::sleep(Duration::from_millis(100) * failures).await;
+                        continue;
+                    }
+                },
+            };
             let (tx, mut rx) = mpsc::channel(BACKFILL_CHANNEL);
-            let (r, from) = (reader.clone(), *last);
+            let r = reader.clone();
             let mut job =
-                AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
+                AbortOnDrop(tokio::spawn(
+                    async move { crate::backfill::backfill_with(&r, from, floor_key, &tx).await },
+                ));
             let mut chunk = Vec::with_capacity(1024);
             let mut buf = Vec::new();
+            let mut frame = Vec::new();
             while rx.recv_many(&mut chunk, 1024).await > 0 {
                 buf.clear();
-                for (_, f) in &chunk {
-                    push_message(&mut buf, OP_BINARY, f);
+                let mut n = 0;
+                for (key, f) in &chunk {
+                    match &renumber {
+                        None => {
+                            push_message(&mut buf, OP_BINARY, f);
+                            seq = *key;
+                        }
+                        Some(r) => {
+                            seq += 1;
+                            // the read started at a checkpoint before the cursor
+                            if seq <= *last {
+                                continue;
+                            }
+                            frame.clear();
+                            r.splice(f, seq, &mut frame);
+                            push_message(&mut buf, OP_BINARY, &frame);
+                        }
+                    }
+                    n += 1;
+                }
+                chunk.clear();
+                if n == 0 {
+                    continue;
                 }
                 out.write(&buf).await?;
-                metrics::FIREHOSE_SENT.inc_by(chunk.len() as u64);
-                metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(chunk.len() as u64);
-                *last = chunk.last().expect("non-empty").0;
-                out.sent(chunk.len(), buf.len(), *last);
-                chunk.clear();
+                metrics::FIREHOSE_SENT.inc_by(n as u64);
+                metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(n as u64);
+                *last = seq;
+                out.sent(n, buf.len(), *last);
                 while let Ok(c) = out.ctl.try_recv() {
                     out.control(Some(c)).await?;
                 }
             }
             let err = match (&mut job.0).await {
                 Ok(Ok(_)) => {
+                    if renumber.is_some() && seq != floor {
+                        // the bucket and the merged stream disagree on how
+                        // many events there are: a numbering bug
+                        tracing::error!(
+                            from,
+                            floor_key,
+                            read_to = seq,
+                            floor,
+                            "firehose backfill: stream seqs don't match the bucket"
+                        );
+                    }
                     *last = (*last).max(floor); // everything <= floor that exists was sent
                     (overtaken, failures) = (0, 0);
                     continue;
@@ -1020,6 +1254,9 @@ impl Drop for Subscribed {
 }
 
 const BACKFILL_ATTEMPTS: u32 = 3;
+/// How long a renumbered stream waits to reach a cursor past its head
+/// before calling it FutureCursor.
+const FUTURE_CURSOR_GRACE: Duration = Duration::from_secs(2);
 /// Frames between a backfill reader and its subscriber's writer (they are
 /// slices of segments the reader holds anyway).
 const BACKFILL_CHANNEL: usize = 1024;
