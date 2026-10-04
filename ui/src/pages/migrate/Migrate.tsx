@@ -1,6 +1,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { CopyText, ErrorNotice, Field, Notice, Spinner, Status, Topbar } from '../../components/ui'
 import { RecoveryKeyExplainer, RecoveryKeyPicker, type RecoveryKeyChoice } from '../../components/RecoveryKey'
+import { BackupBox } from '../../components/Backup'
+import { canStreamToDisk, type BackupSource } from '../../lib/backup'
 import * as I from '../../components/icons'
 import { fmtBytes, fmtNum } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
@@ -62,6 +64,7 @@ const SIMPLE_STEPS: { label: string; ids: StepId[] }[] = [
   { label: 'Find your account', ids: ['find', 'signin'] },
   { label: 'Get ready', ids: ['check', 'handle', 'create'] },
   { label: 'Copy your posts and photos', ids: ['copy'] },
+  { label: 'Save a copy (optional)', ids: ['backup'] },
   { label: 'Switch over', ids: ['identity', 'finish'] },
 ]
 
@@ -146,6 +149,8 @@ export function Migrate() {
     )
   } else if (step === 'copy') {
     body = <CopyStep saved={saved} oldPds={oldPds!} newPds={newPds!} update={update} />
+  } else if (step === 'backup') {
+    body = <BackupStep saved={saved} oldPds={oldPds!} update={update} />
   } else if (step === 'identity') {
     body = <IdentityStep saved={saved} oldPds={oldPds!} newPds={newPds!} update={update} />
   } else if (step === 'finish') {
@@ -245,6 +250,7 @@ function currentStep(s: Saved | null): StepId {
   if (!s.newHandle) return 'handle'
   if (!s.created) return 'create'
   if (!(s.repoDone && s.blobsDone && s.prefsDone)) return 'copy'
+  if (!s.backup && !s.identityDone) return 'backup'
   if (!s.identityDone) return 'identity'
   if (!(s.activated && s.oldDeactivated)) return 'finish'
   return 'done'
@@ -1315,7 +1321,71 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
   )
 }
 
-// ---------------------------------------------------------------- 7. identity
+// ---------------------------------------------------------------- 7. backup
+
+const pdsSource = (pds: Pds, handle: string): BackupSource => ({ base: pds.base, did: pds.did, handle, call: (nsid, o) => pds.call(nsid, o) })
+
+/** Optional, and offered once: the last moment the old server's copy is
+ * the account's live one. Taken from there, not from the copy here. */
+function BackupStep({ saved, oldPds, update }: { saved: Saved; oldPds: Pds; update: (p: Partial<Saved>) => void }) {
+  const adv = useAdv()
+  const old = hostOf(saved.oldPds)
+  const [done, setDone] = useState(false)
+  const source = useMemo(() => pdsSource(oldPds, saved.oldHandle), [oldPds, saved.oldHandle])
+  return (
+    <Card
+      title={adv ? 'Back up before the switch' : 'Save a copy of your account'}
+      sub={
+        adv ? (
+          <>
+            Optional. Everything is copied here; this is the last chance to keep what {old} holds while it is still your live server. One ZIP:{' '}
+            <span className="mono">repo.car</span>, every blob (sha-256 checked against its CID), preferences, your DID document and PLC audit log, and a
+            README on restoring anywhere. No passwords or session tokens.
+          </>
+        ) : (
+          <>
+            Optional. Before the switch, you can keep a copy of your whole account from {old} on this device: posts, follows, likes, photos and videos,
+            and settings, in one .zip file. Everything has already been copied here either way.
+          </>
+        )
+      }
+    >
+      {adv && (
+        <p className="small muted">
+          {canStreamToDisk()
+            ? 'This browser writes the ZIP straight to the file you pick, so size is no concern.'
+            : 'This browser assembles the ZIP in memory, then saves it to your downloads.'}
+        </p>
+      )}
+      <BackupBox
+        source={source}
+        simple={!adv}
+        primary={!done}
+        onSaved={() => setDone(true)}
+        leading={
+          done ? undefined : (
+            <button type="button" className="btn" name="skip-backup" onClick={() => update({ backup: 'skipped' })}>
+              Skip
+            </button>
+          )
+        }
+        trailing={
+          done ? (
+            <button type="button" className="btn primary" onClick={() => update({ backup: 'saved' })}>
+              Continue
+            </button>
+          ) : undefined
+        }
+      />
+    </Card>
+  )
+}
+
+// ---------------------------------------------------------------- 8. identity
+
+/** A recovery key generated during this move, for the welcome screen's
+ * backup. Memory only: gone with the tab, never in storage. */
+let madeKey: { did: string; privateHex: string; didKey: string } | undefined
 
 type Recommended = {
   alsoKnownAs: string[]
@@ -1384,6 +1454,9 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
       }
       await newPds.call('com.atproto.identity.submitPlcOperation', { body: { operation: op } })
       keepSignedOp(saved.did, undefined)
+      if (ownKey && userKey.status === 'ready' && userKey.privateHex && userKey.didKey === ownKey) {
+        madeKey = { did: saved.did, privateHex: userKey.privateHex, didKey: ownKey }
+      }
       update({ identityDone: true })
     } catch (err) {
       setError(err)
@@ -1559,7 +1632,7 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
   )
 }
 
-// ---------------------------------------------------------------- 8. finish
+// ---------------------------------------------------------------- 9. finish
 
 function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds; newPds: Pds; update: (p: Partial<Saved>) => void }) {
   const [error, setError] = useState<unknown>()
@@ -1704,6 +1777,22 @@ function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onRes
           It is deactivated at {hostOf(saved.oldPds)}, not deleted. Once you're happy here, you can delete it there.
         </li>
       </ol>
+      {newPds.tokens && (
+        <details className="mig-adv mig-backup">
+          <summary>{adv ? 'Download a backup from here' : 'Save a copy of your account'}</summary>
+          <p className="small">
+            {adv
+              ? `The same ZIP as before the switch, read from ${here}: repo, blobs, preferences, DID document and PLC audit log.`
+              : `One .zip file with your posts, follows, likes, photos and videos, and settings, as they are now on ${here}.`}
+          </p>
+          <BackupBox
+            source={pdsSource(newPds, saved.newHandle ?? saved.oldHandle)}
+            simple={!adv}
+            primary={false}
+            recoveryKey={adv && madeKey?.did === saved.did ? madeKey : undefined}
+          />
+        </details>
+      )}
       <div className="row between">
         <button type="button" className="btn quiet" onClick={onReset}>
           Move another account

@@ -1,9 +1,63 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { ErrorNotice, Loading, Notice, PageHead, Panel, Spinner, saveBlob } from '../../components/ui'
 import { Download } from '../../components/icons'
+import { BackupBox } from '../../components/Backup'
+import { canStreamToDisk, type BackupSource } from '../../lib/backup'
 import { fmtBytes } from '../../lib/format'
 import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { acall } from '../../lib/xrpc'
+
+/** What only this server knows about the account, minus anything secret:
+ * app password names (not the passwords), OAuth clients (not their tokens),
+ * the PLC rotation keys (public did:keys). */
+async function serverExtras(): Promise<Record<string, unknown>> {
+  const out: Record<string, unknown> = {}
+  const [pw, apps, plc] = await Promise.allSettled([
+    acall('com.atproto.server.listAppPasswords'),
+    acall('vlpds.oauth.listSessions'),
+    acall('vlpds.identity.getPlcData'),
+  ])
+  if (pw.status === 'fulfilled') {
+    out['vlpds/app-passwords.json'] = (pw.value.passwords ?? []).map((p: any) => ({ name: p.name, createdAt: p.createdAt, privileged: !!p.privileged }))
+  }
+  if (apps.status === 'fulfilled') {
+    out['vlpds/connected-apps.json'] = (apps.value.sessions ?? []).map((x: any) => ({
+      clientId: x.clientId,
+      scope: x.scope,
+      createdAt: x.createdAt,
+      lastUsedAt: x.updatedAt,
+    }))
+  }
+  if (plc.status === 'fulfilled') {
+    const d = plc.value
+    out['vlpds/rotation-keys.json'] = {
+      rotationKeys: d.rotationKeys,
+      serverKeys: d.serverKeys,
+      operatorRecoveryKey: d.recoveryKey,
+      signingKey: d.verificationMethods?.atproto ?? null,
+    }
+  }
+  return out
+}
+
+function FullBackup() {
+  const s = useSession()!
+  const source = useMemo<BackupSource>(() => ({ base: '', did: s.did, handle: s.handle, call: acall }), [s.did, s.handle])
+  return (
+    <Panel
+      title="Download my data"
+      desc={
+        <>
+          Everything in your account as one .zip: your repository (<span className="mono">repo.car</span>), every image and video, your preferences,
+          your DID document and PLC history, app password names and connected apps (never passwords or tokens), and a README on restoring it on any
+          server. {canStreamToDisk() ? 'It is written straight to the file you pick.' : 'This browser builds it in memory, then saves it to your downloads.'}
+        </>
+      }
+    >
+      <BackupBox source={source} extras={serverExtras} />
+    </Panel>
+  )
+}
 
 export function Export() {
   const s = useSession()!
@@ -31,7 +85,8 @@ export function Export() {
   })
   return (
     <>
-      <PageHead title="Export" desc="Download your whole repository: every record, signed and verifiable, in the standard CAR format." />
+      <PageHead title="Export" desc="Download your data: a full backup, or just the repository." />
+      <FullBackup />
       <Panel title="Repository archive" desc="Use it as a backup or to move your account to another server. Media files are not included; they're listed in Media.">
         <ErrorNotice error={dl.error} />
         {result && (

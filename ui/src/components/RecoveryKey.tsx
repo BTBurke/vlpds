@@ -3,7 +3,8 @@ import { CopyText, Field, Notice, saveBlob } from './ui'
 import { Download } from './icons'
 import { checkDidKey, generateRotationKey } from '../lib/didkey'
 
-export type RecoveryKeyChoice = { status: 'empty' } | { status: 'incomplete' } | { status: 'ready'; didKey: string }
+/** `privateHex`: only for a key generated here, so the caller can offer it in a backup. */
+export type RecoveryKeyChoice = { status: 'empty' } | { status: 'incomplete' } | { status: 'ready'; didKey: string; privateHex?: string }
 
 /** What a user-held recovery key does, in a sentence or three (inline: the caller picks the block). */
 export function RecoveryKeyExplainer({ server }: { server: string }) {
@@ -29,7 +30,7 @@ export function RecoveryKeyPicker({ onChange }: { onChange: (c: RecoveryKeyChoic
     if (mode === 'paste') {
       onChange(!pasted.trim() ? { status: 'empty' } : check?.ok ? { status: 'ready', didKey: pasted.trim() } : { status: 'incomplete' })
     } else {
-      onChange(!made ? { status: 'empty' } : saved ? { status: 'ready', didKey: made.didKey } : { status: 'incomplete' })
+      onChange(!made ? { status: 'empty' } : saved ? { status: 'ready', didKey: made.didKey, privateHex: made.privateHex } : { status: 'incomplete' })
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, pasted, made, saved])

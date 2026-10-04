@@ -56,16 +56,18 @@ record keeps pointing at it.
 ## Simple and advanced modes
 
 ```diagram
-caption: "One state machine, two views. Simple mode (the default) groups the eight steps into four and uses plain words; advanced mode shows each step, the DIDs, keys and counts, and the option to add your own recovery key."
+caption: "One state machine, two views. Simple mode (the default) groups the nine steps into five and uses plain words; advanced mode shows each step, the DIDs, keys and counts, and the option to add your own recovery key."
 nodes:
   - { id: s1, label: Find your account, sub: "find · sign in", at: [0, 0], size: [10, 3], tone: accent }
-  - { id: s2, label: Get ready, sub: "checks · handle · create", at: [13, 0], size: [10, 3], tone: accent }
-  - { id: s3, label: Copy, sub: "repo · blobs · preferences", at: [26, 0], size: [10, 3], tone: accent }
-  - { id: s4, label: Switch over, sub: "identity · finish", at: [39, 0], size: [10, 3], tone: solid }
+  - { id: s2, label: Get ready, sub: "checks · handle · create", at: [12, 0], size: [10, 3], tone: accent }
+  - { id: s3, label: Copy, sub: "repo · blobs · preferences", at: [24, 0], size: [10, 3], tone: accent }
+  - { id: s4, label: Save a copy, sub: "optional backup ZIP", at: [36, 0], size: [10, 3], tone: muted }
+  - { id: s5, label: Switch over, sub: "identity · finish", at: [48, 0], size: [10, 3], tone: solid }
 edges:
   - s1 -> s2
   - s2 -> s3
   - s3 -> s4
+  - s4 -> s5
 notes:
   - { at: [0, 5], text: "Nothing changes anywhere before \"Create\". Nothing is final before the identity step.", align: start }
 ```
@@ -119,6 +121,37 @@ Not copied: sessions, app passwords and OAuth authorisations (the user signs in 
 two-factor setting on the old server.
 
 How big imports are admitted, and why they stay cheap: [Record storage](record-storage.md#imports).
+
+## Backups
+
+Between the copy and the identity move, the page offers one optional step: save a backup of the
+account, taken from the **old** server while it is still the live one. "Save a copy (recommended)"
+and "Skip" are equal choices; either way the step is not offered again. The same backup is on the
+welcome screen (read from this server) and on the account page under **Export → Download my data**.
+
+| In the ZIP | From |
+|---|---|
+| `repo.car` | `com.atproto.sync.getRepo` |
+| `blobs/<cid>` | `listBlobs` + `getBlob`, each checked against its CID's sha-256 |
+| `missing-blobs.txt` | only when a blob can't be fetched or doesn't match: its CID and the reason; the backup still finishes |
+| `preferences.json` | `app.bsky.actor.getPreferences` |
+| `identity/did.json`, `identity/plc-audit-log.json` | `resolveDid` and `vlpds.identity.getPlcAuditLog` on this server (the directory's log, for accounts hosted here) |
+| `account.json` | DID, handle, email, server, the latest commit, dates and counts |
+| `README.txt` | what each file is and how to restore it on any PDS |
+| `vlpds/*.json` | account page only: app password names and dates, connected OAuth apps, the PLC rotation keys (all public; no secrets) |
+| `keys/recovery-key.txt` | only if the user generated a recovery key in this tab (advanced mode) and ticked "include my recovery private key" (off by default) |
+
+The backup never contains a password, app password secret or session token, and the server's repo
+signing key is not exportable: a new server signs with its own key once the DID points to it.
+
+The browser builds the ZIP itself (stored, not compressed: blobs are already-compressed media). Where
+the File System Access API exists (desktop Chrome and Edge), it streams straight into the file the
+user picks, so account size doesn't matter. Elsewhere it is assembled in memory and saved as a
+download; the page shows a size estimate first and warns when it looks too large for the tab. Blob
+fetches run four at a time and back off on a 429 like the copy does.
+
+To restore elsewhere: create the account with the DID, `importRepo` the CAR, upload each blob,
+`putPreferences`, then point the DID at the new server (the README gives the calls).
 
 ## Moving the identity
 

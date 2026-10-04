@@ -55,7 +55,7 @@ export async function parse(r: Response) {
 }
 
 /** `base`: another server's origin (the migration page's old PDS); default this one. */
-export type CallOpts = { params?: Params; body?: unknown; auth?: string; raw?: boolean; method?: 'GET' | 'POST'; base?: string }
+export type CallOpts = { params?: Params; body?: unknown; auth?: string; raw?: boolean; method?: 'GET' | 'POST'; base?: string; signal?: AbortSignal }
 
 export async function call<T = any>(nsid: string, o: CallOpts = {}): Promise<T> {
   const method = o.method ?? (o.body !== undefined ? 'POST' : 'GET')
@@ -66,6 +66,7 @@ export async function call<T = any>(nsid: string, o: CallOpts = {}): Promise<T> 
     method,
     headers,
     body: o.body !== undefined ? JSON.stringify(o.body) : undefined,
+    signal: o.signal,
   })
   if (o.raw) {
     if (!r.ok) await parse(r)

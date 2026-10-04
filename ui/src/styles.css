@@ -2629,3 +2629,16 @@ table.data.rl-side-table td {
   overflow-wrap: anywhere;
   min-width: 0;
 }
+
+/* account backup ZIP (/migrate, account Export) */
+.bk-key {
+  margin: 4px 0 12px;
+}
+.bk-progress {
+  margin: 4px 0 14px;
+}
+.bk-progress .row span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
