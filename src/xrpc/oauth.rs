@@ -1363,7 +1363,7 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         email: field("email"),
         invite_code: field("invite_code"),
     };
-    if rl::check_ip(&[&rl::CREATE_ACCOUNT], 1).is_err() {
+    if rl::check_ip(&[&rl::GLOBAL_IP, &rl::CREATE_ACCOUNT], 1).is_err() {
         let msg = "Too many sign-up attempts. Please try again later.";
         return signup_page(&app, &flow, &v, Some(msg), StatusCode::TOO_MANY_REQUESTS);
     }
