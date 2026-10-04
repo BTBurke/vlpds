@@ -12,3 +12,4 @@
 !/src/bin/
 __pycache__/
 /bench/migrate/out/
+.DS_Store
