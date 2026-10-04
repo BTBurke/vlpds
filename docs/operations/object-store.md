@@ -31,16 +31,16 @@ facts:
   - { value: "~$1.7k", unit: /mo, label: "S3 at Bluesky's write load", note: "3 nodes / 64 shards, modeled; requests, not storage, dominate", tone: violet }
 ```
 
-vlpds keeps every durable byte in one bucket: the commit log, the repo state, the cluster's leases,
-and the blobs. The local disk is only a cache. So the bucket is the most important choice an operator
-makes: whether it is correct (conditional writes), how fast it is (every acked write waits for a
-segment PUT), and what it costs (requests far more than storage).
+vlpds keeps every durable byte in one bucket. That's the commit log, the repo state, the cluster's
+leases and the blobs, and the local disk is only a cache. So the bucket is the most important choice
+you'll make. It has to get conditional writes right, every acked write waits for one of its PUTs, and
+its bill comes from requests far more than from storage.
 
 ## What vlpds needs from a store
 
 | Needs | Relied on by | If it's missing |
 |---|---|---|
-| `If-None-Match: *` PUTs (create only if absent), strongly consistent | log segments, log fences, handle and email claims | a fenced, dead node could still append to its log: acked writes lost on failover |
+| `If-None-Match: *` PUTs (create only if absent), strongly consistent | log segments, log fences, handle and email claims | a fenced, dead node could still append to its log, and acked writes would be lost on failover |
 | `If-Match: <etag>` PUTs (compare-and-swap), and the ETag a PUT returns | node leases, shard assignments, the shard layout, writer ids | two nodes could own one shard at once |
 | Read-after-write and list-after-write, ordered LIST with start-after | the fence scan, replay, retention | replay could skip a segment |
 | Multipart upload (complete and abort) | large SSTs and blobs | big uploads fail |
@@ -51,42 +51,42 @@ The probe checks every row. These providers have passed it:
 |---|---|---|---|
 | Cloudflare R2 | `https://<account id>.r2.cloudflarestorage.com` | `auto` | No egress fees, generous free tier. No object versioning. Slower per request (below). |
 | AWS S3 | `https://s3.<region>.amazonaws.com` | `<region>` | Fastest in-region. Versioning available. Egress costs if nodes run outside AWS. |
-| Google Cloud Storage | `https://storage.googleapis.com` with HMAC keys | `auto` | **Turn soft delete off**: otherwise deleted segments and replaced SSTs stay billable for 7 days. |
+| Google Cloud Storage | `https://storage.googleapis.com` with HMAC keys | `auto` | **Turn soft delete off.** Otherwise deleted segments and replaced SSTs stay billable for 7 days. |
 | MinIO | your server | any | For development and benchmarks (`just minio` starts one on `:9000`). |
 
-Give the node a key pair for its bucket only. On R2, an API token with "Object Read & Write" on the
-bucket, limited to the host's IP where you can. On S3, a role with object get, put, delete and
+Give the node a key pair for its bucket only. On R2, use an API token with "Object Read & Write" on
+the bucket, limited to the host's IP where you can. On S3, use a role with object get, put, delete and
 list on the bucket, and no `s3:DeleteObjectVersion`, bucket-policy or lifecycle permissions.
 
 ## Running the probe
 
 ```steps
 - title: Point it at the bucket
-  body: "It reads the node's own settings: `VLPDS_S3_ENDPOINT`, `VLPDS_S3_BUCKET`, `VLPDS_S3_REGION`, and the keys as `VLPDS_S3_*_KEY` or `VLPDS_S3_*_KEY_FILE`. Run it from where the nodes will run: latency is part of the answer."
+  body: "It reads the node's own settings: `VLPDS_S3_ENDPOINT`, `VLPDS_S3_BUCKET`, `VLPDS_S3_REGION`, and the keys as `VLPDS_S3_*_KEY` or `VLPDS_S3_*_KEY_FILE`. Run it from where the nodes will run, since latency is part of the answer."
 - title: Run it
-  body: "`vlpds-bucket-probe` (it is in the image, next to `vlpds`). With Ansible: `-e vlpds_preflight_probe=true` runs it from the deployed image with the node's settings, and refuses to start the node unless it passes. Off by default, because it writes to the bucket (a few thousand requests, ~1k Class A)."
+  body: "Run `vlpds-bucket-probe` (it's in the image, next to `vlpds`). With Ansible, `-e vlpds_preflight_probe=true` runs it from the deployed image with the node's settings and refuses to start the node unless it passes. It's off by default, because it writes to the bucket (a few thousand requests, ~1k Class A)."
 - title: Correctness checks
-  body: "`conditional_create`, `compare_and_swap`, `race_create` and `race_cas` (16 writers race for one key, 4 rounds; exactly one may win), `list_read_delete`, `multipart`. It works under a fresh `vlpds-probe/<random>/` prefix and deletes what it wrote (`--keep` leaves it)."
+  body: "The checks are `conditional_create`, `compare_and_swap`, `race_create` and `race_cas` (16 writers race for one key over 4 rounds, and exactly one may win), `list_read_delete` and `multipart`. It works under a fresh `vlpds-probe/<random>/` prefix and deletes what it wrote (`--keep` leaves it)."
 - title: Latency
-  body: "200 requests at 4 in flight for each request shape the node issues: `put_create_64kib` (a segment PUT), `put_cas_small` (a lease renewal), `get_1kib`, `get_range_4kib`, `list` and more, as p50 / p90 / p99 / max. `--skip-latency` runs only the checks; `--json report.json` saves the report."
+  body: "It sends 200 requests at 4 in flight for each request shape the node issues, such as `put_create_64kib` (a segment PUT), `put_cas_small` (a lease renewal), `get_1kib`, `get_range_4kib` and `list`, and reports p50 / p90 / p99 / max. `--skip-latency` runs only the checks, and `--json report.json` saves the report."
 - title: Read the verdict
-  body: "The last line is `SAFE for vlpds` (exit 0) or `UNSAFE: <check>: <reason>` (exit 1). Exit 2 means it could not run: endpoint, credentials, network, or a `--prefix` that isn't empty. Never run vlpds on a bucket that is UNSAFE."
+  body: "The last line is `SAFE for vlpds` (exit 0) or `UNSAFE: <check>: <reason>` (exit 1). Exit 2 means it couldn't run, because of the endpoint, credentials, network, or a `--prefix` that isn't empty. Never run vlpds on a bucket that's UNSAFE."
 ```
 
-The report's notes turn the latency into what it means for the node: an acked write waits for at
-least one `put_create_64kib`, so its p50 and p99 are the floor of write latency from that host. The
-lease CAS's max should stay well under the renewal interval (TTL/5: 12 s on the tiny profile, 2 s on
+The report's notes say what the latency means for the node. An acked write waits for at least one
+`put_create_64kib`, so its p50 and p99 are the floor of write latency from that host. The lease CAS's
+max should stay well under the renewal interval (TTL/5, which is 12 s on the tiny profile and 2 s on
 standard).
 
 ## Bucket layout
 
-Everything lives under `--prefix` (`VLPDS_PREFIX`) in `--s3-bucket`. **One prefix is one PDS**: never
-point two deployments, or a test and a real one, at the same prefix. Two PDSes can share a bucket
+Everything lives under `--prefix` (`VLPDS_PREFIX`) in `--s3-bucket`. One prefix is one PDS, so never
+point two deployments (or a test and a real one) at the same prefix. Two PDSes can share a bucket
 under different prefixes.
 
 | Key | What | Written |
 |---|---|---|
-| `log/{log_id}/{ordinal}.seg` | each node incarnation's commit log: the WAL and the firehose | create-only, one segment per batch; deleted after `--log-retention` (72 h) once no replay needs it |
+| `log/{log_id}/{ordinal}.seg` | each node incarnation's commit log (the WAL and the firehose) | create-only, one segment per batch, deleted after `--log-retention` (72 h) once no replay needs it |
 | `state/{shard}/` | one SlateDB per shard (its own WAL off), e.g. `state/0000000042/` | memtable flushes, compaction, manifests |
 | `assign/{shard}`, `assign/layout` | who owns each shard, and the slot → shard map | CAS |
 | `nodes/{node_id}` | node leases | CAS every TTL/5 |
@@ -95,13 +95,13 @@ under different prefixes.
 | `cluster/version` | the active feature level and its history | at finalize |
 | `handle/{handle}`, `email/{sha256}` | uniqueness claims | create-only |
 | `blob/{did}/{cid}` | blob bytes, MIME type as Content-Type | streamed, multipart when large |
-| `config/ratelimits.json`, `config/crawlers.json` | settings changed in the console | on change; polled (rate limits every 10 s) |
-| `budget/mail.json` | the cluster's mail count for the current day (`mail-cluster-day`) | CAS per account mail; polled every minute |
+| `config/ratelimits.json`, `config/crawlers.json` | settings changed in the console | on change, and polled (rate limits every 10 s) |
+| `budget/mail.json` | the cluster's mail count for the current day (`mail-cluster-day`) | CAS per account mail, polled every minute |
 | `blob-quarantine/{did}/{cid}` | a taken-down blob's bytes, until restored or purged | per takedown |
 | `moderation/` | audit log, cases, active takedowns, accounts over their blob quota | per moderation action |
 
-Never edit or delete objects by hand: `assign/` and `nodes/` are how nodes agree on ownership, and a
-missing segment is lost history. Details of each part: [Architecture](../architecture.md#shards-and-ownership),
+Never edit or delete objects by hand. `assign/` and `nodes/` are how nodes agree on ownership, and a
+missing segment is lost history. Details: [Architecture](../architecture.md#shards-and-ownership),
 [State storage](../state-storage.md#key-layout), [Firehose](../firehose.md#retention),
 [Blobs](../blobs.md).
 
@@ -123,7 +123,7 @@ edges:
 | Provider | Abort incomplete multipart uploads after 1 day | Also |
 |---|---|---|
 | R2 | Dashboard: bucket → Settings → Object lifecycle rules, or OpenTofu (`cloudflare_r2_bucket_lifecycle`, as in `deploy/cloudflare/r2.tf`) | Nothing else. |
-| S3 | `aws s3api put-bucket-lifecycle-configuration` with an `AbortIncompleteMultipartUpload` rule, `DaysAfterInitiation: 1`, empty prefix filter | Versioning with a noncurrent-version expiry is optional insurance; see [Backups and recovery](backups-and-recovery.md). |
+| S3 | `aws s3api put-bucket-lifecycle-configuration` with an `AbortIncompleteMultipartUpload` rule, `DaysAfterInitiation: 1`, empty prefix filter | Versioning with a noncurrent-version expiry is optional insurance (see [Backups and recovery](backups-and-recovery.md)). |
 | GCS | an `AbortIncompleteMultipartUpload` lifecycle rule, age 1 day | Disable soft delete. |
 
 Don't add expiry rules for anything else. vlpds deletes old log segments, replaced SSTs and
@@ -135,29 +135,30 @@ could delete a segment a takeover still has to replay.
 ```facts
 - { value: "$0", unit: /mo, label: personal PDS on R2, note: "tiny profile idle: 0.30 M Class A + 1.07 M Class B/mo, inside the free tier up to ~3,000 commits/day", tone: amber }
 - { value: "~$2", unit: /mo, label: the same on S3, note: "$1.95 idle, ~$2.30 with 200 commits/day and 2 GB stored", tone: amber }
-- { value: "~$50", unit: /mo, label: "one node, 64 shards, idle", note: "per-shard SlateDB polling; why tiny uses 1 shard", tone: rust }
-- { value: "~$1.5–1.7k", unit: /mo, label: "Bluesky's write load", note: "3 nodes / 64 shards: R2 / S3 and GCS (modeled); blobs extra", tone: violet }
+- { value: "~$50", unit: /mo, label: "one node, 64 shards, idle", note: "per-shard SlateDB polling · why tiny uses 1 shard", tone: rust }
+- { value: "~$1.5–1.7k", unit: /mo, label: "Bluesky's write load", note: "3 nodes / 64 shards · R2 / S3 and GCS (modeled) · blobs extra", tone: violet }
 ```
 
-Requests, not storage, set the bill, and they follow **nodes and shards, not traffic**:
+Most of the bill is requests, and the request count follows the number of nodes and shards instead
+of traffic:
 
-- **Per node:** the lease CAS every TTL/5, a membership LIST, retention passes, and segment PUTs: a
-  busy node PUTs once per PUT round trip whatever its load (~27/s per node up to ~20k commits/s).
-- **Per shard:** SlateDB's manifest and compactor polling, checkpoint flushes and their compactions.
-  This is why the tiny profile has 1 shard and a 60 s manifest poll, and the standard profile starts at
-  64 shards rather than 256.
-- **Per commit:** ~7.6 Class A and ~28 Class B requests at personal-PDS rates (measured on the tiny
+- Each node does a lease CAS every TTL/5, a membership LIST, retention passes and segment PUTs. A busy
+  node PUTs once per PUT round trip whatever its load (~27/s per node up to ~20k commits/s).
+- Each shard adds SlateDB's manifest and compactor polling, checkpoint flushes and their compactions.
+  That's why the tiny profile has 1 shard and a 60 s manifest poll, and the standard profile starts at
+  64 shards instead of 256.
+- Each commit costs ~7.6 Class A and ~28 Class B requests at personal-PDS rates (measured on the tiny
   profile).
-- **Storage** is small next to requests at Bluesky scale: state plus 72 h of log is ~4.9 TB, ~$110/mo
-  on S3. Blobs are the exception: ~350 TB, ~$7.8k/mo on S3.
-- **Egress.** R2 charges none. Nodes outside AWS or Google using S3 or GCS also pay egress for every
-  state read past the disk cache, every peer's log read, and relay backfill, which the model doesn't
-  include.
+- Storage is small next to requests at Bluesky scale. State plus 72 h of log is ~4.9 TB, or ~$110/mo
+  on S3. Blobs are the exception at ~350 TB, ~$7.8k/mo on S3.
+- R2 charges no egress. Nodes outside AWS or Google using S3 or GCS also pay egress for every state
+  read past the disk cache, every peer's log read, and relay backfill. The model doesn't include
+  that.
 
 R2's free tier (1 M Class A, 10 M Class B and 10 GB a month) is per Cloudflare account, so other
 buckets on the same account share it. Check the real numbers after the first week with
-`vlpds_object_store_requests_total` by `component` and `op`; see
-[Monitoring](monitoring.md#object-store-request-accounting).
+`vlpds_object_store_requests_total` by `component` and `op` (see
+[Monitoring](monitoring.md#object-store-request-accounting)).
 
 Sources: `bench/results/tiny-pds-idle-2026-10-02` (single node, measured) and
 `bench/results/cost-model-2026-10-02` (cluster, measured and modeled).
@@ -179,33 +180,33 @@ edges:
   - { from: seg.b, to: lease.t, label: same store, dash: true, arrow: none }
 ```
 
-**Per-request latency.** Measured with the probe, R2 answers a PUT in ~255 ms p50 / ~500 ms p99 and a
-GET in ~80 ms p50, and the numbers were the same from a VPS and from a home connection in different
-places, so they are R2's own and not the distance. On a small single-node deployment, segment PUTs ran ~300 ms p50 / ~650 ms p99 over a day
-(`vlpds_segment_put_seconds`). A write on R2 therefore takes about a third of a second to ack, which is
-fine for a personal PDS. For in-region S3, the latency model estimates ~40–50 ms p50 / ~150 ms p99 commit acks (modeled, not measured). A
-repo's next commit doesn't wait for the previous one to be durable, so slow PUTs cost latency, not
-throughput.
+Measured with the probe, R2 answers a PUT in ~255 ms p50 / ~500 ms p99 and a GET in ~80 ms p50. The
+numbers were the same from a VPS and from a home connection in different places, so that's R2 itself
+and not the distance. On a small single-node deployment, segment PUTs ran ~300 ms p50 / ~650 ms p99
+over a day (`vlpds_segment_put_seconds`). So a write on R2 takes about a third of a second to ack,
+which is fine for a personal PDS. For in-region S3, the latency model estimates ~40–50 ms p50 /
+~150 ms p99 commit acks (modeled, not measured). A repo's next commit doesn't wait for the previous one
+to be durable, so slow PUTs add latency but don't limit throughput.
 
-**Hedged PUTs.** A segment PUT still pending after `--hedge-after-ms` (100 ms) gets one duplicate
-PUT, and the first to land wins. On R2, whose median is above that threshold, nearly every segment PUT
-is hedged: on that single-node deployment all 195 segments in one day were (`vlpds_segment_put_hedges_total` against
-`vlpds_segment_put_seconds_count`). Each hedge is one more Class A request. That is noise at a personal
-PDS's rate; on a busy node on a slow store, compare the two counters and set the threshold near the
-store's PUT p90–p99, so hedges still cut the tail without doubling every PUT.
+A segment PUT still pending after `--hedge-after-ms` (100 ms) gets one duplicate PUT, and the first to
+land wins. R2's median is above that threshold, so nearly every segment PUT there is hedged. On that
+single-node deployment, all 195 segments in one day were hedged (`vlpds_segment_put_hedges_total`
+against `vlpds_segment_put_seconds_count`). Each hedge is one more Class A request. That's noise at a
+personal PDS's rate. On a busy node on a slow store, compare the two counters and set the threshold
+near the store's PUT p90–p99, so hedges still cut the tail without doubling every PUT.
 
-**When the store slows down or fails:**
+Here's what happens when the store slows down or fails:
 
 ```steps
 - title: Writes queue, then shed
-  body: "Segment PUTs retry until they succeed. Acks stop, write latency climbs, then admission control sheds with 503 `Overloaded`. No write is acked that isn't durable."
+  body: "Segment PUTs retry until they succeed. Acks stop and write latency climbs, and then admission control sheds load with 503 `Overloaded`. A write is never acked before it's durable."
 - title: Slow renewals stop nodes
-  body: "A lease renewal slower than 0.4 × TTL (24 s on tiny, 4 s on standard) opens a validity gap, and the node fail-stops (exit 5). A brownout of the whole store past that stops every node. That costs availability, never an acked write."
+  body: "A lease renewal slower than 0.4 × TTL (24 s on tiny, 4 s on standard) opens a validity gap, and the node fail-stops (exit 5). If the whole store browns out for longer than that, every node stops. That costs availability, but never an acked write."
 - title: Recovery is automatic
-  body: "The supervisor restarts the nodes. When the store answers again they rejoin, fence the dead incarnations' logs, replay and serve."
+  body: "The supervisor restarts the nodes. When the store answers again, they rejoin, fence the dead incarnations' logs, replay and serve."
 ```
 
 Don't lower `--lease-ttl-ms` during an incident (it lowers the ceiling), and don't delete anything.
-A store shared with other heavy tenants can slow vlpds' renewals the same way. Alerts and steps:
-`VlpdsObjectStoreBrownout`, `VlpdsSegmentPutLatencyHigh` and the lease alerts in the
-[runbook](runbook.md#slow-or-failing-object-store).
+A store shared with other heavy tenants can slow vlpds' renewals the same way. The alerts are
+`VlpdsObjectStoreBrownout`, `VlpdsSegmentPutLatencyHigh` and the lease alerts, and their steps are in
+the [runbook](runbook.md#slow-or-failing-object-store).
