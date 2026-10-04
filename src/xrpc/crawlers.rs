@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn local_addresses() {
-        for h in ["127.0.0.1:2620", "localhost", "[::1]:80", "10.0.0.4", "192.168.1.2:9", "pds.test", "::1"] {
+        for h in ["127.0.0.1:2620", "localhost", "[::1]:80", "10.1.2.3", "192.168.1.2:9", "pds.test", "::1"] {
             assert!(is_local(h), "{h}");
         }
         for h in ["bsky.network", "relay.example.com:443", "8.8.8.8", "[2001:db8::1]:443"] {

@@ -9,7 +9,7 @@ session there, checks its bytes against the CID, and uploads it to the new PDS.
 
     python3 recover_blobs.py --did did:plc:... \\
         --new https://pds.example.com \\
-        --old https://morel.us-east.host.bsky.network [--login https://bsky.social]
+        --old https://<old-pds-host> [--login https://bsky.social]
 
 Passwords are prompted for (never arguments). Logging in to the old server
 does not reactivate the account there. Blobs are kept in --dir, so a rerun

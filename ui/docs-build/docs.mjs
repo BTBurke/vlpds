@@ -1,4 +1,4 @@
-// Loads packages/vlpds/docs/**/*.md at build time: front matter, markdown →
+// Loads docs/**/*.md at build time: front matter, markdown →
 // HTML (markdown-it + highlight.js, nothing shipped to the browser), the
 // fenced visuals (hero, diagram, facts, steps, pages), and validation: front
 // matter, a hero first on every page, internal links and their anchors.

@@ -1,4 +1,4 @@
-// Real migrations (README.md "Real run"): seeds test accounts on a live
+// Real migrations: seeds test accounts on a live
 // reference PDS, drives the deployed /migrate for some of them, verifies
 // against the live PLC directory. Unlike e2e.mjs this writes to the public
 // network, so it paces itself: at most ~1.8 writes/s per account with jitter,
@@ -8,7 +8,7 @@
 //   node real.mjs drive    migrate the accounts listed in MIGRATE (comma names)
 //   node real.mjs verify   check the migrated ones
 //
-// Env: REF_PDS, VLPDS, VLPDS_ADMIN_URL (where vlpds.admin/createInviteCodes is
+// Env: REF_PDS, VLPDS, EMAIL_DOMAIN (required), VLPDS_ADMIN_URL (where vlpds.admin/createInviteCodes is
 // reachable), VLPDS_ADMIN (token), REF_SSH (user@host of the old PDS, for
 // invite codes and the PLC confirmation token in /pds/account.sqlite).
 
@@ -18,13 +18,17 @@ import { execFileSync } from 'node:child_process'
 import { deflateSync } from 'node:zlib'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 
-const REF = process.env.REF_PDS ?? 'https://old-pds.example.com'
-const VLPDS = process.env.VLPDS ?? 'https://pds.example.com'
+const REF = process.env.REF_PDS
+const VLPDS = process.env.VLPDS
 const ADMIN_URL = process.env.VLPDS_ADMIN_URL ?? VLPDS
 const ADMIN = process.env.VLPDS_ADMIN
 const REF_SSH = process.env.REF_SSH
 const PLC = process.env.PLC ?? 'https://plc.directory'
-const NAMES = (process.env.NAMES ?? 'vlmig1,vlmig2,vlmig3,jazmig').split(',')
+const EMAIL_DOMAIN = process.env.EMAIL_DOMAIN
+for (const [k, v] of Object.entries({ REF_PDS: REF, VLPDS, EMAIL_DOMAIN })) {
+  if (!v) throw new Error(`${k} is required`)
+}
+const NAMES = (process.env.NAMES ?? 'vlmig1,vlmig2,vlmig3,vlmig4').split(',')
 const OUT = new URL('./out/', import.meta.url).pathname
 const STATE = `${OUT}real.json`
 const SHOTS = `${OUT}real-shots/`
@@ -187,7 +191,7 @@ async function seed() {
   for (const [i, name] of NAMES.entries()) {
     if (state.accounts[name]) continue
     const handle = `${name}.${new URL(REF).hostname}`
-    const email = `${name}@example.com`
+    const email = `${name}@${EMAIL_DOMAIN}`
     const password = randomBytes(15).toString('base64url')
     const invite = ssh('sudo pdsadmin create-invite-code').split('\n').pop().trim()
     const s = await xrpc(REF, 'com.atproto.server.createAccount', { body: { handle, email, password, inviteCode: invite } })

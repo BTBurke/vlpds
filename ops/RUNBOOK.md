@@ -1911,7 +1911,7 @@ a node cert, but needn't be public).
 `--peer-tls-dir`; the first node creates `ca.crt` + `ca.key` (under a lock)
 and each node issues its own certificate from them at startup. Across hosts,
 copy `ca.crt` and `ca.key` into each host's directory before starting its
-nodes (bench/xhost does). Never in production: the CA key sits next to the
+nodes (a cross-host bench harness does). Never in production: the CA key sits next to the
 nodes.
 
 **Renew a node certificate** (alert [VlpdsPeerTlsCertExpiring](#vlpdspeertlscertexpiring)

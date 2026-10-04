@@ -19,8 +19,8 @@ Nodes: --mode native (processes) or docker (one container per node:
 --network host, --ipc host, --log-driver none (logs to a bind-mounted file),
 seccomp unconfined, nofile 1M, --memory = --memory-swap = the node's cap; the release binary is
 bind-mounted into DOCKER_IMAGE (default ubuntu:24.04), or DOCKER_BIN=image
-uses the image's own `vlpds`). Ports --base-port.. (benchbox's Alloy scrapes
-2700-2715 and 7100-7105/7700-7705 every second into the vlpds dashboard);
+uses the image's own `vlpds`). Ports --base-port.. (a fixed range, so a
+metrics agent can scrape the nodes every second into the vlpds dashboard);
 each node's mTLS peer listener on --base-port+100.., all nodes sharing the
 dev-mode --peer-tls-dir <state>/peer-tls (the first node creates the CA).
 
@@ -37,7 +37,7 @@ no histogram buckets) and MinIO's cluster metrics (S3 requests by API, bytes)
 go to metrics.jsonl; the prefix's on-disk bytes (when BENCH_MINIO_DATA or the
 laptop's native MinIO dir is known) every 30 s.
 
-Env (bench/benchbox/remote/runner.sh sets these): BENCH_BIN (release dir with
+Env (a remote runner sets these): BENCH_BIN (release dir with
 vlpds + loadgen), BENCH_SCRATCH (state, logs, caches), BENCH_OUT_DIR (results),
 BENCH_MINIO_DATA (MinIO data dir: direct prefix delete + .trash purge + du),
 MIN_FREE_GB (refuse to continue below; default 150), NODE_EXTRA (extra vlpds
@@ -60,7 +60,7 @@ import time
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# memcap.py: next to this file when shipped (benchbox, xhost), bench/ in the repo
+# memcap.py: next to this file when shipped to a bench host, bench/ in the repo
 sys.path[:0] = [HERE, os.path.join(HERE, "..")]
 import memcap  # noqa: E402
 

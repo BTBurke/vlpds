@@ -1,6 +1,9 @@
 # vlpds: atproto PDS on object storage. The web UI (ui/, React + Vite) is
 # built into ui/dist, which vlpds reads at startup (--ui-dir; src/xrpc/webui.rs).
 
+# Site-specific recipes (a dedicated bench host), absent in a plain checkout
+import? 'bench/benchbox/recipes.just'
+
 target_dir := env_var_or_default("CARGO_TARGET_DIR", "target")
 
 # Build the web UI into ui/dist (served from the next vlpds start)
@@ -79,14 +82,9 @@ checker-rs host="http://127.0.0.1:2620" *args:
 docker-build tag="vlpds:local":
     docker build -t {{tag}} .
 
-# Build + push the production image for deploy/ansible's vlpds_image (docker login ghcr.io first; features e.g. profiling)
+# Build + push the production image (docker login to the registry first; features e.g. profiling)
 docker-push tag=`git rev-parse --short=12 HEAD` image="ghcr.io/jazware/vlpds" platform="linux/amd64" features="":
     docker buildx build --platform {{platform}} --build-arg VLPDS_FEATURES={{features}} --build-arg VLPDS_GIT_REV=`git rev-parse --short=12 HEAD` -t {{image}}:{{tag}} --push .
-
-# The production image built on benchbox (native amd64) from HEAD, loaded here and pushed with `gh auth token`
-# (build/benchbox-image.sh: env PUSH=0 to only load, FEATURES, FORCE=1 while a bench/pipeline runs)
-docker-build-benchbox tag=`git rev-parse --short=12 HEAD`:
-    build/benchbox-image.sh {{tag}}
 
 # Observability stack for load tests (bench/obs/README.md): Prometheus (1 s scrapes) :9090,
 # Grafana (vlpds dashboard, anonymous admin) :3300, Pyroscope :4040, all on 127.0.0.1
@@ -99,37 +97,10 @@ obs-up:
 obs-down:
     docker compose -f bench/obs/docker-compose.yml down
 
-# Regenerate the vlpds Grafana dashboards (operator `vlpds` + `vlpds-internals`): bench copies and deploy/ansible's (--check: exit 1 if any is stale)
+# Regenerate the vlpds Grafana dashboards (operator `vlpds` + `vlpds-internals`) (--check: exit 1 if any is stale)
 dashboards *args:
     python3 bench/obs/grafana/gen_dashboard.py {{args}}
 
 # CPU profile of a running vlpds (built with --features profiling): top functions by self and cumulative time
 profile host="127.0.0.1:2583" seconds="10" *args:
     bench/obs/profile.sh {{args}} {{host}} {{seconds}}
-
-# Benchbox bench campaigns (bench/benchbox/README.md): unattended, packed into batch pipeline windows,
-# results in bench/results/<name>/ (SUMMARY.md).
-
-# ~20 min regression check of HEAD (each given commit: ~15 min of steps + a ~5 min build if uncached): 2 write grids, read sweep 1M/10M, methods, proxy, failover
-benchbox-quick *shas:
-    bench/benchbox/campaign.sh quick {{shas}}
-
-# ~45 min: the full single-box set (3 grids, all methods, 4-size read sweep, proxy, coldload x2, restarts, failover)
-benchbox-full *shas:
-    bench/benchbox/campaign.sh full {{shas}}
-
-# A/B the given commits (grid 10k/5k inj25 + methods sample each, parallel cached builds); ROUNDS=2 runs ABBA
-benchbox-bisect +shas:
-    bench/benchbox/campaign.sh bisect {{shas}}
-
-# Shard-count sweep for the cost model (16/32/64/256 shards, ~21 min per count)
-benchbox-cost *shas:
-    bench/benchbox/campaign.sh cost {{shas}}
-
-# Re-attach to a running campaign (stream its log, copy the results back)
-benchbox-attach name:
-    bench/benchbox/campaign.sh attach {{name}}
-
-# Running campaign, cached builds, population snapshots, batch guard
-benchbox-status:
-    bench/benchbox/campaign.sh status

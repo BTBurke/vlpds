@@ -1,4 +1,4 @@
-//! Runs the independent Go sync 1.1 verifier (packages/vlpds/checker, built on
+//! Runs the independent Go sync 1.1 verifier (checker/, built on
 //! indigo's repo.VerifyCommitMessage) against the firehose of an in-process
 //! server after a varied write workload, and requires it to report zero
 //! failures. The binary is built with `go build` into CARGO_TARGET_TMPDIR; if

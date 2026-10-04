@@ -196,7 +196,7 @@ vlpds test, an N/A reason, a documented divergence or a gap.
 
 - **One binary.** `tests/*.rs` became `tests/all/*.rs`, `mod common;` became `use crate::common::*`, and there were no name collisions.
 - **Flake: `sync::get_repo_since_returns_diff`.** It asserted `diff.blocks.len() < 10`. vlpds answers `getRepo?since=` with the commit, *all* MST
-  nodes and the records newer than `since`. That is a deliberate superset of the reference's rev-filtered block set (TODO.md), so the
+  nodes and the records newer than `since`. That is a deliberate superset of the reference's rev-filtered block set, so the
   block count depends on the shape of an MST over 20 random TIDs, and the test failed in 2 of 3 runs. The test now checks the same
   thing deterministically: no record block from before `since` is in the diff, and every block other than the commit and the new record is an
   MST node. It still checks that the diff is smaller than the full repo and that diff + old blocks = the new tree.

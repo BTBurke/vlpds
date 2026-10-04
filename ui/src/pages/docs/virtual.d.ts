@@ -1,4 +1,4 @@
-// Generated at build time from packages/vlpds/docs by docs-build/plugin.mjs.
+// Generated at build time from docs/ by docs-build/plugin.mjs.
 declare module 'virtual:vlpds-docs' {
   export type DocHeading = { id: string; text: string; level: number }
   export type DocMeta = {

@@ -1,4 +1,4 @@
-//! Log storage (TODO "Storage measured on real data"): segments are stored
+//! Log storage: segments are stored
 //! zstd-compressed and every reader decodes them.
 
 use crate::common::*;

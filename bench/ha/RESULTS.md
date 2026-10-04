@@ -54,7 +54,7 @@ The default node template is:
 --dev-mode --workers 2 --io-threads 3 --firehose-ring-mb 256
 ```
 
-Peers talk mTLS only (packages/vlpds DESIGN.md "Exposure"): node `i`'s peer
+Peers talk mTLS only (DESIGN.md "Exposure"): node `i`'s peer
 listener is on `BASE_PORT+800+i`, behind its peer faultproxy (`+200+i`, the
 advertised `https://` address); containers publish it on `+1400+i`.
 `bench/ha/upgrade.sh`'s default previous release is the first build with

@@ -42,8 +42,8 @@ refused -> next node; 502/503/504 -> backoff + retry):
 
 Resumable: <scratch>/<name>/state.json keeps the setup flags, the soak clock,
 the history counters and each load process's tracked rkeys. SIGTERM/SIGINT or
-a failing guard (SOAK_GUARD_CMD, checked every 60 s; on benchbox
-`guard.sh 25`) stops cleanly (graceful node shutdown, state saved, report
+a failing guard (SOAK_GUARD_CMD, checked every 60 s, e.g. a script that
+fails while the host is needed elsewhere) stops cleanly (graceful node shutdown, state saved, report
 written) and exits 75; `run` again resumes. Exit 0 once --hours of soak are
 done.
 
@@ -78,7 +78,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# memcap.py: next to this file when shipped (benchbox), bench/ in the repo
+# memcap.py: next to this file when shipped to a bench host, bench/ in the repo
 sys.path[:0] = [HERE, os.path.join(HERE, "..")]
 import memcap  # noqa: E402
 
@@ -2253,7 +2253,7 @@ def config(argv):
     ap.add_argument("--hours", type=float, default=6.0, help="soak clock length (sum over resumes)")
     ap.add_argument("--nodes", type=int, default=3)
     ap.add_argument("--stable-nodes", type=int, default=1, help="first K nodes are never restarted")
-    ap.add_argument("--base-port", type=int, default=2700, help="benchbox's Alloy scrapes 2700-2715 every second")
+    ap.add_argument("--base-port", type=int, default=2700, help="a fixed range (2700-2715) a metrics agent can scrape")
     ap.add_argument("--shards", type=int, default=32)
     ap.add_argument("--shard-band", type=int, default=2, help="split/merge keep the shard count within shards +- band")
     ap.add_argument("--population", type=int, default=50_000)

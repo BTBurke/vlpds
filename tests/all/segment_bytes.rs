@@ -1,5 +1,5 @@
-//! Log bytes per commit for single-record commits (TODO "Perf: segment
-//! bytes"): 16 repos of ~300 records each, then 100 likes and 100 posts per
+//! Log bytes per commit for single-record commits: 16 repos of ~300
+//! records each, then 100 likes and 100 posts per
 //! repo, written concurrently so segments group-commit as under load. Prints
 //! log bytes / commit per phase (summed object sizes under the node's log).
 //! `cargo test --test all segment_bytes -- --ignored --nocapture`

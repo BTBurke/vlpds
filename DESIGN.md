@@ -724,7 +724,7 @@ no cleartext peer mode), and is authorized by the shared internal token
   issues its own certificate (advertise host plus `127.0.0.1`/`localhost`)
   when it's missing, from another CA, expiring within a week or missing a
   host. Processes on one host share a directory; across hosts the harness
-  copies `ca.crt` + `ca.key` to each host's directory first (bench/xhost).
+  copies `ca.crt` + `ca.key` to each host's directory first.
   Outside dev mode nothing is generated (the CA key stays offline).
 - **Rotation.** CA, cert and key are re-read on SIGHUP and on file change (60
   s poll); a set that fails those checks is refused (counted, logged) and
@@ -2172,8 +2172,7 @@ differently:
      owner (`/internal/v1/sync/listRepos`, body passed through unparsed),
      so a page costs one shard scan instead of a scan on every node plus a
      merge. (slot, DID) is a stable key order: a repo that exists for the
-     whole enumeration is listed exactly once. 1M repos over 64
-     shards / 3 in-process nodes: see TODO.md.
+     whole enumeration is listed exactly once.
    - Rate limits and abuse controls per shard.
 
 Moving further is mostly confined to the log and cluster layers: segments,
@@ -5024,8 +5023,8 @@ active level and is restored only by a build whose window contains it).
   unpruned segments, known to the writer), and a `cluster finalize --min`
   would require every report and every log named in an assignment span to
   be past it (**not built**: today `min_seg_format` is the test level's
-  lower bound and `finalize` has no `--min`; TODO.md "Rolling upgrades,
-  when first needed"). Backups keep old segments; a restore build must still read
+  lower bound and `finalize` has no `--min`; to be built when the first
+  magic is retired). Backups keep old segments; a restore build must still read
   them, so dropping a magic is also gated on backup retention.
 - **State key families: dual-read always, lazy write-through, background
   sweep only to drop read support.** Binary values gain a leading tag
@@ -5131,12 +5130,11 @@ active level and is restored only by a build whose window contains it).
   (fixtures + MANIFEST freeze), `cargo test --features test-level --test
   level_gating`, and `bench/ha/upgrade.sh --minio upgrade-rolling` on a
   throwaway MinIO container (needs Docker, Go and the `vlpds-minio:local`
-  image; ~10 min cold, most of it the three builds). On the self-hosted
-  runners (`runs-on: [self-hosted, lab]`, as the Go services' builds):
-  a workflow on `packages/vlpds/**` pushes/PRs with `actions/checkout@v4`
+  image; ~10 min cold, most of it the three builds). On self-hosted
+  runners: a workflow on pushes/PRs with `actions/checkout@v4`
   (`fetch-depth: 0`, so the previous release rev and tags exist), the
   Rust toolchain from `rust-toolchain.toml`, `actions/setup-go@v5`, and
-  one step `cd packages/vlpds && just upgrade-ci`; keep `target/upgrade`
+  one step `just upgrade-ci`; keep `target/upgrade`
   between runs (a runner-local `CARGO_TARGET_DIR`) so the previous build
   is cached, and upload `bench/ha/out/` as an artifact.
 

@@ -1,28 +1,22 @@
-// The docs site is public: fail the docs check if a published page names the
-// author's own hosts, networks, accounts or domains. Files starting with `_`
-// are not published and are skipped.
-import { readdirSync, readFileSync } from "node:fs";
+// The docs site is public: fail the docs check if a published page matches a
+// pattern in docs-deny.txt (a deployment's own hosts, networks, accounts or
+// domains). Files starting with `_` are not published and are skipped.
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const docsDir = join(dirname(fileURLToPath(import.meta.url)), "../../docs");
 
-const patterns = [
-  /lab/i,
-  /example-tailnet/i,
-  /vlpds-node1/i,
-  /benchbox/i,
-  /devhost/i,
-  /example/i,
-  /40\.160\./,
-  /ovh/i,
-  /us-west/i,
-  /someone/i,
-  /tag:vlpds/i,
-  /10\.0\.6\./,
-  /operator/i,
-  /0000000/i,
-];
+const denyFile = join(dirname(fileURLToPath(import.meta.url)), "docs-deny.txt");
+if (!existsSync(denyFile)) {
+  console.log("check-docs-private: no docs-deny.txt, skipped");
+  process.exit(0);
+}
+const patterns = readFileSync(denyFile, "utf8")
+  .split("\n")
+  .map((l) => l.trim())
+  .filter((l) => l && !l.startsWith("#"))
+  .map((l) => new RegExp(l, "i"));
 
 function walk(dir) {
   const out = [];

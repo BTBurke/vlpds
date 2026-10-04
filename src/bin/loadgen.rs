@@ -132,7 +132,7 @@ enum Cmd {
         json_out: String,
         /// Fixed handles (sw<size>.vlpds.test): a repo an earlier --reuse run
         /// filled is logged into and read as is instead of created and filled
-        /// again (bench/benchbox population snapshots).
+        /// again (population snapshots for repeated bench runs).
         #[arg(long)]
         reuse: bool,
         /// Create and fill the repos, skip the read benchmarks.

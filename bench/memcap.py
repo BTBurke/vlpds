@@ -2,7 +2,7 @@
 """Memory caps and cache budgets for bench processes (stdlib only).
 
 One host budget: RAM minus BENCH_RESERVE_GB (12) for whatever else lives on
-the box (benchbox: other services, the batch pipeline, the OS). It is split into
+the box (other services, the OS). It is split into
 MinIO (docker --memory), the driver, the loadgens and the vlpds nodes; every
 vlpds and loadgen process runs in its own `systemd-run --user --scope` with
 MemoryMax and MemorySwapMax=0 inside the vlpds-bench slice, whose MemoryMax
@@ -371,7 +371,7 @@ def setup_host(nodes, loadgens, minio_container="vlpds-bench-minio", ram_mb=None
         floor = min_avail_mb()
         if avail - floor < p["slice_mb"] * 0.5:
             raise BudgetError(f"memcap: only {avail} MiB available now; the bench budget is {p['bench_mb']} MiB with a "
-                              f"{floor} MiB floor. Something else is using the reserve (batch pipeline?)")
+                              f"{floor} MiB floor. Something else is using the reserve")
     log(f"memcap: {json.dumps(p)}")
     return p
 
@@ -408,7 +408,7 @@ def disk_of(path):
 
 def check_cache_disk(cache_dir, minio_data, bulk):
     """An SST disk cache next to MinIO's data during a bulk load saturates the
-    drive (benchbox round 3): refuse it."""
+    drive (measured on a bulk load): refuse it."""
     if not (cache_dir and minio_data and bulk):
         return
     a, b = disk_of(cache_dir), disk_of(minio_data)

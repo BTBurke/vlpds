@@ -90,7 +90,7 @@ Regression tests are in `tests/all/e2e_regressions.rs` unless noted.
 7. **LOW-MED: `/.well-known/atproto-did` (HTTPS handle verification by Host) was not served.** Subdomain handles could only be verified over DNS, which vlpds doesn't publish.
    - Fix: added it, answering on every node; 404 for inactive or unknown handles, 503 while the owner is unreachable.
    - Test: `well_known_atproto_did_by_host`.
-8. **LOW-MED (open TODO item): every case variant of a handle got its own 30 createSession attempts per 5 min.**
+8. **LOW-MED: every case variant of a handle got its own 30 createSession attempts per 5 min.**
    - Fix: the key is normalized like the OAuth sign-in key, whose buckets it shares.
    - Test: `rate_limits::create_session_identifier_variants_share_a_bucket`.
    - Still separate buckets: the DID, handle and email forms of one account. That is reference behavior, and the per-IP global limit still applies.

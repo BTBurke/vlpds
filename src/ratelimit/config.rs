@@ -12,7 +12,7 @@
 //!     {"ip": "203.0.113.0/24", "limiters": ["global-ip"], "exempt": true, "note": "relay"},
 //!     {"did": "did:plc:abc", "limiters": ["repo-write-hour", "repo-write-day"], "points": 50000}
 //!   ],
-//!   "updatedAt": "...", "updatedBy": "jaz", "note": "...", "history": [...]
+//!   "updatedAt": "...", "updatedBy": "admin", "note": "...", "history": [...]
 //! }
 //! ```
 //!
