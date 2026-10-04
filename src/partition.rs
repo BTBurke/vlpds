@@ -1922,6 +1922,41 @@ mod clone_tests {
         m.close().await.unwrap();
     }
 
+    /// Regression: a merge of halves that still hold more of their parent's
+    /// L0s than one compaction takes (8) has each parent SST behind two views,
+    /// and the oldest 8 start at the second half's copy of an SST the first
+    /// half also holds. SlateDB used to cut the writer's L0 at the first view
+    /// of the compacted SST, dropping uncompacted views from the compactor's
+    /// manifest (the writer's next flush then failed with `InvalidClockTick`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merging_halves_that_share_many_l0s_keeps_them() {
+        let store = Store { prefix: "sml".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        let slots = [10u16, 20000, 40000, 65535];
+        for r in 0..12 {
+            for s in slots {
+                db.put(k(s, &format!("h/{r:02}")), format!("v{s}/{r}")).await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
+        }
+        db.close().await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
+        clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
+        clone_db(&store, ShardId(3), &[(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
+        assert!(m.manifest().l0().len() > 16, "L0s: {}", m.manifest().l0().len());
+        compact_away_l0(&m).await;
+        for r in 0..12 {
+            for s in slots {
+                let v = m.get(k(s, &format!("h/{r:02}"))).await.unwrap();
+                assert_eq!(v.as_deref(), Some(format!("v{s}/{r}").as_bytes()), "slot {s} round {r}");
+            }
+        }
+        m.close().await.unwrap();
+    }
+
     /// Model check: random generations of split/merge clones with writes,
     /// flushes and compactions in between; every key ever written stays
     /// readable from the shard holding its slot. Timing-dependent (whether a

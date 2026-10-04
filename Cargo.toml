@@ -145,8 +145,9 @@ name = "level_gating"
 path = "tests/level_gating.rs"
 required-features = ["test-level"]
 
-# slatedb 0.17.0 (upstream c1e36fc) plus four patches on the fork branch
-# vlpds-0.17-filtercache (all pending an upstream report):
+# slatedb 0.17.0 (upstream c1e36fc) plus five patches: 1-4 on the fork branch
+# vlpds-0.17-filtercache, 5 on fix/l0-view-merge-dup-sst on top of it (all
+# pending an upstream report):
 # 1. a union clone (a shard merge) of two sources that inherited the same L0
 #    SST from a common ancestor (a split's halves merged back) repeated its L0
 #    view id, and the merged shard's first compaction of it dropped one half's
@@ -161,10 +162,16 @@ required-features = ["test-level"]
 # 4. CompactionWorkerBuilder::with_db_cache: a standalone worker seeds its
 #    output SSTs' index and filters into the DB's cache, so a fresh SST isn't
 #    a guaranteed metadata miss for its first reads.
+# 5. the writer/compactor manifest merge cut L0 at the first view of the last
+#    compacted SST, but a union clone has one SST behind several views (a
+#    merge of halves still holding their parent's L0s; a families clone): the
+#    compactor wrote an L0 missing live views and the writer's next flush
+#    failed with InvalidClockTick (LsmTreeState::merge_writer_and_compactor
+#    now cuts at the view id; partition.rs merging_halves_that_share_many_l0s_keeps_them).
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a" }
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "c7b29a0673d54a8346cb8dd6f4b888e0b7dda84a" }
 
 # Fat LTO + 1 codegen unit: ~4 min of a release build is this crate's
 # single-threaded optimization and LTO, but cheaper settings cost runtime
