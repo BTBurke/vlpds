@@ -86,6 +86,7 @@ mod maintenance_coverage;
 mod memory_budget;
 mod migration;
 mod moderation;
+mod moderation_console;
 mod move_warm;
 mod mst_lazy;
 mod oauth;

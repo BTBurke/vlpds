@@ -317,6 +317,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("stream/batch.bin", vlpds::remote::encode_batch(&batch).to_vec()),
         ("stream/watermark.bin", vlpds::remote::encode_watermark(1003 << 8).to_vec()),
         ("private/rows.json", private_rows()),
+        ("private/blob_quota.json", blob_quota_rows()),
     ];
     v.extend(frames());
     v
@@ -332,7 +333,17 @@ fn secrets() -> vlpds::secrets::Secrets {
 /// Every private (`p/`) row kind, from the lib's fixed-value builders
 /// (`vlpds::xrpc::private_rows`): `[{routing, name, value}]`, values UTF-8.
 fn private_rows() -> Vec<u8> {
-    let rows: Vec<serde_json::Value> = vlpds::xrpc::private_rows::private_row_fixtures(DID)
+    rows_json(vlpds::xrpc::private_rows::private_row_fixtures(DID))
+}
+
+/// Blob quota rows (`private_rows::blob_quota_row_fixtures`), added after
+/// level 1's `private/rows.json` was frozen.
+fn blob_quota_rows() -> Vec<u8> {
+    rows_json(vlpds::xrpc::private_rows::blob_quota_row_fixtures(DID))
+}
+
+fn rows_json(rows: Vec<vlpds::xrpc::private_rows::PrivateRow>) -> Vec<u8> {
+    let rows: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|(routing, name, v)| serde_json::json!({"routing": routing, "name": name, "value": String::from_utf8(v).expect("private row values are UTF-8")}))
         .collect();
@@ -685,6 +696,14 @@ async fn check(level: u32, name: &str, b: &[u8]) {
                 kinds.insert(kind);
             }
             assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
+        }
+        "private/blob_quota.json" => {
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&rows) == b, "{name}: re-encode differs");
+            for r in &rows {
+                let (routing, n, v) = (r["routing"].as_str().unwrap(), r["name"].as_str().unwrap(), r["value"].as_str().unwrap());
+                vlpds::xrpc::private_rows::check_private_row(routing, n, v.as_bytes()).unwrap_or_else(|e| panic!("L{level}/{name}: {routing} {n}: {e:#}"));
+            }
         }
         JWT_FIXTURE => check_jwts(name, b),
         // checked as a whole: check_slatedb

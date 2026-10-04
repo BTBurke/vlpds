@@ -17,12 +17,18 @@ pub fn private_row_fixtures(did: &str) -> Vec<PrivateRow> {
     rows
 }
 
+/// Row kinds added after `private/rows.json` was frozen with level 1, in a
+/// fixture file of their own (`private/blob_quota.json`).
+pub fn blob_quota_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    super::blob_quota::fixture_rows(did)
+}
+
 /// Decodes a private row the way its readers do: Ok(the row's kind), Err if
 /// it doesn't decode, lacks a field its readers use, or doesn't re-encode to
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 5] = [super::server::check_row, super::admin::check_row, super::email2fa::check_row, super::proxy::check_row, check_shared_row];
+    let checks: [Check; 6] = [super::server::check_row, super::admin::check_row, super::email2fa::check_row, super::proxy::check_row, super::blob_quota::check_row, check_shared_row];
     for check in checks {
         if let Some(r) = check(routing, name, val) {
             return r;

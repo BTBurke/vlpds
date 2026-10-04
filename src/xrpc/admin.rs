@@ -341,13 +341,33 @@ pub async fn is_blob_takendown(app: &App, did: &str, cid: &str) -> XResult<bool>
     Ok(ctl(app, did).await?.has_takedown(&format!("blob/{cid}")))
 }
 
+/// `r` Some takes the account down with that ref, None reverses it. As the
+/// reference's takedownAccount (revokeRefreshTokensByDid, token.removeByDid),
+/// a takedown revokes refresh and OAuth tokens; legacy access tokens stay
+/// valid until they expire.
+pub(super) async fn takedown_account(app: &App, did: &str, r: Option<String>) -> XResult<()> {
+    let applied = r.is_some();
+    update_account(app, did, false, true, move |a| {
+        set_extra(a, "takedownRef", r.map_or(J::Null, |r| json!(r)));
+        recompute_status(a);
+        Ok(())
+    })
+    .await
+    .map_err(|_| invalid_request(format!("Account not found: {did}")))?;
+    if applied {
+        super::server::revoke_refresh_tokens(app, did).await?;
+        revoke_oauth_sessions(app, did).await?;
+    }
+    Ok(())
+}
+
 /// `val` None lifts it; `name` is relative to [`TAKEDOWN`].
-async fn set_subject_takedown(app: &App, did: &str, name: &str, val: Option<J>) -> XResult<()> {
+pub(super) async fn set_subject_takedown(app: &App, did: &str, name: &str, val: Option<J>) -> XResult<()> {
     put_sec(app, did, vec![pmut(did, &format!("{TAKEDOWN}{name}"), val.map(|v| to_json_bytes(&v)))]).await
 }
 
 /// `{collection}/{rkey}` of an at:// URI naming a record of `did`.
-fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
+pub(super) fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
     uri.strip_prefix("at://")
         .and_then(|r| r.strip_prefix(did))
         .and_then(|r| r.strip_prefix('/'))
@@ -674,48 +694,31 @@ async fn revoke_oauth_sessions(app: &App, did: &str) -> XResult<()> {
     })
 }
 
-async fn update_subject_status(State(app): AppState, Auth(creds): Auth, Json(inp): Json<UpdateSubjectStatusIn>) -> XResult<Json<J>> {
+async fn update_subject_status(
+    State(app): AppState,
+    Auth(creds): Auth,
+    super::moderation::ClientIp(peer): super::moderation::ClientIp,
+    Json(inp): Json<UpdateSubjectStatusIn>,
+) -> XResult<Json<J>> {
     require_moderator(&creds)?;
     if inp.takedown.as_ref().is_some_and(|t| t.applied) && inp.deactivated.as_ref().is_some_and(|d| !d.applied) {
         return Err(invalid_request("Cannot activate and takedown an account at the same time"));
     }
     let subject = parse_subject(&inp.subject)?;
     if let Some(td) = &inp.takedown {
-        let counted = |kind: &str| {
-            let action = if td.applied { "takedown" } else { "reversed" };
-            crate::metrics::MODERATION_ACTIONS.with_label_values(&[kind, action]).inc();
+        use super::moderation::SubjectRef;
+        let s = match &subject {
+            Subject::Repo(did) => SubjectRef::account(did),
+            Subject::Record { uri, did, cid } => SubjectRef { kind: "record".into(), did: did.clone(), uri: Some(uri.clone()), cid: cid.clone() },
+            Subject::Blob { did, cid } => SubjectRef::blob(did, cid),
         };
-        match &subject {
-            Subject::Repo(did) => {
-                let r = td.r#ref.clone().unwrap_or_else(crate::events::now_rfc3339);
-                let applied = td.applied;
-                update_account(&app, did, false, true, move |a| {
-                    set_extra(a, "takedownRef", if applied { json!(r) } else { J::Null });
-                    recompute_status(a);
-                    Ok(())
-                })
-                .await
-                .map_err(|_| invalid_request(format!("Account not found: {did}")))?;
-                if applied {
-                    // refresh tokens and OAuth tokens, as the reference's
-                    // takedownAccount (revokeRefreshTokensByDid, token.removeByDid);
-                    // legacy access tokens stay valid until they expire
-                    super::server::revoke_refresh_tokens(&app, did).await?;
-                    revoke_oauth_sessions(&app, did).await?;
-                }
-                counted("account");
-            }
-            Subject::Record { uri, did, cid } => {
-                let v = td.applied.then(|| json!({"uri": uri, "did": did, "cid": cid, "ref": td.r#ref}));
-                set_subject_takedown(&app, did, &format!("rec/{}", record_path(uri, did)?), v).await?;
-                counted("record");
-            }
-            Subject::Blob { did, cid } => {
-                let v = td.applied.then(|| json!({"did": did, "cid": cid, "ref": td.r#ref}));
-                set_subject_takedown(&app, did, &format!("blob/{cid}"), v).await?;
-                counted("blob");
-            }
-        }
+        let actor = match &creds {
+            Credentials::ModService { iss } => iss.clone(),
+            _ => "admin".into(),
+        };
+        let who = super::moderation::Who { actor, ip: peer.map(|ip| ip.to_string()) };
+        let act = super::moderation::Action { applied: td.applied, reason: None, r#ref: td.r#ref.clone(), case_id: None };
+        super::moderation::apply(&app, &s, &act, &who).await?;
     }
     if let (Some(d), Subject::Repo(did)) = (&inp.deactivated, &subject) {
         set_deactivated(&app, did, d.applied, None).await?;

@@ -12,6 +12,8 @@ pub mod extract;
 pub mod internal;
 pub mod authn;
 pub mod blobs;
+mod blob_quota;
+pub mod moderation;
 mod identity;
 #[doc(hidden)]
 pub mod private_rows;
@@ -306,6 +308,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(internal::routes())
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
+        .merge(moderation::routes())
         .merge(feature_level::routes())
         .merge(webui::routes())
         // Local routes only (their extractors bound the decoded size): the

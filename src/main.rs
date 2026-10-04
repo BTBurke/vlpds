@@ -500,6 +500,19 @@ struct Args {
     /// Delete unreferenced blobs uploaded more than this many seconds ago.
     #[arg(long, env = "VLPDS_BLOB_GC_GRACE_SECS", default_value_t = 6 * 3600)]
     blob_gc_grace_secs: u64,
+    /// Per-account blob storage quota (GB = 10^9 bytes; 0: unlimited). The
+    /// console overrides it per account. Blobs of a repo moving in count but
+    /// are never refused.
+    #[arg(long, env = "VLPDS_BLOB_QUOTA_GB", default_value_t = vlpds::server::DEFAULT_BLOB_QUOTA_GB)]
+    blob_quota_gb: u64,
+    /// Per-account uploadBlob calls per UTC day (0: unlimited); a repo moving
+    /// in uploads its referenced blobs outside it.
+    #[arg(long, env = "VLPDS_BLOB_UPLOADS_PER_DAY", default_value_t = vlpds::server::DEFAULT_BLOB_UPLOADS_PER_DAY)]
+    blob_uploads_per_day: u32,
+    /// Days a taken-down blob's bytes stay in quarantine (restorable) before
+    /// they are deleted.
+    #[arg(long, env = "VLPDS_BLOB_QUARANTINE_DAYS", default_value_t = vlpds::server::DEFAULT_BLOB_QUARANTINE_DAYS)]
+    blob_quarantine_days: u64,
     /// PLC directory: did:plc resolution and, with PLC registration on,
     /// where new accounts' genesis ops and their updates are submitted (a
     /// local did-method-plc server works for e2e runs).
@@ -1179,6 +1192,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         terms_of_service_url: flag_or_env(&args.terms_of_service_url, "PDS_TERMS_OF_SERVICE_URL"),
         contact_email_address: flag_or_env(&args.contact_email_address, "PDS_CONTACT_EMAIL_ADDRESS"),
         blob_gc_grace: Duration::from_secs(args.blob_gc_grace_secs),
+        blob_quota_bytes: args.blob_quota_gb.saturating_mul(1_000_000_000),
+        blob_uploads_per_day: args.blob_uploads_per_day,
+        blob_quarantine: Duration::from_secs(args.blob_quarantine_days.saturating_mul(86_400)),
         plc_url: args.plc_url.clone(),
         plc: plc_config(&args)?,
         invite_required: args.invite_required,

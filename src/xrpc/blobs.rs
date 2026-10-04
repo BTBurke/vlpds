@@ -37,7 +37,7 @@ pub(super) fn blob_path(app: &App, did: &str, cid: impl std::fmt::Display) -> ob
 /// next upload or sweep repeats) rather than a row without one.
 pub(super) const STORED: &str = "blob/";
 
-fn stored(did: &str, cid: &str, present: bool) -> crate::segment::Mutation {
+pub(super) fn stored(did: &str, cid: &str, present: bool) -> crate::segment::Mutation {
     super::server::pmut(did, &format!("{STORED}{cid}"), present.then(Vec::new))
 }
 
@@ -102,6 +102,7 @@ async fn upload_blob(
     if declared.is_some_and(|n| n > max) {
         return Err(too_large(max));
     }
+    super::blob_quota::precheck(&app, &did, declared, moving_in).await?;
     let mut attrs = Attributes::new();
     attrs.insert(Attribute::ContentType, mime.clone().into());
 
@@ -115,32 +116,41 @@ async fn upload_blob(
         buffered: 0,
         multipart: None,
     };
-    let res = up.run(body, max).await;
-    let (cid, size) = match res {
+    let (cid, size) = match up.receive(body, max).await {
         Ok(v) => v,
         Err(e) => {
-            if let Some((w, tmp)) = up.multipart.take() {
-                let _ = w.abort().await;
-                let _ = app.store.raw.delete(&tmp).await;
-            }
+            up.abort().await;
             return Err(e);
         }
     };
     if declared.is_some_and(|n| n != size) {
         tracing::debug!(%did, declared = ?declared, size, "uploadBlob: content-length mismatch");
     }
-    // checked after storing: the bytes are content-addressed, so that changed nothing
     let c = cid.to_string();
-    if moving_in && !referenced(&*app.partition(&did)?, &did, &c).await.map_err(XrpcError::from_err)? {
-        crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
-    }
-    let (recorded, takendown) = tokio::join!(app.put_private(&did, vec![stored(&did, &c, true)]), super::admin::is_blob_takendown(&app, &did, &c));
-    recorded?;
-    if takendown? {
-        return Err(XrpcError::bad(
-            "InvalidRequest",
-            "Blob has been takendown, cannot re-upload",
-        ));
+    let checks = async {
+        // before the bytes land under blob/: a taken-down blob stays in
+        // quarantine (and is purged) however often it is re-uploaded
+        if super::admin::is_blob_takendown(&app, &did, &c).await? {
+            return Err(XrpcError::bad("InvalidRequest", "Blob has been takendown, cannot re-upload"));
+        }
+        // blobs of the repo moving in: no daily count, no byte refusal
+        // (they still count toward the bytes)
+        let imported = moving_in && referenced(&*app.partition(&did)?, &did, &c).await.map_err(XrpcError::from_err)?;
+        if moving_in && !imported {
+            crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
+        }
+        Ok(super::blob_quota::Exempt { daily: imported, bytes: imported })
+    };
+    let exempt = match checks.await {
+        Ok(x) => x,
+        Err(e) => {
+            up.abort().await;
+            return Err(e);
+        }
+    };
+    if let Err(e) = super::blob_quota::commit(&app, &did, &c, size, exempt, up.commit(cid)).await {
+        up.abort().await;
+        return Err(e);
     }
     crate::metrics::BLOB_UPLOADS.with_label_values(&[crate::metrics::blob_kind(&up.mime)]).inc();
     crate::metrics::BLOB_UPLOAD_BYTES.inc_by(size);
@@ -161,7 +171,9 @@ struct Upload<'a> {
 }
 
 impl Upload<'_> {
-    async fn run(&mut self, body: Body, max: u64) -> XResult<(Cid, u64)> {
+    /// Reads and hashes the body: held in memory, or in a multipart upload to
+    /// `blob-tmp/` once large. Nothing is under `blob/` until [`Self::commit`].
+    async fn receive(&mut self, body: Body, max: u64) -> XResult<(Cid, u64)> {
         let mut stream = body.into_data_stream();
         let mut hasher = Sha256::new();
         let mut size: u64 = 0;
@@ -198,6 +210,19 @@ impl Upload<'_> {
             codec: crate::cid::CODEC_RAW,
             digest: hasher.finalize().into(),
         };
+        Ok((cid, size))
+    }
+
+    /// Drops a pending multipart upload (the in-memory body needs nothing).
+    async fn abort(&mut self) {
+        if let Some((w, tmp)) = self.multipart.take() {
+            let _ = w.abort().await;
+            let _ = self.app.store.raw.delete(&tmp).await;
+        }
+    }
+
+    /// Stores the received bytes at `blob/{did}/{cid}`.
+    async fn commit(&mut self, cid: Cid) -> XResult<()> {
         let dest = blob_path(self.app, self.did, cid);
         let store = &self.app.store.raw;
         match self.multipart.take() {
@@ -224,7 +249,7 @@ impl Upload<'_> {
                 copied.map_err(XrpcError::from_err)?;
             }
         }
-        Ok((cid, size))
+        Ok(())
     }
 
     /// As the reference (file-type), a recognized signature overrides the
@@ -329,6 +354,12 @@ async fn get_blob(
     }
     let r = match app.store.raw.get(&blob_path(&app, &q.did, cid)).await {
         Ok(r) => r,
+        // the operator reviewing a taken-down blob reads its quarantined copy
+        Err(object_store::Error::NotFound { .. }) if is_admin => match app.store.raw.get(&super::moderation::quarantine_path(&app, &q.did, cid)).await {
+            Ok(r) => r,
+            Err(object_store::Error::NotFound { .. }) => return Err(XrpcError::bad("BlobNotFound", "Blob not found")),
+            Err(e) => return Err(XrpcError::from_err(e)),
+        },
         Err(object_store::Error::NotFound { .. }) => {
             return Err(XrpcError::bad("BlobNotFound", "Blob not found"))
         }
@@ -468,12 +499,16 @@ async fn list_missing_blobs(
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let mut cursor = q.cursor.clone();
     let mut missing: Vec<J> = Vec::new();
+    // a taken-down blob can't be re-uploaded: not the user's to fix
+    let takedowns = super::server::ctl(&app, &did).await?;
     'outer: loop {
-        let page = referenced_blobs(&app, &did, cursor.as_deref(), 256, None).await?;
+        let mut page = referenced_blobs(&app, &did, cursor.as_deref(), 256, None).await?;
         if page.is_empty() {
             break;
         }
         cursor = page.last().map(|(c, _)| c.clone());
+        let full = page.len() == 256;
+        page.retain(|(cid, _)| !takedowns.has_takedown(&format!("blob/{cid}")));
         let checks: Vec<_> = page
             .iter()
             .map(|(cid, _)| {
@@ -498,7 +533,7 @@ async fn list_missing_blobs(
                 }
             }
         }
-        if page.len() < 256 {
+        if !full {
             break;
         }
     }
@@ -524,6 +559,11 @@ pub fn spawn_blob_gc(app: Arc<App>) -> tokio::task::JoinHandle<()> {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("blob gc: {e:#}"),
+            }
+            match super::moderation::sweep_quarantine(&app, app.config.blob_quarantine).await {
+                Ok(n) if n > 0 => tracing::info!(purged = n, "taken-down blobs purged from quarantine"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!("blob quarantine sweep: {e:#}"),
             }
         }
     })
@@ -607,7 +647,7 @@ async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool>
 }
 
 /// (did, cid) of a `.../{did}/{cid}` object path.
-fn did_cid(path: &object_store::path::Path) -> Option<(String, String)> {
+pub(super) fn did_cid(path: &object_store::path::Path) -> Option<(String, String)> {
     let parts: Vec<String> = path.parts().map(|p| super::sync::pct_decode(p.as_ref(), false)).collect();
     let n = parts.len();
     (n >= 2).then(|| (parts[n - 2].clone(), parts[n - 1].clone()))
@@ -656,7 +696,7 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
             }
             continue;
         }
-        if let Err(e) = app.put_private(&did, vec![stored(&did, &cid, false)]).await {
+        if let Err(e) = super::blob_quota::drop_stored(app, &did, &cid, meta.size).await {
             tracing::warn!(path = %meta.location, "blob gc: dropping the stored row: {}", e.message);
             continue;
         }
@@ -680,11 +720,20 @@ pub async fn sweep_blobs_settle(app: &App, grace: Duration, settle: Duration) ->
         if referenced(&p, &did, &cid).await? {
             // a write that checked the blob before the move: put it back
             let Ok(c) = Cid::parse(&cid) else { continue };
-            if let Err(e) = app.put_private(&did, vec![stored(&did, &cid, true)]).await {
+            if let Err(e) = super::blob_quota::restore_stored(app, &did, &cid, meta.size).await {
                 tracing::warn!(path = %meta.location, "blob gc restore: {}", e.message);
                 continue;
             }
-            if let Err(e) = store.copy(&meta.location, &blob_path(app, &did, c)).await {
+            // taken down meanwhile: its bytes belong in the takedown's quarantine
+            let dest = match super::admin::is_blob_takendown(app, &did, &cid).await {
+                Ok(true) => super::moderation::quarantine_path(app, &did, c),
+                Ok(false) => blob_path(app, &did, c),
+                Err(e) => {
+                    tracing::warn!(path = %meta.location, "blob gc restore: {}", e.message);
+                    continue;
+                }
+            };
+            if let Err(e) = store.copy(&meta.location, &dest).await {
                 tracing::warn!(path = %meta.location, "blob gc restore: {e}");
                 continue;
             }

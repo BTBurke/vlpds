@@ -244,6 +244,8 @@ lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password
 lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
 lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
 lazy!(BLOB_UPLOADS: IntCounterVec = register_int_counter_vec!("vlpds_blob_uploads_total", "Blobs stored by uploadBlob, by kind (image, video, other: from the stored MIME type)", &["kind"]));
+lazy!(BLOB_QUOTA_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_blob_quota_rejections_total", "uploadBlob calls refused by the per-account quotas: bytes (413 BlobQuotaExceeded, stored bytes over --blob-quota-gb or the account override), uploads (429, over --blob-uploads-per-day)", &["reason"]));
+lazy!(BLOB_QUARANTINE: IntCounterVec = register_int_counter_vec!("vlpds_blob_quarantine_total", "Taken-down blobs: quarantined (bytes moved to blob-quarantine/ by a takedown), restored (moved back by a reversal), purged (deleted after --blob-quarantine-days)", &["event"]));
 lazy!(BLOB_UPLOAD_BYTES: IntCounter = register_int_counter!("vlpds_blob_upload_bytes_total", "Bytes of blobs stored by uploadBlob"));
 lazy!(REPORTS: IntCounterVec = register_int_counter_vec!("vlpds_reports_total", "Moderation reports (com.atproto.moderation.createReport) passed on to the moderation service, by result (ok; failed: the service refused it or was unreachable)", &["result"]));
 lazy!(UPSTREAM_REQUESTS: IntCounterVec = register_int_counter_vec!("vlpds_upstream_requests_total", "Requests proxied for users to other services, by service (appview: the Bluesky AppView, chat, moderation, other) and result (ok: 2xx/3xx; client_error: 4xx; server_error: 5xx; unreachable: connection failure or timeout)", &["service", "result"]));
@@ -476,6 +478,8 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&PASSWORD_RESETS, &["requested", "unknown_email", "completed"]),
     (&INVITE_CODES, &["created", "used"]),
     (&BLOB_UPLOADS, &["image", "video", "other"]),
+    (&BLOB_QUOTA_REJECTIONS, &["bytes", "uploads"]),
+    (&BLOB_QUARANTINE, &["quarantined", "restored", "purged"]),
     (&REPORTS, &["ok", "failed"]),
     (&HANDLE_RESOLUTIONS, &["dns", "http", "not_found"]),
     (&IDENTITY_EVENTS, &["identity", "account"]),
