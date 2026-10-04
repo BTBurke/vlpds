@@ -34,6 +34,8 @@ pub enum MstError {
 
 type Result<T> = std::result::Result<T, MstError>;
 
+pub mod single_create;
+
 const MAX_KEY_BYTES: usize = 1024;
 
 /// Deepest tree accepted from a block set. 2^32 keys give a tree ~16 levels
@@ -1045,6 +1047,9 @@ pub struct Tree {
     /// blocks expect `Partial` and structure errors and keep the old root to
     /// restore on error.
     built: bool,
+    /// Mutate in place like a built tree, poisoning on error: for a caller
+    /// that drops the tree at the first error (a verifier).
+    no_rollback: bool,
 }
 
 /// What `self.root` holds while a mutation owns the real root.
@@ -1061,7 +1066,7 @@ impl Default for Tree {
 
 impl Tree {
     pub fn new() -> Tree {
-        Tree { root: Arc::new(Node::empty(0)), built: true }
+        Tree { root: Arc::new(Node::empty(0)), built: true, no_rollback: false }
     }
 
     /// Runs a mutation that consumes the root. A built tree hands over its
@@ -1071,7 +1076,7 @@ impl Tree {
     /// becomes a stub, so every later read or write fails rather than report
     /// a half-applied tree's root.
     fn mutate<T>(&mut self, root: Arc<Node>, f: impl FnOnce(Arc<Node>) -> Result<(Arc<Node>, T)>) -> Result<T> {
-        if self.built {
+        if self.built || self.no_rollback {
             return match f(root) {
                 Ok((r, x)) => {
                     self.root = r;
@@ -1120,6 +1125,24 @@ impl Tree {
     }
 
     pub fn remove(&mut self, key: &[u8]) -> Result<Option<Cid>> {
+        self.remove_inner(key, true)
+    }
+
+    /// Mutations stop keeping the old root to restore on error (which makes
+    /// every one copy the nodes on its path); after an error the tree is
+    /// poisoned instead.
+    pub fn without_rollback(mut self) -> Tree {
+        self.no_rollback = true;
+        self
+    }
+
+    /// Without proof marking: a verifier undoing ops only wants the new
+    /// root, and marked neighbours would be re-encoded and re-hashed for it.
+    pub fn remove_no_proof(&mut self, key: &[u8]) -> Result<Option<Cid>> {
+        self.remove_inner(key, false)
+    }
+
+    fn remove_inner(&mut self, key: &[u8], prove: bool) -> Result<Option<Cid>> {
         if !valid_key(key) {
             return Err(MstError::InvalidKey);
         }
@@ -1127,7 +1150,7 @@ impl Tree {
             return Ok(None);
         }
         let root = std::mem::replace(&mut self.root, placeholder());
-        self.mutate(root, |r| remove(r, key, None, true))
+        self.mutate(root, |r| remove(r, key, None, prove))
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Cid>> {
@@ -1203,7 +1226,7 @@ impl Tree {
         let mut l = Loader { blocks, seen: Default::default(), path };
         let mut r = l.load(root, 0, None, None)?.ok_or(MstError::Partial)?;
         ensure_heights(&mut r, 0)?;
-        Ok(Tree { root: r, built: false })
+        Ok(Tree { root: r, built: false, no_rollback: false })
     }
 
     pub fn walk(&self, f: &mut dyn FnMut(&[u8], Cid)) {
