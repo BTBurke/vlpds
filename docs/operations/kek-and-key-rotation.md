@@ -27,9 +27,9 @@ facts:
   - { value: "0", label: restarts during a KMS outage, note: "a restart empties the key cache and turns every account cold", tone: muted }
 ```
 
-This page is the operator's view of the keys described in [Keys and security](../keys-security.md): what to
-create before the first deploy, how to rotate each key without downtime, and what to do when the key service is
-down. Exact commands for each procedure are in `ops/RUNBOOK.md`, in the section named at the end of each part here.
+[Keys and security](../keys-security.md) describes the keys. Here's what to create before the first deploy, how
+to rotate each key without downtime, and what to do when the key service is down. The exact commands are in
+`ops/RUNBOOK.md`, in the section named at the end of each part below.
 
 ## KEK provisioning
 
@@ -46,28 +46,28 @@ edges:
   - "local -> ring: current, or unwrap-only"
 ```
 
-A node refuses to start outside `--dev-mode` without a KEK, and every node of a cluster needs the same KEK set.
+Outside `--dev-mode`, a node refuses to start without a KEK. Every node of a cluster needs the same KEK set.
 
-**Cloud KMS** (recommended for anything beyond a personal server):
+Cloud KMS is the recommended setup for anything beyond a personal server:
 
 ```steps
 - title: Create the key
-  body: "A symmetric `ENCRYPT_DECRYPT` key in a multi-region location. `deploy/gcp` does this in OpenTofu: key ring `vlpds` and key `secrets` in `us`, a 120-day destroy-scheduled duration and `prevent_destroy` (`just plan`, `just apply`)."
+  body: "Create a symmetric `ENCRYPT_DECRYPT` key in a multi-region location. `deploy/gcp` does this in OpenTofu with key ring `vlpds` and key `secrets` in `us`, a 120-day destroy-scheduled duration and `prevent_destroy` (`just plan`, `just apply`)."
 - title: Grant one identity
-  body: "The nodes' service account gets `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key only. Nobody routinely holds `cloudkms.cryptoKeyVersions.destroy`. Off GCE, create a JSON key for that account and store it with the other secrets (e.g. in sops or Ansible Vault)."
+  body: "Give the nodes' service account `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key only. Nobody routinely holds `cloudkms.cryptoKeyVersions.destroy`. Off GCE, create a JSON key for that account and store it with the other secrets (e.g. in sops or Ansible Vault)."
 - title: Point the nodes at it
-  body: "`--gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets`, plus `--gcp-credentials-file` off GCE. The Ansible role writes the JSON key to `/run/vlpds/gcp-sa.json` (0400) from `vlpds_gcp_credentials_json`."
+  body: "Set `--gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets`, plus `--gcp-credentials-file` off GCE. The Ansible role writes the JSON key to `/run/vlpds/gcp-sa.json` (0400) from `vlpds_gcp_credentials_json`."
 - title: Check
-  body: "The `secrets at rest` startup line prints `kek=G…` and `unwrap_keks=`, which must match on every node. `vlpds_kms_requests_total` shows wraps (new accounts) and unwraps (cold loads)."
+  body: "The `secrets at rest` startup line prints `kek=G…` and `unwrap_keks=`, and those must match on every node. `vlpds_kms_requests_total` shows wraps (new accounts) and unwraps (cold loads)."
 ```
 
-**Local KEK**: `openssl rand -out kek.bin 32` (64 hex chars or base64 also work), distributed like the other secrets
-at mode 0400 and passed as `--kek-file` (Ansible: `vlpds_kek_hex`). Back it up offline: it is the only way to read
-the stored keys.
+For a local KEK, run `openssl rand -out kek.bin 32` (64 hex chars or base64 also work). Distribute it like the other
+secrets at mode 0400 and pass it as `--kek-file` (Ansible: `vlpds_kek_hex`). Back it up offline, since it's the only
+way to read the stored keys.
 
 > [!WARNING]
-> Losing the KEK loses every account's signing key. Protect it: a multi-region KMS key with deletion protection,
-> or offline copies of the KEK file.
+> Losing the KEK loses every account's signing key. Protect it with a multi-region KMS key with deletion protection,
+> or with offline copies of the KEK file.
 
 Runbook: "KEK provisioning", "Secrets as files".
 
@@ -75,21 +75,21 @@ Runbook: "KEK provisioning", "Secrets as files".
 
 ```steps
 - title: Roll the new KEK out as current
-  body: "Inside one CryptoKey, create a new version and make it primary: nothing to configure, KMS still decrypts old versions. Moving to another key, or from local to KMS: `--gcp-kms-key NEW` with `--gcp-kms-old-key OLD` (or `--kek-file old.bin`). Local to local: `--kek-file new.bin --kek-old-file old.bin`."
+  body: "Inside one CryptoKey, create a new version and make it primary. There's nothing to configure, since KMS still decrypts old versions. To move to another key, or from local to KMS, set `--gcp-kms-key NEW` with `--gcp-kms-old-key OLD` (or `--kek-file old.bin`). For local to local, set `--kek-file new.bin --kek-old-file old.bin`."
 - title: Rewrap
-  body: "`vlpds admin rewrap-secrets` runs `vlpds.admin.rewrapSecrets` on every node, each over the shards it owns: signing keys, reserved keys and TOTP secrets. Add `--check-versions` for a version rotation inside one CryptoKey (one KMS decrypt per secret). No events, no evictions. Re-run until `failed` is 0."
+  body: "`vlpds admin rewrap-secrets` runs `vlpds.admin.rewrapSecrets` on every node, each over the shards it owns. It covers signing keys, reserved keys and TOTP secrets. Add `--check-versions` for a version rotation inside one CryptoKey (one KMS decrypt per secret). It emits no events and evicts nothing. Re-run it until `failed` is 0."
 - title: Verify
-  body: "`--dry-run` until `stale` is 0 on every node; shards that moved during the rewrap show up here."
+  body: "Run it with `--dry-run` until `stale` is 0 on every node. Shards that moved during the rewrap show up here."
 - title: Rewrap the PLC rotation key file
-  body: "It is a file, not a row: pipe the old `vw1.` file through `vlpds --wrap-plc-rotation-key` with the new KEK configured, and roll the result out."
+  body: "The PLC rotation key is a file and not a row. Pipe the old `vw1.` file through `vlpds --wrap-plc-rotation-key` with the new KEK configured, and roll the result out."
 - title: Retire the old KEK
-  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed): log segments still hold blobs wrapped under it until retention deletes them."
+  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed), because log segments still hold blobs wrapped under it until retention deletes them."
 ```
 
-A signing-key rotation that is still pending keeps its new key wrapped under the KEK it started with, and
-`rewrap-secrets` doesn't touch it: finish pending rotations before retiring a KEK. A blob under a KEK no node has
-fails with `wrapped under unknown key-encryption key` and `VlpdsSecretUnwrapRejected`; put the old KEK back on every
-node and rerun the rewrap. Never edit a row by hand.
+A signing-key rotation that's still pending keeps its new key wrapped under the KEK it started with, and
+`rewrap-secrets` doesn't touch it. So finish pending rotations before retiring a KEK. A blob under a KEK that no node
+has fails with `wrapped under unknown key-encryption key` and `VlpdsSecretUnwrapRejected`. Put the old KEK back on
+every node and rerun the rewrap. Never edit a row by hand.
 
 Runbook: "KEK rotation", "VlpdsSecretUnwrapRejected".
 
@@ -109,21 +109,22 @@ edges:
   - { from: no.r, to: kms.l, label: retried after 1 s, dash: true }
 ```
 
-`VlpdsKeyServiceUnavailable` fires on `vlpds_kms_requests_total{result="unavailable"}`. Warm accounts keep writing;
-cold accounts' writes, `createAccount`, `reserveSigningKey`, TOTP setup and TOTP logins get 503. Reads, exports,
-the firehose and proxying are unaffected. Clients retry 503s, and when KMS comes back the next retry succeeds:
-refused writes were never applied, so nothing needs replaying.
+`VlpdsKeyServiceUnavailable` fires on `vlpds_kms_requests_total{result="unavailable"}`. Warm accounts keep writing.
+Cold accounts' writes, `createAccount`, `reserveSigningKey`, TOTP setup and TOTP logins get 503. Reads, exports,
+the firehose and proxying are unaffected. Clients retry 503s, and when KMS comes back the next retry succeeds.
+Refused writes were never applied, so nothing needs replaying.
 
-- **Don't restart nodes or move shards** (no rolling deploys, splits or handbacks) while KMS is down. A restart or
+- Don't restart nodes or move shards (no rolling deploys, splits or handbacks) while KMS is down. A restart or
   takeover empties the key cache and makes every account on that node cold.
-- **One node affected** (its network or metadata server): drain it with SIGTERM so its shards move to nodes that can
-  reach KMS.
-- **IAM**: a removed role looks the same as an outage (403s). Check it before blaming Google.
-- **Key destroyed for good**: restore it from an offline copy if one exists. Otherwise every account needs a new signing key and a PLC
-  update, which needs the PLC rotation key and, for accounts that no longer list it, the users' own keys.
+- If only one node is affected (its network or metadata server), drain it with SIGTERM so its shards move to nodes
+  that can reach KMS.
+- A removed IAM role looks the same as an outage (403s). Check IAM before blaming Google.
+- If the key is destroyed for good, restore it from an offline copy if one exists. Otherwise every account needs a
+  new signing key and a PLC update. That needs the PLC rotation key, plus the users' own keys for accounts that no
+  longer list it.
 
-A node won't *start* during a KMS outage if its PLC rotation key file is KMS-wrapped: it is unwrapped at startup.
-Another reason not to restart.
+If a node's PLC rotation key file is KMS-wrapped, the node can't start during a KMS outage, because the file is
+unwrapped at startup. That's another reason not to restart.
 
 Runbook: "Key service (KMS) outage".
 
@@ -131,22 +132,22 @@ Runbook: "Key service (KMS) outage".
 
 ```steps
 - title: Generate it wrapped
-  body: "On a host with the node's KEK config: `vlpds --gcp-kms-key … --wrap-plc-rotation-key </dev/null >plc-rotation.key`. Empty stdin makes a new key; 64 hex chars on stdin wrap an existing one (a reference PDS's `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). The did:key goes to stderr: record it. Check the file is one `vw1.` line."
+  body: "On a host with the node's KEK config, run `vlpds --gcp-kms-key … --wrap-plc-rotation-key </dev/null >plc-rotation.key`. Empty stdin makes a new key, and 64 hex chars on stdin wrap an existing one (a reference PDS's `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`). The did:key goes to stderr, so record it. Check that the file is one `vw1.` line."
 - title: Distribute and start
-  body: "Same file on every node, mode 0400, `--plc-rotation-key-file` (Ansible: `vlpds_plc_rotation_key`). The `PLC registration on` startup line shows the same `rotation_key` on every node."
+  body: "Put the same file on every node at mode 0400 and pass `--plc-rotation-key-file` (Ansible: `vlpds_plc_rotation_key`). The `PLC registration on` startup line shows the same `rotation_key` on every node."
 - title: Back it up
-  body: "Keep an offline copy next to the KEK's: the file needs the KEK to open, and it is not in the bucket."
+  body: "Keep an offline copy next to the KEK's. The file needs the KEK to open, and it isn't in the bucket."
 ```
 
-**Rotating it.** Roll every node with the new key as current and the old one in `--plc-rotation-key-old-file`. New DIDs
-list the new key, and any update of an old DID is signed by the old key and swaps in the new one. Then
-`vlpds admin rotate-plc-keys --dry-run` reports per node `current`, `rotated` (still on the old key), `foreign` (DIDs
-that list neither: migrated away, or synthetic) and `failed`; run it without `--dry-run` to submit the updates
-(4 in flight per node; the directory rate-limits, so millions of accounts take a while). When dry runs show
-`rotated` 0 everywhere, drop the old key. For a **compromised** key, also use the
+To rotate it, roll every node with the new key as current and the old one in `--plc-rotation-key-old-file`. New
+DIDs list the new key. Any update of an old DID is signed by the old key and swaps in the new one. Then
+`vlpds admin rotate-plc-keys --dry-run` reports `current`, `rotated` (still on the old key), `foreign` (DIDs that
+list neither, because they migrated away or are synthetic) and `failed` per node. Run it without `--dry-run` to
+submit the updates (4 in flight per node). The directory rate-limits, so millions of accounts take a while. When
+dry runs show `rotated` 0 everywhere, drop the old key. If the key was compromised, also use the
 [operator recovery key](#operator-recovery-key) to undo ops the attacker signed in the last 72 h.
 
-Never point a test cluster at `plc.directory`: use a local did-method-plc server, or `--dev-mode` without a key.
+Never point a test cluster at `plc.directory`. Use a local did-method-plc server, or `--dev-mode` without a key.
 `VlpdsPlcDirectoryUnavailable` and `VlpdsPlcOpsRejected` cover directory trouble.
 
 Runbook: "PLC rotation key provisioning", "PLC rotation key rotation", "PLC directory outage".
@@ -164,24 +165,25 @@ edges:
   - run -> after
 ```
 
-A secp256k1 key the operator keeps offline. It outranks the server rotation key: within 72 h of an op signed by the
-server key (a leaked key, a bad deploy), an op signed by the recovery key replaces it.
+The operator recovery key is a secp256k1 key the operator keeps offline. It outranks the server rotation key. Within
+72 h of an op signed by the server key (a leaked key, a bad deploy), an op signed by the recovery key replaces it.
 
 ```steps
 - title: Make it offline
-  body: "`vlpds --generate-did-key` prints the private key (hex) and its did:key and needs no other configuration. Store the hex offline in two places (paper, a vault, the password manager). It never goes on a node."
+  body: "`vlpds --generate-did-key` prints the private key (hex) and its did:key, and it needs no other configuration. Store the hex offline in two places (paper, a vault, the password manager). It never goes on a node."
 - title: Roll it out
-  body: "`--plc-recovery-did-key did:key:…` on every node (or the reference's `PDS_RECOVERY_DID_KEY`; Ansible `vlpds_plc_recovery_did_key`). New accounts and `getRecommendedDidCredentials` list it from then on."
+  body: "Set `--plc-recovery-did-key did:key:…` on every node (or the reference's `PDS_RECOVERY_DID_KEY`, or Ansible's `vlpds_plc_recovery_did_key`). New accounts and `getRecommendedDidCredentials` list it from then on."
 - title: Backfill existing accounts
-  body: "`vlpds admin ensure-recovery-key --dry-run` reports `present`, `added`, `foreign`, `full` (already 10 keys) and `failed` per node; `--json` shows sample changes. Then run it without `--dry-run`, paced at `--per-second` (default 4) DIDs per node. Re-run until `failed` is 0; it is idempotent."
+  body: "`vlpds admin ensure-recovery-key --dry-run` reports `present`, `added`, `foreign`, `full` (already 10 keys) and `failed` per node, and `--json` shows sample changes. Then run it without `--dry-run`, paced at `--per-second` (default 4) DIDs per node. It's idempotent, so re-run it until `failed` is 0."
 - title: Use it only in an emergency
-  body: "Build the corrective op (prev = the last good op's CID, the good keys and services), sign it offline with the recovery key (for example `goat plc`) and post it to the directory within 72 h of the bad op. Then rotate the server rotation key."
+  body: "Build the corrective op (prev = the last good op's CID, plus the good keys and services). Sign it offline with the recovery key (for example with `goat plc`) and post it to the directory within 72 h of the bad op. Then rotate the server rotation key."
 ```
 
-Changing the recovery key: roll out the new did:key and rerun `ensure-recovery-key`. The old one stays listed until a
-DID's keys are rewritten; remove it only if it leaked. Set it before the first account where you can; `ensure-recovery-key`
-backfills it onto accounts created earlier. Users add their own keys, ahead of the operator's, on the account page or in `/migrate`'s advanced
-mode ([Keys and security](../keys-security.md#plc-rotation-key-and-recovery-keys)).
+To change the recovery key, roll out the new did:key and rerun `ensure-recovery-key`. The old one stays listed until
+a DID's keys are rewritten. Remove it only if it leaked. Where you can, set it before the first
+account. `ensure-recovery-key` backfills it onto accounts created earlier. Users add their own keys, ahead of the
+operator's, on the account page or in `/migrate`'s advanced mode
+([Keys and security](../keys-security.md#plc-rotation-key-and-recovery-keys)).
 
 Runbook: "Operator recovery key".
 
@@ -189,19 +191,19 @@ Runbook: "Operator recovery key".
 
 ```steps
 - title: Begin
-  body: "The new key, wrapped under the KEK, is written to the account row as pending in one durable log entry. From here the repo's writes get a retryable 503 `KeyUnavailable`, so nothing is signed with the old key once the DID document may change."
+  body: "vlpds writes the new key, wrapped under the KEK, to the account row as pending in one durable log entry. From here the repo's writes get a retryable 503 `KeyUnavailable`, so nothing is signed with the old key once the DID document may change."
 - title: PLC
-  body: "The DID's `atproto` verification method is set to the new key (did:plc only; a did:web's document is its owner's to change)."
+  body: "The DID's `atproto` verification method is set to the new key. This is did:plc only, since a did:web's document is its owner's to change."
 - title: Finish
-  body: "The account takes the new key and the head commit is re-signed (same data, next rev). One log entry carries the head, the row, `#identity` and `#sync`; writes resume."
+  body: "The account takes the new key and the head commit is re-signed (same data, next rev). One log entry carries the head, the row, `#identity` and `#sync`, and then writes resume."
 ```
 
 `vlpds admin rotate-keys --generate <did>` (admin `updateAccountSigningKey`) rotates to a fresh key. Without
-`--generate` it re-publishes the current key to PLC and re-signs the head, like the reference's rotate-keys script.
+`--generate`, it re-publishes the current key to PLC and re-signs the head, like the reference's rotate-keys script.
 Relays see commits signed with the old key, then `#identity` and `#sync`, then commits signed with the new key.
 
 A rotation interrupted between Begin and Finish (a directory or KMS outage, a crash, a shard move) stays pending with
-the repo's writes fenced. Nothing sweeps for them: **re-run the same command**, or let the first refused write finish it
-in the background (one attempt per second per account). It is abandoned only if the directory definitely refused the
-update and still doesn't list the key. Pending keys aren't covered by `rewrap-secrets`, so finish rotations before
-retiring a KEK.
+the repo's writes fenced. Nothing sweeps for these, so re-run the same command. You can also let the first refused
+write finish it in the background (one attempt per second per account). It's abandoned only if the directory
+definitely refused the update and still doesn't list the key. Pending keys aren't covered by `rewrap-secrets`, so
+finish rotations before retiring a KEK.
