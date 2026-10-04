@@ -1,0 +1,488 @@
+{
+ "name": "buildspeed-ab",
+ "profile": "bisect",
+ "scale": "benchbox",
+ "created": 1791085988.883411,
+ "shas": [
+  "42c4617",
+  "19b5c0f",
+  "1d0c09a",
+  "3cfc7b6",
+  "3d0ad75"
+ ],
+ "fmt": {
+  "42c4617": "e93aa9b",
+  "19b5c0f": "e93aa9b",
+  "1d0c09a": "e93aa9b",
+  "3cfc7b6": "e93aa9b",
+  "3d0ad75": "e93aa9b"
+ },
+ "baseline": "",
+ "steps": [
+  {
+   "id": "ab-grid-42c4617-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-42c4617",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-methods-42c4617-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-grid-19b5c0f-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-19b5c0f",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-methods-19b5c0f-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-grid-1d0c09a-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-1d0c09a",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-methods-1d0c09a-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-grid-3cfc7b6-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3cfc7b6",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-methods-3cfc7b6-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-grid-3d0ad75-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3d0ad75",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3d0ad75"
+  },
+  {
+   "id": "ab-methods-3d0ad75-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3d0ad75"
+  },
+  {
+   "id": "ab-grid-3d0ad75-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3d0ad75",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3d0ad75"
+  },
+  {
+   "id": "ab-methods-3d0ad75-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3d0ad75"
+  },
+  {
+   "id": "ab-grid-3cfc7b6-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3cfc7b6",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-methods-3cfc7b6-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-grid-1d0c09a-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-1d0c09a",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-methods-1d0c09a-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-grid-19b5c0f-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-19b5c0f",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-methods-19b5c0f-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-grid-42c4617-r2",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-42c4617",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-methods-42c4617-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-grid-42c4617-r3",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-42c4617",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-methods-42c4617-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "42c4617"
+  },
+  {
+   "id": "ab-grid-19b5c0f-r3",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-19b5c0f",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-methods-19b5c0f-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "19b5c0f"
+  },
+  {
+   "id": "ab-grid-1d0c09a-r3",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-1d0c09a",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-methods-1d0c09a-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "1d0c09a"
+  },
+  {
+   "id": "ab-grid-3cfc7b6-r3",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3cfc7b6",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-methods-3cfc7b6-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3cfc7b6"
+  },
+  {
+   "id": "ab-grid-3d0ad75-r3",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3d0ad75",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3d0ad75"
+  },
+  {
+   "id": "ab-methods-3d0ad75-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3d0ad75"
+  }
+ ]
+}
