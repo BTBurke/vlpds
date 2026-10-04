@@ -83,6 +83,11 @@ docker-build tag="vlpds:local":
 docker-push tag=`git rev-parse --short=12 HEAD` image="ghcr.io/jazware/vlpds" platform="linux/amd64" features="":
     docker buildx build --platform {{platform}} --build-arg VLPDS_FEATURES={{features}} --build-arg VLPDS_GIT_REV=`git rev-parse --short=12 HEAD` -t {{image}}:{{tag}} --push .
 
+# The production image built on benchbox (native amd64) from HEAD, loaded here and pushed with `gh auth token`
+# (build/benchbox-image.sh: env PUSH=0 to only load, FEATURES, FORCE=1 while a bench/pipeline runs)
+docker-build-benchbox tag=`git rev-parse --short=12 HEAD`:
+    build/benchbox-image.sh {{tag}}
+
 # Observability stack for load tests (bench/obs/README.md): Prometheus (1 s scrapes) :9090,
 # Grafana (vlpds dashboard, anonymous admin) :3300, Pyroscope :4040, all on 127.0.0.1
 obs-up:
