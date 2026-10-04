@@ -29,13 +29,9 @@ facts:
   - { value: "1,024", unit: conns, label: per upstream host, note: "pooled; a burst waits instead of connecting", tone: blue }
 ```
 
-Most of what a Bluesky app asks its PDS for is not the PDS's data: timelines, threads, profiles and
-notifications come from the AppView. The PDS signs each such call as the user and passes it on.
-This is the busiest path a PDS serves, and at Bluesky's scale it uses more CPU than commits do.
-
-This page explains which calls are proxied and where they run, the pools and limits around the
-upstream, how a user sees their own fresh writes, and what keeps a user-supplied service URL from
-reaching inside your network.
+Most of what a Bluesky app asks its PDS for isn't the PDS's data. Timelines, threads, profiles and
+notifications come from the AppView, so the PDS signs each of those calls as the user and passes it on.
+It's the busiest path a PDS serves, and at Bluesky's scale it uses more CPU than commits do.
 
 ## What is proxied
 
@@ -50,21 +46,21 @@ reaching inside your network.
 | `app.bsky.feed.getFeed` | the AppView, with a token for the feed generator | |
 
 The Ansible role defaults to `https://api.bsky.app` and Bluesky's moderation service. Without
-`--appview`, AppView methods answer 400 "No service configured". A request naming the configured
+`--appview`, AppView methods answer 400 "No service configured". A request that names the configured
 AppView's DID in `atproto-proxy` uses the configured URL without resolving anything.
 
-Before anything goes upstream the owner checks:
+Before anything goes upstream, the owner checks:
 
-- **Scope.** OAuth tokens need `rpc:<method>?aud=<did>#<service>` (403 `ScopeMissingError`
+- Scope. OAuth tokens need `rpc:<method>?aud=<did>#<service>` (403 `ScopeMissingError`
   otherwise). Non-privileged app passwords can't call the `chat.bsky.*` methods the reference
   marks privileged.
-- **Not a PDS method.** Account and session methods (`com.atproto.server.*`, `updateHandle`, the
+- Not a PDS method. Account and session methods (`com.atproto.server.*`, `updateHandle`, the
   PLC signing methods) are never proxied, whatever the header says.
-- **Account status.** A taken-down or suspended account gets 401 `AccountTakedown`, except for the
+- Account status. A taken-down or suspended account gets 401 `AccountTakedown`, except for the
   moderation inbox's appeal method.
 
 The forwarded request carries the reference's header allow-list (`Accept-Language`,
-`atproto-accept-labelers`, `x-atproto-*`, `x-bsky-topics`) and a service-auth JWT with
+`atproto-accept-labelers`, `x-atproto-*`, `x-bsky-topics`) and a service-auth JWT. The JWT has
 `iss` = the user, `aud` = the service DID and `lxm` = the method. For `getFeed`, the token's
 audience is the feed generator's DID (looked up on the AppView, cached a minute) and its `lxm` is
 `getFeedSkeleton`, so the AppView can call the generator as the user.
@@ -90,55 +86,55 @@ edges:
   - n1.t -> jwt.b
 ```
 
-The routing rule for methods outside `com.atproto.*` and `vlpds.*` is the bearer token's `sub`
-alone, whatever DIDs the parameters name. The entry node forwards to the owner over the peer
-mTLS connection pool, as it does for writes (see
+For methods outside `com.atproto.*` and `vlpds.*`, routing uses only the bearer token's `sub`,
+whatever DIDs the parameters name. The entry node forwards to the owner over the peer mTLS
+connection pool, the same way it does for writes (see
 [Architecture](architecture.md#request-routing-and-forwarding)). Running every request for an
 account on one node keeps three things in one place:
 
-- **The account.** Its signing key and status are cached on the owner, valid only in the shard
-  epoch they were read in. The owner's repo worker drops the entry when an account change applies,
-  so a takedown or a key rotation affects the very next request; a 60 s age limit is the backstop.
-  An unchanged key never goes back to the keyring or KMS.
-- **Service tokens.** A JWT lives 60 s and is reused for 30 s per (issuer, audience, method, key),
-  so a busy user's requests sign nothing. A rotated key is part of the cache key and mints new
-  tokens at once.
-- **The per-account cap and the recent-writes log** (below) need one counter and one log per
-  account, not one per node.
+- The account. Its signing key and status are cached on the owner, and the entry is only valid in
+  the shard epoch it was read in. The owner's repo worker drops the entry when an account change
+  applies, so a takedown or a key rotation affects the very next request. A 60 s age limit is the
+  backstop. An unchanged key never goes back to the keyring or KMS.
+- Service tokens. A JWT lives 60 s and is reused for 30 s per (issuer, audience, method, key),
+  so a busy user's requests don't sign anything. A rotated key is part of the cache key, so it
+  mints new tokens at once.
+- The per-account cap and the recent-writes log (below). These need one counter and one log per
+  account, instead of one per node.
 
 With Caddy spreading requests evenly over N nodes, about (N − 1)/N of proxied calls take this one
-extra hop, a fraction of a millisecond on a LAN. A forwarded proxied call waits up to 30 s for its
-response head (the AppView's own deadline is shorter, below).
+extra hop. That's a fraction of a millisecond on a LAN. A forwarded proxied call waits up to 30 s
+for its response head (the AppView's own deadline is shorter, below).
 
 ## Connection pools and limits
 
 ```facts
-- { value: "1,024", unit: conns, label: per upstream host, note: "idle + busy; a request past it waits for one", tone: blue }
-- { value: "128", unit: KiB, label: read whole before replying, note: "frees the connection at once; larger bodies stream" }
+- { value: "1,024", unit: conns, label: per upstream host, note: "idle + busy · a request past it waits for one", tone: blue }
+- { value: "128", unit: KiB, label: read whole before replying, note: "frees the connection at once · larger bodies stream" }
 - { value: "10 s / 30 s", label: head deadline / body idle, note: "10 MiB response cap", tone: violet }
-- { value: "64", label: in flight per account, note: "until each body is done; 429 RateLimitExceeded", tone: amber }
+- { value: "64", label: in flight per account, note: "until each body is done · 429 RateLimitExceeded", tone: amber }
 ```
 
-- **Pools.** Every outbound client is built once and shared. A plain `http://` AppView (one on a
-  private network) uses vlpds's own HTTP/1.1 pool: one pool per host with a slot per IO thread,
-  so a request normally touches only its own thread's slot, and never more than 1,024 connections
-  (`vlpds_http_client_pool_waits_total` counts waits). An `https://` AppView, the default
-  deployment, uses one h2/HTTP/1.1 client per IO thread. Pooled HTTP/1.1 measured faster than one
-  multiplexed h2c connection. No client follows redirects. New connections show in
-  `vlpds_http_client_connects_total`, which should stay flat under steady load.
-- **Deadlines.** The proxy allows 10 s for the response head and 30 s without body progress, the
-  reference's defaults, and arms those timers only while the upstream keeps it waiting.
-- **Bodies.** Responses up to 128 KiB are read whole before the client gets them, so the upstream
-  connection goes back to the pool however slowly the client reads. Larger ones stream through;
-  a client that takes no data for 30 s has its upstream body dropped
-  (`vlpds_http_stalled_bodies_total`). Compressed responses pass through as the upstream encoded
-  them; vlpds never decodes and re-compresses a body it isn't changing.
-- **Per-account cap.** At most 64 proxied requests per account are in flight on its owner, counted
-  until each response body is done, so one client can't hold most of the pool with responses it
+- Pools. Every outbound client is built once and shared. A plain `http://` AppView (one on a
+  private network) uses vlpds's own HTTP/1.1 pool. There's one pool per host with a slot per IO
+  thread, so a request normally touches only its own thread's slot, and the pool never holds more
+  than 1,024 connections (`vlpds_http_client_pool_waits_total` counts waits). An `https://` AppView
+  (the default deployment) uses one h2/HTTP/1.1 client per IO thread. Pooled HTTP/1.1 measured
+  faster than one multiplexed h2c connection. No client follows redirects. New connections show up
+  in `vlpds_http_client_connects_total`, which should stay flat under steady load.
+- Deadlines. The proxy allows 10 s for the response head and 30 s without body progress (the
+  reference's defaults). It only arms those timers while the upstream keeps it waiting.
+- Bodies. Responses up to 128 KiB are read whole before the client gets them, so the upstream
+  connection goes back to the pool however slowly the client reads. Larger ones stream through. If
+  a client takes no data for 30 s, its upstream body is dropped (`vlpds_http_stalled_bodies_total`).
+  Compressed responses pass through as the upstream encoded them, since vlpds never decodes and
+  re-compresses a body it isn't changing.
+- Per-account cap. At most 64 proxied requests per account are in flight on its owner, counted
+  until each response body is done. So one client can't hold most of the pool with responses it
   never reads (`vlpds_proxy_rejected_total{reason="account_cap"}`,
   `VlpdsProxyAccountCapSustained`).
-- **Errors.** Upstream errors pass through with the reference's mapping (a 500 becomes 502
-  `UpstreamFailure`); an unreachable upstream is 502. CORS preflights are answered locally.
+- Errors. Upstream errors pass through with the reference's mapping (a 500 becomes 502
+  `UpstreamFailure`), and an unreachable upstream is a 502. CORS preflights are answered locally.
 
 Watch `vlpds_upstream_requests_total{service,result}` and `vlpds_upstream_request_seconds{service}`
 (services: `appview`, `chat`, `moderation`, `other`).
@@ -161,9 +157,9 @@ edges:
 ```
 
 The AppView indexes a write a few seconds after it happens, so a user who just posted or edited
-their profile would not see it. Like the reference PDS, the owner merges the requester's own
-records newer than the AppView's rev into the methods the reference rewrites, when an AppView is
-configured:
+their profile wouldn't see it. Like the reference PDS, when an AppView is configured, the owner
+merges the requester's own records newer than the AppView's rev into the methods the reference
+rewrites:
 
 | Method | What is merged |
 |---|---|
@@ -171,21 +167,21 @@ configured:
 | `feed.getActorLikes` | the profile over the requester's post authors |
 | `feed.getAuthorFeed` | on the requester's own feed: the profile, then new posts |
 | `feed.getTimeline` | new posts, by `indexedAt` |
-| `feed.getPostThread` | new replies under their parents; a thread built locally when the AppView doesn't know the requester's new post yet |
+| `feed.getPostThread` | new replies under their parents · a thread built locally when the AppView doesn't know the requester's new post yet |
 
-The owner keeps a small **recent-writes log** per active repo: the head rev, a base rev and every
-current record above the base (up to 32 records or 64 KiB, posts and the profile with their
-values). A commit's ack updates it before the client is answered, so the next read already sees
-it. Nearly every response carries a rev at or past the head and streams through untouched, with no
-store read and no copy. Only a response with records to merge is buffered, decoded, rewritten and
+The owner keeps a small **recent-writes log** per active repo. It holds the head rev, a base rev and
+every current record above the base (up to 32 records or 64 KiB, posts and the profile with their
+values). A commit's ack updates it before the client is answered, so the next read already sees it.
+Nearly every response carries a rev at or past the head and streams through untouched, with no
+store read and no copy. Only a response with records to merge gets buffered, decoded, rewritten and
 sent with `Atproto-Upstream-Lag` (milliseconds since the oldest merged write).
 
-Rewriting means parsing an upstream body, so it is bounded: 10 MiB on the wire and decoded, at most
-two content codings, decoding of large or compressed bodies on blocking threads, and at most
-32 MiB of bodies being rewritten at once (past that a response goes out unchanged). For these
-methods the client's `Accept-Encoding` is narrowed to codings vlpds can decode. The outcome is in
-`vlpds_proxy_read_after_write_total{result}`. Measured cost on the no-merge path: none above the
-noise (~43 µs CPU per request before and after).
+Rewriting means parsing an upstream body, so it's bounded. The cap is 10 MiB on the wire and
+decoded, with at most two content codings. Large or compressed bodies decode on blocking threads.
+At most 32 MiB of bodies are rewritten at once, and past that a response goes out unchanged. For
+these methods the client's `Accept-Encoding` is narrowed to codings vlpds can decode. The outcome
+is in `vlpds_proxy_read_after_write_total{result}`. On the no-merge path the measured cost is
+nothing above the noise (~43 µs CPU per request before and after).
 
 ## Outbound safety
 
@@ -207,18 +203,17 @@ edges:
 ```
 
 `atproto-proxy` lets a client send the user's signed request to any service named in any DID
-document, so the endpoint is attacker-chosen. vlpds treats it as such, as the reference does:
+document, so an attacker gets to pick the endpoint. vlpds treats it that way, as the reference does:
 
 - The URL must be `https`, and an IP-literal host must be a public unicast address (`localhost` and
   `*.localhost` are refused).
-- The request goes through the **guarded client**, whose DNS resolver drops every non-public
-  address, so a name that resolves to `10.x`, `169.254.x` or loopback is never connected to. The same
-  client fetches `did:web` documents, handle `.well-known` files, OAuth client metadata and
-  lexicons.
+- The request goes through the guarded client. Its DNS resolver drops every non-public address, so
+  vlpds never connects to a name that resolves to `10.x`, `169.254.x` or loopback. The same client
+  fetches `did:web` documents, handle `.well-known` files, OAuth client metadata and lexicons.
 - No client follows redirects, so an allowed host can't bounce a request inward.
 
 A refused endpoint answers 502 "Upstream service unreachable" and logs the reason. `--dev-mode`
-lifts these checks so local stacks work; never run production in dev mode. The reference's SSRF
+lifts these checks so local stacks work. Never run production in dev mode. The reference's SSRF
 tests run against vlpds in `tests/all/ref_ssrf.rs`.
 
 ## Throughput
@@ -230,13 +225,13 @@ tests run against vlpds in `tests/all/ref_ssrf.rs`.
 - { value: "~0.8", unit: Gbit/s, label: each direction at that load, note: "~5 KB per response", tone: violet }
 ```
 
-On a 16-core / 32-thread desktop-class box against a stub AppView, one node proxied 334k req/s with 50k active
-accounts and ~300k with 1M, at about 50 µs of server CPU each and a p99 of 3–7 ms at 512–1,024 in
-flight. Cold accounts cost more until the account and
-token caches warm (~100 µs per request while a million accounts load). The numbers are bounded by
-the box running the load generator and the stub too, so they are a floor for the server.
+On a 16-core / 32-thread desktop-class box against a stub AppView, one node proxied 334k req/s with
+50k active accounts and ~300k with 1M. That's about 50 µs of server CPU each, with a p99 of 3–7 ms
+at 512–1,024 in flight. Cold accounts cost more (~100 µs per request while a million accounts load)
+until the account and token caches warm up. The same box also ran the load generator and the stub,
+so these numbers are a floor for the server.
 
-What that means for sizing: proxying and Argon2 logins, not commits, set a cluster's CPU. Bluesky's
-assumed 20k proxied req/s is about one core fleet-wide and ~0.8 Gbit/s each way; at 10× it is ~10
-cores and ~8 Gbit/s, which is why a 3-node cluster wants 3–10 Gbit/s NICs. See
+For sizing, that means most of a cluster's CPU goes to proxying and Argon2 logins. Bluesky's assumed
+20k proxied req/s is about one core fleet-wide and ~0.8 Gbit/s each way. At 10× it's ~10 cores and
+~8 Gbit/s, which is why a 3-node cluster wants 3–10 Gbit/s NICs. See
 [Scaling and clustering](operations/scaling-and-clustering.md#sizing-rules).
