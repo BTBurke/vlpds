@@ -177,6 +177,5 @@ PLC document names this server with the right rotation keys, the account is acti
 there, and a new post is accepted. `KEEP=1` leaves the stack running; details are in
 `bench/migrate/README.md`.
 
-Before migrating real accounts to a new server, do one test account by hand with the checklist in
-`deploy/ansible/roles/vlpds/README.md` ("Migration dry-run checklist"); see
-[Deploy](operations/deploy.md#taking-over-an-existing-pds-hostname).
+Before migrating real accounts to a new server, migrate one test account and check it from outside
+(the last steps of [Verify](operations/deploy.md#verify)).

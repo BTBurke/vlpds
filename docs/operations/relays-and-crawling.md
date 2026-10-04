@@ -63,7 +63,7 @@ interval from 1 s to 7 days.
 **Asking now.** The console's **Crawl all now** (or a relay's **Crawl now**) button, or
 `vlpds admin request-crawl [RELAY,...]` (the `pdsadmin request-crawl` equivalent), asks
 immediately, whatever the throttle, and prints a result per relay (exit 1 if any refused). Do it
-after a first deploy and after [taking over an existing hostname](deploy.md#taking-over-an-existing-pds-hostname).
+after a first deploy and after moving accounts in.
 
 **Watch** `vlpds_request_crawl_total{relay,result}` and
 `vlpds_request_crawl_last_success_time_seconds{relay}`, which exist at 0 for every configured relay.

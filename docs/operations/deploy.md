@@ -41,7 +41,7 @@ This page deploys one vlpds node with the Ansible role in `deploy/ansible/roles/
 single small VPS serving `pds.example.com` as the worked example. One node owns every shard, so the
 setup is simple and cheap. The node keeps nothing on its disk that it can't rebuild, so moving to
 more nodes later is a matter of starting another one on the same bucket and prefix. For that, see
-[Scaling and clustering](scaling-and-clustering.md).
+[Scaling and clustering](scaling-and-clustering.md#with-the-ansible-role).
 
 ## What you need
 
@@ -83,7 +83,7 @@ Put the host in its own inventory, e.g. `inventories/<name>/` with a `hosts.yml`
 | Profile | `tiny`, `vlpds_mem_limit_mb: 3072`, 2 I/O threads, 1 worker | Caches size themselves from the 3 GiB limit. ~0.8 GiB stays for the OS, Caddy (~60 MiB) and Alloy (~250 MiB). |
 | Object store | R2 bucket `<your-bucket>`, `vlpds_s3_prefix` set to a name for this PDS | Add the lifecycle rule that aborts incomplete multipart uploads. Scope the API token to this bucket and, where the provider allows it, to the host's IP. |
 | DNS | `pds.example.com` and `*.pds.example.com`, DNS-only (grey cloud) | Cloudflare's proxy would cap uploads at 100 MB and close the firehose's idle websockets. |
-| Secrets | sops (`inventories/<name>/secrets.yml`, outside `group_vars/` so Ansible doesn't load the ciphertext as variables), read with the `community.sops.sops` lookup, or Ansible Vault | The role writes each one to a file and passes only `VLPDS_*_FILE`, so `docker inspect` shows no secret. |
+| Secrets | sops: `group_vars/<group>.sops.yaml` beside (not inside) `group_vars/<group>/`, decrypted by the `community.sops` vars plugin | The role writes each one to a file and passes only `VLPDS_*_FILE`, so `docker inspect` shows no secret. |
 | KEK | Cloud KMS (`vlpds_gcp_kms_key`) with a service-account key | Nothing on the box can unwrap a signing key without KMS. A local KEK works too and can be rewrapped onto KMS later. |
 | Identity | live plc.directory, operator recovery key in every DID | `vlpds_plc_recovery_did_key`; the private half is offline. See [KEK and key rotation](kek-and-key-rotation.md#operator-recovery-key). |
 | Console | `https://<node>.<your-tailnet>.ts.net:8443/admin` | `tailscale serve` terminates TLS on the private network only. Caddy can't do this: traffic it gets from Docker comes from the bridge gateway, not a private-network address. |
@@ -203,42 +203,3 @@ docker run -d --name vlpds --restart unless-stopped --stop-timeout 90 \
 For a local server to click around in, `just dev` builds the UI and runs an in-memory node on
 `127.0.0.1:2620` in dev mode (admin token `dev-admin-token`; nothing persists). `just seed` adds
 accounts and records.
-
-## Taking over an existing PDS hostname
-
-The role can also replace a reference PDS on the same host, keeping its hostname. That host's
-existing Caddy is reconfigured, not replaced, and the reference PDS keeps running beside vlpds until
-it is retired.
-
-```diagram
-caption: "Cutover on a host that already runs the reference PDS. The existing Caddy's config is backed up, then pointed at vlpds; rollback restores it. Accounts move one by one inside the cutover window."
-nodes:
-  - { id: caddy, label: existing Caddy, sub: "hostname + *.handles", at: [0, 3.5], size: [9, 3] }
-  - { id: v, label: vlpds, sub: fresh prefix, at: [16, 0], size: [8, 3], tone: accent }
-  - { id: ref, label: reference PDS, sub: "127.0.0.1:3000", at: [16, 7], size: [8, 3], tone: muted }
-  - { id: b, label: bucket, at: [31, 0], size: [7, 3], shape: store, tone: amber }
-edges:
-  - { from: caddy.r30, to: v.l, label: after cutover, labelAt: [12.5, 2.6] }
-  - { from: caddy.r70, to: ref.l, label: rollback, dash: true, labelAt: [12.5, 7.2] }
-  - v -> b
-  - { from: ref.t80, to: v.b80, label: migrate each account, tone: blue, labelAt: [22.4, 5] }
-```
-
-1. **Side by side first.** In `existing-sidebyside` mode the existing Caddy keeps serving the
-   reference PDS unchanged, with one `import` line added that serves vlpds on a second hostname on a
-   throwaway prefix. Migrate a test account there and run the whole checklist in the role README
-   ("Migration dry-run checklist").
-2. **Cutover.** `playbooks/vlpds-cutover.yml -e vlpds_cutover_confirm=<hostname>` switches the node
-   to the real hostname on a **fresh prefix**, keeps the old Caddyfile as `Caddyfile.pre-vlpds-cutover`,
-   and reloads Caddy with vlpds behind the hostname and its handles. The new config is validated by
-   the running Caddy first.
-3. **Move the accounts**, with `OLD` = the reference PDS over an SSH tunnel to `127.0.0.1:3000`. Until
-   an account is migrated, its requests reach vlpds, which doesn't have it yet, so keep the window
-   short and announce it. Then `vlpds admin request-crawl`.
-4. **Rollback**, if needed: `playbooks/vlpds-cutover-rollback.yml` restores the old Caddyfile and
-   stops vlpds gracefully. Accounts already moved need moving back, and the relay's cursor for the
-   host is then ahead of anything the reference PDS has. Roll back early, before accounts move, when
-   in doubt.
-
-The full procedure, with every check, is "Cutover" in `deploy/ansible/roles/vlpds/README.md`. To
-upgrade the node afterwards, see [Upgrades](upgrades.md).

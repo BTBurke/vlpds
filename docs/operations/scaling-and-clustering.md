@@ -33,8 +33,8 @@ how big to make a cluster, how to change it, and how to change the shard layout.
 (leases, takeover, handback) are in [Architecture](../architecture.md#shards-and-ownership).
 
 > [!NOTE]
-> The Ansible role deploys **one node**. A multi-node cluster runs from the same image with the
-> peer flags below, which the role doesn't set.
+> The Ansible role runs a lone node until `vlpds_cluster_enabled` is set; then it sets the peer
+> flags below on every node. See [With the Ansible role](#with-the-ansible-role).
 
 ## Sizing rules
 
@@ -112,6 +112,40 @@ replay. If the node can't fence its own log (store errors for min(TTL, 30 s)), i
 lease, so peers presume it dead and fence it themselves. A crashed node, by contrast, is noticed
 after its lease goes quiet (~12 s at the default 10 s TTL, 3–5 s if its port refuses connections);
 see [Architecture](../architecture.md#failure-and-takeover).
+
+## With the Ansible role
+
+Every node of the inventory group shares the bucket, prefix, identity and secrets (group vars) and has
+its own node id, sizing and peer address (host vars). Peers talk over the private network: each node
+publishes its peer port on loopback and `tailscale serve` forwards it from the node's private address,
+so the peer port is never on a public interface. TLS passes straight through to vlpds.
+
+**Adding a node**, starting from one running node:
+
+```steps
+- title: Make the cluster CA, once
+  body: "`vlpds admin tls ca --out ./pki`. `ca.crt` goes in the group vars (`vlpds_peer_tls_ca_cert`). Keep `ca.key` offline, never on a node."
+- title: Issue a certificate per node
+  body: "`vlpds admin tls issue --ca ./pki/ca.crt --ca-key ./pki/ca.key --out ./pki --node-id <node id> --host <its private address>`, for the running node too. Per node: the certificate in its host vars (`vlpds_peer_tls_cert`), the key in its encrypted host vars (`vlpds_peer_tls_key`), the address in `vlpds_peer_host`."
+- title: Let the nodes reach each other
+  body: "Allow node-to-node TCP on `vlpds_peer_port` (2584) in the private network's access policy. Nothing public changes."
+- title: Make the running node a cluster of one
+  body: "Set `vlpds_cluster_enabled: true` and run the playbook. The node restarts once, gracefully, with `--peer-listen`, `--advertise-url` and `--peer-tls-dir`; `vlpds admin cluster status` still shows it owning every shard."
+- title: Provision the new node
+  body: "A fresh host: `playbooks/bootstrap.yml` for it, then enable it in the inventory and run the playbook (one node at a time). It starts on the same bucket and prefix and the running node hands it its fair share."
+- title: Send it traffic
+  body: "Point DNS at it too, or instead. With wildcard handle certificates, set `vlpds_caddy_hostname_dns01: true` first so the new node's Caddy holds the hostname's certificate before DNS sends it requests. Add its metrics target (Alloy does, through the same role)."
+```
+
+A prefix made with the `tiny` profile has one shard: one node owns it and the others forward to it,
+which is enough for failover. Split it (below) to spread writes. Takeover after a crash waits about one
+lease TTL, 60 s on `tiny`; a lower `vlpds_lease_ttl_ms` shortens it for more object-store requests.
+
+**Removing a node**: move DNS away from it first, then stop it with `docker compose down` in
+`/opt/vlpds` (SIGTERM with the 90 s grace period: it hands its shards out, see
+[Removing a node](#removing-a-node)), and take it out of the inventory. The playbook refuses to run two
+enabled nodes while `vlpds_cluster_enabled` is off, because two lone nodes on one prefix never talk
+to each other.
 
 ## Shard split and merge
 
