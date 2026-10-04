@@ -87,7 +87,7 @@ export function Landing() {
                 <>
                   <dt>Contact</dt>
                   <dd>
-                    <a href={`mailto:${info.contact.email}`}>{info.contact.email}</a>
+                    <Email address={info.contact.email} />
                   </dd>
                 </>
               )}
@@ -134,10 +134,38 @@ export function Landing() {
         {info?.links?.termsOfService && <a href={info.links.termsOfService}>Terms</a>}
         {info?.contact?.email && (
           <span>
-            Report abuse: <a href={`mailto:${info.contact.email}`}>{info.contact.email}</a>
+            Report abuse: <Email address={info.contact.email} />
           </span>
         )}
       </footer>
     </>
+  )
+}
+
+// Spelled out and without a mailto: href in the DOM so address harvesters scraping the page don't pick it up; the
+// link is only built on click.
+function Email({ address }: { address: string }) {
+  const at = address.lastIndexOf('@')
+  if (at < 0) return <span>{address}</span>
+  const [local, domain] = [address.slice(0, at), address.slice(at + 1)]
+  const parts = domain.split('.')
+  return (
+    <a
+      href="#"
+      className="email"
+      onClick={(e) => {
+        e.preventDefault()
+        location.href = `mailto:${local}@${domain}`
+      }}
+    >
+      {local}
+      <span className="sep"> [at] </span>
+      {parts.map((p, i) => (
+        <span key={i}>
+          {i > 0 && <span className="sep"> [dot] </span>}
+          {p}
+        </span>
+      ))}
+    </a>
   )
 }

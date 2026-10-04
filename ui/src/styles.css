@@ -2245,6 +2245,10 @@ table.data.rl-side-table td {
   padding-right: 7px;
 }
 
+.email .sep {
+  color: var(--ink3);
+}
+
 /* ------------------------------------------------------------ migrate (move an account here) */
 
 .landing .move-here {
