@@ -167,8 +167,12 @@ def vlpds_flags(exe):
 def local_plan(exe):
     """A `check` for node_flags that runs `exe --memory-plan` here."""
     def check(argv):
+        # vlpds checks the budget against its own cgroup's memory.max: run it
+        # in a scope of the node's cap, not in the (much smaller) driver's
+        cap = argv[argv.index(BUDGET_FLAG) + 1] if BUDGET_FLAG in argv else None
+        pre = scope_args(int(cap), name="memory-plan") if cap else []
         try:
-            r = subprocess.run([exe, "--memory-plan", *argv], capture_output=True, text=True, timeout=60)
+            r = subprocess.run([*pre, exe, "--memory-plan", *argv], capture_output=True, text=True, timeout=60)
         except OSError as e:
             return False, str(e)
         return r.returncode == 0, (r.stdout.strip().splitlines() or [""])[-1] if r.returncode == 0 else r.stderr.strip()[-600:]
