@@ -154,7 +154,7 @@ docker run --rm ghcr.io/jazware/vlpds dashboards --name vlpds > vlpds.json
 ```
 
 In Grafana, go to Dashboards → New → Import, upload a file and pick your Prometheus when it asks.
-The same files are in the repo at `bench/obs/grafana/dashboards/`
+The console's Live metrics page has download buttons for both. The same files are in the repo at `bench/obs/grafana/dashboards/`
 ([vlpds.json](https://raw.githubusercontent.com/jazware/vlpds/main/bench/obs/grafana/dashboards/vlpds.json),
 [vlpds-internals.json](https://raw.githubusercontent.com/jazware/vlpds/main/bench/obs/grafana/dashboards/vlpds-internals.json)).
 

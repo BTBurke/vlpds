@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Chart, type Series } from '../../components/Chart'
-import { ErrorNotice, Panel } from '../../components/ui'
+import { ErrorNotice, Panel, saveBlob } from '../../components/ui'
 import { fmtBytes, fmtNum, fmtSecs, fmtSi } from '../../lib/format'
+import { useAction } from '../../lib/hooks'
 import { parseProm, quantile, rate, rateBy, sum, type Scrape } from '../../lib/prom'
+import { admin } from '../../lib/xrpc'
 
 const INTERVAL = 2000
 const KEEP = 180 // 6 minutes at 2 s
@@ -240,7 +242,28 @@ export function Metrics() {
           />
         </Panel>
       </div>
+      <GrafanaDashboards />
     </>
+  )
+}
+
+/** The dashboards `vlpds dashboards` prints, for Grafana's Import dialog. */
+function GrafanaDashboards() {
+  const dl = useAction(async (name: string, file: string) => {
+    const r: Response = await admin('vlpds.admin.getGrafanaDashboard', { params: { name }, raw: true })
+    saveBlob(await r.blob(), file)
+  })
+  return (
+    <div className="muted small">
+      History and alerts: import the Grafana dashboards (Dashboards → New → Import, then pick your Prometheus):{' '}
+      <button className="btn" disabled={dl.busy} onClick={() => dl.run('vlpds', 'vlpds.json')}>
+        vlpds.json
+      </button>{' '}
+      <button className="btn" disabled={dl.busy} onClick={() => dl.run('internals', 'vlpds-internals.json')}>
+        vlpds-internals.json
+      </button>
+      <ErrorNotice error={dl.error} />
+    </div>
   )
 }
 

@@ -16,6 +16,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.rotatePlcKeys", post(rotate_plc_keys))
         .route("/xrpc/vlpds.admin.ensureRecoveryKey", post(ensure_recovery_key))
         .route("/xrpc/vlpds.admin.getDevMail", get(get_dev_mail))
+        .route("/xrpc/vlpds.admin.getGrafanaDashboard", get(get_grafana_dashboard))
         .route("/xrpc/com.atproto.admin.getAccountInfo", get(get_account_info))
         .route("/xrpc/com.atproto.admin.getAccountInfos", get(get_account_infos))
         .route("/xrpc/com.atproto.admin.searchAccounts", get(search_accounts))
@@ -1055,6 +1056,23 @@ async fn send_email(State(app): AppState, Auth(creds): Auth, Json(inp): Json<Sen
     let subject = inp.subject.unwrap_or_else(|| "Message via your PDS".into());
     super::server::deliver_moderation(&app, &to, &subject, &inp.content);
     Ok(Json(json!({"sent": true})))
+}
+
+#[derive(Deserialize)]
+struct DashboardQ {
+    name: String,
+}
+
+/// The import-ready Grafana dashboard `vlpds dashboards --name` prints, for
+/// the console's Live metrics page.
+async fn get_grafana_dashboard(Auth(creds): Auth, Query(q): Query<DashboardQ>) -> XResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    require_admin(&creds)?;
+    let (_, _, body) = crate::cli::dashboards::DASHBOARDS
+        .iter()
+        .find(|(n, _, _)| *n == q.name)
+        .ok_or_else(|| invalid_request("name: vlpds or internals"))?;
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], *body).into_response())
 }
 
 #[derive(Deserialize)]
