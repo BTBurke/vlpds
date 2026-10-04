@@ -40,6 +40,8 @@ RUN rustup show active-toolchain
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY lexicons ./lexicons
+# embedded by `vlpds dashboards` (src/cli/dashboards.rs)
+COPY bench/obs/grafana/dashboards ./bench/obs/grafana/dashboards
 # the manifest declares the test binary; it is never built here
 RUN mkdir -p tests/all && touch tests/all/main.rs
 # Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for

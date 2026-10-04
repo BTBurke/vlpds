@@ -11,7 +11,11 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(about = "vlpds: a very large atproto PDS on object storage")]
+#[command(
+    about = "vlpds: a very large atproto PDS on object storage",
+    after_help = "Subcommands: `vlpds admin --help` (operator commands against a running node), \
+                  `vlpds dashboards --help` (the Grafana dashboards as JSON)."
+)]
 struct Args {
     #[arg(long, env = "VLPDS_LISTEN", default_value = "0.0.0.0:2583")]
     listen: String,
@@ -859,6 +863,49 @@ fn tls_main(cmd: TlsCmd) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Parser)]
+#[command(
+    name = "vlpds dashboards",
+    bin_name = "vlpds dashboards",
+    about = "Print the Grafana dashboards, ready for Grafana's Dashboards > New > Import \
+             (docs/operations/monitoring.md)"
+)]
+struct DashboardsArgs {
+    /// The dashboard to print: vlpds (the operator's view) or internals.
+    /// With --out: write only this one.
+    #[arg(long, value_parser = ["vlpds", "internals"])]
+    name: Option<String>,
+    /// Write the dashboards into this directory (vlpds.json,
+    /// vlpds-internals.json) instead of printing one to stdout.
+    #[arg(long)]
+    out: Option<std::path::PathBuf>,
+    /// Pre-select this Prometheus datasource uid (or `default`) and drop the
+    /// Import dialog's datasource prompt: for Grafana file provisioning.
+    #[arg(long)]
+    datasource_uid: Option<String>,
+}
+
+fn dashboards_main(args: DashboardsArgs) -> anyhow::Result<()> {
+    use vlpds::cli::dashboards::{render, DASHBOARDS};
+    let uid = args.datasource_uid.as_deref();
+    let Some(dir) = args.out else {
+        let name = args.name.as_deref().unwrap_or("vlpds");
+        let (_, _, body) = DASHBOARDS.iter().find(|(n, _, _)| *n == name).expect("clap checks --name");
+        use std::io::Write;
+        return Ok(std::io::stdout().write_all(render(body, uid)?.as_bytes())?);
+    };
+    std::fs::create_dir_all(&dir)?;
+    for (name, file, body) in DASHBOARDS {
+        if args.name.as_deref().is_some_and(|n| n != name) {
+            continue;
+        }
+        let path = dir.join(file);
+        std::fs::write(&path, render(body, uid)?)?;
+        eprintln!("wrote {}", path.display());
+    }
+    Ok(())
+}
+
 fn admin_main(args: AdminArgs) -> anyhow::Result<()> {
     let cmd = match args.cmd {
         AdminCmd::Tls(cmd) => return tls_main(cmd),
@@ -902,8 +949,10 @@ fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
 }
 
 fn main() -> anyhow::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("admin") {
-        return admin_main(AdminArgs::parse_from(std::env::args().skip(1)));
+    match std::env::args().nth(1).as_deref() {
+        Some("admin") => return admin_main(AdminArgs::parse_from(std::env::args().skip(1))),
+        Some("dashboards") => return dashboards_main(DashboardsArgs::parse_from(std::env::args().skip(1))),
+        _ => {}
     }
     let mut args = Args::parse();
     if args.generate_did_key {

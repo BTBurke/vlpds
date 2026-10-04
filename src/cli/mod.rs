@@ -1,4 +1,5 @@
-//! Command-line clients of a running node (the `vlpds` binary's
-//! subcommands that talk to it over HTTP).
+//! The `vlpds` binary's subcommands: clients of a running node over HTTP
+//! (`admin`), and offline helpers (`dashboards`).
 
 pub mod admin;
+pub mod dashboards;

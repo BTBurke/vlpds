@@ -4,6 +4,7 @@ ui/node_modules/
 ui/dist/
 ui/screenshots/
 bench/
+!bench/obs/grafana/dashboards/
 checker/
 testdata/
 tests/
