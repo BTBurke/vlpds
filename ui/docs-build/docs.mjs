@@ -98,8 +98,12 @@ function renderFigure(spec, where) {
     throw new Error(`${where}: ${e.message}`)
   }
   const wide = d.width > 560 ? ' dg-wide' : ''
+  // DocsApp opens the diagram full screen from this button (or a click on the diagram)
+  const expand =
+    `<button type="button" class="dg-expand" aria-label="Expand diagram" title="Expand">` +
+    `<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><path d="M12 3.5h4.5V8M8 16.5H3.5V12M16.5 3.5 11.5 8.5M3.5 16.5l5-5"/></svg></button>`
   return (
-    `<figure class="figure${wide}"><div class="dg-scroll">${d.svg}</div>` +
+    `<figure class="figure${wide}">${expand}<div class="dg-scroll">${d.svg}</div>` +
     (spec.caption ? `<figcaption>${esc(spec.caption).replace(/`([^`]+)`/g, '<code>$1</code>')}</figcaption>` : '') +
     `</figure>`
   )

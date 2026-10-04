@@ -3,6 +3,7 @@ import { loaders, nav, pages, type DocMeta } from 'virtual:vlpds-docs'
 import { Topbar } from '../../components/ui'
 import { Link, navigate } from '../../lib/router'
 import '../../docs.css'
+import { Lightbox, diagramOf, type Diagram } from './Lightbox'
 
 const bySlug = new Map(pages.map((p) => [p.slug, p]))
 const order = nav.flatMap((s) => s.pages)
@@ -19,11 +20,13 @@ export function DocsApp({ path }: { path: string }) {
   const [body, setBody] = useState<string | null>(() => html.get(slug) ?? null)
   const [failed, setFailed] = useState(false)
   const [navOpen, setNavOpen] = useState(false)
+  const [diagram, setDiagram] = useState<Diagram | null>(null)
   const article = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     document.title = page ? `${page.title} · vlpds docs` : 'Not found · vlpds docs'
     setNavOpen(false)
+    setDiagram(null)
     setFailed(false)
     if (!page) return
     const cached = html.get(slug)
@@ -48,7 +51,14 @@ export function DocsApp({ path }: { path: string }) {
   }, [body])
 
   const onClick = (e: MouseEvent<HTMLDivElement>) => {
-    const a = (e.target as HTMLElement).closest('a')
+    const t = e.target as Element
+    const fig = t.closest<HTMLElement>('.figure')
+    if (fig && (t.closest('.dg-expand') || t.closest('svg.dg'))) {
+      const d = diagramOf(fig)
+      if (d) setDiagram(d)
+      return
+    }
+    const a = t.closest('a')
     const href = a?.getAttribute('href')
     if (!a || !href || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
     if (href.startsWith('/docs')) {
@@ -123,6 +133,7 @@ export function DocsApp({ path }: { path: string }) {
         </main>
         {page && body !== null && <Toc page={page} root={article} />}
       </div>
+      {diagram && <Lightbox diagram={diagram} onClose={() => setDiagram(null)} />}
     </>
   )
 }

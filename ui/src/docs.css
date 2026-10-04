@@ -435,6 +435,174 @@ pre.code code {
   border: 1px solid var(--rule);
   border-radius: 8px;
   padding: 14px 14px 10px;
+  position: relative;
+}
+.figure svg.dg {
+  cursor: zoom-in;
+}
+.dg-expand {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--sheet);
+  color: var(--ink2);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.dg-expand svg,
+.dgl-btn svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.figure:hover .dg-expand,
+.dg-expand:focus-visible {
+  opacity: 1;
+}
+.dg-expand:hover {
+  color: var(--ink);
+  border-color: var(--ink3);
+}
+/* touch screens have no hover: always show it */
+@media (hover: none) {
+  .dg-expand {
+    opacity: 0.92;
+  }
+}
+
+/* The full-screen diagram (Lightbox.tsx). */
+.dgl {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .dgl {
+    animation: dgl-in 0.14s ease-out;
+  }
+}
+@keyframes dgl-in {
+  from {
+    opacity: 0;
+  }
+}
+.dgl-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px 10px 20px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--sheet);
+}
+.dgl-cap {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--ink2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.dgl-tools {
+  display: flex;
+  gap: 6px;
+  flex: none;
+}
+.dgl-btn {
+  display: grid;
+  place-items: center;
+  min-width: 36px;
+  height: 36px;
+  padding: 0 8px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+.dgl-btn:hover:not(:disabled) {
+  border-color: var(--ink3);
+}
+.dgl-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.dgl-pct {
+  font-family: var(--mono);
+  font-size: 12px;
+  min-width: 56px;
+}
+.dgl-close {
+  margin-left: 6px;
+}
+.dgl-stage {
+  flex: 1;
+  min-height: 0;
+  margin: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: zoom-out;
+}
+.dgl-canvas {
+  flex: none;
+  transform-origin: 50% 50%;
+  cursor: zoom-in;
+}
+.dgl-stage.zoomed .dgl-canvas {
+  cursor: grab;
+}
+.dgl-stage.zoomed .dgl-canvas:active {
+  cursor: grabbing;
+}
+.dgl-canvas svg.dg {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  min-width: 0;
+}
+.dgl-hint {
+  max-width: none;
+  margin: 0 0 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--ink3);
+}
+@media (max-width: 600px) {
+  .dgl-bar {
+    padding: 8px 8px 8px 12px;
+  }
+  .dgl-stage {
+    margin: 8px;
+  }
+  .dgl-pct {
+    display: none;
+  }
 }
 .figure figcaption {
   font-size: 13px;
