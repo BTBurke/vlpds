@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -587,11 +587,25 @@ impl Firehose {
     /// past it.
     pub fn upgrade(
         self: &Arc<Self>,
-        mut req: axum::extract::Request,
+        req: axum::extract::Request,
         cursor: Option<i64>,
         shard: Option<SlotRange>,
         client: Option<std::net::IpAddr>,
     ) -> Response {
+        self.upgrade_tracked(req, cursor, shard, client, None)
+    }
+
+    /// [`upgrade`](Self::upgrade), reporting the connection through `conn`
+    /// (which can also kick it).
+    pub fn upgrade_tracked(
+        self: &Arc<Self>,
+        mut req: axum::extract::Request,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        client: Option<std::net::IpAddr>,
+        conn: Option<Arc<ConnStats>>,
+    ) -> Response {
+        let closed = conn.map(ClosedOnDrop);
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
@@ -609,9 +623,19 @@ impl Firehose {
         let fh = self.clone();
         self.runtime.spawn(async move {
             let _slot = slot;
-            match on_upgrade.await {
-                Ok(up) => fh.serve(up, cursor, shard).await,
-                Err(e) => tracing::debug!("subscribeRepos upgrade failed: {e}"),
+            let up = match on_upgrade.await {
+                Ok(up) => up,
+                Err(e) => return tracing::debug!("subscribeRepos upgrade failed: {e}"),
+            };
+            match closed.as_ref().map(|c| c.0.clone()) {
+                // dropping `serve` closes the socket wherever it was waiting
+                Some(c) => {
+                    tokio::select! {
+                        _ = fh.serve(up, cursor, shard, Some(c.clone())) => {}
+                        _ = c.kick.notified() => {}
+                    }
+                }
+                None => fh.serve(up, cursor, shard, None).await,
             }
         });
         (
@@ -644,17 +668,24 @@ impl Firehose {
         self.per_ip.lock().get(&ip_key(ip)).copied().unwrap_or(0)
     }
 
-    async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>, shard: Option<SlotRange>) {
+    async fn serve(
+        self: Arc<Self>,
+        up: hyper::upgrade::Upgraded,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        conn: Option<Arc<ConnStats>>,
+    ) {
         use hyper_util::rt::TokioIo;
         use tokio::net::TcpStream;
-        metrics::FIREHOSE_SUBSCRIBERS.inc();
+        // this future is only dropped unfinished by a kick (or a runtime shutdown)
+        let mut sub = Subscribed::new("kicked");
         // Move the socket onto this runtime's reactor (it was accepted on
         // the request runtime), so its readiness events are ours too.
         let reason = match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(up) {
             Ok(parts) => match parts.io.into_inner().into_std().and_then(TcpStream::from_std) {
                 Ok(tcp) => {
                     let (r, w) = tcp.into_split();
-                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard).await
+                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard, conn).await
                 }
                 Err(e) => {
                     tracing::debug!("subscribeRepos socket: {e}");
@@ -666,27 +697,32 @@ impl Firehose {
                     "subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO"
                 );
                 let (r, w) = tokio::io::split(TokioIo::new(up));
-                self.serve_conn(r, w, cursor, shard).await
+                self.serve_conn(r, w, cursor, shard, conn).await
             }
         };
-        metrics::FIREHOSE_SUBSCRIBERS.dec();
-        metrics::FIREHOSE_DISCONNECTS.with_label_values(&[reason]).inc();
+        sub.reason = reason;
     }
 
-    async fn serve_conn<R, W>(&self, r: R, w: W, cursor: Option<i64>, shard: Option<SlotRange>) -> &'static str
+    async fn serve_conn<R, W>(
+        &self,
+        r: R,
+        w: W,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        conn: Option<Arc<ConnStats>>,
+    ) -> &'static str
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
     {
         let (ctl_tx, ctl) = mpsc::channel(8);
-        let reader = tokio::spawn(read_client(r, ctl_tx));
-        let mut out = Out { w, ctl, idle: self.write_idle };
-        let reason = match self.stream(&mut out, cursor, shard).await {
+        // the read half keeps the socket open until it's aborted, kicks included
+        let _reader = AbortOnDrop(tokio::spawn(read_client(r, ctl_tx)));
+        let mut out = Out { w, ctl, idle: self.write_idle, conn };
+        match self.stream(&mut out, cursor, shard).await {
             Ok(()) => "shutdown",
             Err(reason) => reason,
-        };
-        reader.abort();
-        reason
+        }
     }
 
     async fn stream<W: AsyncWrite + Unpin>(
@@ -757,23 +793,25 @@ impl Firehose {
                 if i == b.events.len() {
                     continue;
                 }
-                let sent = match &shard {
+                let (sent, bytes) = match &shard {
                     None => {
                         let wire = b.wire_from(i);
                         out.send_live(&mut [std::io::IoSlice::new(&wire)], &mut head, b.start(), allowance).await?;
-                        b.events.len() - i
+                        (b.events.len() - i, wire.len())
                     }
                     // only the matching events: each run of them is one
                     // slice of the shared bytes, all written in one go
                     Some(range) => {
                         let (mut runs, n) = b.wire_runs(i, range);
+                        let len = runs.iter().map(|r| r.len()).sum();
                         if n > 0 {
                             out.send_live(&mut runs, &mut head, b.start(), allowance).await?;
                         }
-                        n
+                        (n, len)
                     }
                 };
                 metrics::FIREHOSE_SENT.inc_by(sent as u64);
+                out.sent(sent, bytes, b.last);
                 last = b.last;
                 sent_to = Some(b.end);
                 while let Ok(c) = out.ctl.try_recv() {
@@ -787,6 +825,18 @@ impl Firehose {
     /// reaches back to `last` (the floor moves while it backfills); history
     /// that's gone is skipped with an `OutdatedCursor` info.
     async fn catch_up<W: AsyncWrite + Unpin>(
+        &self,
+        out: &mut Out<W>,
+        last: &mut i64,
+        shard: Option<SlotRange>,
+    ) -> Result<(), &'static str> {
+        out.set_backfilling(true);
+        let r = self.catch_up_from_bucket(out, last, shard).await;
+        out.set_backfilling(false);
+        r
+    }
+
+    async fn catch_up_from_bucket<W: AsyncWrite + Unpin>(
         &self,
         out: &mut Out<W>,
         last: &mut i64,
@@ -867,6 +917,7 @@ impl Firehose {
                 metrics::FIREHOSE_SENT.inc_by(chunk.len() as u64);
                 metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(chunk.len() as u64);
                 *last = chunk.last().expect("non-empty").0;
+                out.sent(chunk.len(), buf.len(), *last);
                 chunk.clear();
                 while let Ok(c) = out.ctl.try_recv() {
                     out.control(Some(c)).await?;
@@ -907,6 +958,64 @@ impl Firehose {
             tracing::warn!(from, floor, "firehose backfill failed, retrying: {err:#}");
             tokio::time::sleep(Duration::from_millis(100) * failures).await;
         }
+    }
+}
+
+/// One subscriber's progress, for an operator's view of who is connected
+/// (opt-in: [`Firehose::upgrade_tracked`]). Updated once per batch written.
+#[derive(Default)]
+pub struct ConnStats {
+    /// Events written to the subscriber.
+    pub events: AtomicU64,
+    /// Bytes of those events' messages.
+    pub bytes: AtomicU64,
+    /// Stream position: the newest seq passed (0 = none yet). A sharded
+    /// subscriber passes events it isn't sent.
+    pub last_seq: AtomicI64,
+    /// Streaming from the bucket rather than the ring.
+    pub backfilling: AtomicBool,
+    /// The connection ended (or never started), however it ended.
+    pub closed: AtomicBool,
+    kick: tokio::sync::Notify,
+}
+
+impl ConnStats {
+    /// Disconnects the subscriber at once, even an idle one.
+    pub fn kick(&self) {
+        // notify_one keeps a permit: a kick before the upgrade completes isn't lost
+        self.kick.notify_one();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+}
+
+struct ClosedOnDrop(Arc<ConnStats>);
+
+impl Drop for ClosedOnDrop {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A served subscriber, counted out with its disconnect reason when its
+/// serve future ends or is dropped.
+struct Subscribed {
+    reason: &'static str,
+}
+
+impl Subscribed {
+    fn new(reason: &'static str) -> Subscribed {
+        metrics::FIREHOSE_SUBSCRIBERS.inc();
+        Subscribed { reason }
+    }
+}
+
+impl Drop for Subscribed {
+    fn drop(&mut self) {
+        metrics::FIREHOSE_SUBSCRIBERS.dec();
+        metrics::FIREHOSE_DISCONNECTS.with_label_values(&[self.reason]).inc();
     }
 }
 
@@ -1218,9 +1327,24 @@ struct Out<W> {
     ctl: mpsc::Receiver<Ctl>,
     /// Longest a write outside the live path may go without progress.
     idle: Duration,
+    conn: Option<Arc<ConnStats>>,
 }
 
 impl<W: AsyncWrite + Unpin> Out<W> {
+    fn sent(&self, events: usize, bytes: usize, last_seq: i64) {
+        if let Some(c) = &self.conn {
+            c.events.fetch_add(events as u64, Ordering::Relaxed);
+            c.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            c.last_seq.store(last_seq, Ordering::Relaxed);
+        }
+    }
+
+    fn set_backfilling(&self, on: bool) {
+        if let Some(c) = &self.conn {
+            c.backfilling.store(on, Ordering::Relaxed);
+        }
+    }
+
     /// Writes `data`; a client that takes nothing for `idle` is dropped
     /// (the live path bounds lag instead, `send_live`).
     async fn write(&mut self, data: &[u8]) -> Result<(), &'static str> {
@@ -1576,14 +1700,14 @@ mod tests {
     async fn stalled_writes_drop_the_subscriber() {
         let (w, _r) = tokio::io::duplex(64);
         let (_ctl_tx, ctl) = mpsc::channel(1);
-        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100), conn: None };
         let t = std::time::Instant::now();
         assert_eq!(out.write(&[0u8; 4096]).await, Err("write_stalled"));
         assert!(t.elapsed() < Duration::from_secs(2));
         // a reader that keeps taking bytes is fine, however slowly
         let (w, mut r) = tokio::io::duplex(64);
         let (_ctl_tx, ctl) = mpsc::channel(1);
-        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100), conn: None };
         let reader = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let mut n = 0;
@@ -1596,6 +1720,43 @@ mod tests {
         reader.await.unwrap();
     }
 
+    /// A tracked live subscriber's stats count the events and bytes it was
+    /// sent and its position.
+    #[tokio::test]
+    async fn conn_stats_count_what_was_sent() {
+        let store = crate::store::Store::memory(None);
+        let fh = Firehose::new(Options::default());
+        *fh.store.write() = Some(store.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (tx, rx) = mpsc::unbounded_channel();
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let conn = Arc::new(ConnStats::default());
+        let (w, _r) = tokio::io::duplex(1 << 16);
+        let (_ctl_tx, ctl) = mpsc::channel(1);
+        let mut out = Out { w, ctl, idle: Duration::from_secs(5), conn: Some(conn.clone()) };
+        let fh2 = fh.clone();
+        let streaming = AbortOnDrop(tokio::spawn(async move { fh2.stream(&mut out, None, None).await }));
+        // a live subscriber starts at the head: let it get there first
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for k in 0..3 {
+            tx.send(put_seg(&store, "A", k as u64, seq(k), 100).await).unwrap();
+            wa.store(seq(k), Ordering::Release);
+        }
+        let t = std::time::Instant::now();
+        while conn.events.load(Ordering::Relaxed) < 3 {
+            assert!(t.elapsed() < Duration::from_secs(5), "events {}", conn.events.load(Ordering::Relaxed));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(conn.events.load(Ordering::Relaxed), 3);
+        // each message: the 100-byte frame plus a 2-byte websocket header
+        assert_eq!(conn.bytes.load(Ordering::Relaxed), 3 * 102);
+        assert_eq!(conn.last_seq.load(Ordering::Relaxed), seq(2));
+        assert!(!conn.backfilling.load(Ordering::Relaxed));
+        assert!(!streaming.0.is_finished());
+    }
+
     /// Backfills beyond `max_backfills` wait for a slot (answering their
     /// client meanwhile), and one whose client leaves stops waiting.
     #[tokio::test]
@@ -1604,7 +1765,7 @@ mod tests {
         let out = || {
             let (w, _r) = tokio::io::duplex(1 << 16);
             let (tx, ctl) = mpsc::channel(1);
-            (Out { w, ctl, idle: Duration::from_secs(5) }, tx, _r)
+            (Out { w, ctl, idle: Duration::from_secs(5), conn: None }, tx, _r)
         };
         let (mut a, _a_tx, _ar) = out();
         let first = fh.backfill_slot(&mut a).await.unwrap();
