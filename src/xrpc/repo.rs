@@ -761,7 +761,7 @@ async fn import_repo(State(app): AppState, Auth(creds): Auth, headers: HeaderMap
     Ok(StatusCode::OK)
 }
 
-pub(super) type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
+pub type ImportedRecord = (String, Cid, Bytes, Vec<Cid>);
 
 /// An imported record's blob refs, once its size and encoding are checked.
 pub(super) fn imported_record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid>> {
@@ -777,7 +777,7 @@ pub(super) fn imported_record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid
 
 /// The import of a CAR in any block order. Record bytes are sliced from
 /// `body`, not copied.
-pub(super) fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
+pub fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate::mst::Tree)> {
     let bad = |m: String| XrpcError::bad("InvalidRequest", m);
     let (roots, blocks) = car::read_car(body).map_err(|e| bad(format!("invalid CAR: {e}")))?;
     if roots.len() != 1 {

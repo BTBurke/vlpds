@@ -124,6 +124,18 @@ pub fn cert_info(der: &[u8]) -> Result<CertInfo> {
     })
 }
 
+/// The node a peer's verified client certificate names: an extension on
+/// every request of a peer TLS connection, for routes that care who calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerIdentity(pub Arc<str>);
+
+impl PeerIdentity {
+    pub fn of(conn: &rustls::ServerConnection) -> Option<PeerIdentity> {
+        let leaf = conn.peer_certificates()?.first()?;
+        node_id_of(leaf).map(|id| PeerIdentity(id.into()))
+    }
+}
+
 fn node_id_of(der: &[u8]) -> Option<String> {
     cert_info(der).ok()?.node_id
 }

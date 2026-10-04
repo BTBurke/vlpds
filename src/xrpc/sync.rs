@@ -339,7 +339,8 @@ pub(crate) async fn prefetch_nodes(
     }
 }
 
-type ChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+pub type ExportChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+type ChunkTx = ExportChunkTx;
 
 /// Err: the client is gone, or took nothing for `stall` (e.g. an h2 stream
 /// at a zero window).
@@ -459,8 +460,9 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
     Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], Body::from_stream(stream)).into_response())
 }
 
-/// Err: why it ended early (`client_gone`, `stalled`, `error`).
-async fn stream_export(
+/// Err: why it ended early (`client_gone`, `stalled`, `error`). Also the
+/// relay's archival getRepo, over its mirrored repos (same layout).
+pub async fn stream_export(
     snap: Arc<slatedb::DbSnapshot>,
     did: Arc<str>,
     gen: u64,
@@ -600,7 +602,7 @@ async fn get_blocks(
 
 /// The c/ index names the paths holding that CID (or one sharing its key
 /// prefix), so the record at a path must match.
-async fn find_record(snap: &slatedb::DbSnapshot, did: &str, gen: u64, cid: &Cid) -> XResult<Option<Vec<u8>>> {
+pub async fn find_record(snap: &slatedb::DbSnapshot, did: &str, gen: u64, cid: &Cid) -> XResult<Option<Vec<u8>>> {
     let prefix = state::record_cid_prefix(did, gen, cid);
     let mut iter = snap.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {

@@ -1112,14 +1112,101 @@ pub fn db_path(store: &Store, id: ShardId) -> String {
 /// the sources' SSTs. The sources must be closed (all their state in SSTs).
 /// Idempotent.
 pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u32)]) -> anyhow::Result<()> {
-    use std::ops::Bound;
     anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
-    let admin = slatedb::admin::AdminBuilder::new(db_path(store, child), store.raw.clone()).build();
+    let srcs: Vec<(String, (bytes::Bytes, bytes::Bytes))> =
+        sources.iter().map(|&(id, lo, hi)| (db_path(store, id), crate::state::slot_range_keys(lo, hi))).collect();
+    clone_projected(store, db_path(store, child), &clone_checkpoint_name(child), &srcs).await
+}
+
+/// Slots [lo, hi) to the key range one family's rows of those slots span.
+pub type FamilyRange = fn(u32, u32) -> (bytes::Bytes, bytes::Bytes);
+
+/// [`clone_db`] for a DB that keeps slot-keyed rows under several key
+/// families, each family's rows of a slot range one contiguous key range
+/// (the first is usually [`crate::state::slot_range_keys`]). Keys outside
+/// every family stay with the parent, as with `clone_db`. vlpds itself never
+/// calls it: an embedder with more families (vlRelay) opts in.
+///
+/// SlateDB projects a clone source to one range and takes each source path
+/// once, so each family past the first is cloned into a staging DB of its own
+/// (O(manifest) too), and the child is the union of the sources and their
+/// stages. The stages go once the child is initialized: the child names the
+/// SSTs' owners, never a stage.
+pub async fn clone_db_families(
+    store: &Store,
+    child: ShardId,
+    sources: &[(ShardId, u32, u32)],
+    families: &[FamilyRange],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(!sources.is_empty(), "clone of shard {child} without sources");
+    let Some((first, rest)) = families.split_first() else { anyhow::bail!("clone of shard {child} without families") };
+    let path = db_path(store, child);
     let name = clone_checkpoint_name(child);
+    let admin = slatedb::admin::AdminBuilder::new(path.clone(), store.raw.clone()).build();
+    if !admin.read_manifest(None).await?.is_some_and(|m| m.initialized()) {
+        let mut union = Vec::with_capacity(sources.len() * families.len());
+        for &(id, lo, hi) in sources {
+            union.push((db_path(store, id), first(lo, hi)));
+            for (i, f) in rest.iter().enumerate() {
+                let stage = stage_path(store, child, id, i + 1);
+                clone_projected(store, stage.clone(), &name, &[(db_path(store, id), f(lo, hi))]).await?;
+                union.push((stage, f(lo, hi)));
+            }
+        }
+        clone_projected(store, path, &name, &union).await?;
+    }
+    for &(id, ..) in sources {
+        for i in 1..families.len() {
+            let s = stage_path(store, child, id, i);
+            if let Err(e) = drop_stage(store, &s).await {
+                tracing::debug!(stage = %s, "clone stage left behind: {e:#}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stage_path(store: &Store, child: ShardId, src: ShardId, family: usize) -> String {
+    // not a shard key, so reshard GC never takes it for a retired shard
+    format!("{}.f{family}.{}", db_path(store, child), src.key())
+}
+
+/// Releases what a stage pinned in its source (the child pins those SSTs
+/// with checkpoints of its own) and deletes it.
+async fn drop_stage(store: &Store, stage: &str) -> anyhow::Result<()> {
+    use futures::{StreamExt, TryStreamExt};
+    let admin = slatedb::admin::AdminBuilder::new(stage.to_string(), store.raw.clone()).build();
+    if let Some(m) = admin.read_manifest(None).await? {
+        for x in m.external_dbs() {
+            let Some(cp) = x.final_checkpoint_id else { continue };
+            let src = slatedb::admin::AdminBuilder::new(x.path.clone(), store.raw.clone()).build();
+            src.delete_checkpoint(cp).await?;
+        }
+    }
+    let prefix = object_store::path::Path::from(stage);
+    let objs: Vec<object_store::path::Path> =
+        store.raw.list(Some(&prefix)).map_ok(|m| m.location).try_collect().await?;
+    let mut deleted = store.raw.delete_stream(futures::stream::iter(objs.into_iter().map(Ok)).boxed());
+    while let Some(r) = deleted.next().await {
+        r?;
+    }
+    Ok(())
+}
+
+/// Creates the DB at `path` from `sources` (path, projected key range), each
+/// read at a checkpoint named `name`. Idempotent.
+async fn clone_projected(
+    store: &Store,
+    path: String,
+    name: &str,
+    sources: &[(String, (bytes::Bytes, bytes::Bytes))],
+) -> anyhow::Result<()> {
+    use std::ops::Bound;
+    let admin = slatedb::admin::AdminBuilder::new(path, store.raw.clone()).build();
     // Our own retry check: SlateDB's wants every source named in the
     // clone's manifest, which a source with no SSTs of its own isn't.
     if admin.read_manifest(None).await?.is_some_and(|m| m.initialized()) {
-        drop_clone_checkpoints(store, &name, sources).await;
+        drop_clone_checkpoints(store, name, sources).await;
         return Ok(());
     }
     // Read each source at a checkpoint of our own, named for the child, and
@@ -1128,11 +1215,11 @@ pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u
     // for a source the clone's manifest doesn't name, and would hold a
     // retired parent (reshard_gc keeps a dir while any checkpoint lives).
     let mut specs = Vec::with_capacity(sources.len());
-    for &(id, lo, hi) in sources {
-        let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
+    for (src_path, (a, b)) in sources {
+        let src = slatedb::admin::AdminBuilder::new(src_path.clone(), store.raw.clone()).build();
         let now = chrono::Utc::now();
         let existing = src
-            .list_checkpoints(Some(&name))
+            .list_checkpoints(Some(name))
             .await?
             .into_iter()
             .find(|c| c.expire_time.is_none_or(|t| t > now + chrono::Duration::minutes(5)));
@@ -1141,17 +1228,16 @@ pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u
             None => {
                 src.create_detached_checkpoint(&slatedb::config::CheckpointOptions {
                     lifetime: Some(CLONE_CHECKPOINT_LIFETIME),
-                    name: Some(name.clone()),
+                    name: Some(name.to_string()),
                     ..Default::default()
                 })
                 .await?
                 .id
             }
         };
-        let (a, b) = crate::state::slot_range_keys(lo, hi);
         specs.push(
-            slatedb::CloneSourceSpec::with_checkpoint(db_path(store, id), cp)
-                .with_projection_range((Bound::Included(a), Bound::Excluded(b))),
+            slatedb::CloneSourceSpec::with_checkpoint(src_path.clone(), cp)
+                .with_projection_range((Bound::Included(a.clone()), Bound::Excluded(b.clone()))),
         );
     }
     let mut specs = specs.into_iter();
@@ -1160,7 +1246,7 @@ pub async fn clone_db(store: &Store, child: ShardId, sources: &[(ShardId, u32, u
         b = b.with_source(s);
     }
     b.build().await?;
-    drop_clone_checkpoints(store, &name, sources).await;
+    drop_clone_checkpoints(store, name, sources).await;
     Ok(())
 }
 
@@ -1172,9 +1258,9 @@ fn clone_checkpoint_name(child: ShardId) -> String {
 }
 
 /// Best effort: they expire on their own.
-async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, u32, u32)]) {
-    for &(id, ..) in sources {
-        let src = slatedb::admin::AdminBuilder::new(db_path(store, id), store.raw.clone()).build();
+async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(String, (bytes::Bytes, bytes::Bytes))]) {
+    for (path, _) in sources {
+        let src = slatedb::admin::AdminBuilder::new(path.clone(), store.raw.clone()).build();
         let r = async {
             for c in src.list_checkpoints(Some(name)).await? {
                 src.delete_checkpoint(c.id).await?;
@@ -1182,7 +1268,7 @@ async fn drop_clone_checkpoints(store: &Store, name: &str, sources: &[(ShardId, 
             anyhow::Ok(())
         };
         if let Err(e) = r.await {
-            tracing::debug!(shard = id.0, name, "clone source checkpoint left to expire: {e:#}");
+            tracing::debug!(%path, name, "clone source checkpoint left to expire: {e:#}");
         }
     }
 }
@@ -1833,6 +1919,114 @@ mod clone_tests {
         assert!(m.get(k(65535, "h/zz")).await.unwrap().is_some());
         assert!(m.get(k(100, "h/new9001")).await.unwrap().is_some());
         m.close().await.unwrap();
+    }
+
+    fn tagged(tag: u8) -> impl Fn(u16, &str) -> Vec<u8> {
+        move |slot, rest| [&[tag][..], &slot.to_be_bytes(), rest.as_bytes()].concat()
+    }
+
+    fn tag_range(tag: u8, lo: u32, hi: u32) -> (bytes::Bytes, bytes::Bytes) {
+        let at = |s: u32| -> bytes::Bytes {
+            if s >= crate::slots::SLOTS {
+                bytes::Bytes::copy_from_slice(&[tag + 1])
+            } else {
+                bytes::Bytes::copy_from_slice(&[&[tag][..], &(s as u16).to_be_bytes()].concat())
+            }
+        };
+        (at(lo), at(hi))
+    }
+
+    const FAMILIES: &[FamilyRange] =
+        &[crate::state::slot_range_keys, |lo, hi| tag_range(0x02, lo, hi), |lo, hi| tag_range(0x03, lo, hi)];
+
+    /// Every family's rows follow their slots through a split and a merge
+    /// (an empty family included), shard-wide keys stay behind, and no stage
+    /// or clone checkpoint outlives the clone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn clone_with_families_splits_and_merges_every_family() {
+        let store = Store { prefix: "fam".into(), ..Store::memory(None) };
+        let (two, three) = (tagged(0x02), tagged(0x03));
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        let slots = [0u16, 100, 32767, 32768, 50000, 65535];
+        for s in slots {
+            for i in 0..20 {
+                db.put(k(s, &format!("d/{i:03}")), "r").await.unwrap();
+                db.put(three(s, &format!("{i:03}")), "seed").await.unwrap();
+            }
+        }
+        db.put(b"meta/applied/log-a", b"m").await.unwrap();
+        db.close().await.unwrap();
+        let fam = |c: u32, srcs: Vec<(ShardId, u32, u32)>| {
+            let store = store.clone();
+            async move { clone_db_families(&store, ShardId(c), &srcs, FAMILIES).await.unwrap() }
+        };
+        fam(1, vec![(ShardId(0), 0, 32768)]).await;
+        fam(1, vec![(ShardId(0), 0, 32768)]).await;
+        fam(2, vec![(ShardId(0), 32768, 65536)]).await;
+        for (id, lo, hi) in [(1u32, 0u32, 32768u32), (2, 32768, 65536)] {
+            let c = open_db(&store, ShardId(id), None).await.unwrap();
+            assert!(c.get(b"meta/applied/log-a").await.unwrap().is_none());
+            for s in slots {
+                let mine = (lo..hi).contains(&(s as u32));
+                assert_eq!(c.get(k(s, "d/001")).await.unwrap().is_some(), mine, "shard {id} slot {s}");
+                assert_eq!(c.get(three(s, "001")).await.unwrap().is_some(), mine, "shard {id} slot {s}");
+            }
+            assert_eq!(count(&c).await, 3 * 20 * 2);
+            c.put(two(lo as u16 + 1, "host"), "h").await.unwrap();
+            c.close().await.unwrap();
+        }
+        fam(3, vec![(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)]).await;
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
+        assert_eq!(count(&m).await, 6 * 20 * 2 + 2);
+        assert!(m.get(two(1, "host")).await.unwrap().is_some());
+        assert!(m.get(two(32769, "host")).await.unwrap().is_some());
+        assert!(m.get(three(65535, "019")).await.unwrap().is_some());
+        m.close().await.unwrap();
+        let r = store.raw.list_with_delimiter(Some(&format!("{}/state", store.prefix).into())).await.unwrap();
+        let dirs: Vec<String> = r.common_prefixes.iter().filter_map(|p| p.filename().map(str::to_string)).collect();
+        assert_eq!(dirs.len(), 4, "stages left: {dirs:?}");
+        for id in [0u32, 1, 2] {
+            let admin = slatedb::admin::AdminBuilder::new(db_path(&store, ShardId(id)), store.raw.clone()).build();
+            let cps = admin.list_checkpoints(None).await.unwrap();
+            assert!(cps.iter().all(|c| c.expire_time.is_none() && c.name.is_none()), "shard {id}: {cps:?}");
+        }
+    }
+
+    /// Regression: a families clone gives the child each parent L0 SST once
+    /// per family (a view per projection, the stages' after the parent's).
+    /// Once the child's compactor took some, SlateDB's L0 merge cut at the
+    /// wrong copy of the compacted SST and the writer's next flush failed
+    /// with `InvalidClockTick` (fork patch 5 in Cargo.toml).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn family_child_flushes_through_compaction() {
+        let three = tagged(0x03);
+        let store = Store { prefix: "probe".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        for r in 0..12 {
+            for i in 0..20 {
+                db.put(k(10 + i, &format!("d/{r}")), "r").await.unwrap();
+                db.put(three(10 + i, &format!("{r}")), "s").await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        db.put(b"meta/applied/x", b"m").await.unwrap();
+        db.close().await.unwrap();
+        clone_db_families(&store, ShardId(1), &[(ShardId(0), 0, 32768)], FAMILIES).await.unwrap();
+        let c = open_db(&store, ShardId(1), None).await.unwrap();
+        for i in 0..80 {
+            c.put(k(11, &format!("d/new{i}")), "x").await.unwrap();
+            let r = c
+                .flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await;
+            if let Err(e) = r {
+                panic!("flush {i}: {e} (L0s {})", c.manifest().l0().len());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        c.close().await.unwrap();
     }
 
     /// A merge whose sources have no SSTs of their own (split halves that

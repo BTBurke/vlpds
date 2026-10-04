@@ -27,7 +27,7 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use parking_lot::RwLock;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -50,6 +50,27 @@ impl Source {
     }
 }
 
+/// Stream seqs other than the log keys, for vlRelay (opt-in through
+/// [`Firehose::set_renumber`]; vlpds's own firehose sends the keys). Logs and
+/// the merger stay in keys. Each emitted event gets the next seq of a dense
+/// counter, spliced into its frame once per node, and cursors, the ring,
+/// `last_emitted` and `ConnStats::last_seq` are in those seqs.
+pub trait Renumber: Send + Sync + 'static {
+    /// The seq of the merged stream's last event with key <= `key`. Asked
+    /// once, for the start floor, after every log is durable up to it.
+    fn anchor(&self, key: i64) -> futures::future::BoxFuture<'static, anyhow::Result<i64>>;
+    /// Where to read the bucket from to serve the events after seq `after`:
+    /// (key, seq of the last event with key <= it). The seq is <= `after`
+    /// unless what's in between was pruned (then the caller sends
+    /// OutdatedCursor and resumes from there).
+    fn locate(&self, after: i64) -> futures::future::BoxFuture<'static, anyhow::Result<(i64, i64)>>;
+    /// Writes `frame` with `seq` in place of the seq it carries.
+    fn splice(&self, frame: &[u8], seq: i64, out: &mut Vec<u8>);
+    /// The merger emitted `keys` as seqs `first`, `first + 1`, ..., and
+    /// every event with key <= `bound` has been emitted.
+    fn emitted(&self, keys: &[i64], first: i64, bound: i64);
+}
+
 pub struct MergedBatch {
     pub first: i64,
     pub last: i64,
@@ -68,6 +89,12 @@ pub struct MergedBatch {
     offs: Vec<usize>,
     /// Computed by the first sharded subscriber to read the batch.
     slots: OnceLock<Vec<u16>>,
+    /// Each event's log key when renumbered (empty: the seqs are the keys).
+    keys: Vec<i64>,
+    /// The [`FrameFilter`]'s verdicts and the generation they're for, from
+    /// the first subscriber to read the batch under it. None inside: it
+    /// skips none of these events.
+    skips: parking_lot::Mutex<Option<(u64, Option<Arc<[bool]>>)>>,
 }
 
 impl MergedBatch {
@@ -75,15 +102,39 @@ impl MergedBatch {
     fn new(events: Vec<(i64, Bytes)>, emitted: u64) -> MergedBatch {
         let mut buf = Vec::with_capacity(events.iter().map(|(_, f)| f.len() + 10).sum());
         let mut offs = Vec::with_capacity(events.len());
-        let mut payload = Vec::with_capacity(events.len());
-        for (_, f) in &events {
+        let mut seqs = Vec::with_capacity(events.len());
+        for (seq, f) in &events {
             offs.push(buf.len());
             push_message(&mut buf, OP_BINARY, f);
-            payload.push(buf.len() - f.len());
+            seqs.push((*seq, buf.len() - f.len()));
         }
+        Self::build(buf, offs, seqs, Vec::new(), emitted)
+    }
+
+    /// `events` in key order, as seqs `first`, `first + 1`, ...
+    fn renumbered(events: Vec<(i64, Bytes)>, first: i64, r: &dyn Renumber, emitted: u64) -> MergedBatch {
+        let mut buf = Vec::with_capacity(events.iter().map(|(_, f)| f.len() + 16).sum());
+        let mut offs = Vec::with_capacity(events.len());
+        let mut seqs = Vec::with_capacity(events.len());
+        let mut keys = Vec::with_capacity(events.len());
+        let mut frame = Vec::new();
+        for (i, (key, f)) in events.iter().enumerate() {
+            frame.clear();
+            r.splice(f, first + i as i64, &mut frame);
+            offs.push(buf.len());
+            push_message(&mut buf, OP_BINARY, &frame);
+            seqs.push((first + i as i64, buf.len() - frame.len()));
+            keys.push(*key);
+        }
+        Self::build(buf, offs, seqs, keys, emitted)
+    }
+
+    /// `seqs`: each event's seq and where its payload starts in `buf`.
+    fn build(buf: Vec<u8>, offs: Vec<usize>, seqs: Vec<(i64, usize)>, keys: Vec<i64>, emitted: u64) -> MergedBatch {
         let wire = Bytes::from(buf);
+        let end = |j: usize| offs.get(j + 1).copied().unwrap_or(wire.len());
         let events: Vec<(i64, Bytes)> =
-            events.iter().zip(payload).map(|((seq, f), at)| (*seq, wire.slice(at..at + f.len()))).collect();
+            seqs.iter().enumerate().map(|(j, (seq, at))| (*seq, wire.slice(*at..end(j)))).collect();
         MergedBatch {
             first: events[0].0,
             last: events[events.len() - 1].0,
@@ -93,7 +144,18 @@ impl MergedBatch {
             wire,
             offs,
             slots: OnceLock::new(),
+            keys,
+            skips: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Event `i`'s log key (its seq unless renumbered).
+    pub fn key(&self, i: usize) -> i64 {
+        self.keys.get(i).copied().unwrap_or(self.events[i].0)
+    }
+
+    fn last_key(&self) -> i64 {
+        self.key(self.events.len() - 1)
     }
 
     fn start(&self) -> u64 {
@@ -108,20 +170,44 @@ impl MergedBatch {
         self.slots.get_or_init(|| self.events.iter().map(|(_, f)| event_slot(f)).collect())
     }
 
+    /// Which events `filter` skips, computed once per filter generation
+    /// (None: it skips none of them).
+    fn skipped(&self, filter: &dyn FrameFilter) -> Option<Arc<[bool]>> {
+        let g = filter.generation()?;
+        let mut c = self.skips.lock();
+        match &*c {
+            Some((cg, v)) if *cg == g => v.clone(),
+            _ => {
+                let v: Vec<bool> = self.events.iter().map(|(_, f)| filter.skip(&frame_meta(f))).collect();
+                let v: Option<Arc<[bool]>> = v.contains(&true).then(|| v.into());
+                *c = Some((g, v.clone()));
+                v
+            }
+        }
+    }
+
     /// The messages of the events from index `i` on whose repo is in
-    /// `range`: one slice of `wire` per run of consecutive matching events.
-    /// Returns the slices and the number of events.
-    fn wire_runs(&self, i: usize, range: &SlotRange) -> (Vec<std::io::IoSlice<'_>>, usize) {
-        let slots = self.slots();
+    /// `range` (None: any) and that `skip` doesn't mark: one slice of `wire`
+    /// per run of consecutive kept events. Returns the slices and the number
+    /// of events.
+    fn wire_runs(
+        &self,
+        i: usize,
+        range: Option<&SlotRange>,
+        skip: Option<&[bool]>,
+    ) -> (Vec<std::io::IoSlice<'_>>, usize) {
+        let slots = range.map(|r| (r, self.slots()));
+        let keep = |j: usize| slots.map_or(true, |(r, s)| r.contains(s[j])) && skip.map_or(true, |s| !s[j]);
         let end = |j: usize| self.offs.get(j).copied().unwrap_or(self.wire.len());
+        let len = self.events.len();
         let (mut runs, mut n, mut j) = (Vec::new(), 0, i);
-        while j < slots.len() {
-            if !range.contains(slots[j]) {
+        while j < len {
+            if !keep(j) {
                 j += 1;
                 continue;
             }
             let a = j;
-            while j < slots.len() && range.contains(slots[j]) {
+            while j < len && keep(j) {
                 j += 1;
             }
             n += j - a;
@@ -154,6 +240,80 @@ fn frame_did(f: &[u8]) -> Option<&[u8]> {
         cbor_skip(f, &mut i, 0)?;
     }
     None
+}
+
+/// A frame's event type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    Commit,
+    Sync,
+    Identity,
+    Account,
+    /// `#info`, errors, anything else.
+    Other,
+}
+
+/// What a [`FrameFilter`] sees of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMeta<'a> {
+    pub kind: FrameKind,
+    /// `repo` of a #commit, `did` of a #sync, #identity or #account: the
+    /// key each kind is checked and applied by, so a frame carrying both
+    /// can't pass as the other DID. None for other kinds or a frame
+    /// without it.
+    pub did: Option<&'a [u8]>,
+}
+
+/// The type and DID of a frame, read straight from its DAG-CBOR without
+/// decoding it.
+pub fn frame_meta(f: &[u8]) -> FrameMeta<'_> {
+    let mut meta = FrameMeta { kind: FrameKind::Other, did: None };
+    let mut i = 0;
+    let Some((5, n)) = cbor_head(f, &mut i) else { return meta };
+    for _ in 0..n {
+        let Some(key) = cbor_text(f, &mut i) else { return meta };
+        if key == b"t" {
+            meta.kind = match cbor_text(f, &mut i) {
+                Some(b"#commit") => FrameKind::Commit,
+                Some(b"#sync") => FrameKind::Sync,
+                Some(b"#identity") => FrameKind::Identity,
+                Some(b"#account") => FrameKind::Account,
+                Some(_) => FrameKind::Other,
+                None => return meta,
+            };
+        } else if cbor_skip(f, &mut i, 0).is_none() {
+            return meta;
+        }
+    }
+    let want: &[u8] = match meta.kind {
+        FrameKind::Commit => b"repo",
+        FrameKind::Sync | FrameKind::Identity | FrameKind::Account => b"did",
+        FrameKind::Other => return meta,
+    };
+    let Some((5, n)) = cbor_head(f, &mut i) else { return meta };
+    for _ in 0..n {
+        let Some(key) = cbor_text(f, &mut i) else { return meta };
+        if key == want {
+            meta.did = cbor_text(f, &mut i);
+            return meta;
+        }
+        if cbor_skip(f, &mut i, 0).is_none() {
+            return meta;
+        }
+    }
+    meta
+}
+
+/// Frames subscribeRepos leaves out, live and in cursor backfill (opt-in
+/// through [`Firehose::set_filter`]; vlRelay's takedowns). A skipped frame
+/// keeps its seq, so consumers see a gap rather than renumbered events.
+pub trait FrameFilter: Send + Sync + 'static {
+    /// None while it skips nothing: frames aren't even parsed. Otherwise a
+    /// number that changes whenever `skip` may answer differently, since a
+    /// ring batch's verdicts are computed once per generation and shared by
+    /// all of its subscribers. Change it after the change `skip` sees.
+    fn generation(&self) -> Option<u64>;
+    fn skip(&self, frame: &FrameMeta<'_>) -> bool;
 }
 
 /// (major type, argument) of the item at `i`; definite lengths only (DAG-CBOR).
@@ -284,6 +444,13 @@ pub struct Firehose {
     /// The ring holds every event with seq > ring_floor (the start floor
     /// until the ring evicts). Older cursors are backfilled from S3.
     ring_floor: AtomicI64,
+    /// `ring_floor` as a log key (the same unless renumbered). Both change
+    /// under the ring's write lock.
+    ring_floor_key: AtomicI64,
+    renumber: OnceLock<Arc<dyn Renumber>>,
+    filter: OnceLock<Arc<dyn FrameFilter>>,
+    /// False while renumbered and not anchored yet: nothing is served.
+    ready: watch::Sender<bool>,
     /// The merged stream's start floor F: events <= F are only served by the
     /// S3 backfill.
     start_floor: i64,
@@ -320,6 +487,10 @@ impl Firehose {
             last_emitted: AtomicI64::new(0),
             sources: RwLock::new(HashMap::new()),
             ring_floor: AtomicI64::new(floor),
+            ring_floor_key: AtomicI64::new(floor),
+            renumber: OnceLock::new(),
+            filter: OnceLock::new(),
+            ready: watch::channel(true).0,
             start_floor: floor,
             settled: AtomicI64::new(i64::MIN),
             store: RwLock::new(None),
@@ -396,6 +567,43 @@ impl Firehose {
         self.frozen.store(true, Ordering::Release);
     }
 
+    /// Serves renumbered seqs (see [`Renumber`]). Set before `spawn_merger`.
+    pub fn set_renumber(&self, r: Arc<dyn Renumber>) {
+        if self.renumber.set(r).is_ok() {
+            self.ready.send_replace(false);
+        }
+    }
+
+    pub fn renumbered(&self) -> bool {
+        self.renumber.get().is_some()
+    }
+
+    /// Leaves the frames `f` skips out of every subscriber's stream (see
+    /// [`FrameFilter`]). Set once, before serving.
+    pub fn set_filter(&self, f: Arc<dyn FrameFilter>) {
+        let _ = self.filter.set(f);
+    }
+
+    /// (ring floor, its key), read together.
+    fn ring_floors(&self) -> (i64, i64) {
+        let _ring = self.ring.read();
+        (self.ring_floor.load(Ordering::Acquire), self.ring_floor_key.load(Ordering::Acquire))
+    }
+
+    /// The log key of the event with seq `seq` if it's in the ring, else
+    /// the ring floor's key if it's older (None: newer than the head).
+    pub fn key_at(&self, seq: i64) -> Option<i64> {
+        let ring = self.ring.read();
+        let i = ring.partition_point(|b| b.last < seq);
+        match ring.get(i) {
+            Some(b) if b.first <= seq => {
+                Some(b.key(b.events.partition_point(|(s, _)| *s < seq).min(b.events.len() - 1)))
+            }
+            Some(_) => Some(self.ring_floor_key.load(Ordering::Acquire)),
+            None => None,
+        }
+    }
+
     /// Over this many queued bytes, logs are spilled (see `spawn_merger`).
     pub fn set_max_queue_bytes(&self, n: usize) {
         self.max_queue_bytes.store(n, Ordering::Relaxed);
@@ -428,6 +636,11 @@ impl Firehose {
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut behind = false;
             let mut pushed = 0u64;
+            let renumber = fh.renumber.get().cloned();
+            // the seq of the last event emitted, once anchored
+            let mut seq: Option<i64> = None;
+            let mut anchoring: Option<tokio::task::JoinHandle<anyhow::Result<i64>>> = None;
+            let mut anchor_retry = tokio::time::Instant::now();
             loop {
                 if !behind {
                     tick.tick().await;
@@ -504,6 +717,35 @@ impl Firehose {
                 if late > 0 {
                     tracing::warn!(late, emitted, "firehose merger: dropped late events below the emitted watermark");
                 }
+                if let Some(r) = renumber.as_ref().filter(|_| seq.is_none()) {
+                    if anchoring.is_none()
+                        && fh.settled.load(Ordering::Acquire) >= fh.start_floor
+                        && tokio::time::Instant::now() >= anchor_retry
+                    {
+                        anchoring = Some(tokio::spawn(r.anchor(fh.start_floor)));
+                    }
+                    if anchoring.as_ref().is_some_and(|j| j.is_finished()) {
+                        match anchoring.take().expect("checked").await {
+                            Ok(Ok(n)) => {
+                                tracing::info!(key = fh.start_floor, seq = n, "firehose: stream seqs anchored");
+                                seq = Some(n);
+                                {
+                                    let _ring = fh.ring.write();
+                                    fh.ring_floor.store(n, Ordering::Release);
+                                }
+                                fh.last_emitted.store(n, Ordering::Release);
+                                fh.ready.send_replace(true);
+                            }
+                            Ok(Err(e)) => tracing::warn!("firehose: anchoring stream seqs failed, retrying: {e:#}"),
+                            Err(e) => tracing::warn!("firehose: anchoring stream seqs failed, retrying: {e}"),
+                        }
+                        anchor_retry = tokio::time::Instant::now() + Duration::from_millis(500);
+                    }
+                    // nothing leaves the queues until seqs can be numbered
+                    if seq.is_none() {
+                        bound = bound.min(fh.start_floor);
+                    }
+                }
                 let mut out = Vec::new();
                 for lq in logs.values_mut() {
                     while let Some((seq, f)) = lq.q.front() {
@@ -526,16 +768,28 @@ impl Firehose {
                 fh.queued_bytes.store(total, Ordering::Relaxed);
                 metrics::FIREHOSE_MERGE_QUEUE_BYTES.set(total as i64);
                 if out.is_empty() {
+                    if let (Some(r), Some(n)) = (&renumber, seq) {
+                        r.emitted(&[], n + 1, emitted);
+                    }
                     continue;
                 }
                 out.sort_unstable_by_key(|(s, _)| *s);
-                let batch = Arc::new(MergedBatch::new(out, pushed));
+                let batch = match (&renumber, seq) {
+                    (Some(r), Some(n)) => {
+                        let b = MergedBatch::renumbered(out, n + 1, r.as_ref(), pushed);
+                        seq = Some(b.last);
+                        r.emitted(&b.keys, b.first, emitted);
+                        b
+                    }
+                    _ => MergedBatch::new(out, pushed),
+                };
+                let batch = Arc::new(batch);
                 pushed = batch.end;
                 STATS.firehose_events.fetch_add(batch.events.len() as u64, Ordering::Relaxed);
                 metrics::FIREHOSE_EVENTS.inc_by(batch.events.len() as u64);
                 metrics::FIREHOSE_BATCH.observe(batch.events.len() as f64);
                 metrics::FIREHOSE_EMIT_DELAY
-                    .observe(crate::tid::now_micros().saturating_sub((batch.first >> 8) as u64) as f64 / 1e6);
+                    .observe(crate::tid::now_micros().saturating_sub((batch.key(0) >> 8) as u64) as f64 / 1e6);
                 fh.push(batch);
             }
         }));
@@ -549,6 +803,7 @@ impl Firehose {
             while self.ring_bytes.load(Ordering::Relaxed) > self.max_ring_bytes && ring.len() > 1 {
                 let old = ring.pop_front().unwrap();
                 self.ring_floor.fetch_max(old.last, Ordering::AcqRel);
+                self.ring_floor_key.fetch_max(old.last_key(), Ordering::AcqRel);
                 self.ring_bytes.fetch_sub(old.bytes as i64, Ordering::Relaxed);
             }
         }
@@ -587,11 +842,25 @@ impl Firehose {
     /// past it.
     pub fn upgrade(
         self: &Arc<Self>,
-        mut req: axum::extract::Request,
+        req: axum::extract::Request,
         cursor: Option<i64>,
         shard: Option<SlotRange>,
         client: Option<std::net::IpAddr>,
     ) -> Response {
+        self.upgrade_tracked(req, cursor, shard, client, None)
+    }
+
+    /// [`upgrade`](Self::upgrade), reporting the connection through `conn`
+    /// (which can also kick it).
+    pub fn upgrade_tracked(
+        self: &Arc<Self>,
+        mut req: axum::extract::Request,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        client: Option<std::net::IpAddr>,
+        conn: Option<Arc<ConnStats>>,
+    ) -> Response {
+        let closed = conn.map(ClosedOnDrop);
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
@@ -609,9 +878,19 @@ impl Firehose {
         let fh = self.clone();
         self.runtime.spawn(async move {
             let _slot = slot;
-            match on_upgrade.await {
-                Ok(up) => fh.serve(up, cursor, shard).await,
-                Err(e) => tracing::debug!("subscribeRepos upgrade failed: {e}"),
+            let up = match on_upgrade.await {
+                Ok(up) => up,
+                Err(e) => return tracing::debug!("subscribeRepos upgrade failed: {e}"),
+            };
+            match closed.as_ref().map(|c| c.0.clone()) {
+                // dropping `serve` closes the socket wherever it was waiting
+                Some(c) => {
+                    tokio::select! {
+                        _ = fh.serve(up, cursor, shard, Some(c.clone())) => {}
+                        _ = c.kick.notified() => {}
+                    }
+                }
+                None => fh.serve(up, cursor, shard, None).await,
             }
         });
         (
@@ -644,17 +923,24 @@ impl Firehose {
         self.per_ip.lock().get(&ip_key(ip)).copied().unwrap_or(0)
     }
 
-    async fn serve(self: Arc<Self>, up: hyper::upgrade::Upgraded, cursor: Option<i64>, shard: Option<SlotRange>) {
+    async fn serve(
+        self: Arc<Self>,
+        up: hyper::upgrade::Upgraded,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        conn: Option<Arc<ConnStats>>,
+    ) {
         use hyper_util::rt::TokioIo;
         use tokio::net::TcpStream;
-        metrics::FIREHOSE_SUBSCRIBERS.inc();
+        // this future is only dropped unfinished by a kick (or a runtime shutdown)
+        let mut sub = Subscribed::new("kicked");
         // Move the socket onto this runtime's reactor (it was accepted on
         // the request runtime), so its readiness events are ours too.
         let reason = match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(up) {
             Ok(parts) => match parts.io.into_inner().into_std().and_then(TcpStream::from_std) {
                 Ok(tcp) => {
                     let (r, w) = tcp.into_split();
-                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard).await
+                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard, conn).await
                 }
                 Err(e) => {
                     tracing::debug!("subscribeRepos socket: {e}");
@@ -666,27 +952,32 @@ impl Firehose {
                     "subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO"
                 );
                 let (r, w) = tokio::io::split(TokioIo::new(up));
-                self.serve_conn(r, w, cursor, shard).await
+                self.serve_conn(r, w, cursor, shard, conn).await
             }
         };
-        metrics::FIREHOSE_SUBSCRIBERS.dec();
-        metrics::FIREHOSE_DISCONNECTS.with_label_values(&[reason]).inc();
+        sub.reason = reason;
     }
 
-    async fn serve_conn<R, W>(&self, r: R, w: W, cursor: Option<i64>, shard: Option<SlotRange>) -> &'static str
+    async fn serve_conn<R, W>(
+        &self,
+        r: R,
+        w: W,
+        cursor: Option<i64>,
+        shard: Option<SlotRange>,
+        conn: Option<Arc<ConnStats>>,
+    ) -> &'static str
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin,
     {
         let (ctl_tx, ctl) = mpsc::channel(8);
-        let reader = tokio::spawn(read_client(r, ctl_tx));
-        let mut out = Out { w, ctl, idle: self.write_idle };
-        let reason = match self.stream(&mut out, cursor, shard).await {
+        // the read half keeps the socket open until it's aborted, kicks included
+        let _reader = AbortOnDrop(tokio::spawn(read_client(r, ctl_tx)));
+        let mut out = Out { w, ctl, idle: self.write_idle, conn };
+        match self.stream(&mut out, cursor, shard).await {
             Ok(()) => "shutdown",
             Err(reason) => reason,
-        };
-        reader.abort();
-        reason
+        }
     }
 
     async fn stream<W: AsyncWrite + Unpin>(
@@ -696,6 +987,13 @@ impl Firehose {
         shard: Option<SlotRange>,
     ) -> Result<(), &'static str> {
         let mut head = self.head.subscribe();
+        let mut ready = self.ready.subscribe();
+        while !*ready.borrow_and_update() {
+            tokio::select! {
+                r = ready.changed() => if r.is_err() { return Ok(()) },
+                c = out.ctl.recv() => out.control(c).await?,
+            }
+        }
         let mut last = match cursor {
             Some(c) => c,
             // the ring holds everything above its floor
@@ -703,9 +1001,24 @@ impl Firehose {
         };
         if let Some(c) = cursor {
             // seqs are time-based: a cursor beyond both the stream head and the
-            // current clock can't have been issued by us
-            let now = crate::nodelog::seq_floor(crate::tid::now_micros()) | 0xff;
-            if c > self.last_emitted.load(Ordering::Acquire).max(now) {
+            // current clock can't have been issued by us. Renumbered seqs
+            // aren't: another node's stream may just be ahead of ours (an
+            // edge trails the cores), so give ours a moment to get there.
+            let future = if self.renumbered() {
+                let deadline = tokio::time::Instant::now() + FUTURE_CURSOR_GRACE;
+                while c > self.last_emitted.load(Ordering::Acquire) && tokio::time::Instant::now() < deadline {
+                    tokio::select! {
+                        _ = head.changed() => {}
+                        _ = tokio::time::sleep_until(deadline) => {}
+                        c = out.ctl.recv() => out.control(c).await?,
+                    }
+                }
+                c > self.last_emitted.load(Ordering::Acquire)
+            } else {
+                let now = crate::nodelog::seq_floor(crate::tid::now_micros()) | 0xff;
+                c > self.last_emitted.load(Ordering::Acquire).max(now)
+            };
+            if future {
                 out.finish(&events::error_frame("FutureCursor", "cursor in the future")).await;
                 return Err("future_cursor");
             }
@@ -757,23 +1070,26 @@ impl Firehose {
                 if i == b.events.len() {
                     continue;
                 }
-                let sent = match &shard {
-                    None => {
+                let skip = self.filter.get().and_then(|f| b.skipped(f.as_ref()));
+                let (sent, bytes) = match (&shard, &skip) {
+                    (None, None) => {
                         let wire = b.wire_from(i);
                         out.send_live(&mut [std::io::IoSlice::new(&wire)], &mut head, b.start(), allowance).await?;
-                        b.events.len() - i
+                        (b.events.len() - i, wire.len())
                     }
-                    // only the matching events: each run of them is one
-                    // slice of the shared bytes, all written in one go
-                    Some(range) => {
-                        let (mut runs, n) = b.wire_runs(i, range);
+                    // only the kept events: each run of them is one slice
+                    // of the shared bytes, all written in one go
+                    _ => {
+                        let (mut runs, n) = b.wire_runs(i, shard.as_ref(), skip.as_deref());
+                        let len = runs.iter().map(|r| r.len()).sum();
                         if n > 0 {
                             out.send_live(&mut runs, &mut head, b.start(), allowance).await?;
                         }
-                        n
+                        (n, len)
                     }
                 };
                 metrics::FIREHOSE_SENT.inc_by(sent as u64);
+                out.sent(sent, bytes, b.last);
                 last = b.last;
                 sent_to = Some(b.end);
                 while let Ok(c) = out.ctl.try_recv() {
@@ -787,6 +1103,18 @@ impl Firehose {
     /// reaches back to `last` (the floor moves while it backfills); history
     /// that's gone is skipped with an `OutdatedCursor` info.
     async fn catch_up<W: AsyncWrite + Unpin>(
+        &self,
+        out: &mut Out<W>,
+        last: &mut i64,
+        shard: Option<SlotRange>,
+    ) -> Result<(), &'static str> {
+        out.set_backfilling(true);
+        let r = self.catch_up_from_bucket(out, last, shard).await;
+        out.set_backfilling(false);
+        r
+    }
+
+    async fn catch_up_from_bucket<W: AsyncWrite + Unpin>(
         &self,
         out: &mut Out<W>,
         last: &mut i64,
@@ -818,8 +1146,9 @@ impl Firehose {
         let (mut overtaken, mut failures) = (0u32, 0u32);
         // a running-backfill slot, taken once there is something to read
         let mut slot: Option<BackfillSlot> = None;
+        let renumber = self.renumber.get().cloned();
         loop {
-            let floor = self.ring_floor.load(Ordering::Acquire);
+            let (floor, floor_key) = self.ring_floors();
             if *last >= floor {
                 return Ok(true);
             }
@@ -827,10 +1156,10 @@ impl Firehose {
             // watermark: its events <= F may not be in S3 yet. Wait for the
             // merger to settle past it, answering the client meanwhile (and
             // noticing it leave).
-            if self.settled.load(Ordering::Acquire) < floor {
+            if self.settled.load(Ordering::Acquire) < floor_key {
                 let mut settled = self.settled_tx.subscribe();
                 tokio::select! {
-                    _ = async { settled.wait_for(|s| *s >= floor).await.is_ok() } => {}
+                    _ = async { settled.wait_for(|s| *s >= floor_key).await.is_ok() } => {}
                     c = out.ctl.recv() => out.control(c).await?,
                     // the floor moves as the ring evicts: look again
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -841,39 +1170,112 @@ impl Firehose {
                 slot = Some(self.backfill_slot(out).await?);
                 continue; // the floor moved while it waited
             }
-            // older than what log retention deleted: OutdatedCursor, then the
-            // oldest events left (retention.rs raises this before deleting)
-            match crate::retention::retained_floor(&reader.store).await {
-                Ok(pruned) if *last < pruned => {
-                    out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
-                    *last = pruned;
-                    continue;
+            // Where to read from, in keys, and the seq of the last event at
+            // or below it (renumbered: the next event read is `seq + 1`).
+            let (from, mut seq) = match &renumber {
+                None => {
+                    // older than what log retention deleted: OutdatedCursor, then the
+                    // oldest events left (retention.rs raises this before deleting)
+                    match crate::retention::retained_floor(&reader.store).await {
+                        Ok(pruned) if *last < pruned => {
+                            out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
+                            *last = pruned;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
+                    }
+                    (*last, *last)
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("reading the retained floor failed: {e:#}"),
-            }
+                Some(r) => match r.locate(*last).await {
+                    Ok((key, seq)) if seq > *last => {
+                        out.send(&info_frame("OutdatedCursor", OUTDATED_CURSOR)).await?;
+                        *last = seq;
+                        if seq >= floor {
+                            // what's left starts in the ring
+                            continue;
+                        }
+                        (key, seq)
+                    }
+                    Ok(v) => v,
+                    Err(e) => {
+                        failures += 1;
+                        if failures >= BACKFILL_ATTEMPTS {
+                            tracing::warn!(
+                                after = *last,
+                                "firehose backfill: locating the cursor failed, disconnecting: {e:#}"
+                            );
+                            out.close(1011).await;
+                            return Err("backfill_failed");
+                        }
+                        tracing::warn!(after = *last, "firehose backfill: locating the cursor failed, retrying: {e:#}");
+                        tokio::time::sleep(Duration::from_millis(100) * failures).await;
+                        continue;
+                    }
+                },
+            };
             let (tx, mut rx) = mpsc::channel(BACKFILL_CHANNEL);
-            let (r, from) = (reader.clone(), *last);
+            let r = reader.clone();
             let mut job =
-                AbortOnDrop(tokio::spawn(async move { crate::backfill::backfill_with(&r, from, floor, &tx).await }));
+                AbortOnDrop(tokio::spawn(
+                    async move { crate::backfill::backfill_with(&r, from, floor_key, &tx).await },
+                ));
             let mut chunk = Vec::with_capacity(1024);
             let mut buf = Vec::new();
+            let mut frame = Vec::new();
             while rx.recv_many(&mut chunk, 1024).await > 0 {
                 buf.clear();
-                for (_, f) in &chunk {
-                    push_message(&mut buf, OP_BINARY, f);
+                let mut n = 0;
+                let filter = self.filter.get().filter(|f| f.generation().is_some());
+                let skip = |f: &[u8]| filter.is_some_and(|x| x.skip(&frame_meta(f)));
+                for (key, f) in &chunk {
+                    match &renumber {
+                        None => {
+                            seq = *key;
+                            if skip(f) {
+                                continue;
+                            }
+                            push_message(&mut buf, OP_BINARY, f);
+                        }
+                        Some(r) => {
+                            seq += 1;
+                            // the read started at a checkpoint before the cursor
+                            if seq <= *last || skip(f) {
+                                continue;
+                            }
+                            frame.clear();
+                            r.splice(f, seq, &mut frame);
+                            push_message(&mut buf, OP_BINARY, &frame);
+                        }
+                    }
+                    n += 1;
+                }
+                chunk.clear();
+                if n == 0 {
+                    continue;
                 }
                 out.write(&buf).await?;
-                metrics::FIREHOSE_SENT.inc_by(chunk.len() as u64);
-                metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(chunk.len() as u64);
-                *last = chunk.last().expect("non-empty").0;
-                chunk.clear();
+                metrics::FIREHOSE_SENT.inc_by(n as u64);
+                metrics::FIREHOSE_BACKFILL_EVENTS.inc_by(n as u64);
+                *last = seq;
+                out.sent(n, buf.len(), *last);
                 while let Ok(c) = out.ctl.try_recv() {
                     out.control(Some(c)).await?;
                 }
             }
             let err = match (&mut job.0).await {
                 Ok(Ok(_)) => {
+                    if renumber.is_some() && seq != floor {
+                        // the bucket and the merged stream disagree on how
+                        // many events there are: a numbering bug
+                        tracing::error!(
+                            from,
+                            floor_key,
+                            read_to = seq,
+                            floor,
+                            "firehose backfill: stream seqs don't match the bucket"
+                        );
+                    }
                     *last = (*last).max(floor); // everything <= floor that exists was sent
                     (overtaken, failures) = (0, 0);
                     continue;
@@ -910,7 +1312,68 @@ impl Firehose {
     }
 }
 
+/// One subscriber's progress, for an operator's view of who is connected
+/// (opt-in: [`Firehose::upgrade_tracked`]). Updated once per batch written.
+#[derive(Default)]
+pub struct ConnStats {
+    /// Events written to the subscriber.
+    pub events: AtomicU64,
+    /// Bytes of those events' messages.
+    pub bytes: AtomicU64,
+    /// Stream position: the newest seq passed (0 = none yet). A sharded
+    /// subscriber passes events it isn't sent.
+    pub last_seq: AtomicI64,
+    /// Streaming from the bucket rather than the ring.
+    pub backfilling: AtomicBool,
+    /// The connection ended (or never started), however it ended.
+    pub closed: AtomicBool,
+    kick: tokio::sync::Notify,
+}
+
+impl ConnStats {
+    /// Disconnects the subscriber at once, even an idle one.
+    pub fn kick(&self) {
+        // notify_one keeps a permit: a kick before the upgrade completes isn't lost
+        self.kick.notify_one();
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+}
+
+struct ClosedOnDrop(Arc<ConnStats>);
+
+impl Drop for ClosedOnDrop {
+    fn drop(&mut self) {
+        self.0.closed.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A served subscriber, counted out with its disconnect reason when its
+/// serve future ends or is dropped.
+struct Subscribed {
+    reason: &'static str,
+}
+
+impl Subscribed {
+    fn new(reason: &'static str) -> Subscribed {
+        metrics::FIREHOSE_SUBSCRIBERS.inc();
+        Subscribed { reason }
+    }
+}
+
+impl Drop for Subscribed {
+    fn drop(&mut self) {
+        metrics::FIREHOSE_SUBSCRIBERS.dec();
+        metrics::FIREHOSE_DISCONNECTS.with_label_values(&[self.reason]).inc();
+    }
+}
+
 const BACKFILL_ATTEMPTS: u32 = 3;
+/// How long a renumbered stream waits to reach a cursor past its head
+/// before calling it FutureCursor.
+const FUTURE_CURSOR_GRACE: Duration = Duration::from_secs(2);
 /// Frames between a backfill reader and its subscriber's writer (they are
 /// slices of segments the reader holds anyway).
 const BACKFILL_CHANNEL: usize = 1024;
@@ -1218,9 +1681,24 @@ struct Out<W> {
     ctl: mpsc::Receiver<Ctl>,
     /// Longest a write outside the live path may go without progress.
     idle: Duration,
+    conn: Option<Arc<ConnStats>>,
 }
 
 impl<W: AsyncWrite + Unpin> Out<W> {
+    fn sent(&self, events: usize, bytes: usize, last_seq: i64) {
+        if let Some(c) = &self.conn {
+            c.events.fetch_add(events as u64, Ordering::Relaxed);
+            c.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+            c.last_seq.store(last_seq, Ordering::Relaxed);
+        }
+    }
+
+    fn set_backfilling(&self, on: bool) {
+        if let Some(c) = &self.conn {
+            c.backfilling.store(on, Ordering::Relaxed);
+        }
+    }
+
     /// Writes `data`; a client that takes nothing for `idle` is dropped
     /// (the live path bounds lag instead, `send_live`).
     async fn write(&mut self, data: &[u8]) -> Result<(), &'static str> {
@@ -1388,45 +1866,42 @@ mod tests {
     use crate::segment::SegmentBuilder;
     use object_store::{ObjectStoreExt, PutPayload};
 
+    /// A #commit, #sync, #identity or #account (by `kind % 4`) for `did`.
+    fn kind_frame(kind: usize, did: &str, seq: i64) -> Bytes {
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let f = match kind % 4 {
+            0 => {
+                let ops = [
+                    events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
+                    events::RepoOp { action: "update", path: "app.bsky.feed.like/3j", cid: Some(cid), prev: Some(cid) },
+                ];
+                events::commit_frame(&events::CommitFrame {
+                    repo: did,
+                    rev: "3kabc",
+                    since: Some("3kabb"),
+                    commit: cid,
+                    prev_data: Some(cid),
+                    blocks: &[7u8; 300],
+                    ops: &ops,
+                    time: "2026-01-01T00:00:00Z",
+                })
+            }
+            1 => events::sync_frame(did, "3kabc", &[1, 2, 3], "t"),
+            2 => events::identity_frame(did, "a.test", "t"),
+            _ => events::account_frame(did, false, Some("takendown"), "t"),
+        };
+        let mut out = Vec::new();
+        f.finish(seq, &mut out);
+        Bytes::from(out)
+    }
+
     /// event_slot finds the repo of every event kind (a #commit's `repo`
     /// sits after its ops), and wire_runs writes exactly the matching
     /// events' messages, one slice per run.
     #[test]
     fn event_slots_and_runs() {
-        let cid = crate::cid::Cid::dag_cbor(b"x");
         let dids: Vec<String> = (0..64).map(crate::state::bulk_did).collect();
-        let frame = |i: usize| -> Bytes {
-            let did = dids[i].as_str();
-            let f = match i % 4 {
-                0 => {
-                    let ops = [
-                        events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
-                        events::RepoOp {
-                            action: "update",
-                            path: "app.bsky.feed.like/3j",
-                            cid: Some(cid),
-                            prev: Some(cid),
-                        },
-                    ];
-                    events::commit_frame(&events::CommitFrame {
-                        repo: did,
-                        rev: "3kabc",
-                        since: Some("3kabb"),
-                        commit: cid,
-                        prev_data: Some(cid),
-                        blocks: &[7u8; 300],
-                        ops: &ops,
-                        time: "2026-01-01T00:00:00Z",
-                    })
-                }
-                1 => events::sync_frame(did, "3kabc", &[1, 2, 3], "t"),
-                2 => events::identity_frame(did, "a.test", "t"),
-                _ => events::account_frame(did, false, Some("takendown"), "t"),
-            };
-            let mut out = Vec::new();
-            f.finish(1000 + i as i64, &mut out);
-            Bytes::from(out)
-        };
+        let frame = |i: usize| kind_frame(i, &dids[i], 1000 + i as i64);
         let evs: Vec<(i64, Bytes)> = (0..dids.len()).map(|i| (1000 + i as i64, frame(i))).collect();
         for (i, (_, f)) in evs.iter().enumerate() {
             assert_eq!(event_slot(f), crate::slots::slot_of(&dids[i]), "event {i}");
@@ -1438,7 +1913,7 @@ mod tests {
             for k in 0..n {
                 let range = SlotRange::new(k, n).unwrap();
                 for from in [0, 17] {
-                    let (runs, count) = batch.wire_runs(from, &range);
+                    let (runs, count) = batch.wire_runs(from, Some(&range), None);
                     let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
                     let want: Vec<(i64, Bytes)> =
                         evs[from..].iter().filter(|(_, f)| range.contains(event_slot(f))).cloned().collect();
@@ -1451,6 +1926,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Skips #commit and #sync frames of one DID while it's set.
+    #[derive(Default)]
+    struct SkipDid {
+        did: parking_lot::Mutex<Option<String>>,
+        generation: AtomicU64,
+        calls: AtomicUsize,
+    }
+
+    impl SkipDid {
+        fn set(&self, did: Option<&str>) {
+            *self.did.lock() = did.map(String::from);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl FrameFilter for SkipDid {
+        fn generation(&self) -> Option<u64> {
+            self.did.lock().is_some().then(|| self.generation.load(Ordering::Acquire))
+        }
+        fn skip(&self, f: &FrameMeta<'_>) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            matches!(f.kind, FrameKind::Commit | FrameKind::Sync)
+                && f.did == self.did.lock().as_deref().map(str::as_bytes)
+        }
+    }
+
+    /// frame_meta reads each kind's own DID key, even with the other one
+    /// in the frame, and never panics on garbage.
+    #[test]
+    fn frame_meta_reads_the_kind_and_its_did() {
+        use crate::cbor::*;
+        let did = crate::state::bulk_did(1);
+        for (k, kind) in
+            [FrameKind::Commit, FrameKind::Sync, FrameKind::Identity, FrameKind::Account].into_iter().enumerate()
+        {
+            let f = kind_frame(k, &did, 7);
+            assert_eq!(frame_meta(&f), FrameMeta { kind, did: Some(did.as_bytes()) });
+        }
+        // a #commit carrying a `did` (sorted first) is still its `repo`'s
+        let mut f = Vec::new();
+        write_map_head(&mut f, 2);
+        write_text(&mut f, "t");
+        write_text(&mut f, "#commit");
+        write_text(&mut f, "op");
+        write_uint(&mut f, 1);
+        write_map_head(&mut f, 2);
+        write_text(&mut f, "did");
+        write_text(&mut f, "did:plc:other");
+        write_text(&mut f, "repo");
+        write_text(&mut f, "did:plc:real");
+        assert_eq!(frame_meta(&f), FrameMeta { kind: FrameKind::Commit, did: Some(b"did:plc:real".as_slice()) });
+        let info = info_frame("OutdatedCursor", "x");
+        assert_eq!(frame_meta(&info), FrameMeta { kind: FrameKind::Other, did: None });
+        let full = kind_frame(0, &did, 7);
+        for n in 0..full.len() {
+            let m = frame_meta(&full[..n]);
+            assert!(m.did.is_none_or(|d| d == did.as_bytes()), "truncated at {n}");
+        }
+        assert_eq!(frame_meta(b"").kind, FrameKind::Other);
+    }
+
+    /// A batch asks the filter once per generation (every subscriber shares
+    /// the verdicts), reports none skipped when nothing matches, and its
+    /// runs leave out exactly the skipped events, with or without a shard.
+    #[test]
+    fn filtered_runs_skip_exactly_the_marked_events() {
+        let dids: Vec<String> = (0..4).map(crate::state::bulk_did).collect();
+        let evs: Vec<(i64, Bytes)> =
+            (0..64).map(|i| (1000 + i as i64, kind_frame(i % 4, &dids[(i / 4) % 4], 1000 + i as i64))).collect();
+        let batch = MergedBatch::new(evs.clone(), 0);
+        let filter = SkipDid::default();
+        assert!(batch.skipped(&filter).is_none());
+        assert_eq!(filter.calls.load(Ordering::Relaxed), 0, "no generation: frames aren't parsed");
+        filter.set(Some("did:plc:nobody"));
+        assert!(batch.skipped(&filter).is_none());
+        filter.set(Some(&dids[1]));
+        let calls = filter.calls.load(Ordering::Relaxed);
+        let skip = batch.skipped(&filter).expect("did 1's commits and syncs");
+        assert!(Arc::ptr_eq(&skip, &batch.skipped(&filter).unwrap()));
+        assert_eq!(filter.calls.load(Ordering::Relaxed), calls + evs.len(), "once per generation");
+        let want_skip = |i: usize| (i / 4) % 4 == 1 && i % 4 < 2;
+        assert_eq!(skip.iter().filter(|s| **s).count(), 8);
+        assert!(skip.iter().enumerate().all(|(i, s)| *s == want_skip(i)));
+        let range = SlotRange::new(1, 2).unwrap();
+        for shard in [None, Some(&range)] {
+            for from in [0, 5, 63] {
+                let (runs, count) = batch.wire_runs(from, shard, Some(&skip));
+                let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
+                let mut want = Vec::new();
+                let mut n = 0;
+                for (i, (_, f)) in evs.iter().enumerate().skip(from) {
+                    if !want_skip(i) && shard.is_none_or(|r| r.contains(event_slot(f))) {
+                        push_message(&mut want, OP_BINARY, f);
+                        n += 1;
+                    }
+                }
+                assert_eq!((got, count), (want, n), "shard {shard:?} from {from}");
+            }
+        }
+        filter.set(None);
+        assert!(batch.skipped(&filter).is_none(), "lifted: everything again");
+    }
+
+    /// The filter's cost (ignored; --ignored --nocapture): the verdicts for
+    /// a 2,000-event batch against a 10,000-DID set, once per batch, and
+    /// the runs each of 16 subscribers then writes.
+    #[test]
+    #[ignore]
+    fn frame_filter_cost() {
+        struct Set(std::collections::HashSet<Vec<u8>>);
+        impl FrameFilter for Set {
+            fn generation(&self) -> Option<u64> {
+                Some(1)
+            }
+            fn skip(&self, f: &FrameMeta<'_>) -> bool {
+                matches!(f.kind, FrameKind::Commit | FrameKind::Sync) && f.did.is_some_and(|d| self.0.contains(d))
+            }
+        }
+        // one taken-down DID in the batch: every subscriber writes runs
+        let set = Set((10_000..20_000u64).chain([7]).map(|i| crate::state::bulk_did(i).into_bytes()).collect());
+        let evs: Vec<(i64, Bytes)> =
+            (0..2000u64).map(|i| (i as i64, kind_frame(0, &crate::state::bulk_did(i), i as i64))).collect();
+        let rounds = 50;
+        let (mut skip_t, mut runs_t) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..rounds {
+            let b = MergedBatch::new(evs.clone(), 0);
+            let t = std::time::Instant::now();
+            std::hint::black_box(b.skipped(&set));
+            skip_t += t.elapsed();
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                let skip = b.skipped(&set);
+                match skip {
+                    None => std::hint::black_box(b.wire_from(0).len()),
+                    Some(s) => std::hint::black_box(b.wire_runs(0, None, Some(&s)).1),
+                };
+            }
+            runs_t += t.elapsed();
+        }
+        let per = |d: Duration| d.as_nanos() as f64 / (rounds * evs.len()) as f64;
+        eprintln!(
+            "filter verdicts: {:.0} ns/event once per batch; 16 subscribers' cached lookups: {:.1} ns/event total",
+            per(skip_t),
+            per(runs_t)
+        );
     }
 
     /// Sharded fan-out cost per event (ignored; --ignored --nocapture):
@@ -1489,7 +2111,7 @@ mod tests {
             slots_t += t.elapsed();
             let t = std::time::Instant::now();
             for k in 0..16 {
-                std::hint::black_box(b.wire_runs(0, &SlotRange::new(k, 16).unwrap()));
+                std::hint::black_box(b.wire_runs(0, Some(&SlotRange::new(k, 16).unwrap()), None));
             }
             runs_t += t.elapsed();
         }
@@ -1515,7 +2137,10 @@ mod tests {
     }
 
     async fn put_seg(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame_len: usize) -> LogBatch {
-        let frame = Bytes::from(vec![ord as u8; frame_len]);
+        put_frame(store, log, ord, seq, Bytes::from(vec![ord as u8; frame_len])).await
+    }
+
+    async fn put_frame(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame: Bytes) -> LogBatch {
         let mut b = SegmentBuilder::new();
         b.push(seq, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(&frame), &[]);
         let mut obj = b.header(log, ord);
@@ -1576,14 +2201,14 @@ mod tests {
     async fn stalled_writes_drop_the_subscriber() {
         let (w, _r) = tokio::io::duplex(64);
         let (_ctl_tx, ctl) = mpsc::channel(1);
-        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100), conn: None };
         let t = std::time::Instant::now();
         assert_eq!(out.write(&[0u8; 4096]).await, Err("write_stalled"));
         assert!(t.elapsed() < Duration::from_secs(2));
         // a reader that keeps taking bytes is fine, however slowly
         let (w, mut r) = tokio::io::duplex(64);
         let (_ctl_tx, ctl) = mpsc::channel(1);
-        let mut out = Out { w, ctl, idle: Duration::from_millis(100) };
+        let mut out = Out { w, ctl, idle: Duration::from_millis(100), conn: None };
         let reader = tokio::spawn(async move {
             let mut buf = [0u8; 512];
             let mut n = 0;
@@ -1596,6 +2221,254 @@ mod tests {
         reader.await.unwrap();
     }
 
+    /// A tracked live subscriber's stats count the events and bytes it was
+    /// sent and its position.
+    #[tokio::test]
+    async fn conn_stats_count_what_was_sent() {
+        let store = crate::store::Store::memory(None);
+        let fh = Firehose::new(Options::default());
+        *fh.store.write() = Some(store.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (tx, rx) = mpsc::unbounded_channel();
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let conn = Arc::new(ConnStats::default());
+        let (w, _r) = tokio::io::duplex(1 << 16);
+        let (_ctl_tx, ctl) = mpsc::channel(1);
+        let mut out = Out { w, ctl, idle: Duration::from_secs(5), conn: Some(conn.clone()) };
+        let fh2 = fh.clone();
+        let streaming = AbortOnDrop(tokio::spawn(async move { fh2.stream(&mut out, None, None).await }));
+        // a live subscriber starts at the head: let it get there first
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for k in 0..3 {
+            tx.send(put_seg(&store, "A", k as u64, seq(k), 100).await).unwrap();
+            wa.store(seq(k), Ordering::Release);
+        }
+        let t = std::time::Instant::now();
+        while conn.events.load(Ordering::Relaxed) < 3 {
+            assert!(t.elapsed() < Duration::from_secs(5), "events {}", conn.events.load(Ordering::Relaxed));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(conn.events.load(Ordering::Relaxed), 3);
+        // each message: the 100-byte frame plus a 2-byte websocket header
+        assert_eq!(conn.bytes.load(Ordering::Relaxed), 3 * 102);
+        assert_eq!(conn.last_seq.load(Ordering::Relaxed), seq(2));
+        assert!(!conn.backfilling.load(Ordering::Relaxed));
+        assert!(!streaming.0.is_finished());
+    }
+
+    /// The websocket messages' payloads, as a subscriber reads them, until
+    /// `n` have come.
+    async fn read_messages(r: &mut tokio::io::DuplexStream, n: usize) -> Vec<Bytes> {
+        let (mut buf, mut out) = (Vec::new(), Vec::new());
+        while out.len() < n {
+            let mut tmp = [0u8; 8192];
+            let k = tokio::time::timeout(Duration::from_secs(5), r.read(&mut tmp))
+                .await
+                .unwrap_or_else(|_| panic!("got {} of {n} messages", out.len()))
+                .unwrap();
+            assert!(k > 0, "closed after {} of {n} messages", out.len());
+            buf.extend_from_slice(&tmp[..k]);
+            loop {
+                if buf.len() < 2 {
+                    break;
+                }
+                let (len, at) = match buf[1] & 0x7f {
+                    126 if buf.len() >= 4 => (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4),
+                    127 if buf.len() >= 10 => (u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize, 10),
+                    126 | 127 => break,
+                    n => (n as usize, 2),
+                };
+                if buf.len() < at + len {
+                    break;
+                }
+                out.push(Bytes::copy_from_slice(&buf[at..at + len]));
+                buf.drain(..at + len);
+            }
+        }
+        out
+    }
+
+    /// A filtered subscriber from an old cursor gets every frame but the
+    /// skipped ones, from the bucket and from the ring, with their seqs
+    /// unchanged; once the filter lets a DID go, its frames come back.
+    #[tokio::test]
+    async fn filter_skips_frames_in_backfill_and_live() {
+        let store = crate::store::Store::memory(None);
+        // the ring keeps only the newest batch: the rest is backfilled
+        let fh = Firehose::new(Options { ring_bytes: 1, ..Options::default() });
+        *fh.store.write() = Some(store.clone());
+        let filter = Arc::new(SkipDid::default());
+        fh.set_filter(filter.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sub = fh.subscribe();
+        let mut last = i64::MIN;
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let dids: Vec<String> = (0..3).map(crate::state::bulk_did).collect();
+        // commits and syncs from 3 DIDs, then DID 0's #account
+        let mut frames: Vec<Bytes> = (0..12).map(|k| kind_frame(k % 2, &dids[k % 3], seq(k as i64))).collect();
+        frames.push(kind_frame(3, &dids[0], seq(12)));
+        for (k, f) in frames.iter().enumerate() {
+            tx.send(put_frame(&store, "A", k as u64, seq(k as i64), f.clone()).await).unwrap();
+            wa.store(seq(k as i64), Ordering::Release);
+            next_batches(&fh, &mut sub, &mut last).await;
+        }
+        assert!(fh.ring_floor.load(Ordering::Acquire) >= seq(11), "older events are only in the bucket");
+        let subscribe = |cursor: i64| {
+            let (w, r) = tokio::io::duplex(1 << 20);
+            let (ctl_tx, ctl) = mpsc::channel(1);
+            let mut out = Out { w, ctl, idle: Duration::from_secs(5), conn: None };
+            let fh = fh.clone();
+            (AbortOnDrop(tokio::spawn(async move { fh.stream(&mut out, Some(cursor), None).await })), r, ctl_tx)
+        };
+        filter.set(Some(&dids[0]));
+        let kept: Vec<Bytes> =
+            frames.iter().enumerate().filter(|(k, _)| k % 3 != 0 || *k == 12).map(|(_, f)| f.clone()).collect();
+        let (_s, mut r, _c) = subscribe(base);
+        assert_eq!(read_messages(&mut r, kept.len()).await, kept);
+        // live: a later commit of DID 0 is skipped, DID 1's isn't
+        let later = [kind_frame(0, &dids[0], seq(13)), kind_frame(0, &dids[1], seq(14))];
+        for (k, f) in later.iter().enumerate() {
+            let k = 13 + k as i64;
+            tx.send(put_frame(&store, "A", k as u64, seq(k), f.clone()).await).unwrap();
+        }
+        wa.store(seq(14), Ordering::Release);
+        assert_eq!(read_messages(&mut r, 1).await, vec![later[1].clone()]);
+        // lifted: the same cursor gets everything again
+        filter.set(None);
+        let all: Vec<Bytes> = frames.iter().chain(later.iter()).cloned().collect();
+        let (_s, mut r, _c) = subscribe(base);
+        assert_eq!(read_messages(&mut r, all.len()).await, all);
+    }
+
+    /// Ring replay fan-out with and without a filter (ignored; --ignored
+    /// --nocapture): 16 subscribers replay the same 40,000 ~5 KB commits
+    /// from the ring into in-memory pipes, with no filter, a filter with an
+    /// empty set, and one whose set hits one DID in 1,000 (most batches
+    /// write runs instead of one slice).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn frame_filter_fanout() {
+        struct Set(std::collections::HashSet<Vec<u8>>);
+        impl FrameFilter for Set {
+            fn generation(&self) -> Option<u64> {
+                (!self.0.is_empty()).then_some(1)
+            }
+            fn skip(&self, f: &FrameMeta<'_>) -> bool {
+                matches!(f.kind, FrameKind::Commit | FrameKind::Sync) && f.did.is_some_and(|d| self.0.contains(d))
+            }
+        }
+        let (n, subs, per_batch) = (40_000usize, 16usize, 500usize);
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let ops = [events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None }];
+        let blocks = vec![7u8; 5000];
+        let frames: Vec<Bytes> = (0..n as u64)
+            .map(|i| {
+                let did = crate::state::bulk_did(i % 5000);
+                let f = events::commit_frame(&events::CommitFrame {
+                    repo: &did,
+                    rev: "3kabc",
+                    since: None,
+                    commit: cid,
+                    prev_data: None,
+                    blocks: &blocks,
+                    ops: &ops,
+                    time: "2026-01-01T00:00:00.000Z",
+                });
+                let mut out = Vec::new();
+                f.finish(i as i64, &mut out);
+                Bytes::from(out)
+            })
+            .collect();
+        let modes: [(&str, Option<Set>); 3] = [
+            ("no filter", None),
+            ("empty set", Some(Set(Default::default()))),
+            (
+                "1 DID in 1,000",
+                Some(Set((0..5000u64).step_by(1000).map(|i| crate::state::bulk_did(i).into_bytes()).collect())),
+            ),
+        ];
+        for (name, filter) in modes {
+            let msg_len = |f: &Bytes| {
+                let mut v = Vec::new();
+                push_message(&mut v, OP_BINARY, &[]);
+                v.len()
+                    + if f.len() < 126 {
+                        0
+                    } else if f.len() <= 65535 {
+                        2
+                    } else {
+                        8
+                    }
+                    + f.len()
+            };
+            let want: usize =
+                frames.iter().filter(|f| filter.as_ref().is_none_or(|s| !s.skip(&frame_meta(f)))).map(msg_len).sum();
+            let mut best = Duration::MAX;
+            let filter = filter.map(Arc::new);
+            for _ in 0..3 {
+                let fh = Firehose::new(Options { ring_bytes: 1 << 30, ..Options::default() });
+                // without one, a cursor gets an OutdatedCursor first
+                *fh.store.write() = Some(crate::store::Store::memory(None));
+                if let Some(f) = &filter {
+                    fh.set_filter(f.clone());
+                }
+                let (_, wa) = fh.add_remote("A");
+                let (tx, rx) = mpsc::unbounded_channel();
+                let mut sub = fh.subscribe();
+                let mut last = i64::MIN;
+                fh.spawn_merger(rx);
+                let base = fh.position();
+                for (b, chunk) in frames.chunks(per_batch).enumerate() {
+                    let events: Vec<(i64, Bytes)> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(j, f)| (base + ((b * per_batch + j) as i64 + 1) * 256, f.clone()))
+                        .collect();
+                    let top = events.last().unwrap().0;
+                    tx.send(LogBatch { log_id: "A".into(), ordinal: b as u64, events }).unwrap();
+                    wa.store(top, Ordering::Release);
+                    next_batches(&fh, &mut sub, &mut last).await;
+                }
+                let t = std::time::Instant::now();
+                let mut tasks = Vec::new();
+                for _ in 0..subs {
+                    let (w, mut r) = tokio::io::duplex(1 << 20);
+                    let (ctl_tx, ctl) = mpsc::channel(1);
+                    let fh = fh.clone();
+                    let s = tokio::spawn(async move {
+                        let mut out = Out { w, ctl, idle: Duration::from_secs(30), conn: None };
+                        let _ctl = ctl_tx;
+                        let _ = fh.stream(&mut out, Some(base), None).await;
+                    });
+                    tasks.push(tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1 << 20];
+                        let mut got = 0;
+                        while got < want {
+                            got += r.read(&mut buf).await.unwrap();
+                        }
+                        s.abort();
+                        got
+                    }));
+                }
+                for t in tasks {
+                    assert_eq!(t.await.unwrap(), want, "{name}");
+                }
+                best = best.min(t.elapsed());
+            }
+            let events = frames.len() as f64 * subs as f64;
+            eprintln!(
+                "{name:>15}: {:.2} GB/s out, {:.2}M events/s across {subs} subscribers (best of 3)",
+                (want * subs) as f64 / best.as_secs_f64() / 1e9,
+                events / best.as_secs_f64() / 1e6,
+            );
+        }
+    }
+
     /// Backfills beyond `max_backfills` wait for a slot (answering their
     /// client meanwhile), and one whose client leaves stops waiting.
     #[tokio::test]
@@ -1604,7 +2477,7 @@ mod tests {
         let out = || {
             let (w, _r) = tokio::io::duplex(1 << 16);
             let (tx, ctl) = mpsc::channel(1);
-            (Out { w, ctl, idle: Duration::from_secs(5) }, tx, _r)
+            (Out { w, ctl, idle: Duration::from_secs(5), conn: None }, tx, _r)
         };
         let (mut a, _a_tx, _ar) = out();
         let first = fh.backfill_slot(&mut a).await.unwrap();

@@ -1421,6 +1421,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             skew: Duration::from_millis(args.lease_ttl_ms / 5),
             clock_offset_ms: 0,
             levels: vlpds::version::Window::BUILD,
+            lease_plane: None,
         }),
         memory_store: None,
         metrics_listen: metrics_addr.clone(),

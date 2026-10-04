@@ -779,11 +779,17 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         let _ = sock.set_nodelay(true);
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
         let (acceptor, builder) = (acceptor.clone(), builder.clone());
+        // set once the handshake has verified the client certificate
+        let identity: Arc<std::sync::OnceLock<crate::peer_tls::PeerIdentity>> = Arc::default();
+        let id = identity.clone();
         let svc = TowerToHyperService::new(Track {
             inner: tower::ServiceExt::map_request(
                 router.clone(),
                 move |mut req: axum::http::Request<hyper::body::Incoming>| {
                     req.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+                    if let Some(id) = id.get() {
+                        req.extensions_mut().insert(id.clone());
+                    }
                     req
                 },
             ),
@@ -812,6 +818,9 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
                                 return;
                             }
                         };
+                    if let Some(id) = crate::peer_tls::PeerIdentity::of(tls.get_ref().1) {
+                        let _ = identity.set(id);
+                    }
                     crate::metrics::HTTP_SERVER_OPEN.inc();
                     let _ = builder.serve_connection_with_upgrades(TokioIo::new(tls), svc).await;
                 }

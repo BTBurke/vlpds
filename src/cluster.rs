@@ -53,6 +53,11 @@ pub struct NodeLease {
     pub max_level: u32,
     /// 0 = not read yet.
     pub seen_level: u32,
+    /// How long this node's oldest log append had waited to be durable at
+    /// the renewal, on its own clock (`ShardHost::pending_age`): peers judge
+    /// a slow log without comparing clocks. Absent unless the host says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_age_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
@@ -95,8 +100,8 @@ const TRIM_SPANS: usize = 8;
 /// only a crash loop that never once opens the shard cleanly gets here.
 const MAX_SPANS: usize = 1024;
 
-fn trim_history(history: &mut Vec<Span>, applied: u64) {
-    if history.len() > TRIM_SPANS {
+fn trim_history(history: &mut Vec<Span>, applied: u64, keep: usize) {
+    if history.len() > keep {
         history.retain(|sp| sp.epoch >= applied);
     }
 }
@@ -125,6 +130,43 @@ pub struct ClusterConfig {
     pub clock_offset_ms: i64,
     /// The build's window; tests pose as other builds.
     pub levels: version::Window,
+    /// Where the lease is renewed. None: the caller's runtime and `store`.
+    pub lease_plane: Option<LeasePlane>,
+}
+
+/// A runtime and an object-store client for lease renewal alone. A node
+/// whose request runtime is saturated (a consumer reconnect storm, a
+/// backfill burst) or whose bucket connections are all busy would otherwise
+/// renew late, lapse and fail-stop. The store must point at the same bucket
+/// and prefix; its own client means its own connections, driven on
+/// `runtime`.
+#[derive(Clone)]
+pub struct LeasePlane {
+    pub runtime: tokio::runtime::Handle,
+    pub store: Store,
+}
+
+impl std::fmt::Debug for LeasePlane {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LeasePlane").finish_non_exhaustive()
+    }
+}
+
+impl LeasePlane {
+    /// One worker thread of its own: renewals are a PUT every fifth of the
+    /// TTL and the watchdog a timer.
+    pub fn new(store: Store) -> LeasePlane {
+        static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        let rt = RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("lease")
+                .enable_all()
+                .build()
+                .expect("lease runtime")
+        });
+        LeasePlane { runtime: rt.handle().clone(), store }
+    }
 }
 
 impl Default for ClusterConfig {
@@ -138,6 +180,7 @@ impl Default for ClusterConfig {
             skew: Duration::from_secs(2),
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
+            lease_plane: None,
         }
     }
 }
@@ -212,6 +255,15 @@ pub trait ShardHost: Send + Sync + 'static {
     async fn refused(&self, _addr: &str) -> bool {
         false
     }
+    /// Joiner with live peers: false holds the join (a host that knows its
+    /// peers can't reach it yet would take shards only to give them up).
+    fn may_join(&self) -> bool {
+        true
+    }
+    /// Published in our lease as `pending_age_ms`. None: not published.
+    fn pending_age(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// What we last saw of a peer's lease, timed on our monotonic clock.
@@ -279,6 +331,13 @@ pub struct Cluster {
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// With a lease plane every renewal runs there: callers elsewhere ask
+    /// its loop (`renew_now`) and wait for a renewal that started after
+    /// they asked (`renew_started`, then `renew_done` carrying its number).
+    renew_now: tokio::sync::Notify,
+    renew_started: AtomicU64,
+    renew_done: tokio::sync::watch::Sender<u64>,
+    on_plane: AtomicBool,
     /// Tests: this in-process node "crashed" (`halt`). Its store calls hang;
     /// it must never fail-stop the shared test process.
     halted: AtomicBool,
@@ -328,6 +387,11 @@ pub struct Cluster {
     /// Tests: list every step even when alone (a unit-test host's greetings
     /// never reach its peers' `learn_peer`).
     pub(crate) list_every_step: AtomicBool,
+    /// `TRIM_SPANS` unless the host set its own (`set_trim_spans`).
+    trim_spans: std::sync::atomic::AtomicUsize,
+    /// `set_revalidate`: a lapsed lease is renewed (if our log is unfenced)
+    /// instead of fail-stopping.
+    revalidate: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -405,6 +469,10 @@ const JOIN_LEASE_RETRIES: u32 = 5;
 
 enum Recreate {
     Done,
+    /// The object is our own renewal: it landed, but its answer was lost
+    /// (a connection reset after the store applied it) and the client's
+    /// retry of the same If-Match failed. Its ETag is ours now.
+    Landed,
     /// Our lease is someone else's now, or our log is fenced: fail-stop.
     Lost,
     /// The next renewal tries again.
@@ -449,6 +517,7 @@ impl Cluster {
                 min_level: cfg.levels.min,
                 max_level: cfg.levels.max,
                 seen_level: 0,
+                pending_age_ms: None,
             }),
             expires_local_ms: AtomicU64::new(0),
             valid_until: RwLock::new(Instant::now()),
@@ -470,6 +539,10 @@ impl Cluster {
             step_lock: tokio::sync::Mutex::new(()),
             gone: AtomicBool::new(false),
             renew_lock: tokio::sync::Mutex::new(()),
+            renew_now: tokio::sync::Notify::new(),
+            renew_started: AtomicU64::new(0),
+            renew_done: tokio::sync::watch::channel(0).0,
+            on_plane: AtomicBool::new(false),
             halted: AtomicBool::new(false),
             bounded: AtomicBool::new(false),
             nudged: tokio::sync::Notify::new(),
@@ -489,6 +562,8 @@ impl Cluster {
             contact: AtomicBool::new(false),
             nodes_listed: parking_lot::Mutex::new((None, 0)),
             list_every_step: AtomicBool::new(false),
+            trim_spans: std::sync::atomic::AtomicUsize::new(TRIM_SPANS),
+            revalidate: AtomicBool::new(false),
             cfg,
         };
         let v = c.ensure_version().await?;
@@ -664,6 +739,17 @@ impl Cluster {
     /// As of its last write, plus flags set since.
     pub fn own_lease(&self) -> NodeLease {
         self.lease.read().clone()
+    }
+
+    /// `node_id`'s lease as the bucket has it now.
+    pub async fn read_lease(&self, node_id: &str) -> anyhow::Result<Option<NodeLease>> {
+        Ok(self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await?.map(|(l, _)| l))
+    }
+
+    /// Whether `lease` expired by its own clock, read against ours with
+    /// the configured skew as margin.
+    pub fn lease_expired(&self, lease: &NodeLease) -> bool {
+        lease.expires_ms + (self.cfg.skew.as_millis() as u64) < self.wall_ms()
     }
 
     /// Once per TTL. An active level outside our window (an operator forced
@@ -860,6 +946,102 @@ impl Cluster {
         *self.policy.write() = p;
     }
 
+    /// Histories longer than `n` spans drop the spans a checkpoint made
+    /// redundant (`ShardHost::checkpointed`). A host whose opens pay per
+    /// span (a relay replays each earlier owner's log) wants 1.
+    pub fn set_trim_spans(&self, n: usize) {
+        self.trim_spans.store(n.max(1), Ordering::Release);
+    }
+
+    fn trim_at(&self) -> usize {
+        self.trim_spans.load(Ordering::Acquire)
+    }
+
+    /// Opt-in for a host whose log holds (rather than fails) while the
+    /// lease is lapsed: a node that wakes from a pause with its lease lapsed
+    /// renews it by CAS on its own lease and goes on if its log is still
+    /// unfenced, instead of fail-stopping. Safety still rests on the fence:
+    /// a peer that presumed us dead fenced our log before taking anything,
+    /// so we see the fence and fail-stop, and a fence landing after our
+    /// check fails our next segment PUT. The watchdog then fail-stops only
+    /// past `revalidate_window`.
+    pub fn set_revalidate(&self, on: bool) {
+        self.revalidate.store(on, Ordering::Release);
+    }
+
+    /// How long past its validity a lapsed lease may still be revalidated.
+    /// Peers presume us dead 2 x skew after it; a TTL more is when the
+    /// slowest of them has surely fenced us.
+    fn revalidate_window(&self) -> Duration {
+        self.cfg.skew * 2 + self.cfg.ttl
+    }
+
+    /// Our lapsed lease: renew it by CAS and check our log isn't fenced.
+    /// The lease counts as valid again only once the check passed. False
+    /// means fail-stop.
+    async fn try_revalidate(&self, host: &Arc<dyn ShardHost>) -> bool {
+        let etag = self.lease_etag.read().clone();
+        let renewed = match self.write_lease_ungranted(if_match(etag)).await {
+            Ok(v) => v,
+            Err(e) => {
+                let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
+                if !moved {
+                    // still lapsed (no validity from a failed write): the
+                    // next renewal retries, the watchdog bounds it
+                    tracing::warn!("revalidating our lapsed node lease failed (will retry): {e:#}");
+                    return true;
+                }
+                // our previous attempt may have landed with its answer lost
+                return match self.recreate_vanished_lease().await {
+                    Recreate::Lost => {
+                        tracing::error!("lapsed node lease was rewritten under us: fail-stop ({e:#})");
+                        false
+                    }
+                    Recreate::Landed => {
+                        crate::metrics::LEASE_EVENTS.with_label_values(&["renewal_landed"]).inc();
+                        tracing::warn!("a revalidation of our lapsed lease landed with its answer lost: adopted it, still lapsed ({e:#})");
+                        true
+                    }
+                    // recreated only after its own fence check
+                    Recreate::Done | Recreate::Retry => true,
+                };
+            }
+        };
+        match self.bounded_any("fence-scan", self.own_log_fenced(host)).await {
+            Ok(false) => {
+                *self.valid_until.write() = renewed;
+                crate::metrics::LEASE_EVENTS.with_label_values(&["revalidated"]).inc();
+                tracing::warn!("node lease had lapsed (a pause?) but our log is unfenced: renewed it and carry on");
+                true
+            }
+            Ok(true) => {
+                tracing::error!("node lease lapsed and our log is fenced: fail-stop");
+                false
+            }
+            Err(e) => {
+                tracing::warn!("checking our log for a fence after revalidating (will retry): {e:#}");
+                true
+            }
+        }
+    }
+
+    /// A peer's fence goes at our log's first hole, which is at or past
+    /// `durable_end` and at most `next_ordinal`: a few GETs, where the scan
+    /// LISTs the whole log (3 s and more on a slow bucket path).
+    async fn own_log_fenced(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<bool> {
+        let (from, to) = (host.durable_end(), host.next_ordinal());
+        if to < from || to - from > 64 {
+            self.count("list");
+            return Ok(crate::nodelog::first_free(&self.store, &self.log_id).await?.1);
+        }
+        let heads = futures::future::try_join_all((from..=to).map(|o| {
+            self.count("get");
+            crate::nodelog::read_head(&self.store, &self.log_id, o)
+        }))
+        .await?;
+        Ok(heads.iter().any(|h| matches!(h, crate::nodelog::Head::Fence)))
+    }
+
     pub fn layout(&self) -> Arc<Layout> {
         self.layout.read().0.clone()
     }
@@ -956,7 +1138,6 @@ impl Cluster {
         self.bounded("put", self.put_json_unbounded(path, v, mode)).await
     }
 
-    /// Renewals: never cancelled.
     async fn put_json_unbounded<T: Serialize>(
         &self,
         path: &Path,
@@ -964,8 +1145,18 @@ impl Cluster {
         mode: PutMode,
     ) -> Result<Option<String>, object_store::Error> {
         self.count("put");
+        Self::put_json_on(&self.store, path, v, mode).await
+    }
+
+    /// Renewals: never cancelled.
+    async fn put_json_on<T: Serialize>(
+        store: &Store,
+        path: &Path,
+        v: &T,
+        mode: PutMode,
+    ) -> Result<Option<String>, object_store::Error> {
         let body = PutPayload::from(serde_json::to_vec(v).unwrap());
-        self.store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
+        store.raw.put_opts(path, body, PutOptions { mode, ..Default::default() }).await.map(|r| r.e_tag)
     }
 
     /// (file name, ETag) of every object under `rel`.
@@ -1025,6 +1216,15 @@ impl Cluster {
     }
 
     async fn write_lease(&self, mode: PutMode) -> anyhow::Result<()> {
+        let valid_until = self.write_lease_ungranted(mode).await?;
+        *self.valid_until.write() = valid_until;
+        Ok(())
+    }
+
+    /// [`Cluster::write_lease`] without granting the validity it earns,
+    /// which it returns: a revalidation grants it only once our log is
+    /// known unfenced, or the log could PUT and ack in between.
+    async fn write_lease_ungranted(&self, mode: PutMode) -> anyhow::Result<Instant> {
         let sent = Instant::now();
         let mut l = self.lease.read().clone();
         l.expires_ms = self.wall_ms() + self.cfg.ttl.as_millis() as u64;
@@ -1033,7 +1233,9 @@ impl Cluster {
         // the send time, so the cap never exceeds what peers read
         let expires_local_ms = now_ms() + self.cfg.ttl.as_millis() as u64;
         l.wm_cap = crate::nodelog::seq_floor(expires_local_ms * 1000);
-        let put = self.put_json_unbounded(&self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        let store = self.cfg.lease_plane.as_ref().map_or(&self.store, |p| &p.store);
+        let put = Self::put_json_on(store, &self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        self.count("put");
         crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
         let etag = put?;
         *self.lease_etag.write() = etag;
@@ -1046,8 +1248,7 @@ impl Cluster {
             cur.wm_cap = l.wm_cap;
         }
         self.expires_local_ms.store(expires_local_ms, Ordering::Release);
-        *self.valid_until.write() = sent + self.cfg.ttl - self.cfg.skew;
-        Ok(())
+        Ok(sent + self.cfg.ttl - self.cfg.skew)
     }
 
     /// True while we may acknowledge writes and PUT segments.
@@ -1203,27 +1404,39 @@ impl Cluster {
         self.spawned.store(true, Ordering::Release);
         // Renewals get their own loop: a step makes O(shards) store calls,
         // and one slow step must not let the lease lapse.
+        let spawn = |f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>| match &self.cfg.lease_plane {
+            Some(p) => drop(p.runtime.spawn(f)),
+            None => drop(tokio::spawn(f)),
+        };
         let me = self.clone();
         let h = host.clone();
-        tokio::spawn(async move {
+        self.on_plane.store(self.cfg.lease_plane.is_some(), Ordering::Release);
+        spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = me.renew_now.notified() => {}
+                }
                 // keeps renewing through a graceful shutdown's drain
                 if me.gone.load(Ordering::Acquire) {
+                    me.on_plane.store(false, Ordering::Release);
+                    me.renew_done.send_replace(u64::MAX);
                     return;
                 }
-                me.renew(&h).await;
+                let n = me.renew_started.fetch_add(1, Ordering::AcqRel) + 1;
+                me.renew_here(&h).await;
+                me.renew_done.send_replace(n);
             }
-        });
+        }));
         // Watchdog: a node whose store calls hang never reaches the
         // validity checks before a PUT or ack, and would hold requests open
         // as a zombie. Peers presume us dead no earlier than 2 x skew after
         // our validity ends: by then we can never ack again, so fail-stop.
         let me = self.clone();
         let h = host.clone();
-        tokio::spawn(async move {
+        spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every / 2);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -1232,7 +1445,9 @@ impl Cluster {
                     return;
                 }
                 let lapsed_for = Instant::now().saturating_duration_since(*me.valid_until.read());
-                if lapsed_for > me.cfg.skew * 2 {
+                let limit =
+                    if me.revalidate.load(Ordering::Acquire) { me.revalidate_window() } else { me.cfg.skew * 2 };
+                if lapsed_for > limit {
                     tracing::error!(
                         lapsed_ms = lapsed_for.as_millis() as u64,
                         "node lease lapsed past takeover: fail-stop"
@@ -1241,7 +1456,7 @@ impl Cluster {
                     return;
                 }
             }
-        });
+        }));
         let me = self.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
@@ -1367,6 +1582,10 @@ impl Cluster {
         if !peers.is_empty() && !self.spawned.load(Ordering::Acquire) {
             return false;
         }
+        if !peers.is_empty() && !host.may_join() {
+            tracing::info!("not joining yet: the host holds the join");
+            return false;
+        }
         let confirmed =
             |l: &NodeLease, c: &HashMap<String, i64>| l.follows.get(&self.log_id).or_else(|| c.get(&l.log_id)).copied();
         let mut floor = self.join_floor.load(Ordering::Acquire);
@@ -1456,8 +1675,22 @@ impl Cluster {
         Ok(host.follow_floors().get(&log_id).copied())
     }
 
-    /// A conflict means someone else rewrote our lease: fail-stop.
+    /// Renews now. On a lease plane the plane's loop does it: a renewal
+    /// sent from a starved runtime (a step's keepalive during a heavy shard
+    /// open) would hold the renew lock across a late answer and starve the
+    /// plane's own renewals too.
     async fn renew(&self, host: &Arc<dyn ShardHost>) {
+        if !self.on_plane.load(Ordering::Acquire) {
+            return self.renew_here(host).await;
+        }
+        let mut done = self.renew_done.subscribe();
+        let asked = self.renew_started.load(Ordering::Acquire);
+        self.renew_now.notify_one();
+        let _ = tokio::time::timeout(self.cfg.ttl, done.wait_for(|n| *n > asked)).await;
+    }
+
+    /// A conflict means someone else rewrote our lease: fail-stop.
+    async fn renew_here(&self, host: &Arc<dyn ShardHost>) {
         let _g = self.renew_lock.lock().await;
         if self.gone.load(Ordering::Acquire) {
             return;
@@ -1466,6 +1699,14 @@ impl Cluster {
         // a renewal landing now would make them count us live again and
         // release shards they just took.
         if !self.lease_valid() {
+            let lapsed_for = Instant::now().saturating_duration_since(*self.valid_until.read());
+            if self.revalidate.load(Ordering::Acquire) && lapsed_for <= self.revalidate_window() {
+                if !self.try_revalidate(host).await {
+                    crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
+                    host.lost();
+                }
+                return;
+            }
             crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
             tracing::error!("node lease lapsed before renewal: fail-stop");
             host.lost();
@@ -1474,6 +1715,7 @@ impl Cluster {
         {
             let mut l = self.lease.write();
             l.next_ordinal = host.next_ordinal();
+            l.pending_age_ms = host.pending_age().map(|a| a.as_millis() as u64);
             l.follows = host.follow_floors();
         }
         let etag = self.lease_etag.read().clone();
@@ -1482,6 +1724,10 @@ impl Cluster {
             let recreated = if moved { self.recreate_vanished_lease().await } else { Recreate::Retry };
             match (moved, recreated) {
                 (true, Recreate::Done) => {}
+                (true, Recreate::Landed) => {
+                    crate::metrics::LEASE_EVENTS.with_label_values(&["renewal_landed"]).inc();
+                    tracing::warn!("node lease renewal landed but its answer was lost: adopted it ({e:#})");
+                }
                 (true, Recreate::Lost) => {
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["conflict"]).inc();
                     tracing::error!("node lease lost (CAS conflict): {e:#}");
@@ -1509,7 +1755,19 @@ impl Cluster {
         let path = self.path(&format!("nodes/{}", self.cfg.node_id));
         match self.get_json::<serde_json::Value>(&path).await {
             Ok(None) => {}
-            Ok(Some(_)) => return Recreate::Lost,
+            // validity isn't extended: when the write was sent is unknown,
+            // and the next renewal (a fifth of the TTL away) does it
+            Ok(Some((l, etag))) => {
+                let mut cur = self.lease.write();
+                return match serde_json::from_value::<NodeLease>(l) {
+                    Ok(l) if l.log_id == cur.log_id && l.renewals > cur.renewals => {
+                        cur.renewals = l.renewals;
+                        *self.lease_etag.write() = etag;
+                        Recreate::Landed
+                    }
+                    _ => Recreate::Lost,
+                };
+            }
             Err(e) => {
                 tracing::warn!("reading our node lease after a failed renewal: {e:#}");
                 return Recreate::Retry;
@@ -2024,7 +2282,7 @@ impl Cluster {
             let mut next = history.clone();
             next.push(Span { log_id: self.log_id.clone(), epoch, start: host.next_ordinal(), end: None });
             // never drop a span to make room: an unreplayed one holds acked writes
-            trim_history(&mut next, cur.applied_epoch);
+            trim_history(&mut next, cur.applied_epoch, self.trim_at());
             if next.len() > MAX_SPANS {
                 tracing::error!(shard = s.0, spans = next.len(), applied_epoch = cur.applied_epoch, "shard history at its cap with no clean open to trim it: not taking it (spans are never dropped unreplayed)");
                 crate::metrics::LEASE_EVENTS.with_label_values(&["history_full"]).inc();
@@ -2277,7 +2535,7 @@ impl Cluster {
                 }
             }
             if frozen.is_none() {
-                trim_history(&mut a.history, a.applied_epoch);
+                trim_history(&mut a.history, a.applied_epoch, self.trim_at());
             }
             match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
@@ -2328,7 +2586,7 @@ impl Cluster {
         Ok(false)
     }
 
-    /// Trims our histories past TRIM_SPANS (a crash loop, many takeovers)
+    /// Trims our histories past `trim_at` (a crash loop, many takeovers)
     /// that a durable checkpoint inside our own span made redundant. Best
     /// effort.
     async fn trim_owned(&self, host: &Arc<dyn ShardHost>) {
@@ -2343,7 +2601,7 @@ impl Cluster {
                     (ours
                         && e.is_some()
                         && a.frozen.is_none()
-                        && a.history.len() > TRIM_SPANS
+                        && a.history.len() > self.trim_at()
                         && a.history.iter().any(|sp| sp.epoch < a.epoch))
                     .then(|| (s, a.clone(), e.clone()))
                 })
@@ -2352,7 +2610,7 @@ impl Cluster {
         };
         for (s, mut a, etag) in cands {
             a.applied_epoch = a.applied_epoch.max(a.epoch);
-            trim_history(&mut a.history, a.applied_epoch);
+            trim_history(&mut a.history, a.applied_epoch, self.trim_at());
             let path = self.path(&format!("assign/{}", s.key()));
             match self.put_json(&path, &a, if_match(etag)).await {
                 Ok(e) => {
@@ -2372,6 +2630,14 @@ impl Cluster {
                 }
             }
         }
+    }
+
+    /// Writes our lease as draining ahead of `shutdown`, for a node with
+    /// its own work to hand over first: peers stop handing it shards, and
+    /// its own steps stop taking them.
+    pub async fn announce_drain(&self, host: &Arc<dyn ShardHost>) {
+        self.lease.write().draining = true;
+        self.renew(host).await;
     }
 
     /// Closes and releases every shard, fences our log, drops our lease.
@@ -2414,7 +2680,7 @@ impl Cluster {
         }
         // Peers following our log drop its firehose source only at a fence;
         // without one every peer's merged firehose stalls at our watermark.
-        if let Err(e) = self.fence_own_log().await {
+        if let Err(e) = self.fence_own_log(host).await {
             {
                 let _r = self.renew_lock.lock().await;
                 self.gone.store(true, Ordering::Release);
@@ -2444,6 +2710,32 @@ impl Cluster {
         host.nudge(nudges).await;
     }
 
+    /// Ok(true): our log is fenced at `end` (by us, or a peer before us).
+    /// Ok(false): a segment holds `end`.
+    async fn fence_own_at(&self, end: u64, last_seq: i64) -> anyhow::Result<bool> {
+        let path = crate::nodelog::segment_path(&self.store, &self.log_id, end);
+        self.count("put");
+        let put = self.store.raw.put_opts(
+            &path,
+            PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)),
+            PutOptions { mode: PutMode::Create, ..Default::default() },
+        );
+        match self.bounded("fence", put).await {
+            Ok(_) => {}
+            Err(e) if is_conflict(&e) => {
+                self.count("get");
+                let b = self.bounded("get", async { self.store.raw.get(&path).await?.bytes().await }).await?;
+                if !matches!(crate::segment::parse(b, false, None)?, crate::segment::LogObject::Fence { .. }) {
+                    return Ok(false);
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.fenced.write().insert(self.log_id.clone(), (end, last_seq));
+        tracing::info!(log_id = %self.log_id, fence_ordinal = end, "fenced our log at its end");
+        Ok(true)
+    }
+
     /// A TTL, at most 30 s (inside a supervisor's stop timeout).
     fn shutdown_fence_budget(&self) -> Duration {
         self.cfg.ttl.min(Duration::from_secs(30))
@@ -2451,10 +2743,18 @@ impl Cluster {
 
     /// Retries with backoff for `shutdown_fence_budget`. A fence PUT that
     /// timed out but landed is found by the next attempt's scan.
-    async fn fence_own_log(&self) -> anyhow::Result<()> {
+    async fn fence_own_log(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.shutdown_fence_budget();
         let mut backoff = Duration::from_millis(200);
         let mut attempt = 1u32;
+        // Quiesced, our log's end is known: fence there without the scan,
+        // whose LIST of a long-lived log outlasted the whole budget under
+        // load. Anything else at that ordinal falls back to the scan.
+        match self.fence_own_at(host.durable_end(), host.seq_high()).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("fencing our log at its end failed (scanning it instead): {e:#}"),
+        }
         loop {
             let e = match self.fence(&self.log_id).await {
                 Ok(_) => return Ok(()),
@@ -2503,6 +2803,8 @@ mod tests {
         unheard: std::sync::atomic::AtomicBool,
         /// peer logs our "firehose" follows (published in our lease)
         follows: Mutex<BTreeMap<String, i64>>,
+        /// `ShardHost::may_join` answers false
+        hold_join: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -2558,6 +2860,28 @@ mod tests {
         fn follow_floors(&self) -> BTreeMap<String, i64> {
             self.follows.lock().clone()
         }
+        fn may_join(&self) -> bool {
+            !self.hold_join.load(Ordering::SeqCst)
+        }
+    }
+
+    /// vlrelay's chaos `consumers` scenario: a node whose runtime was
+    /// saturated renewed late, lapsed and fail-stopped. On a lease plane the
+    /// renewals go on while the caller's only thread is stuck.
+    #[test]
+    fn a_starved_runtime_keeps_its_lease_on_the_lease_plane() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let store = Store::memory(None);
+            let plane = LeasePlane::new(store.clone());
+            let c = join(ClusterConfig { lease_plane: Some(plane), ..cfg("a") }, store).await.unwrap();
+            let h = Arc::new(Host::default());
+            c.spawn(h.clone());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            std::thread::sleep(Duration::from_millis(1800));
+            assert!(c.lease_valid(), "renewals stopped with the caller's runtime");
+            assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+        });
     }
 
     /// Joins as a node whose step loop runs (`spawn`): it greets peers, so
@@ -2587,6 +2911,7 @@ mod tests {
             skew: Duration::from_millis(100),
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
+            lease_plane: None,
         }
     }
 
@@ -2651,6 +2976,7 @@ mod tests {
             min_level: 1,
             max_level: 1,
             seen_level: 1,
+            pending_age_ms: None,
         };
         a.put_json(&a.path(&format!("nodes/{id}")), &lease, PutMode::Overwrite).await.unwrap();
         let b = join(cfg(&id), store.clone()).await.unwrap();
@@ -2855,6 +3181,26 @@ mod tests {
         assert_eq!(ha.closed.lock().len(), 1, "a hands b its share at once");
     }
 
+    /// A host that holds its join (`may_join`) stays out while it has peers.
+    #[tokio::test]
+    async fn joiner_waits_while_its_host_holds_the_join() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (_ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        let (hb, hb_dyn) = host();
+        hb.hold_join.store(true, Ordering::SeqCst);
+        for _ in 0..3 {
+            b.step(&hb_dyn).await.unwrap();
+            a.step(&ha_dyn).await.unwrap();
+        }
+        assert!(!b.joined() && b.owned().is_empty());
+        hb.hold_join.store(false, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap();
+        assert!(b.joined());
+    }
+
     /// A joiner's seqs must pass every floor before it joins: here its
     /// previous incarnation's published watermark cap, as a clock behind it.
     #[tokio::test]
@@ -3027,6 +3373,100 @@ mod tests {
         );
     }
 
+    /// A pause that lapsed our lease (as `set_revalidate` hosts see it):
+    /// unfenced, the next renewal takes the lease back; fenced, it
+    /// fail-stops; without the opt-in it fail-stops as before.
+    #[tokio::test]
+    async fn lapsed_lease_is_revalidated_only_while_unfenced() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.set_revalidate(true);
+        let lapse = |c: &Cluster| *c.valid_until.write() = Instant::now() - c.cfg.skew;
+        lapse(&a);
+        assert!(!a.lease_valid());
+        let renewals = a.own_lease().renewals;
+        a.renew(&ha_dyn).await;
+        assert!(a.lease_valid(), "revalidated");
+        assert!(a.own_lease().renewals > renewals);
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+
+        // a peer presumed us dead and fenced our log
+        lapse(&a);
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        b.fence(&a.log_id).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 1, "fenced: fail-stop");
+
+        // past the window, or without the opt-in: fail-stop as before
+        let c = join(cfg("c"), store.clone()).await.unwrap();
+        let (hc, hc_dyn) = host();
+        c.set_revalidate(true);
+        *c.valid_until.write() = Instant::now() - c.revalidate_window() - Duration::from_millis(10);
+        c.renew(&hc_dyn).await;
+        assert_eq!(hc.lost.load(Ordering::SeqCst), 1, "past the window");
+        let d = join(cfg("d"), store.clone()).await.unwrap();
+        let (hd, hd_dyn) = host();
+        lapse(&d);
+        d.renew(&hd_dyn).await;
+        assert_eq!(hd.lost.load(Ordering::SeqCst), 1, "no opt-in");
+    }
+
+    /// A revalidation's CAS grants no validity before the fence check, and
+    /// one that landed with its answer lost is adopted on the next try
+    /// instead of read as our lease rewritten under us.
+    #[tokio::test]
+    async fn revalidation_grants_nothing_early_and_survives_a_lost_answer() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.set_revalidate(true);
+        let lapse = |c: &Cluster| *c.valid_until.write() = Instant::now() - c.cfg.skew;
+        lapse(&a);
+        let etag = a.lease_etag.read().clone();
+        a.write_lease_ungranted(if_match(etag)).await.unwrap();
+        assert!(!a.lease_valid(), "the CAS alone grants nothing");
+
+        // our CAS landed, its answer didn't: the bucket is a renewal ahead
+        let mut landed = a.own_lease();
+        landed.renewals += 1;
+        let path = a.path("nodes/a");
+        Cluster::put_json_on(&store, &path, &landed, PutMode::Overwrite).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a lost answer is no rewrite");
+        assert!(!a.lease_valid(), "still lapsed until a revalidation passes");
+        a.renew(&ha_dyn).await;
+        assert!(a.lease_valid(), "revalidated");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// With `set_trim_spans(1)` one checkpointed takeover is enough: the
+    /// dead owner's span leaves the history as soon as ours is checkpointed.
+    #[tokio::test]
+    async fn trim_spans_one_trims_after_a_single_takeover() {
+        let store = Store::memory(None);
+        let d = dead_owner(&store, 3).await;
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        b.set_trim_spans(1);
+        let (hb, hb_dyn) = host();
+        let t = Instant::now();
+        while b.owned().len() < 8 {
+            b.step(&hb_dyn).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(t.elapsed() < Duration::from_secs(3), "never took over");
+        }
+        b.step(&hb_dyn).await.unwrap();
+        assert_eq!(read_assign(&store, ShardId(0)).await.history.len(), 2, "not checkpointed yet: nothing dropped");
+        hb.checkpointed.store(true, Ordering::SeqCst);
+        b.step(&hb_dyn).await.unwrap();
+        let s0 = read_assign(&store, ShardId(0)).await;
+        assert_eq!((s0.history.len(), s0.applied_epoch), (1, s0.epoch), "{s0:?}");
+        assert_eq!(s0.history[0].log_id, b.log_id);
+        assert!(s0.history.iter().all(|sp| sp.log_id != d.log_id));
+    }
+
     /// A same-id restart before peers presumed the old incarnation dead: b1
     /// held all 8, a joined (fair share 4), b1 died before handing any back,
     /// b2 came up. b2 reclaims its share of b1's shards; the rest name owner
@@ -3175,6 +3615,15 @@ mod tests {
             if self.take("fail", location.as_ref()) {
                 return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
+            if self.take("landed", location.as_ref()) {
+                // applied, answer lost, and the client's retry of the same
+                // conditional request refused
+                self.inner.put_opts(location, payload, opts).await?;
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "armed: landed, retry refused".into(),
+                });
+            }
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -3273,6 +3722,33 @@ mod tests {
         assert!(stalls.stalled.load(Ordering::SeqCst) >= 3, "the stalls were hit");
         assert!(b.fenced_logs().contains_key(&a.log_id));
         assert_eq!(hb.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A renewal that lands but whose answer is lost (a reset after the
+    /// store applied it; seen under the vlrelay chaos harness's bucket
+    /// resets, where every core fail-stopped within a second) comes back as
+    /// a conflict on the client's retry. The lease is still ours: adopt it.
+    #[tokio::test]
+    async fn a_renewal_whose_answer_was_lost_is_adopted() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        stalls.arm("landed", "nodes/a");
+        a.renew(&ha_dyn).await;
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the armed renewal ran");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a landed renewal is no lost lease");
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "the next renewal CASes on the adopted ETag");
+        assert!(a.lease_valid());
+
+        // a lease someone else rewrote is still a conflict
+        let mut l = a.lease.read().clone();
+        l.log_id = "someone-else".into();
+        a.put_json_unbounded(&a.path("nodes/a"), &l, PutMode::Overwrite).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 1);
     }
 
     /// A same-id restart whose previous incarnation's lease vanishes between
@@ -3593,6 +4069,27 @@ mod tests {
         assert_eq!(stalls.stalled.load(Ordering::SeqCst), 2, "two failed fence PUTs, then one that landed");
         assert!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1, "our log is fenced");
         assert!(a.get_json::<NodeLease>(&a.path("nodes/a")).await.unwrap().is_none(), "lease dropped");
+    }
+
+    /// Quiesced, shutdown fences our log at its known end without a LIST.
+    #[tokio::test]
+    async fn shutdown_fences_our_log_at_its_end_without_a_scan() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        for ord in 0..3 {
+            store
+                .raw
+                .put(&crate::nodelog::segment_path(&store, &a.log_id, ord), segment(&a.log_id, ord, 100 + ord as i64))
+                .await
+                .unwrap();
+        }
+        ha.ord.store(3, Ordering::SeqCst);
+        let lists = a.store_lists();
+        a.shutdown(&ha_dyn).await.unwrap();
+        assert_eq!(a.store_lists(), lists, "no fence scan");
+        assert_eq!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap(), (3, true));
     }
 
     /// A fence that keeps failing: shutdown gives up after its budget and
