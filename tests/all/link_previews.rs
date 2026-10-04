@@ -39,7 +39,7 @@ async fn public_pages_have_link_preview_tags() {
     let host = origin.split_once("://").unwrap().1.to_string();
 
     let landing = body(&get("/").await);
-    let built = !landing.contains("built without its web UI");
+    let built = !landing.contains("without its web UI");
     assert_eq!(title(&landing).unwrap(), format!("{host} · vlpds"));
     assert_eq!(canonical(&landing).unwrap(), format!("{origin}/"));
     assert_eq!(meta(&landing, "property", "og:url").unwrap(), format!("{origin}/"));

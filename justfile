@@ -1,9 +1,9 @@
 # vlpds: atproto PDS on object storage. The web UI (ui/, React + Vite) is
-# built into ui/dist and embedded in the binary (src/xrpc/webui.rs).
+# built into ui/dist, which vlpds reads at startup (--ui-dir; src/xrpc/webui.rs).
 
 target_dir := env_var_or_default("CARGO_TARGET_DIR", "target")
 
-# Build the web UI into ui/dist (embedded by the next cargo build)
+# Build the web UI into ui/dist (served from the next vlpds start)
 ui:
     cd ui && npm install --no-audit --no-fund && npm run build
 
@@ -19,7 +19,7 @@ dev-ui url="http://127.0.0.1:2620":
 build: ui
     cargo build --profile dev-release --bins
 
-# Release build with the UI embedded
+# Release build, and the UI it serves from ui/dist
 build-release: ui
     cargo build --release --bins
 

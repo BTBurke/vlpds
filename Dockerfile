@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
-# Production vlpds image: the web UI (ui/) built with node, embedded into a
-# release build of the vlpds (and vlpds-bucket-probe) binaries, on a slim non-root runtime.
+# Production vlpds image: release builds of the vlpds (and vlpds-bucket-probe)
+# binaries and the web UI (ui/, built with node; served from VLPDS_UI_DIR) on a
+# slim non-root runtime. The two builds are independent stages, so a UI- or
+# docs-only change reuses the cached binary and rebuilds only the last layer.
 #
 #   docker build -t vlpds:local .            (or: just docker-build)
 #   docker run -p 2583:2583 -e VLPDS_S3_ENDPOINT=... -e VLPDS_JWT_SECRET=... \
@@ -35,24 +37,18 @@ WORKDIR /src
 COPY rust-toolchain.toml ./
 # installs the pinned toolchain if the base image's differs
 RUN rustup show active-toolchain
-COPY Cargo.toml Cargo.lock build.rs ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY lexicons ./lexicons
 # the manifest declares the test binary; it is never built here
 RUN mkdir -p tests/all && touch tests/all/main.rs
-COPY --from=ui /src/ui/dist ./ui/dist
-# Declared this late because every RUN after an ARG is keyed on its value,
-# and the rev changes on every build.
 # Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for
 # --pyroscope-url (continuous CPU profiles).
 ARG VLPDS_FEATURES=""
-# vlpds_build_info's rev label: the build context has no .git to describe.
-ARG VLPDS_GIT_REV=""
 # no debug info in the image (Cargo.toml keeps debug = 1 for local profiling;
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
-ENV CARGO_PROFILE_RELEASE_DEBUG=0 \
-    VLPDS_GIT_REV=${VLPDS_GIT_REV}
+ENV CARGO_PROFILE_RELEASE_DEBUG=0
 # Both binaries in one invocation: the probe reuses the crate's compiled lib
 # and its LTO link runs beside vlpds's (+3 s; its own profile recompiled
 # the lib after the vlpds build, +40-55 s).
@@ -77,6 +73,7 @@ COPY --from=build /out/vlpds /out/vlpds-bucket-probe /usr/local/bin/
 USER vlpds:vlpds
 WORKDIR /var/lib/vlpds
 ENV VLPDS_LISTEN=0.0.0.0:2583 \
+    VLPDS_UI_DIR=/usr/share/vlpds/ui \
     RUST_LOG=info
 # 2583: XRPC, web UI, /internal (cluster: private network only)
 # 9583: /metrics (Prometheus) when VLPDS_METRICS_LISTEN=0.0.0.0:9583
@@ -85,3 +82,10 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=60s --retries=3 \
     CMD curl -sf http://127.0.0.1:2583/xrpc/_health || exit 1
 # tini forwards SIGTERM so vlpds drains and releases its shards gracefully
 ENTRYPOINT ["/usr/bin/tini", "--", "vlpds"]
+# Last: the layer a UI-only change replaces (and pushes).
+COPY --from=ui /src/ui/dist /usr/share/vlpds/ui
+# vlpds_build_info's rev label (the build context has no .git to describe),
+# read at run time: as a build-time env of the cargo step it would rebuild
+# the binary on every commit.
+ARG VLPDS_GIT_REV=""
+ENV VLPDS_GIT_REV=${VLPDS_GIT_REV}

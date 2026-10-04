@@ -92,8 +92,8 @@ hickory-resolver = "0.25"
 # grapheme counts for lexicon maxGraphemes (src/lexicon.rs)
 unicode-segmentation = "1"
 tower = { version = "0.5", features = ["util"] }
-# embedded web UI (ui/dist, built by `just ui`; build.rs leaves a placeholder)
-rust-embed = { version = "8", features = ["mime-guess"] }
+# web UI content types (src/xrpc/webui.rs)
+mime_guess = "2"
 tower-http = { version = "0.6", features = ["compression-gzip", "decompression-gzip", "decompression-deflate"] }
 # outbound email (src/mail.rs): async SMTP over rustls (ring, webpki roots), no native-tls
 # secrets at rest (src/secrets.rs): XChaCha20-Poly1305 under the local KEK;

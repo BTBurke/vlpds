@@ -36,6 +36,7 @@ pub use server::{drop_revocation, set_delete_crash_hook, reset_token_did, revoca
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
 pub use sync::{export_memory_bytes, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS};
 pub use import_budget::ImportBudget;
+pub use webui::WebUi;
 pub use repo::DEFAULT_MAX_IMPORT_BYTES;
 pub use server::{LogMailer, Mail, Mailer};
 pub(crate) use server::SEC;
@@ -106,6 +107,7 @@ pub struct App {
     pub secrets: Arc<crate::secrets::Secrets>,
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
+    pub ui: Arc<WebUi>,
 }
 
 type AppState = State<Arc<App>>;

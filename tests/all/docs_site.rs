@@ -44,7 +44,7 @@ async fn docs_pages_are_served_with_the_spa_csp() {
     }
 
     let shell = body(&get("/docs/overview".into()).await);
-    if shell.contains("built without its web UI") {
+    if shell.contains("without its web UI") {
         eprintln!("ui/dist is the placeholder (run `just ui`): skipping the bundle checks");
         return;
     }

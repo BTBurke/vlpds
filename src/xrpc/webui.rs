@@ -1,13 +1,91 @@
-//! The embedded web UI (built from `ui/` into `ui/dist`; `build.rs` leaves a
-//! placeholder when it isn't built) and `vlpds.admin.getClusterStatus`, the
-//! view the operator console polls.
+//! The web UI (built from `ui/` into `ui/dist`, read from `--ui-dir` at
+//! startup) and `vlpds.admin.getClusterStatus`, the view the operator
+//! console polls.
 
 use super::*;
-use rust_embed::RustEmbed;
+use std::collections::HashMap;
+use std::path::Path;
 
-#[derive(RustEmbed)]
-#[folder = "ui/dist"]
-struct Assets;
+/// Served when no UI directory is configured and the source tree's isn't built.
+const PLACEHOLDER: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><title>vlpds</title></head>\
+<body><p>This vlpds server runs without its web UI. Run <code>just ui</code>, or point <code>--ui-dir</code> at a built <code>ui/dist</code>, then restart.</p></body></html>";
+
+/// The built UI, read whole at startup (~3 MB): a UI deploy restarts the
+/// process anyway, and serving only names found here rules out traversal.
+pub struct WebUi {
+    files: HashMap<String, UiFile>,
+    /// index.html cut around its `<title>`, where the page's head goes.
+    shell: (String, String),
+    og: Option<OgManifest>,
+}
+
+struct UiFile {
+    data: axum::body::Bytes,
+    mime: header::HeaderValue,
+}
+
+impl WebUi {
+    /// `dir` set: it must hold a complete build (index.html and
+    /// og/manifest.json), so a wrongly built image fails at startup instead
+    /// of serving a placeholder. Unset: this source tree's `ui/dist` when
+    /// built (dev runs and tests), else a placeholder page.
+    pub fn load(dir: Option<&Path>) -> anyhow::Result<WebUi> {
+        use anyhow::Context;
+        if let Some(dir) = dir {
+            let ui = Self::read(dir).with_context(|| format!("--ui-dir {}", dir.display()))?;
+            anyhow::ensure!(ui.og.is_some(), "--ui-dir {}: no og/manifest.json (an incomplete UI build?)", dir.display());
+            return Ok(ui);
+        }
+        let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/dist");
+        if dev.join("index.html").is_file() {
+            return Self::read(&dev).with_context(|| dev.display().to_string());
+        }
+        tracing::warn!(dir = %dev.display(), "no --ui-dir and no built UI there: serving a placeholder page");
+        Ok(WebUi { files: HashMap::new(), shell: split_shell(PLACEHOLDER), og: None })
+    }
+
+    fn read(dir: &Path) -> anyhow::Result<WebUi> {
+        use anyhow::Context;
+        let mut files = HashMap::new();
+        walk(dir, dir, &mut files)?;
+        let index = files.get("index.html").context("no index.html (an empty or unbuilt UI directory?)")?;
+        let shell = split_shell(&String::from_utf8_lossy(&index.data));
+        let og = match files.get("og/manifest.json") {
+            None => None,
+            Some(f) => Some(serde_json::from_slice::<OgManifest>(&f.data).context("og/manifest.json")?),
+        };
+        tracing::info!(dir = %dir.display(), files = files.len(), bytes = files.values().map(|f| f.data.len()).sum::<usize>(), "web UI loaded");
+        Ok(WebUi { files, shell, og })
+    }
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut HashMap<String, UiFile>) -> anyhow::Result<()> {
+    use anyhow::Context;
+    for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+        let path = e?.path();
+        let meta = std::fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if meta.is_dir() {
+            walk(root, &path, out)?;
+        } else if meta.is_file() {
+            let rel = path.strip_prefix(root)?.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
+            let data = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            out.insert(rel, UiFile { data: data.into(), mime: header::HeaderValue::from_str(mime.as_ref())? });
+        }
+    }
+    Ok(())
+}
+
+fn split_shell(html: &str) -> (String, String) {
+    let (start, end) = match (html.find("<title>"), html.find("</title>")) {
+        (Some(a), Some(b)) if b > a => (a, b + "</title>".len()),
+        _ => {
+            let at = html.find("</head>").unwrap_or(0);
+            (at, at)
+        }
+    };
+    (html[..start].to_string(), html[end..].to_string())
+}
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -74,33 +152,14 @@ struct DocMeta {
     card: Card,
 }
 
-static OG: std::sync::LazyLock<Option<OgManifest>> = std::sync::LazyLock::new(|| {
-    let f = Assets::get("og/manifest.json")?;
-    serde_json::from_slice(&f.data).inspect_err(|e| tracing::warn!("ui og/manifest.json: {e}")).ok()
-});
-
-/// index.html cut around its `<title>`, where the page's head goes.
-static SHELL: std::sync::LazyLock<Option<(String, String)>> = std::sync::LazyLock::new(|| {
-    let f = Assets::get("index.html")?;
-    let html = String::from_utf8_lossy(&f.data).into_owned();
-    let (start, end) = match (html.find("<title>"), html.find("</title>")) {
-        (Some(a), Some(b)) if b > a => (a, b + "</title>".len()),
-        _ => {
-            let at = html.find("</head>").unwrap_or(0);
-            (at, at)
-        }
-    };
-    Some((html[..start].to_string(), html[end..].to_string()))
-});
-
 /// Per-route `<head>` tags, server-rendered so link-preview fetchers (which
 /// don't run the SPA) see a title, a description and a card.
-struct PageHead {
+struct PageHead<'a> {
     title: String,
     description: String,
     /// Path of the canonical URL.
     path: String,
-    card: Option<&'static Card>,
+    card: Option<&'a Card>,
     og_type: &'static str,
     noindex: bool,
 }
@@ -137,7 +196,7 @@ fn site_name(app: &App, host: &str) -> String {
     app.config.email_branding.name.clone().unwrap_or_else(|| host.to_string())
 }
 
-impl PageHead {
+impl PageHead<'_> {
     fn render(&self, app: &App) -> String {
         let (origin, host) = origin_and_host(&app.config.public_url);
         let site = esc(&site_name(app, &host));
@@ -150,7 +209,7 @@ impl PageHead {
             "    <meta property=\"og:type\" content=\"{}\" />\n    <meta property=\"og:site_name\" content=\"{site}\" />\n    <meta property=\"og:title\" content=\"{title}\" />\n    <meta property=\"og:description\" content=\"{desc}\" />\n    <meta property=\"og:url\" content=\"{url}\" />\n",
             self.og_type
         ));
-        match (self.card, OG.as_ref()) {
+        match (self.card, app.ui.og.as_ref()) {
             (Some(c), Some(m)) => {
                 let (img, alt) = (esc(&format!("{origin}{}", c.image)), esc(&c.alt));
                 h.push_str(&format!(
@@ -175,7 +234,7 @@ async fn landing_shell(State(app): AppState) -> Response {
 Sign in, create an account, or move an existing Bluesky account here."
         ),
         path: "/".into(),
-        card: OG.as_ref().map(|m| &m.site),
+        card: app.ui.og.as_ref().map(|m| &m.site),
         og_type: "website",
         noindex: false,
     };
@@ -188,7 +247,7 @@ async fn account_shell(State(app): AppState) -> Response {
         title: "Account · vlpds".into(),
         description: format!("Manage your AT Protocol account on {host}: sign-in security, app passwords, your repository and data."),
         path: "/account".into(),
-        card: OG.as_ref().map(|m| &m.site),
+        card: app.ui.og.as_ref().map(|m| &m.site),
         og_type: "website",
         noindex: true,
     };
@@ -217,7 +276,7 @@ async fn migrate_shell(State(app): AppState) -> Response {
 Your handle, followers and posts come with you."
         ),
         path: "/migrate".into(),
-        card: OG.as_ref().map(|m| &m.migrate),
+        card: app.ui.og.as_ref().map(|m| &m.migrate),
         og_type: "website",
         noindex: false,
     };
@@ -232,9 +291,9 @@ fn doc_slug(path: &str) -> &str {
 
 async fn docs_shell(State(app): AppState, uri: axum::http::Uri) -> Response {
     let slug = doc_slug(uri.path());
-    let Some(doc) = OG.as_ref().and_then(|m| m.docs.get(slug)) else {
+    let Some(doc) = app.ui.og.as_ref().and_then(|m| m.docs.get(slug)) else {
         // without a built UI there is no manifest: every page is unknown
-        let status = if OG.is_some() { StatusCode::NOT_FOUND } else { StatusCode::OK };
+        let status = if app.ui.og.is_some() { StatusCode::NOT_FOUND } else { StatusCode::OK };
         let head = PageHead {
             title: "Not found · vlpds docs".into(),
             description: "This documentation page doesn't exist.".into(),
@@ -257,9 +316,7 @@ async fn docs_shell(State(app): AppState, uri: axum::http::Uri) -> Response {
 }
 
 fn shell_with(app: &App, status: StatusCode, head: &PageHead, csp: &'static str) -> Response {
-    let Some((before, after)) = SHELL.as_ref() else {
-        return (StatusCode::NOT_FOUND, "UI not built: run `just ui`").into_response();
-    };
+    let (before, after) = &app.ui.shell;
     let html = format!("{before}{}{after}", head.render(app));
     let mut r = (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-cache")], html).into_response();
     let h = r.headers_mut();
@@ -282,7 +339,7 @@ async fn robots(State(app): AppState) -> Response {
 async fn sitemap(State(app): AppState) -> Response {
     let (origin, _) = origin_and_host(&app.config.public_url);
     let mut paths = vec!["/".to_string(), "/migrate".to_string()];
-    if let Some(m) = OG.as_ref() {
+    if let Some(m) = app.ui.og.as_ref() {
         paths.extend(m.docs.iter().filter(|(_, d)| d.status != "stub").map(|(slug, _)| format!("/docs/{slug}")));
     }
     let mut body = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n");
@@ -293,23 +350,22 @@ async fn sitemap(State(app): AppState) -> Response {
     ([(header::CONTENT_TYPE, "application/xml; charset=utf-8"), (header::CACHE_CONTROL, "public, max-age=3600")], body).into_response()
 }
 
-async fn asset(uri: axum::http::Uri) -> Response {
+async fn asset(State(app): AppState, uri: axum::http::Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    let Some(f) = Assets::get(path) else {
+    let Some(f) = app.ui.files.get(path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     // hashed bundle files and cards never change; fonts, the icon and the email logo keep stable names
     let hashed = path.starts_with("assets/")
         || (path.starts_with("og/") && path.ends_with(".png") && path != "og/email-logo.png");
     let cache = if hashed { "public, max-age=31536000, immutable" } else { "public, max-age=86400" };
-    let mime = f.metadata.mimetype().to_string();
     (
         [
-            (header::CONTENT_TYPE, mime),
-            (header::CACHE_CONTROL, cache.to_string()),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (header::CONTENT_TYPE, f.mime.clone()),
+            (header::CACHE_CONTROL, header::HeaderValue::from_static(cache)),
+            (header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff")),
         ],
-        f.data,
+        f.data.clone(),
     )
         .into_response()
 }

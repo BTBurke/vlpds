@@ -138,6 +138,8 @@ pub struct Config {
     pub cache_budget_bytes: Option<u64>,
     pub cache_entries: Vec<(crate::caches::Cache, usize)>,
     pub reshard_policy: crate::reshard::Policy,
+    /// The built web UI (`xrpc::WebUi::load`). None: the source tree's.
+    pub ui_dir: Option<std::path::PathBuf>,
     /// None: keep retired parents' state forever.
     pub reshard_gc: Option<crate::reshard_gc::Config>,
     pub checkpoint_every: Duration,
@@ -305,6 +307,7 @@ impl Default for Config {
             cache_budget_bytes: None,
             cache_entries: Vec::new(),
             reshard_policy: Default::default(),
+            ui_dir: None,
             reshard_gc: Some(Default::default()),
             checkpoint_every: Duration::from_secs(10),
             checkpoint_stagger: true,
@@ -316,6 +319,7 @@ impl Default for Config {
 }
 
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
+    let ui = Arc::new(xrpc::WebUi::load(cfg.ui_dir.as_deref())?);
     let plan = crate::memory::init(cfg.memory_plan()?);
     let (caps, budget) = crate::caches::resolve(Some(cfg.cache_budget_bytes.unwrap_or(plan.part("in_memory_caches"))), &cfg.cache_entries);
     crate::caches::apply(&caps);
@@ -518,6 +522,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         cluster: Some(cluster),
         log,
         node: node_handle,
+        ui,
     }))
 }
 

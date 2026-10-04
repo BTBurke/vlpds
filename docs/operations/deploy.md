@@ -161,7 +161,7 @@ afterwards with `vlpds admin account delete <did>` if it was only a test.
 
 ## Without Ansible
 
-The image is the whole deployment: one static binary with the web UI embedded, running as uid 10001
+The image is the whole deployment: one static binary and its web UI (`/usr/share/vlpds/ui`), running as uid 10001
 under `tini`. Every flag has a `VLPDS_*` environment variable, and every secret has a `_FILE` form.
 This is the smallest production-shaped run:
 

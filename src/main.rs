@@ -396,6 +396,11 @@ struct Args {
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
+    /// The built web UI (`just ui`'s ui/dist; the image's is
+    /// /usr/share/vlpds/ui). Startup fails if it is set but incomplete.
+    /// Unset: this source tree's ui/dist, or a placeholder page.
+    #[arg(long, env = "VLPDS_UI_DIR")]
+    ui_dir: Option<std::path::PathBuf>,
     /// Serve vlpds.admin.bulkCreate (synthetic benchmark accounts, admin
     /// token) without --dev-mode.
     #[arg(long, env = "VLPDS_ALLOW_BULK_CREATE")]
@@ -1247,6 +1252,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         preload_recent: args.preload_recent,
         forwarded_write_start: (args.forwarded_write_start_ms > 0).then(|| Duration::from_millis(args.forwarded_write_start_ms)),
         retry_unapplied_writes: args.retry_unapplied_writes,
+        ui_dir: args.ui_dir.clone().filter(|d| !d.as_os_str().is_empty()),
     };
     if args.memory_plan {
         println!("{}", cfg.memory_plan()?.to_json());

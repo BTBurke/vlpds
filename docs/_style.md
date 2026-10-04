@@ -19,11 +19,11 @@ The docs site is built from the Markdown files in this directory and served by t
   ```bash
   cd ui && npm run check-docs     # validates and prints the nav
   just dev-ui                     # live preview on :5620, reloads when a page changes
-  just ui                         # what the binary embeds
+  just ui                         # what the server serves (ui/dist)
   ```
 
-- `tests/all/docs_site.rs` checks that the binary serves `/docs/…` with the UI's CSP and that the
-  embedded bundle holds the pages.
+- `tests/all/docs_site.rs` checks that the server serves `/docs/…` with the UI's CSP and that the
+  bundle holds the pages.
 
 ## Adding a page
 

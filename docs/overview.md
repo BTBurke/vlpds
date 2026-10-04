@@ -177,7 +177,7 @@ Details: [Scaling and clustering](operations/scaling-and-clustering.md),
 - **Fail-stop over guessing.** When a node can't be sure it's still allowed to write, it exits and
   lets its supervisor restart it. Unavailability is recoverable; a forked repo is not.
 - **Boring dependencies.** S3-compatible storage, Caddy in front, Prometheus metrics, and a single
-  static binary with the web UI embedded.
+  static binary beside its built web UI.
 
 ## Robustness
 
