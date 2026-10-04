@@ -71,7 +71,7 @@ async fn signing_secret(s: &TestServer, did: &str) -> Vec<u8> {
     s.app.secrets.account_signing_key(&a).await.unwrap().to_bytes().to_vec()
 }
 
-async fn totp_login(s: &TestServer, a: &TestAccount, secret: &[u8], step_offset: u64) -> Resp {
+pub(crate) async fn totp_login(s: &TestServer, a: &TestAccount, secret: &[u8], step_offset: u64) -> Resp {
     let code = vlpds::totp::code_for_step(secret, vlpds::totp::step_at(vlpds::totp::now_secs()) + step_offset);
     s.xrpc
         .post(
@@ -265,14 +265,14 @@ async fn kek_rotation_and_rewrap() {
 /// A Cloud KMS stand-in: `encrypt`/`decrypt` on any CryptoKey with an
 /// AAD-bound local AEAD, a bearer-token check, an up/down switch and call
 /// counters.
-struct MockKms {
+pub(crate) struct MockKms {
     url: String,
     up: AtomicBool,
     encrypts: AtomicU64,
     decrypts: AtomicU64,
 }
 
-async fn mock_kms() -> Arc<MockKms> {
+pub(crate) async fn mock_kms() -> Arc<MockKms> {
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::IntoResponse;
@@ -321,7 +321,7 @@ async fn mock_kms() -> Arc<MockKms> {
     m
 }
 
-fn gcp(m: &MockKms) -> KekConfig {
+pub(crate) fn gcp(m: &MockKms) -> KekConfig {
     KekConfig {
         gcp_key: Some("projects/p/locations/global/keyRings/r/cryptoKeys/vlpds".into()),
         gcp_endpoint: Some(m.url.clone()),

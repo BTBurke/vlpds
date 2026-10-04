@@ -58,6 +58,27 @@ minio:
 minio-down:
     docker compose -f build/docker-compose.yml down
 
+# Vault Transit KEK tests (tests/all/vault_transit.rs) against throwaway Vault dev servers on 127.0.0.1:18200
+# (http) and :18201 (TLS on a private CA), removed afterwards. image=openbao/openbao:latest runs them on OpenBao.
+vault-test image="hashicorp/vault:latest":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    name=vlpds-vault-test
+    tls=$(mktemp -d "${TMPDIR:-/tmp}/vlpds-vault-tls.XXXXXX")
+    chmod 777 "$tls"
+    docker rm -f "$name" "$name-tls" >/dev/null 2>&1 || true
+    trap 'docker rm -f "$name" "$name-tls" >/dev/null; rm -rf "$tls"' EXIT
+    # host.docker.internal: the Kubernetes test's TokenReview mock runs in the test process
+    docker run -d --name "$name" -p 127.0.0.1:18200:8200 --add-host=host.docker.internal:host-gateway \
+        -e SKIP_SETCAP=1 {{image}} server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200 >/dev/null
+    docker run -d --name "$name-tls" -p 127.0.0.1:18201:8200 -v "$tls:/tls" -e SKIP_SETCAP=1 {{image}} \
+        server -dev-tls -dev-tls-cert-dir=/tls -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200 >/dev/null
+    for _ in $(seq 100); do curl -sf http://127.0.0.1:18200/v1/sys/health >/dev/null && break; sleep 0.2; done
+    for _ in $(seq 100); do [ -f "$tls/vault-ca.pem" ] && curl -sf --cacert "$tls/vault-ca.pem" https://127.0.0.1:18201/v1/sys/health >/dev/null && break; sleep 0.2; done
+    VLPDS_TEST_VAULT_ADDR=http://127.0.0.1:18200 VLPDS_TEST_VAULT_TOKEN=root \
+        VLPDS_TEST_VAULT_TLS_ADDR=https://127.0.0.1:18201 VLPDS_TEST_VAULT_TLS_CA="$tls/vault-ca.pem" \
+        cargo test --test all vault_transit::
+
 # bench/step.sh writes ./target/release whatever CARGO_TARGET_DIR says; env ACCOUNTS, RECORDS, DURATION, OUT.
 # One benchmark step on a fresh RAM-backed MinIO: just bench <name> <rate> [hot_rate] [inject_put_ms] [vlpds args...]
 bench name rate *args:

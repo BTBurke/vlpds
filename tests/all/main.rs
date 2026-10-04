@@ -142,6 +142,7 @@ mod takedown_routes;
 mod totp;
 mod untrusted_repo_data;
 mod user_service_auth;
+mod vault_transit;
 mod web_ui;
 #[cfg(feature = "jemalloc")]
 
