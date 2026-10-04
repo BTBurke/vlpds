@@ -562,24 +562,8 @@ fn parse_client_id(id: &str, dev_mode: bool) -> Result<ClientIdKind, OAuthError>
 /// mode), no redirects, size-capped.
 async fn fetch_json(url: &str, dev_mode: bool, max_bytes: usize) -> Result<J, String> {
     use futures::StreamExt;
-    let u = reqwest::Url::parse(url).map_err(|_| "invalid URL".to_string())?;
-    if !dev_mode {
-        if u.scheme() != "https" {
-            return Err(format!("Forbidden protocol \"{}:\"", u.scheme()));
-        }
-        if let Some(h) = u.host_str() {
-            let bare = h.trim_start_matches('[').trim_end_matches(']');
-            if let Ok(ip) = bare.parse::<IpAddr>() {
-                if !crate::did_resolver::is_public_ip(ip) {
-                    return Err("Hostname resolved to non-unicast address".into());
-                }
-            }
-        }
-    } else if !matches!(u.scheme(), "http" | "https") {
-        return Err(format!("Forbidden protocol \"{}:\"", u.scheme()));
-    }
     let resp = crate::http::guarded(dev_mode)
-        .get(u)
+        .get(url)?
         .header("accept", "application/json")
         .timeout(FETCH_TIMEOUT)
         .send()

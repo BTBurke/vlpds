@@ -199,10 +199,8 @@ fn check_record_type(rec: J) -> Result<J, String> {
 
 async fn fetch_bytes(url: &str, dev_mode: bool) -> Result<Vec<u8>, String> {
     use futures::StreamExt;
-    let u = reqwest::Url::parse(url).map_err(|e| e.to_string())?;
-    crate::did_resolver::check_outbound_url(&u, dev_mode)?;
     let resp = crate::http::guarded(dev_mode)
-        .get(u)
+        .get(url)?
         .header("accept", "application/vnd.ipld.car")
         .timeout(Duration::from_secs(10))
         .send()

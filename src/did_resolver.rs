@@ -32,8 +32,7 @@ pub struct DidResolver {
     plc_url: String,
     /// Allow http:// and private addresses (dev/test only).
     allow_insecure: bool,
-    /// SSRF-guarded.
-    http: reqwest::Client,
+    http: crate::http::Guarded,
     /// Not guarded: the operator-configured PLC directory may be local.
     plc_http: reqwest::Client,
     cache: Arc<Mutex<TtlMap<Arc<J>>>>,
@@ -59,7 +58,7 @@ impl DidResolver {
         DidResolver {
             plc_url: plc_url.trim_end_matches('/').to_string(),
             allow_insecure,
-            http: crate::http::guarded(allow_insecure).clone(),
+            http: crate::http::guarded(allow_insecure),
             plc_http: crate::http::public().clone(),
             cache: crate::caches::track(crate::caches::Cache::DidDocs, Default::default()),
             negative: Default::default(),
@@ -112,25 +111,19 @@ impl DidResolver {
     }
 
     async fn fetch(&self, did: &str) -> Result<Arc<J>, ResolveError> {
-        let (url, client) = if let Some(id) = did.strip_prefix("did:plc:") {
+        let req = if let Some(id) = did.strip_prefix("did:plc:") {
+            // alphanumeric only: nothing that could change the PLC URL's path
             if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
                 return Err(ResolveError::BadDid(did.into()));
             }
-            (format!("{}/{}", self.plc_url, did), &self.plc_http)
+            self.plc_http.get(format!("{}/{}", self.plc_url, did))
         } else if let Some(rest) = did.strip_prefix("did:web:") {
             let url = self.did_web_url(did, rest)?;
-            // IP-literal hosts bypass the client's DNS filter; check them here.
-            let parsed = reqwest::Url::parse(&url).map_err(|_| ResolveError::BadDid(did.into()))?;
-            let local_http = parsed.scheme() == "http" && parsed.host_str() == Some("localhost");
-            if !local_http {
-                check_outbound_url(&parsed, self.allow_insecure)
-                    .map_err(|e| ResolveError::Failed(did.into(), e))?;
-            }
-            (url, &self.http)
+            self.http.get(&url).map_err(|e| ResolveError::Failed(did.into(), e))?
         } else {
             return Err(ResolveError::BadDid(did.into()));
         };
-        let doc = tokio::time::timeout(RESOLVE_TIMEOUT, fetch_json(client, &url))
+        let doc = tokio::time::timeout(RESOLVE_TIMEOUT, fetch_json(req))
             .await
             .map_err(|_| ResolveError::Failed(did.into(), "timed out".into()))?
             .map_err(|e| match e {
@@ -179,10 +172,9 @@ enum FetchError {
     Other(String),
 }
 
-async fn fetch_json(client: &reqwest::Client, url: &str) -> Result<J, FetchError> {
+async fn fetch_json(req: reqwest::RequestBuilder) -> Result<J, FetchError> {
     use futures::StreamExt;
-    let resp = client
-        .get(url)
+    let resp = req
         .header("accept", "application/did+ld+json, application/json")
         .send()
         .await
@@ -298,16 +290,18 @@ pub fn check_outbound_url(url: &reqwest::Url, allow_insecure: bool) -> Result<()
     if url.scheme() != "https" {
         return Err(format!("Forbidden protocol \"{}:\"", url.scheme()));
     }
+    let refused = || Err("Hostname resolved to non-unicast address".to_string());
+    // the URL parser has already rewritten decimal, octal, hex and short
+    // IPv4 forms ("2130706433", "0177.1", "0x7f.1") as dotted quads
     let host = url.host_str().ok_or("missing host")?;
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        if !is_public_ip(ip) {
-            return Err("Hostname resolved to non-unicast address".into());
-        }
-    } else if bare.eq_ignore_ascii_case("localhost")
-        || bare.to_ascii_lowercase().ends_with(".localhost")
-    {
-        return Err("Hostname resolved to non-unicast address".into());
+        return if is_public_ip(ip) { Ok(()) } else { refused() };
+    }
+    // a trailing dot names the same host
+    let name = bare.trim_end_matches('.').to_ascii_lowercase();
+    if name == "localhost" || name.ends_with(".localhost") {
+        return refused();
     }
     Ok(())
 }
@@ -376,6 +370,65 @@ mod tests {
         assert!(!r.negative.lock().contains_key(did), "a refresh drops the negative entry");
         assert!(!r.refresh(did), "a second one within the interval is refused");
         assert!(r.refresh("did:plc:other"), "per DID");
+    }
+
+    /// did:web naming a loopback, private or metadata address, in any
+    /// spelling, is refused before connecting; in dev mode the same DID is
+    /// fetched (the control), and a redirect from it is a failure, not
+    /// followed.
+    #[tokio::test]
+    async fn did_web_private_targets_refused() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = hits.clone();
+        let router = axum::Router::new().route(
+            "/.well-known/did.json",
+            axum::routing::get(move |h: axum::http::HeaderMap| {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let host = h.get("host").and_then(|v| v.to_str().ok()).unwrap_or("").replace(':', "%3A");
+                std::future::ready(axum::Json(serde_json::json!({"id": format!("did:web:{host}")})))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let strict = DidResolver::new("https://plc.invalid", false);
+        for did in [
+            format!("did:web:localhost%3A{port}"),
+            format!("did:web:127.0.0.1%3A{port}"),
+            format!("did:web:2130706433%3A{port}"),
+            format!("did:web:0x7f.1%3A{port}"),
+            format!("did:web:sub.localhost%3A{port}"),
+            "did:web:169.254.169.254".to_string(),
+            "did:web:10.0.0.1".to_string(),
+            "did:web:100.100.100.200".to_string(),
+        ] {
+            match strict.resolve(&did).await {
+                Err(ResolveError::Failed(_, m)) => {
+                    assert!(m.contains("non-unicast") || m.contains("Forbidden protocol"), "{did}: {m}")
+                }
+                r => panic!("{did}: {r:?}"),
+            }
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let dev = DidResolver::new("https://plc.invalid", true);
+        let did = format!("did:web:127.0.0.1%3A{port}");
+        assert!(dev.resolve(&did).await.is_ok());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn did_web_redirects_not_followed() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let router = axum::Router::new().fallback(|| async {
+            (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, "http://169.254.169.254/latest/meta-data/")])
+        });
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let dev = DidResolver::new("https://plc.invalid", true);
+        match dev.resolve(&format!("did:web:127.0.0.1%3A{port}")).await {
+            Err(ResolveError::Failed(_, m)) => assert!(m.contains("302"), "{m}"),
+            r => panic!("{r:?}"),
+        }
     }
 
     #[test]

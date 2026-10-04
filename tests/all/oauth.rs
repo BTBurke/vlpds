@@ -1678,6 +1678,58 @@ async fn reopened_authorized_request_keeps_code() {
     tokens(&exchange(&s, &f, &code, &p, &[]).await);
 }
 
+/// Outside dev mode (the SSRF policy on): a loopback development client
+/// (`http://localhost?...`, whose metadata comes from the client_id and is
+/// never fetched) still completes the whole flow with an
+/// `http://127.0.0.1:<port>` redirect, which the browser follows, not the
+/// server. Client metadata the server would fetch from a loopback or
+/// private address, or over http, is refused before anything connects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn loopback_clients_work_and_metadata_fetches_are_guarded_outside_dev_mode() {
+    let s = spawn_with(|c| c.dev_mode = false).await;
+    let acct = create_account(&s, "loopy").await;
+    let key = DpopKey::new();
+    let scope = "atproto transition:generic";
+    for redirect in ["http://127.0.0.1:43123/callback", "http://[::1]:43123/callback"] {
+        let f = Flow::new(&loopback_client_id(scope, redirect), redirect, scope, &key);
+        let t = grant(&s, &mut Browser::default(), &f, &acct).await;
+        assert_eq!(t.scope, scope);
+    }
+    // the bare loopback client id: its default redirects http://127.0.0.1/
+    // and http://[::1]/ match any port (RFC 8252 §7.3), not another path
+    for redirect in ["http://127.0.0.1:43123/", "http://[::1]:43124/"] {
+        let f = Flow::new("http://localhost", redirect, "atproto", &key);
+        grant(&s, &mut Browser::default(), &f, &acct).await;
+    }
+    let f = Flow::new("http://localhost", "http://127.0.0.1:43123/callback", "atproto", &key);
+    assert_eq!(f.par(&s, &pkce(), "x").await.body["error"], "invalid_request");
+
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = hits.clone();
+    tokio::spawn(async move {
+        while let Ok((c, _)) = listener.accept().await {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(c);
+        }
+    });
+    for client_id in [
+        format!("http://127.0.0.1:{port}/client-metadata.json"),
+        format!("https://127.0.0.1:{port}/client-metadata.json"),
+        format!("https://localhost:{port}/client-metadata.json"),
+        format!("https://app.localhost:{port}/client-metadata.json"),
+        format!("https://[::ffff:127.0.0.1]:{port}/client-metadata.json"),
+        "https://169.254.169.254/latest/meta-data".to_string(),
+        "https://2130706433/client-metadata.json".to_string(),
+    ] {
+        let f = Flow::new(&client_id, "https://app.example.com/cb", "atproto", &key);
+        let r = f.par(&s, &pkce(), "x").await;
+        assert_eq!((r.status, r.body["error"].as_str()), (400, Some("invalid_client_metadata")), "{client_id}: {}", r.body);
+    }
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0, "a metadata fetch reached a loopback address");
+}
+
 // Reference-suite ports that reuse this file's client simulation.
 #[path = "ref_oauth.rs"]
 mod ref_oauth;

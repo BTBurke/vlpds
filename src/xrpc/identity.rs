@@ -434,7 +434,7 @@ async fn well_known_did(handle: &str, dev_mode: bool) -> Result<String, String> 
     const MAX_BYTES: usize = 2048;
     let url = format!("https://{handle}/.well-known/atproto-did");
     let fetch = async {
-        let r = crate::http::guarded(dev_mode).get(&url).send().await.map_err(|e| format!("{e:?}"))?;
+        let r = crate::http::guarded(dev_mode).get(&url)?.send().await.map_err(|e| format!("{e:?}"))?;
         if !r.status().is_success() {
             return Err(format!("status {}", r.status()));
         }
@@ -798,9 +798,11 @@ mod tests {
 
     #[tokio::test]
     async fn well_known_check_refuses_private_hosts() {
-        // "localhost" resolves to loopback only: refused at resolution,
-        // before any connection
-        let e = well_known_did("localhost", false).await.unwrap_err();
-        assert!(e.contains("public unicast"), "{e}");
+        // refused before any connection: loopback names and IP literals
+        // (valid handles can't be IP literals, but the fetch doesn't rely on it)
+        for h in ["localhost", "a.localhost", "127.0.0.1", "169.254.169.254", "2130706433", "[::1]"] {
+            let e = well_known_did(h, false).await.unwrap_err();
+            assert!(e.contains("non-unicast"), "{h}: {e}");
+        }
     }
 }

@@ -1,7 +1,7 @@
 //! Outbound HTTP clients, one per role, each built once and shared so
 //! connections are reused (DESIGN.md "HTTP"): [`PeerClient`] (node to
 //! node), [`public`] (operator-configured upstreams), [`proxy`] and [`h1`]
-//! (the AppView proxy), and [`guarded`] (URLs derived from user input).
+//! (the AppView proxy), and [`guarded`] (URLs derived from untrusted input).
 //!
 //! No client follows redirects: forwarded and proxied responses go back to
 //! the caller as they are, and a redirect from a user-controlled host could
@@ -671,18 +671,46 @@ pub mod stall {
     }
 }
 
-/// For user-controlled URLs: outside dev mode, a resolver refuses non-public
-/// addresses. Pair it with [`crate::did_resolver::check_outbound_url`] for
-/// the scheme and IP literals (the resolver only sees DNS names).
-pub fn guarded(dev_mode: bool) -> &'static reqwest::Client {
+/// The one client for destinations taken from untrusted input (DID
+/// documents, handles, OAuth client metadata, `atproto-proxy`). Every
+/// request URL passes [`crate::did_resolver::check_outbound_url`] (https
+/// only, no non-public IP literals: the resolver never sees those), and DNS
+/// names resolve through [`PublicOnlyResolver`], whose vetted addresses are
+/// the ones connected to, so a rebinding answer can't slip in between check
+/// and connect. Redirects aren't followed and no system proxy is used (it
+/// would resolve the name itself). Dev mode (`--dev-mode`, tests) allows
+/// http and any address. Callers bound the response size and overall time.
+#[derive(Clone, Copy, Debug)]
+pub struct Guarded {
+    dev_mode: bool,
+}
+
+pub fn guarded(dev_mode: bool) -> Guarded {
+    Guarded { dev_mode }
+}
+
+impl Guarded {
+    pub fn request(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        let u = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+        crate::did_resolver::check_outbound_url(&u, self.dev_mode)?;
+        Ok(guarded_client(self.dev_mode).request(method, u))
+    }
+
+    pub fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
+        self.request(reqwest::Method::GET, url)
+    }
+}
+
+fn guarded_client(dev_mode: bool) -> &'static reqwest::Client {
     static STRICT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         outbound("guarded", 32)
+            .no_proxy()
             .dns_resolver(Arc::new(PublicOnlyResolver))
             .build()
             .expect("reqwest client")
     });
     static DEV: LazyLock<reqwest::Client> =
-        LazyLock::new(|| outbound("guarded", 32).build().expect("reqwest client"));
+        LazyLock::new(|| outbound("guarded", 32).no_proxy().build().expect("reqwest client"));
     if dev_mode {
         &DEV
     } else {
@@ -924,20 +952,100 @@ impl<S: tower::Service<R>, R> tower::Service<R> for Counted<S> {
 pub(crate) mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn guarded_refuses_private_hosts() {
-        // localhost resolves to loopback only: the strict client never connects
+    /// A loopback listener counting the connections it accepts.
+    async fn counting_listener() -> (u16, Arc<AtomicUsize>) {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
-        let accepted = tokio::spawn(async move { l.accept().await.is_ok() });
+        let n = Arc::new(AtomicUsize::new(0));
+        let seen = n.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                seen.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+        (port, n)
+    }
+
+    #[tokio::test]
+    async fn guarded_refuses_private_hosts() {
+        let (port, accepted) = counting_listener().await;
+        // refused before any connection: a non-https scheme, loopback names,
+        // and non-public IP literals in every spelling the URL parser reads
+        let local = [
+            "http://example.com",
+            "ftp://example.com",
+            "file:///etc/passwd",
+            "https://localhost:{port}",
+            "https://LOCALHOST.:{port}",
+            "https://a.b.localhost:{port}",
+            "https://127.0.0.1:{port}",
+            "https://127.0.0.1.:{port}",
+            "https://127.1:{port}",
+            "https://2130706433:{port}",
+            "https://0x7f000001:{port}",
+            "https://0x7f.1:{port}",
+            "https://0177.0.0.1:{port}",
+            "https://[::1]:{port}",
+            "https://[::ffff:127.0.0.1]:{port}",
+            "https://[::ffff:7f00:1]:{port}",
+            "https://[64:ff9b::7f00:1]:{port}",
+            "https://[2002:7f00:1::]:{port}",
+            "https://0.0.0.0:{port}",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://[fd00:ec2::254]/latest/meta-data/",
+            "https://[fe80::1%25en0]/",
+            "https://10.0.0.1/",
+            "https://172.16.0.1/",
+            "https://192.168.1.1/",
+            "https://100.64.0.1/",
+            "https://224.0.0.1/",
+            "https://255.255.255.255/",
+        ];
+        for u in local {
+            let u = u.replace("{port}", &port.to_string());
+            let e = guarded(false).get(&u).unwrap_err();
+            assert!(
+                e.contains("non-unicast") || e.contains("Forbidden protocol") || e.contains("invalid URL"),
+                "{u}: {e}"
+            );
+        }
+        // a public address passes the URL check (nothing is sent here)
+        assert!(guarded(false).get("https://8.8.8.8/x").is_ok());
+        assert!(guarded(false).get("https://example.com/x").is_ok());
+
+        // a DNS name resolving to loopback, past the URL check: the strict
+        // client's resolver refuses it, and the vetted addresses are the ones
+        // connected to, so no answer can change between check and connect
         let url = format!("http://localhost:{port}/.well-known/atproto-did");
-        let e = guarded(false).get(&url).send().await.unwrap_err();
+        let e = guarded_client(false).get(&url).send().await.unwrap_err();
         assert!(e.is_connect(), "{e:?}");
         assert!(format!("{e:?}").contains("public unicast"), "{e:?}");
         assert!(public_addrs("localhost").await.is_err());
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+
         // dev mode reaches it
-        let _ = tokio::time::timeout(Duration::from_secs(2), guarded(true).get(&url).send()).await;
-        assert!(tokio::time::timeout(Duration::from_secs(2), accepted).await.unwrap().unwrap());
+        let _ = tokio::time::timeout(Duration::from_secs(2), guarded(true).get(&url).unwrap().send()).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A redirect from an untrusted host comes back as the response; its
+    /// target (an internal service here) is never contacted.
+    #[tokio::test]
+    async fn guarded_never_follows_redirects() {
+        let (internal, hits) = counting_listener().await;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let front = format!("http://{}/.well-known/did.json", l.local_addr().unwrap());
+        let to = format!("http://127.0.0.1:{internal}/metrics");
+        let router = axum::Router::new().fallback(move || {
+            let to = to.clone();
+            async move { (axum::http::StatusCode::FOUND, [(axum::http::header::LOCATION, to)]) }
+        });
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let r = guarded(true).get(&front).unwrap().send().await.unwrap();
+        assert_eq!(r.status(), 302);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[test]

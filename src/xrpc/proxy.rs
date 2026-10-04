@@ -232,15 +232,6 @@ pub async fn resolve_did(app: &App, did: &str) -> Result<Arc<J>, did_resolver::R
     app.did_resolver.resolve(did).await
 }
 
-/// Endpoints taken from DID documents use the SSRF-guarded client.
-fn proxy_http(app: &App, trusted: bool) -> &'static reqwest::Client {
-    if trusted {
-        crate::http::proxy()
-    } else {
-        crate::http::guarded(app.config.dev_mode)
-    }
-}
-
 fn upstream_failure(message: &str) -> XrpcError {
     xerr(StatusCode::BAD_GATEWAY, "UpstreamFailure", message)
 }
@@ -770,14 +761,6 @@ async fn send(
         None => None,
     };
 
-    if !target.trusted {
-        let base = reqwest::Url::parse(&target.url)
-            .map_err(|_| XrpcError::bad("InvalidRequest", "invalid service endpoint"))?;
-        if let Err(e) = did_resolver::check_outbound_url(&base, app.config.dev_mode) {
-            tracing::warn!(endpoint = %target.url, "proxy target refused: {e}");
-            return Err(upstream_failure("Upstream service unreachable"));
-        }
-    }
     let ep = endpoint(&target.url)?;
     let with_body = f.body.is_some();
     let headers = forward_headers(f.headers, with_body, authorization.as_deref(), f.accept_encoding);
@@ -802,7 +785,15 @@ async fn send(
             let mut url = String::with_capacity(ep.origin.len() + f.path_and_query.len());
             url.push_str(&ep.origin);
             url.push_str(f.path_and_query);
-            let mut rb = proxy_http(app, target.trusted).request(f.method, &url).headers(headers);
+            let rb = if target.trusted {
+                crate::http::proxy().request(f.method, &url)
+            } else {
+                crate::http::guarded(app.config.dev_mode).request(f.method, &url).map_err(|e| {
+                    tracing::warn!(endpoint = %target.url, "proxy target refused: {e}");
+                    upstream_failure("Upstream service unreachable")
+                })?
+            };
+            let mut rb = rb.headers(headers);
             if let Some(b) = f.body {
                 rb = rb.body(reqwest::Body::wrap_stream(b.into_data_stream()));
             }
