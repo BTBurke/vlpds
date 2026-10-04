@@ -1,4 +1,4 @@
-# vlpds
+# Very Large PDS (vlpds)
 
 **An atproto PDS where the object store is the database.** Every acknowledged write is already in
 your S3, R2 or GCS bucket; nodes keep only caches, and scaling out means starting another node on
