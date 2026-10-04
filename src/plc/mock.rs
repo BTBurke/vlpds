@@ -1,6 +1,6 @@
 //! An in-process PLC directory for tests, with the directory's own checks
 //! on incoming ops. Serves only what the PDS reads: `GET /{did}`,
-//! `/{did}/data` and `/{did}/log/last`. Failures can be injected.
+//! `/{did}/data`, `/{did}/log/last` and `/{did}/log/audit`. Failures can be injected.
 
 use super::{assert_valid_incoming, format_did_doc, PlcLog};
 use axum::extract::{Path, State};
@@ -44,6 +44,7 @@ impl MockPlc {
             .route("/{did}", get(doc).post(post_op))
             .route("/{did}/data", get(data))
             .route("/{did}/log/last", get(last))
+            .route("/{did}/log/audit", get(audit))
             .with_state(inner.clone());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind mock PLC");
         let url = format!("http://{}", l.local_addr().unwrap());
@@ -127,6 +128,21 @@ async fn data(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response 
 async fn last(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
     match known(&s, &did) {
         Ok(l) => Json(l.last().map(|e| e.op.clone()).unwrap_or(J::Null)).into_response(),
+        Err(r) => r,
+    }
+}
+
+async fn audit(State(s): State<Arc<Inner>>, Path(did): Path<String>) -> Response {
+    match known(&s, &did) {
+        Ok(l) => {
+            let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+            let log: Vec<J> = l
+                .entries
+                .iter()
+                .map(|e| json!({"did": did, "operation": e.op, "cid": e.cid, "nullified": e.nullified, "createdAt": at(e.created_at_ms)}))
+                .collect();
+            Json(log).into_response()
+        }
         Err(r) => r,
     }
 }

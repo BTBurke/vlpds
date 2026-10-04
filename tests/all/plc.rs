@@ -664,3 +664,40 @@ async fn ensure_recovery_key_backfills_existing_accounts() {
     b.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h}), &plain.auth()).await.ok();
     assert_eq!(plc.data(&plain.did).unwrap()["rotationKeys"], json!([recovery, rot.did_key()]));
 }
+
+/// vlpds.identity.getPlcAuditLog (the account backup's
+/// identity/plc-audit-log.json): the directory's log for accounts here
+/// only, without auth, oldest op first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn audit_log_for_hosted_accounts_only() {
+    let plc = MockPlc::start().await;
+    let rot = new_key();
+    let s = pds(&plc, &rot, "did:web:pds.test", None).await;
+    let a = s.create_account("audit").await;
+    let h2 = format!("{}.{HANDLE_DOMAIN}", unique_name("audit"));
+    s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": h2}), &a.auth()).await.ok();
+
+    let out = s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", &a.did)], &Auth::None).await.ok();
+    assert_eq!(out["did"], json!(a.did));
+    let log = out["log"].as_array().expect("log array");
+    let ops = plc.ops(&a.did);
+    assert_eq!(log.len(), ops.len());
+    assert!(log.len() >= 2, "genesis and the handle change: {out}");
+    for (entry, op) in log.iter().zip(&ops) {
+        assert_eq!(&entry["operation"], op);
+        assert_eq!(entry["did"], json!(a.did));
+        assert_eq!(entry["nullified"], json!(false));
+        assert!(entry["cid"].is_string() && entry["createdAt"].is_string(), "{entry}");
+    }
+    assert_eq!(log.last().unwrap()["operation"]["alsoKnownAs"], json!([format!("at://{h2}")]));
+
+    // in the directory but not hosted here: no open proxy
+    let other = pds(&plc, &new_key(), "did:web:other.test", None).await;
+    let stranger = other.create_account("elsewhere").await;
+    assert!(!plc.ops(&stranger.did).is_empty());
+    s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", &stranger.did)], &Auth::None).await.err(400, "DidNotFound");
+    s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", "did:web:example.com")], &Auth::None).await.err(400, "InvalidRequest");
+
+    plc.set_down(true);
+    s.xrpc.get("vlpds.identity.getPlcAuditLog", &[("did", &a.did)], &Auth::None).await.err_status(500);
+}

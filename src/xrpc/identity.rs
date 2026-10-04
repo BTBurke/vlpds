@@ -36,6 +36,7 @@ pub fn routes() -> Router<Arc<App>> {
             post(submit_plc_operation),
         )
         .route("/xrpc/vlpds.identity.getPlcData", get(get_plc_data))
+        .route("/xrpc/vlpds.identity.getPlcAuditLog", get(get_plc_audit_log))
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
         .route("/.well-known/did.json", get(well_known_did_json))
         .route("/tls-check", get(tls_check))
@@ -658,6 +659,28 @@ async fn get_plc_data(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J
         "recoveryKey": plc.recovery_did_key(),
         "recommendedRotationKeys": plc.recommended_rotation_keys(),
     })))
+}
+
+/// A hosted account's PLC audit log, for the account backup: the account
+/// page's CSP only allows this origin, and the browser has no other way to
+/// learn which directory this server uses. Accounts here only (any status),
+/// so it is no open proxy.
+async fn get_plc_audit_log(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Json<J>> {
+    if !crate::plc::valid_plc_did(&q.did) {
+        return Err(XrpcError::bad("InvalidRequest", format!("not a did:plc: {}", q.did)));
+    }
+    if super::server::account_if_exists(&app, &q.did).await?.is_none() {
+        return Err(XrpcError::bad("DidNotFound", format!("DID not found: {}", q.did)));
+    }
+    let client = match &app.plc {
+        Some(p) => p.client.clone(),
+        None => crate::plc::PlcClient::new(&app.config.plc_url),
+    };
+    let log = client.audit_log(&q.did).await.map_err(|e| match e {
+        crate::plc::PlcError::NotFound(_) => XrpcError::bad("DidNotFound", format!("{} is not in the PLC directory", q.did)),
+        e => e.into(),
+    })?;
+    Ok(Json(json!({"did": q.did, "log": log})))
 }
 
 /// Deactivated and taken-down accounts too.

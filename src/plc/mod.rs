@@ -35,11 +35,13 @@ const MAX_DID_KEY_LENGTH: usize = 256;
 /// this long (PLC spec "recovery").
 const RECOVERY_WINDOW_MS: i64 = 72 * 3600 * 1000;
 const MAX_RESPONSE_BYTES: usize = 256 << 10;
+/// An audit log is every op the DID ever had (~1 KB each).
+const MAX_AUDIT_LOG_BYTES: usize = 4 << 20;
 
 static PLC_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "vlpds_plc_requests_total",
-        "PLC directory requests by op (create, update_handle, update_signing_key, submit, tombstone, rotate_key, get_last_op, get_data) and result (ok, rejected: 4xx; unavailable: 5xx, timeout, connection; not_found)",
+        "PLC directory requests by op (create, update_handle, update_signing_key, submit, tombstone, rotate_key, get_last_op, get_data, get_audit_log) and result (ok, rejected: 4xx; unavailable: 5xx, timeout, connection; not_found)",
         &["op", "result"]
     )
     .unwrap()
@@ -545,11 +547,15 @@ impl PlcClient {
     /// text/plain "OK" (did-method-plc `res.sendStatus(200)`), so POST bodies
     /// are ignored: any 2xx means the op was applied.
     async fn call(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool) -> Result<Option<J>, PlcError> {
+        self.call_capped(op, rb, did, json, MAX_RESPONSE_BYTES).await
+    }
+
+    async fn call_capped(&self, op: &'static str, rb: reqwest::RequestBuilder, did: &str, json: bool, cap: usize) -> Result<Option<J>, PlcError> {
         let t = Instant::now();
         let r = tokio::time::timeout(REQUEST_TIMEOUT, async {
             let r = rb.send().await.map_err(|e| PlcError::Unavailable(format!("{e}")))?;
             let status = r.status();
-            let body = read_capped(r).await?;
+            let body = read_capped(r, cap).await?;
             if status.is_success() {
                 if body.is_empty() || !json {
                     return Ok(None);
@@ -594,19 +600,27 @@ impl PlcClient {
         self.call("get_data", self.http.get(url), did, true).await?.ok_or_else(|| PlcError::Unavailable("empty response".into()))
     }
 
+    /// Every op with its CID, `nullified` and `createdAt`, oldest first.
+    pub async fn audit_log(&self, did: &str) -> Result<J, PlcError> {
+        let url = self.did_url(did, "/log/audit")?;
+        self.call_capped("get_audit_log", self.http.get(url), did, true, MAX_AUDIT_LOG_BYTES)
+            .await?
+            .ok_or_else(|| PlcError::Unavailable("empty response".into()))
+    }
+
     pub async fn send(&self, did: &str, op: &J, op_label: &'static str) -> Result<(), PlcError> {
         let url = self.did_url(did, "")?;
         self.call(op_label, self.http.post(url).json(op), did, false).await.map(|_| ())
     }
 }
 
-async fn read_capped(r: reqwest::Response) -> Result<Vec<u8>, PlcError> {
+async fn read_capped(r: reqwest::Response, cap: usize) -> Result<Vec<u8>, PlcError> {
     use futures::StreamExt;
     let mut buf = Vec::new();
     let mut s = r.bytes_stream();
     while let Some(c) = s.next().await {
         buf.extend_from_slice(&c.map_err(|e| PlcError::Unavailable(e.to_string()))?);
-        if buf.len() > MAX_RESPONSE_BYTES {
+        if buf.len() > cap {
             return Err(PlcError::Unavailable("response too large".into()));
         }
     }
