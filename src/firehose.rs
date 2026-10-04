@@ -2345,6 +2345,130 @@ mod tests {
         assert_eq!(read_messages(&mut r, all.len()).await, all);
     }
 
+    /// Ring replay fan-out with and without a filter (ignored; --ignored
+    /// --nocapture): 16 subscribers replay the same 40,000 ~5 KB commits
+    /// from the ring into in-memory pipes, with no filter, a filter with an
+    /// empty set, and one whose set hits one DID in 1,000 (most batches
+    /// write runs instead of one slice).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore]
+    async fn frame_filter_fanout() {
+        struct Set(std::collections::HashSet<Vec<u8>>);
+        impl FrameFilter for Set {
+            fn generation(&self) -> Option<u64> {
+                (!self.0.is_empty()).then_some(1)
+            }
+            fn skip(&self, f: &FrameMeta<'_>) -> bool {
+                matches!(f.kind, FrameKind::Commit | FrameKind::Sync) && f.did.is_some_and(|d| self.0.contains(d))
+            }
+        }
+        let (n, subs, per_batch) = (40_000usize, 16usize, 500usize);
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let ops = [events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None }];
+        let blocks = vec![7u8; 5000];
+        let frames: Vec<Bytes> = (0..n as u64)
+            .map(|i| {
+                let did = crate::state::bulk_did(i % 5000);
+                let f = events::commit_frame(&events::CommitFrame {
+                    repo: &did,
+                    rev: "3kabc",
+                    since: None,
+                    commit: cid,
+                    prev_data: None,
+                    blocks: &blocks,
+                    ops: &ops,
+                    time: "2026-01-01T00:00:00.000Z",
+                });
+                let mut out = Vec::new();
+                f.finish(i as i64, &mut out);
+                Bytes::from(out)
+            })
+            .collect();
+        let modes: [(&str, Option<Set>); 3] = [
+            ("no filter", None),
+            ("empty set", Some(Set(Default::default()))),
+            (
+                "1 DID in 1,000",
+                Some(Set((0..5000u64).step_by(1000).map(|i| crate::state::bulk_did(i).into_bytes()).collect())),
+            ),
+        ];
+        for (name, filter) in modes {
+            let msg_len = |f: &Bytes| {
+                let mut v = Vec::new();
+                push_message(&mut v, OP_BINARY, &[]);
+                v.len()
+                    + if f.len() < 126 {
+                        0
+                    } else if f.len() <= 65535 {
+                        2
+                    } else {
+                        8
+                    }
+                    + f.len()
+            };
+            let want: usize =
+                frames.iter().filter(|f| filter.as_ref().is_none_or(|s| !s.skip(&frame_meta(f)))).map(msg_len).sum();
+            let mut best = Duration::MAX;
+            let filter = filter.map(Arc::new);
+            for _ in 0..3 {
+                let fh = Firehose::new(Options { ring_bytes: 1 << 30, ..Options::default() });
+                // without one, a cursor gets an OutdatedCursor first
+                *fh.store.write() = Some(crate::store::Store::memory(None));
+                if let Some(f) = &filter {
+                    fh.set_filter(f.clone());
+                }
+                let (_, wa) = fh.add_remote("A");
+                let (tx, rx) = mpsc::unbounded_channel();
+                let mut sub = fh.subscribe();
+                let mut last = i64::MIN;
+                fh.spawn_merger(rx);
+                let base = fh.position();
+                for (b, chunk) in frames.chunks(per_batch).enumerate() {
+                    let events: Vec<(i64, Bytes)> = chunk
+                        .iter()
+                        .enumerate()
+                        .map(|(j, f)| (base + ((b * per_batch + j) as i64 + 1) * 256, f.clone()))
+                        .collect();
+                    let top = events.last().unwrap().0;
+                    tx.send(LogBatch { log_id: "A".into(), ordinal: b as u64, events }).unwrap();
+                    wa.store(top, Ordering::Release);
+                    next_batches(&fh, &mut sub, &mut last).await;
+                }
+                let t = std::time::Instant::now();
+                let mut tasks = Vec::new();
+                for _ in 0..subs {
+                    let (w, mut r) = tokio::io::duplex(1 << 20);
+                    let (ctl_tx, ctl) = mpsc::channel(1);
+                    let fh = fh.clone();
+                    let s = tokio::spawn(async move {
+                        let mut out = Out { w, ctl, idle: Duration::from_secs(30), conn: None };
+                        let _ctl = ctl_tx;
+                        let _ = fh.stream(&mut out, Some(base), None).await;
+                    });
+                    tasks.push(tokio::spawn(async move {
+                        let mut buf = vec![0u8; 1 << 20];
+                        let mut got = 0;
+                        while got < want {
+                            got += r.read(&mut buf).await.unwrap();
+                        }
+                        s.abort();
+                        got
+                    }));
+                }
+                for t in tasks {
+                    assert_eq!(t.await.unwrap(), want, "{name}");
+                }
+                best = best.min(t.elapsed());
+            }
+            let events = frames.len() as f64 * subs as f64;
+            eprintln!(
+                "{name:>15}: {:.2} GB/s out, {:.2}M events/s across {subs} subscribers (best of 3)",
+                (want * subs) as f64 / best.as_secs_f64() / 1e9,
+                events / best.as_secs_f64() / 1e6,
+            );
+        }
+    }
+
     /// Backfills beyond `max_backfills` wait for a slot (answering their
     /// client meanwhile), and one whose client leaves stops waiting.
     #[tokio::test]
