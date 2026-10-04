@@ -266,9 +266,9 @@ latency, PLC lookups or KMS unwraps on cold writes. Raise `--cache-budget-mb` or
 ## The full runbook
 
 ```facts
-- { value: "79", label: alert sections, note: "Means, Causes, Confirm, Do for every rule in ops/alerts.yml" }
+- { value: "79", label: alert sections, note: "Means, Causes, Confirm, Do for the 80 rules in ops/alerts.yml" }
 - { value: "19", label: procedures, note: "deploys, upgrades, keys, peer TLS, outages, users locked out", tone: blue }
-- { value: "1", label: "list of metric gaps", note: "signals the alerts would want that nothing exports yet", tone: muted }
+- { value: "1", label: "list of metric gaps", note: "signals the alerts would want that no metric exports", tone: muted }
 ```
 
 `ops/RUNBOOK.md` stays the reference the alerts' `runbook_url`s point at. Its procedures:
@@ -278,7 +278,7 @@ latency, PLC lookups or KMS unwraps on cold writes. Raise `--cache-budget-mb` or
 | Deploys | [Rolling deploy](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#rolling-deploy), [Rolling upgrade, finalize, rollback](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#rolling-upgrade-finalize-rollback) |
 | Hosts and nodes | [Replacing a dead host](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#replacing-a-dead-host), [Adding a node](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#adding-a-node), [Shard split / merge](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#shard-split--merge) |
 | Store | [Object-store outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#object-store-outage), [Store saturated by the node's own reads](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#store-saturated-by-the-nodes-own-reads) |
-| Keys | [Secrets as files](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#secrets-as-files), [KEK provisioning](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#kek-provisioning), [KEK rotation](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#kek-rotation), [Key service (KMS) outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#key-service-kms-outage), [PLC rotation key](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#plc-rotation-key-provisioning), [Operator recovery key](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#operator-recovery-key), [PLC directory outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#plc-directory-outage) |
+| Keys | [Secrets as files](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#secrets-as-files), [KEK provisioning](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#kek-provisioning), [KEK rotation](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#kek-rotation), [Key service (KMS) outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#key-service-kms-outage), [PLC rotation key](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#plc-rotation-key-provisioning), [PLC rotation key rotation](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#plc-rotation-key-rotation), [Operator recovery key](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#operator-recovery-key), [PLC directory outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#plc-directory-outage) |
 | Cluster | [Peer TLS](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#peer-tls-mtls-between-nodes) |
 | Users and mail | [Email](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#email-smtp-moderation-mail-branding), [Moderation service, earned invites, external handles](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#moderation-service-earned-invites-external-handles), [A user locked out by a second factor](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#a-user-locked-out-by-a-second-factor) |
 

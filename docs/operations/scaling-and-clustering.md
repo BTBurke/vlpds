@@ -33,8 +33,8 @@ how big to make a cluster, how to change it, and how to change the shard layout.
 (leases, takeover, handback) are in [Architecture](../architecture.md#shards-and-ownership).
 
 > [!NOTE]
-> The Ansible role deploys **one node** today. A multi-node cluster runs from the same image with the
-> peer flags below; the role does not template them yet.
+> The Ansible role deploys **one node**. A multi-node cluster runs from the same image with the
+> peer flags below, which the role doesn't set.
 
 ## Sizing rules
 
@@ -66,7 +66,12 @@ survivors stay under ~60% CPU**: (nodes − 1) × cores × 0.6 ≥ busy cores, f
   incarnations.
 
 Numbers are from DESIGN.md "Initial deployment sizing" and the benchmark campaigns
-(`bench/results/`), and are estimates, not promises.
+(`bench/results/`), and are estimates, not promises. The largest runs so far are 100 M bulk-created
+accounts on 4 nodes and ~60k commits/s on one 16-core node.
+
+Full nodes serve AppView proxying and the firehose; there is no separate read or fan-out tier. To
+serve more, add full nodes. Consumers that can't take the whole stream use `?shard=k/n`; see
+[Firehose](../firehose.md#sharded-subscriptions).
 
 ## Adding a node
 
@@ -196,22 +201,3 @@ vlpds --node-id node-a --peer-listen 0.0.0.0:2584 \
 Renewal and CA rotation, step by step: RUNBOOK
 [Peer TLS](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#peer-tls-mtls-between-nodes).
 Why it is built this way: [Keys and security](../keys-security.md#peer-tls).
-
-## Planet scale
-
-```facts
-- { value: "1–5 B", unit: accounts, label: the design target, note: "analysis only; nothing at this size has been run", tone: muted }
-- { value: "200–500k", unit: commits/s, label: at peak, note: "~35 cores of commit CPU fleet-wide", tone: amber }
-- { value: "~50–150", unit: nodes, label: "16–32 cores each", note: "sized by write throughput and hot-repo memory", tone: blue }
-```
-
-The storage model doesn't change at this size: fixed hash slots, shards that split online, one log
-and one lease per node, and a firehose that merges N node logs rather than thousands of shard
-streams. Start with ~2–4k shards and split hot or large ones. The largest real runs so far are 100 M
-bulk-created accounts on 4 nodes and ~60k commits/s on one 16-core node (`bench/results/`).
-
-**No separate read or fan-out tier is planned.** Full nodes serve AppView proxying and the firehose;
-a dedicated tier would start to pay only above ~300k proxied req/s (a reader is NIC-bound at ~210k
-per 10 Gbit) or with dozens of full-firehose subscribers at 20–100× today's write load. Before that,
-prefer a DID-aware load balancer (it removes the forwarding hop) and more full nodes. Consumers that
-can't take the whole stream use `?shard=k/n`; see [Firehose](../firehose.md#sharded-subscriptions).

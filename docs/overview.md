@@ -131,19 +131,20 @@ owner. See [Architecture](architecture.md#shards-and-ownership) and
 - { value: "~60k", unit: commits/s, label: one 16-core node, note: "measured with 25 ms injected store latency; ~90k with none", tone: amber }
 - { value: "~300k", unit: req/s, label: AppView proxying per node, note: "about 50 µs of CPU per request" }
 - { value: "100M", unit: accounts, label: bulk-created in a test cluster, note: "4 nodes on one MinIO", tone: blue }
-- { value: "~$1.7k", unit: /mo, label: "S3 bill for all of Bluesky's writes", note: "3 nodes · 64 shards · in-region", tone: violet }
+- { value: "~$1.7k", unit: /mo, label: "S3 bill for all of Bluesky's writes", note: "modeled; 3 nodes · 64 shards · in-region", tone: violet }
 ```
 
-These are round numbers from the benchmark campaigns (`bench/results/`) and the cost model, not
-promises. What they mean in practice:
+These are round numbers from the benchmark campaigns (`bench/results/`). The object-store bill at
+Bluesky's load is modeled from measured request rates (`bench/results/cost-model-2026-10-02`). What
+they mean in practice:
 
-| | Personal | Bluesky today | 10× Bluesky |
-|---|---|---|---|
-| Accounts | a handful | 56 M repos, 24 B records | ~560 M repos |
-| Commits/s | a few a day | ~350 avg, ~900 bursts | ~3.5k avg, ~9k bursts |
-| Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, NVMe | 3 × 24 cores or ~8 small nodes |
-| Busy cores, fleet-wide | ~0 | ~3 | ~25 |
-| Object store requests | $0 on R2, ~$2–4 on S3 | ~$1.7k/mo (S3), ~$1.5k (R2) | grows with shards, not commits |
+| | Personal | Bluesky today |
+|---|---|---|
+| Accounts | a handful | 56 M repos, 24 B records |
+| Commits/s | a few a day | ~350 avg, ~900 bursts |
+| Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, NVMe |
+| Busy cores, fleet-wide | ~0 | ~3 |
+| Object store requests | $0 on R2, ~$2–4 on S3 | ~$1.7k/mo (S3), ~$1.5k (R2), modeled |
 
 A few things to know about where the costs come from:
 
@@ -156,8 +157,6 @@ A few things to know about where the costs come from:
 - **Memory follows active repos, not total repos.** Only the MST paths that recent writes visited stay in
   memory (~10–20 KB per active repo), so 32 GB nodes hold a day's writers at Bluesky's scale.
 
-The design is sized for planet scale (1–5 B accounts, 200–500k commits/s, ~50–150 nodes) without changing the
-storage model; that part is analysis, not something that has been run.
 Details: [Scaling and clustering](operations/scaling-and-clustering.md),
 [Configuration](operations/configuration.md).
 

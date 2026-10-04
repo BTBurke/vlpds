@@ -107,9 +107,8 @@ account on one node keeps three things in one place:
   account, not one per node.
 
 With Caddy spreading requests evenly over N nodes, about (N − 1)/N of proxied calls take this one
-extra hop, a fraction of a millisecond on a LAN. A DID-aware load balancer would remove it; that
-is not built. A forwarded proxied call waits up to 30 s for its response head (the AppView's own
-deadline is shorter, below).
+extra hop, a fraction of a millisecond on a LAN. A forwarded proxied call waits up to 30 s for its
+response head (the AppView's own deadline is shorter, below).
 
 ## Connection pools and limits
 
@@ -239,6 +238,5 @@ the box running the load generator and the stub too, so they are a floor for the
 
 What that means for sizing: proxying and Argon2 logins, not commits, set a cluster's CPU. Bluesky's
 assumed 20k proxied req/s is about one core fleet-wide and ~0.8 Gbit/s each way; at 10× it is ~10
-cores and ~8 Gbit/s, which is why a 3-node cluster wants 3–10 Gbit/s NICs. Separate proxy-only
-nodes would start to pay only above ~300k req/s and are not planned. See
+cores and ~8 Gbit/s, which is why a 3-node cluster wants 3–10 Gbit/s NICs. See
 [Scaling and clustering](operations/scaling-and-clustering.md#sizing-rules).

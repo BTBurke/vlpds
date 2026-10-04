@@ -179,6 +179,5 @@ indexers is well under 100 Mbit/s. Egress is a memory copy on the server (1,000 
 Backfill from an old cursor reads the bucket at up to ~1.7 GB/s per subscriber on a fast store,
 which costs GETs and, on S3, egress if the bucket is in another region.
 
-Firehose fan-out nodes are not planned: full nodes serve this well past today's scale, and relays
-that need to split the stream use `?shard=k/n`. Details: [Firehose](../firehose.md#serving-subscribers),
+Every full node serves the firehose, and relays that need to split the stream use `?shard=k/n`. Details: [Firehose](../firehose.md#serving-subscribers),
 [Scaling and clustering](scaling-and-clustering.md#sizing-rules).

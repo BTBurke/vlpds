@@ -13,11 +13,11 @@ diagram:
     - { id: bucket, label: Object store, sub: bucket + prefix, at: [0, 0.2], size: [8, 2.6], shape: store, tone: amber }
     - { id: keys, label: Secrets, sub: "KEK · PLC key · tokens", at: [0, 5.2], size: [8, 2.6], tone: muted }
     - { id: deploy, label: Deploy, sub: Ansible · compose, at: [12, 2.6], size: [8, 3], tone: accent }
-    - { id: watch, label: Monitoring, sub: "metrics · 79 alerts", at: [24, 2.6], size: [8, 3], tone: blue }
+    - { id: watch, label: Monitoring, sub: "metrics · 80 alerts", at: [24, 2.6], size: [8, 3], tone: blue }
     - { id: runbook, label: Runbook, sub: one section per alert, at: [36, 2.6], size: [8, 3], tone: danger }
     - { id: upgrade, label: Upgrades, sub: SIGTERM · roll · finalize, at: [12, 9], size: [8, 3], tone: accent }
     - { id: scale, label: Scaling, sub: "add nodes · split shards", at: [24, 9], size: [8, 3], tone: accent }
-    - { id: backup, label: Backups, sub: design · not built, at: [36, 9], size: [8, 3], shape: note, tone: muted }
+    - { id: backup, label: Backups, sub: "bucket durability · offline keys", at: [36, 9], size: [8, 3], shape: note, tone: muted }
   edges:
     - "bucket.r -> deploy.l30"
     - "keys.r -> deploy.l70"
@@ -28,9 +28,9 @@ diagram:
     - { from: runbook.b, to: backup.t, label: last resort, dash: true }
 facts:
   - { value: "1", unit: binary, label: and one bucket per PDS, note: "the web UI and the admin CLI are in the same binary" }
-  - { value: "79", unit: alerts, label: each with a runbook section, note: "17 page, 62 ticket (ops/alerts.yml)", tone: blue }
+  - { value: "80", unit: alerts, label: each with a runbook section, note: "17 page, 63 ticket (ops/alerts.yml)", tone: blue }
   - { value: "≥ 60 s", label: stop grace for SIGTERM, note: "a graceful stop hands shards over in ~0.2 s each; never SIGKILL", tone: amber }
-  - { value: "0", label: backups built, note: "durability is the bucket's own; copy the KEK offline", tone: rust }
+  - { value: "2", unit: keys, label: to copy offline, note: "the KEK and the PLC rotation key; durability is the bucket's own", tone: rust }
 ```
 
 These pages are for whoever runs a vlpds server, from a personal PDS on a small VM to a cluster.

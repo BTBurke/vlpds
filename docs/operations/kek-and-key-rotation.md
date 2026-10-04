@@ -66,8 +66,8 @@ at mode 0400 and passed as `--kek-file` (Ansible: `vlpds_kek_hex`). Back it up o
 the stored keys.
 
 > [!WARNING]
-> Losing the KEK loses every account's signing key. It belongs in the backup plan: a multi-region KMS key with
-> deletion protection, or offline copies of the KEK file.
+> Losing the KEK loses every account's signing key. Protect it: a multi-region KMS key with deletion protection,
+> or offline copies of the KEK file.
 
 Runbook: "KEK provisioning", "Secrets as files".
 
@@ -83,7 +83,7 @@ Runbook: "KEK provisioning", "Secrets as files".
 - title: Rewrap the PLC rotation key file
   body: "It is a file, not a row: pipe the old `vw1.` file through `vlpds --wrap-plc-rotation-key` with the new KEK configured, and roll the result out."
 - title: Retire the old KEK
-  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed) for the backup retention: backups and log segments still hold blobs wrapped under it."
+  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed): log segments still hold blobs wrapped under it until retention deletes them."
 ```
 
 A signing-key rotation that is still pending keeps its new key wrapped under the KEK it started with, and
@@ -119,7 +119,7 @@ refused writes were never applied, so nothing needs replaying.
 - **One node affected** (its network or metadata server): drain it with SIGTERM so its shards move to nodes that can
   reach KMS.
 - **IAM**: a removed role looks the same as an outage (403s). Check it before blaming Google.
-- **Key destroyed for good**: restore it if a backup exists. Otherwise every account needs a new signing key and a PLC
+- **Key destroyed for good**: restore it from an offline copy if one exists. Otherwise every account needs a new signing key and a PLC
   update, which needs the PLC rotation key and, for accounts that no longer list it, the users' own keys.
 
 A node won't *start* during a KMS outage if its PLC rotation key file is KMS-wrapped: it is unwrapped at startup.
@@ -135,7 +135,7 @@ Runbook: "Key service (KMS) outage".
 - title: Distribute and start
   body: "Same file on every node, mode 0400, `--plc-rotation-key-file` (Ansible: `vlpds_plc_rotation_key`). The `PLC registration on` startup line shows the same `rotation_key` on every node."
 - title: Back it up
-  body: "With the KEK backup plan: the file needs the KEK to open, and it is not in the bucket."
+  body: "Keep an offline copy next to the KEK's: the file needs the KEK to open, and it is not in the bucket."
 ```
 
 **Rotating it.** Roll every node with the new key as current and the old one in `--plc-rotation-key-old-file`. New DIDs

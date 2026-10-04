@@ -201,6 +201,6 @@ why the cost model prices them separately from the ~$1.7k/mo of requests
 costs are bytes stored and, off R2, egress.
 
 The GC's listing grows with the blob count times the node count, not with traffic. A personal or
-community server won't notice it. At Bluesky's scale (~1 B blobs, if the average is ~350 KB) it would be ~1M LIST requests
-per node per hour, which is not in the cost model and would need a cheaper sweep before running
-there. Raising the grace period doesn't help: passes run at least once an hour.
+community server won't notice it. At Bluesky's scale (~1 B blobs, if the average is ~350 KB) the
+estimate is ~1M LIST requests per node per hour, which is not in the cost model. Raising the grace
+period doesn't help: passes run at least once an hour.

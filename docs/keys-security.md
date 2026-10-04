@@ -237,7 +237,7 @@ between nodes)"; joining a node: [Scaling and clustering](operations/scaling-and
 - { value: "'self'", label: the only script source, note: "every UI page; OAuth pages allow only hashed inline code", tone: accent }
 - { value: "DENY", label: framing, note: "frame-ancestors 'none' + X-Frame-Options" }
 - { value: public, label: addresses only for outbound fetches, note: "private, loopback and link-local are refused", tone: blue }
-- { value: "25", unit: rate limits, label: built in, note: "per IP, account or node; tunable live", tone: amber }
+- { value: "32", unit: rate limits, label: built in, note: "per IP, account or node; tunable live", tone: amber }
 ```
 
 - **Headers.** The web UI (`/`, `/account`, `/admin`, `/docs`) is served with a same-origin CSP

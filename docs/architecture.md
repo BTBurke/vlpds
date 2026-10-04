@@ -121,8 +121,8 @@ What comes back decides what the entry node does:
   same answers.
 - **Unknown**: no first byte within 3 s (30 s for exports, uploads and AppView proxying). The owner
   is presumed frozen and the client gets 503 `PartitionUnavailable` with `Retry-After: 1`. The write
-  may have been applied, so it is never resent; the owner's lease will move the shard if it really
-  is stuck.
+  may have been applied, so it is never resent. If the owner really is stuck, its lease lapses and
+  the shard moves.
 
 So a takeover or a cold start shows up as latency rather than errors. `vlpds_write_retries_total{reason}`
 counts resends; `VlpdsForwardErrorsHigh` and `VlpdsWriteResendsSustained` are the alerts.

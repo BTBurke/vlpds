@@ -180,7 +180,7 @@ edges:
 GET in ~80 ms p50, and the numbers were the same from a VPS and from a home connection in different
 places, so they are R2's own and not the distance. On a small single-node deployment, segment PUTs ran ~300 ms p50 / ~650 ms p99 over a day
 (`vlpds_segment_put_seconds`). A write on R2 therefore takes about a third of a second to ack, which is
-fine for a personal PDS. In-region S3 is designed for ~40–50 ms p50 / ~150 ms p99 commit acks. A
+fine for a personal PDS. For in-region S3, the latency model estimates ~40–50 ms p50 / ~150 ms p99 commit acks (modeled, not measured). A
 repo's next commit doesn't wait for the previous one to be durable, so slow PUTs cost latency, not
 throughput.
 

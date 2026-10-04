@@ -14,7 +14,7 @@ diagram:
     - { id: console, label: Live metrics, sub: "/admin/metrics · 2 s", at: [0, 9.5], size: [10, 2.6], tone: accent }
     - { id: alloy, label: Alloy, sub: "scrape 10 s · logs", at: [16, 3.5], size: [8, 3], tone: muted }
     - { id: prom, label: Prometheus, sub: VictoriaMetrics, at: [28, 0], size: [9, 2.6], tone: muted }
-    - { id: vmalert, label: vmalert, sub: "79 rules · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
+    - { id: vmalert, label: vmalert, sub: "80 rules · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
     - { id: loki, label: Loki, sub: JSON log lines, at: [28, 7.4], size: [9, 2.6], tone: muted }
     - { id: grafana, label: Grafana, sub: operator · internals, at: [41, 3.5], size: [8, 3], tone: blue }
   edges:
@@ -28,7 +28,7 @@ diagram:
     - { from: console.t, to: node.b, label: polls }
 facts:
   - { value: "~200", unit: metrics, label: "vlpds_* names per node", note: "Prometheus text; histograms for every latency that matters" }
-  - { value: "79", unit: alerts, label: in nine groups, note: "17 page, 62 ticket; each links its RUNBOOK section", tone: blue }
+  - { value: "80", unit: alerts, label: in nine groups, note: "17 page, 63 ticket; each links its RUNBOOK section", tone: blue }
   - { value: "0.4", unit: × TTL, label: lease renewal ceiling, note: "vlpds_lease_renew_ttl_ratio; past it the node fail-stops", tone: violet }
   - { value: "~150 ms", label: commit p99 on S3, note: "design target; alerts at 500 ms (ticket) and 2 s (page)", tone: amber }
 ```
@@ -70,7 +70,7 @@ The lease ratio is the one to understand. A node renews its lease every TTL/5 an
 10 s TTL, 24 s on the `tiny` profile's 60 s) opens a gap and the node fail-stops. A slow object store
 shows here before it shows anywhere else. See [Architecture](../architecture.md#leases) for why.
 
-Some signals have no metric yet: per-log firehose watermark lag and clock offset between nodes are
+Some signals have no metric: per-log firehose watermark lag and clock offset between nodes are
 visible only in `vlpds admin cluster status` (the console's Cluster page), and the specific cause of
 an exit 5 is only in the log line before it. RUNBOOK
 [Metric gaps](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#metric-gaps)
@@ -146,10 +146,10 @@ edges:
 ```diagram
 caption: "Every rule carries a severity and a `runbook_url` whose anchor is the alert's own section in `ops/RUNBOOK.md`."
 nodes:
-  - { id: rules, label: "ops/alerts.yml", sub: 79 rules · 9 groups, at: [0, 2], size: [9, 3], tone: accent }
+  - { id: rules, label: "ops/alerts.yml", sub: 80 rules · 9 groups, at: [0, 2], size: [9, 3], tone: accent }
   - { id: eval, label: vmalert, sub: or Prometheus, at: [13, 2], size: [8, 3], tone: muted }
   - { id: page, label: page, sub: "17: act now", at: [25, 0], size: [8, 2.6], tone: danger }
-  - { id: ticket, label: ticket, sub: "62: act today", at: [25, 4], size: [8, 2.6], tone: amber }
+  - { id: ticket, label: ticket, sub: "63: act today", at: [25, 4], size: [8, 2.6], tone: amber }
   - { id: rb, label: RUNBOOK section, sub: "Means · Confirm · Do", at: [40, 2], size: [9, 3], tone: solid }
 edges:
   - rules -> eval
@@ -164,27 +164,27 @@ edges:
 | `vlpds-liveness` | 11 | a node down, nothing scraped, a crash loop, format errors |
 | `vlpds-ownership` | 6 | shards unowned for 2 min |
 | `vlpds-leases` | 5 | a renewal past 0.4 × TTL |
-| `vlpds-writes` | 10 | commit p99 over 2 s, the commit log stalled, 5xx over 5% |
+| `vlpds-writes` | 12 | commit p99 over 2 s, the commit log stalled, 5xx over 5% |
 | `vlpds-forwarding` | 3 | (tickets only) |
 | `vlpds-firehose` | 6 | emit delay over 20 s, the firehose stalled |
 | `vlpds-object-store` | 10 | a brownout on two or more nodes |
 | `vlpds-durability` | 9 | (tickets only: checkpoints, retention, dead logs, reshard GC) |
-| `vlpds-resources` | 19 | memory over 95%, KMS or PLC directory down, a signature fault |
+| `vlpds-resources` | 18 | memory over 95%, KMS or PLC directory down, a signature fault |
 
 A `vlpds-derived` group holds the recording rules (`vlpds:layout_shards`). Read the header of
 `ops/alerts.yml` before loading it anywhere:
 
 - **Scrape job `vlpds`**, one cluster per Prometheus. With several clusters, scope the rule set with
-  a `cluster` label (the Ansible deployment loads it scoped to `cluster="vlpds-prod"` so bench nodes
-  on the same job never fire it).
+  a `cluster` label (the Ansible deployment scopes it to its own `cluster` label, so other nodes
+  scraped under the same job never fire it).
 - **The lease alerts scale with each node's TTL** through `vlpds_lease_ttl_seconds`, so the same
   rules fit a 10 s cluster and a 60 s `tiny` node.
 - **Thresholds are marked `design` or `guess`.** Tune the guesses against a week of real traffic.
 - `VlpdsNotScraped` fires when no node of the cluster is scraped at all: without it every other alert
   is silently blind.
 
-In the Ansible deployment, vmalert runs on the monitoring host and there is no Alertmanager yet:
-firing alerts show in Grafana and in vmalert's UI.
+In the Ansible deployment, vmalert runs on the monitoring host without an Alertmanager: firing
+alerts show in Grafana and in vmalert's UI.
 
 ## Logs
 

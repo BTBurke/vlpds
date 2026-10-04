@@ -92,7 +92,7 @@ edges:
 
 ```steps
 - title: Pre-flight
-  body: "`vlpds admin cluster status`: every node healthy, `Feature level: L active`. The new build's `MIN_LEVEL` must be ≤ L (its release notes list its levels and which are persistent)."
+  body: "`vlpds admin cluster status`: every node healthy, `Feature level: L active`. The new build's `MIN_LEVEL` (in `src/version.rs`, with which levels are persistent) must be ≤ L."
 - title: Roll the new build
   body: "Exactly as a rolling deploy. Also check each restarted node's row shows the new rev and a window reaching L+1, and that `vlpds_format_errors_total` stays flat."
 - title: Soak at level L

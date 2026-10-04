@@ -23,13 +23,13 @@ diagram:
     - { label: "small VPS · 2 vCPU / 4 GB", around: [caddy, ts, vlpds, alloy], tone: accent }
   edges:
     - "apps -> caddy: HTTPS"
-    - "op -> ts: private network"
+    - "op -> ts: tailnet"
     - { from: caddy.t95, to: cf.b95, label: DNS-01, labelAt: [19.6, -2.4] }
     - caddy -> vlpds
     - ts -> vlpds
     - "vlpds -> alloy: /metrics"
     - "vlpds -> r2: S3 API"
-    - "alloy -> mon: private network"
+    - "alloy -> mon: tailnet"
 facts:
   - { value: "2 vCPU", unit: "/ 4 GB", label: runs a personal PDS, note: "a small VPS with a 3 GiB container limit" }
   - { value: "$0", unit: /mo, label: object store on R2, note: "tiny profile idles at ~0.3 M Class A/mo (measured)", tone: amber }
@@ -192,7 +192,7 @@ docker run -d --name vlpds --restart unless-stopped --stop-timeout 90 \
   `127.0.0.1:2583`, and blocks `/admin`, `/xrpc/vlpds.admin.*`, `/metrics` and `/internal/*`. For
   on-demand certificates, use `http://127.0.0.1:2583/tls-check` as the `ask` URL. List the proxy in
   `--trusted-proxies` so rate limits see the real client address.
-- The restart policy matters: vlpds fail-stops on purpose (exit codes 2–8) and expects its
+- The restart policy matters: vlpds fail-stops on purpose (exit codes 2–9) and expects its
   supervisor to start it again.
 - Missing or weak secrets stop the node at start. Outside `--dev-mode` it refuses an empty secret, a
   secret shorter than 32 bytes, two tokens that are the same, a missing KEK, and the MinIO default
