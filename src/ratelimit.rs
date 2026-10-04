@@ -96,7 +96,7 @@ macro_rules! limit {
     };
 }
 
-limit!(GLOBAL_IP, 0, "global-ip", Ip, "every XRPC call except sync.getRepo; OAuth sign-in", 5 * MINUTE, 3000);
+limit!(GLOBAL_IP, 0, "global-ip", Ip, "every XRPC call except sync.getRepo and an account moving in sending blobs its repo references; OAuth sign-in", 5 * MINUTE, 3000);
 limit!(GET_REPO, 1, "com.atproto.sync.getRepo-0", Ip, "sync.getRepo", 5 * MINUTE, 6000);
 limit!(CREATE_SESSION_DAY, 2, "com.atproto.server.createSession-0", IdentifierIp, "server.createSession; OAuth sign-in", DAY, 300);
 limit!(CREATE_SESSION_5MIN, 3, "com.atproto.server.createSession-1", IdentifierIp, "server.createSession; OAuth sign-in", 5 * MINUTE, 30);
@@ -425,13 +425,21 @@ pub struct Consumer {
 impl Counters {
     /// Windows are keyed by (bucket, window length, key): a new limit keeps
     /// a key's live window, a new window length starts a fresh one.
-    fn consume_spec(&self, spec: &Spec, limit: u32, key: &str, points: u32, now_ms: u64) -> Status {
+    fn window_id(&self, spec: &Spec, key: &str) -> u64 {
         let mut h = self.hasher.build_hasher();
         spec.name.hash(&mut h);
         spec.window_ms.hash(&mut h);
         key.hash(&mut h);
-        let id = h.finish();
-        let mut guard = self.shards[(id >> 58) as usize % SHARDS].lock();
+        h.finish()
+    }
+
+    fn shard(&self, id: u64) -> &Mutex<Shard> {
+        &self.shards[(id >> 58) as usize % SHARDS]
+    }
+
+    fn consume_spec(&self, spec: &Spec, limit: u32, key: &str, points: u32, now_ms: u64) -> Status {
+        let id = self.window_id(spec, key);
+        let mut guard = self.shard(id).lock();
         let shard = &mut *guard;
         if now_ms >= shard.next_sweep_ms {
             shard.map.retain(|_, w| w.reset_ms > now_ms);
@@ -462,6 +470,22 @@ impl Counters {
             reset_ms,
             exceeded: used > limit,
         }
+    }
+
+    /// Takes back points [`Self::consume_spec`] counted, as long as the
+    /// window it counted them in (`reset_ms`) is still the live one.
+    /// Returns the window's points used after the refund.
+    fn refund_spec(&self, spec: &Spec, key: &str, points: u32, reset_ms: u64) -> Option<u32> {
+        let id = self.window_id(spec, key);
+        let mut guard = self.shard(id).lock();
+        let shard = &mut *guard;
+        let w = shard.map.get_mut(&id).filter(|w| w.reset_ms == reset_ms)?;
+        w.used = w.used.saturating_sub(points);
+        let used = w.used;
+        if let Some(c) = shard.top.get_mut(&spec.tag).and_then(|l| l.iter_mut().find(|c| c.id == id)) {
+            c.used = used;
+        }
+        Some(used)
     }
 
     fn len(&self) -> usize {
@@ -974,18 +998,33 @@ struct Ctx {
     ip_ov: Vec<usize>,
     route: Option<MatchedPath>,
     bypass: bool,
-    /// Least remaining; exceeded wins.
-    tightest: Option<Status>,
+    /// Every bucket this request counted in.
+    seen: Vec<Status>,
+    /// Which of `seen` is the global per-IP bucket, if it counted there.
+    global: Option<usize>,
 }
 
 impl Ctx {
     fn record(&mut self, s: Status) {
-        let replace = match &self.tightest {
-            None => true,
-            Some(t) => (s.exceeded && !t.exceeded) || (s.exceeded == t.exceeded && s.remaining < t.remaining),
-        };
-        if replace {
-            self.tightest = Some(s);
+        self.seen.push(s);
+    }
+
+    /// Least remaining; exceeded wins.
+    fn tightest(&self) -> Option<Status> {
+        self.seen.iter().copied().reduce(|t, s| {
+            if (s.exceeded && !t.exceeded) || (s.exceeded == t.exceeded && s.remaining < t.remaining) {
+                s
+            } else {
+                t
+            }
+        })
+    }
+
+    fn refund_global(&mut self) {
+        let Some(i) = self.global.take() else { return };
+        let spec = self.policy.builtin(&GLOBAL_IP);
+        if let Some(used) = self.limiter.counters.refund_spec(spec, &self.ip, 1, self.seen[i].reset_ms) {
+            self.seen[i].remaining = self.seen[i].limit.saturating_sub(used);
         }
     }
 
@@ -1069,6 +1108,14 @@ pub fn check_ip(limits: &[&'static Limit], points: u32) -> Result<(), XrpcError>
     })
 }
 
+/// Gives back the global per-IP point [`layer`] took for this request, for
+/// a request found exempt only once the handler has read it (an arriving
+/// account's upload of a blob its repo references). Exact: the point is
+/// counted on this node, which forwarded requests reach before [`layer`].
+pub fn refund_global_ip() {
+    let _ = CTX.try_with(|c| c.borrow_mut().refund_global());
+}
+
 pub fn check_repo_write(did: Option<&str>, points: u32) -> Result<(), XrpcError> {
     match did {
         Some(d) => check(&[&REPO_WRITE_HOUR, &REPO_WRITE_DAY], d, points),
@@ -1116,14 +1163,17 @@ pub async fn layer(
         limiter,
         ip,
         bypass,
-        tightest: None,
+        seen: Vec::new(),
+        global: None,
     };
     CTX.scope(RefCell::new(ctx), async move {
         let pre = CTX.with(|c| {
             let mut c = c.borrow_mut();
             let ip = c.ip.clone();
             let g = if global {
-                c.consume(&[&GLOBAL_IP], &ip, 1)
+                let r = c.consume(&[&GLOBAL_IP], &ip, 1);
+                c.global = c.seen.len().checked_sub(1);
+                r
             } else {
                 Ok(())
             };
@@ -1143,7 +1193,7 @@ pub async fn layer(
                 .into_response(),
             Err(e) => e.into_response(),
         };
-        if let Some(s) = CTX.with(|c| c.borrow().tightest) {
+        if let Some(s) = CTX.with(|c| c.borrow().tightest()) {
             set_headers(resp.headers_mut(), &s);
         }
         resp
@@ -1212,6 +1262,22 @@ mod tests {
         spec.window_ms = 60_000;
         let s = c.consume_spec(&spec, 20, "1.2.3.4", 1, 3);
         assert_eq!(s.remaining, 19);
+    }
+
+    #[test]
+    fn refund_only_into_the_window_it_was_counted_in() {
+        let c = Counters::default();
+        let p = Policy::default();
+        let spec = p.builtin(&GLOBAL_IP).clone();
+        let s = c.consume_spec(&spec, 10, "1.2.3.4", 3, 0);
+        assert_eq!(c.refund_spec(&spec, "1.2.3.4", 1, s.reset_ms), Some(2));
+        assert_eq!(c.top(&p, 1, 1)["global-ip"][0].used, 2);
+        // a key that never counted, or a window since replaced: nothing
+        assert_eq!(c.refund_spec(&spec, "5.6.7.8", 1, s.reset_ms), None);
+        let next = c.consume_spec(&spec, 10, "1.2.3.4", 1, s.reset_ms);
+        assert_eq!(next.remaining, 9);
+        assert_eq!(c.refund_spec(&spec, "1.2.3.4", 1, s.reset_ms), None);
+        assert_eq!(c.consume_spec(&spec, 10, "1.2.3.4", 0, s.reset_ms + 1).remaining, 9);
     }
 
     #[test]

@@ -268,3 +268,46 @@ async fn upload_blob_budget_spares_blobs_an_arriving_repo_references() {
     // a blob its repo doesn't reference still counts
     up(&b, img(8)).await.err(429, "RateLimitExceeded");
 }
+
+/// The global per-IP limit (3000 per 5 minutes) would cap a migration's
+/// blob copy: an arriving account's uploads of blobs its repo references
+/// give their point back, so they never use it up; any other upload counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn global_ip_limit_spares_blobs_an_arriving_repo_references() {
+    let s = limited().await;
+    let up = |a: &TestAccount, bytes: Vec<u8>| {
+        let (x, auth) = (s.xrpc.clone(), a.auth());
+        async move { x.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &auth).await }
+    };
+    let img = |i: u8| [b"\x89PNG\r\n\x1a\n".as_slice(), &[i; 64]].concat();
+    let a = s.create_account("rlg").await;
+    for i in 0..3 {
+        let blob = up(&a, img(i)).await.ok()["blob"].clone();
+        s.create_record(&a, "app.bsky.feed.post", image_post("pic", &blob)).await;
+    }
+    let b = s.create_account("rlg").await;
+    s.import_repo(&b.auth(), s.get_repo_car(&a.did).await).await.ok();
+    s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &b.auth()).await.ok();
+
+    // a new window length starts this IP's global window afresh
+    const POINTS: i64 = 8;
+    let cfg = json!({"limiters": {"global-ip": {"points": POINTS, "windowSecs": 3600}}});
+    s.xrpc.post("vlpds.admin.updateRateLimits", &json!({"config": cfg, "ifVersion": 0, "actor": "it-test"}), &Auth::Admin).await.ok();
+
+    for n in 0..3 * POINTS {
+        let r = up(&b, img((n % 3) as u8)).await;
+        assert_eq!(r.status, 200, "upload {n}: {}", r.text());
+        assert_eq!(num(&r, "ratelimit-remaining"), POINTS, "upload {n}");
+    }
+    // a blob its repo doesn't reference counts
+    let r = up(&b, img(8)).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(num(&r, "ratelimit-remaining"), POINTS - 1);
+    // so does every upload by an active account, until the limit
+    for n in 1..POINTS {
+        assert_eq!(up(&a, img(100 + n as u8)).await.status, 200, "active upload {n}");
+    }
+    up(&a, img(120)).await.err(429, "RateLimitExceeded");
+    // over it, nothing reaches a handler: the arriving account waits too
+    up(&b, img(0)).await.err(429, "RateLimitExceeded");
+}

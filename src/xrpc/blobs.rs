@@ -88,8 +88,9 @@ async fn upload_blob(
         return Err(super::takedown_error());
     }
     // An account moving in uploads every blob its imported repo references;
-    // those don't count against the per-IP daily budget (checked below, once
-    // the CID is known), so a big account can arrive in one sitting.
+    // those don't count against the per-IP daily budget or the global per-IP
+    // limit (checked below, once the CID is known), so a big account can
+    // arrive in one sitting at full speed.
     let moving_in = acct.status.as_deref() == Some("deactivated");
     if !moving_in {
         crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
@@ -138,6 +139,9 @@ async fn upload_blob(
         let imported = moving_in && referenced(&*app.partition(&did)?, &did, &c).await.map_err(XrpcError::from_err)?;
         if moving_in && !imported {
             crate::ratelimit::check_ip(&[&crate::ratelimit::UPLOAD_BLOB], 1)?;
+        }
+        if imported {
+            crate::ratelimit::refund_global_ip();
         }
         Ok(super::blob_quota::Exempt { daily: imported, bytes: imported })
     };

@@ -60,7 +60,9 @@ in flight. A failed upload aborts its multipart upload and deletes the temp obje
 same bytes again rewrites the same key, which restarts the GC grace period.
 
 Each IP may upload 1,000 blobs a day. An account moving in (still deactivated) is exempt for blobs
-its imported repo references, so a big account can arrive in one sitting. Unlike the reference
+its imported repo references, from that budget and from the global 3,000-requests-per-5-minutes
+per-IP limit (the handler gives that point back once it knows the blob is referenced), so a big
+account can arrive in one sitting at full speed. Unlike the reference
 PDS, a blob is readable through `getBlob` as soon as it is uploaded, before any record names it.
 
 Metrics: `vlpds_blob_uploads_total{kind}` (`image`, `video`, `other`) and
