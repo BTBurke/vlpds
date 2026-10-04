@@ -138,9 +138,13 @@ function SignIn() {
                     Enter the 6-digit code from your authenticator app for <b>{identifier}</b>, or one of your recovery codes.
                   </p>
                   {!!error && <Notice kind="err">{errText(error)}</Notice>}
+                  {/* password managers pick the account's one-time code by the username beside it */}
+                  <input type="text" className="sr-only" autoComplete="username" value={identifier} readOnly tabIndex={-1} aria-hidden="true" />
                   <Field label="Authentication code">
                     <input
                       type="text"
+                      id="totp"
+                      name="totp"
                       className="code"
                       value={code}
                       onChange={(e) => setCode(e.target.value)}

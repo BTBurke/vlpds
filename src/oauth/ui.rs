@@ -10,6 +10,7 @@ use serde_json::Value as J;
 use std::sync::LazyLock;
 
 const STYLE: &str = r#"
+.u{position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden}
 @font-face{font-family:"Schibsted Grotesk";src:url(/fonts/schibsted-grotesk.woff2) format("woff2");font-weight:400 900;font-display:swap}
 @font-face{font-family:"JetBrains Mono";src:url(/fonts/jetbrains-mono.woff2) format("woff2");font-weight:100 800;font-display:swap}
 :root{--paper:#edefea;--sheet:#f8f9f6;--ink:#18222d;--ink2:#4d5966;--rule:#c9cfc8;--accent:#17705f;--accent-ink:#fff;--amber:#b9770e;--danger:#a93a24;--focus:#3561c9;color-scheme:light}
@@ -198,18 +199,22 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     if let (true, Some(hint)) = (f.totp, f.email_hint) {
         b.push_str(&format!(
             "<p>Two-factor authentication is enabled for <b>{}</b>. We sent a sign-in code to <b>{}</b>.</p>\
+<input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
 <label for=\"code\">Sign-in code from your email</label>\
 <input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" spellcheck=\"false\" required autofocus>\
 <input type=\"hidden\" name=\"step\" value=\"totp\">",
             e(f.identifier),
-            e(hint)
+            e(hint),
+            e(f.identifier)
         ));
     } else if f.totp {
         b.push_str(&format!(
             "<p>Two-factor authentication is enabled for <b>{}</b>.</p>\
+<input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
 <label for=\"code\">Authenticator code (or a recovery code)</label>\
 <input type=\"text\" id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required autofocus>\
 <input type=\"hidden\" name=\"step\" value=\"totp\">",
+            e(f.identifier),
             e(f.identifier)
         ));
     } else {
