@@ -1992,16 +1992,12 @@ mod clone_tests {
         }
     }
 
-    /// Open: a families clone gives the child each parent L0 SST once per
-    /// family (a view per projection, the stages' after the parent's), not
-    /// newest first. Once the child's compactor takes some, its writer's
-    /// next flush fails SlateDB's L0 ULID cutoff (`InvalidClockTick`). The
-    /// likely cause is `LsmTreeState::merge_writer_and_compactor`, which keeps
-    /// the writer's L0 up to the first view matching the compactor's last
-    /// compacted view or SST id: with one SST in several places that's the
-    /// wrong cut. vlRelay clones `0x01` alone until this is fixed.
+    /// Regression: a families clone gives the child each parent L0 SST once
+    /// per family (a view per projection, the stages' after the parent's).
+    /// Once the child's compactor took some, SlateDB's L0 merge cut at the
+    /// wrong copy of the compacted SST and the writer's next flush failed
+    /// with `InvalidClockTick` (fork patch 5 in Cargo.toml).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore]
     async fn family_child_flushes_through_compaction() {
         let three = tagged(0x03);
         let store = Store { prefix: "probe".into(), ..Store::memory(None) };
@@ -2117,6 +2113,41 @@ mod clone_tests {
         assert!(lost.is_empty(), "keys of slots {lost:?} lost by the merged shard's compaction (L0 view ids {ids:?})");
         let unique: std::collections::HashSet<_> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "L0 view ids repeat in the merged shard: {ids:?}");
+        m.close().await.unwrap();
+    }
+
+    /// Regression: a merge of halves that still hold more of their parent's
+    /// L0s than one compaction takes (8) has each parent SST behind two views,
+    /// and the oldest 8 start at the second half's copy of an SST the first
+    /// half also holds. SlateDB used to cut the writer's L0 at the first view
+    /// of the compacted SST, dropping uncompacted views from the compactor's
+    /// manifest (the writer's next flush then failed with `InvalidClockTick`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn merging_halves_that_share_many_l0s_keeps_them() {
+        let store = Store { prefix: "sml".into(), ..Store::memory(None) };
+        let db = open_db(&store, ShardId(0), None).await.unwrap();
+        let slots = [10u16, 20000, 40000, 65535];
+        for r in 0..12 {
+            for s in slots {
+                db.put(k(s, &format!("h/{r:02}")), format!("v{s}/{r}")).await.unwrap();
+            }
+            db.flush_with_options(slatedb::config::FlushOptions { flush_type: slatedb::config::FlushType::MemTable })
+                .await
+                .unwrap();
+        }
+        db.close().await.unwrap();
+        clone_db(&store, ShardId(1), &[(ShardId(0), 0, 32768)]).await.unwrap();
+        clone_db(&store, ShardId(2), &[(ShardId(0), 32768, 65536)]).await.unwrap();
+        clone_db(&store, ShardId(3), &[(ShardId(1), 0, 32768), (ShardId(2), 32768, 65536)]).await.unwrap();
+        let m = open_db(&store, ShardId(3), None).await.unwrap();
+        assert!(m.manifest().l0().len() > 16, "L0s: {}", m.manifest().l0().len());
+        compact_away_l0(&m).await;
+        for r in 0..12 {
+            for s in slots {
+                let v = m.get(k(s, &format!("h/{r:02}"))).await.unwrap();
+                assert_eq!(v.as_deref(), Some(format!("v{s}/{r}").as_bytes()), "slot {s} round {r}");
+            }
+        }
         m.close().await.unwrap();
     }
 

@@ -1676,6 +1676,23 @@ could name the old ones). Pending an upstream report; drop the patch once
 a release carries a fix. `partition.rs`
 `merging_a_splits_halves_keeps_their_shared_l0s` pins it.
 
+The same merged L0 also has one SST behind two views (one per half), out
+of time order. SlateDB's writer/compactor manifest merge
+(`LsmTreeState::merge_writer_and_compactor`) cut the writer's L0 at the
+first view matching the last compacted view id *or SST id*, and the
+compactor holds both in memory. When a compaction took the oldest 8 L0s
+(the default `max_compaction_sources`) starting at the second half's copy
+of an SST the first half also held, the cut landed on the first half's
+copy: the compactor wrote a manifest without live, uncompacted L0 views,
+and the writer's next flush re-added one older than the L0 watermark and
+failed with `InvalidClockTick`. A reopen from that manifest would have lost
+those rows. It needs a merge of halves that still hold more than 8 views of
+their parent's L0s, i.e. a merge soon after a split of a shard with a deep
+L0. The fork branch `fix/l0-view-merge-dup-sst` (rev `c7b29a06`, on top of
+the above) cuts at the view id and uses the SST id only for a V1 marker
+without one; `partition.rs` `merging_halves_that_share_many_l0s_keeps_them`
+pins it.
+
 **Protocol.** One reshard op at a time, cluster-wide, recorded in the
 layout as `op = {id, parents, children, driver}`:
 
