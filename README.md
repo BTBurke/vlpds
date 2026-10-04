@@ -34,7 +34,7 @@ single-node deployment (one 4-vCPU VPS with its data on Cloudflare R2), and it s
 - The operator console covers accounts, invites, takedowns and moderation cases, rate limits,
   relays, cluster ownership and live metrics. An admin CLI makes the same calls.
   → [Admin console and CLI](docs/operations/admin-console.md)
-- It's built to be operated. It has Prometheus metrics, 80 alerts that each have a runbook
+- It's built to be operated. It has Prometheus metrics, 83 alerts that each have a runbook
   section, rolling upgrades with feature levels, Cloud KMS or a local key wrapping every signing
   key, SMTP mail and Ozone moderation. → [Operations](docs/operations/index.md)
 

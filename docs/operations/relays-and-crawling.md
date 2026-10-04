@@ -170,8 +170,8 @@ upgrade, and against a cursor of 0 after anything that touched the log.
 ## Bandwidth
 
 ```facts
-- { value: "~12", unit: Mbit/s, label: one full subscriber today, note: "~4.5 KB frame per commit at ~340 commits/s", tone: blue }
-- { value: "~120", unit: Mbit/s, label: at 10× Bluesky, note: "3.3k commits/s average", tone: violet }
+- { value: "~12", unit: Mbit/s, label: one full subscriber today, note: "~4.5 KB frame per commit at ~330 commits/s", tone: blue }
+- { value: "~120", unit: Mbit/s, label: at 10× Bluesky, note: "~3.3k commits/s average", tone: violet }
 - { value: "~25", label: full subscribers per 10 Gbit node, note: "at 20× today's writes", tone: amber }
 - { value: "~0", label: for a personal PDS, note: "a few commits a day", tone: muted }
 ```

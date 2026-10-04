@@ -37,8 +37,10 @@ the alert name (the `runbook_url` anchors point here). Everything here comes fro
 - A node CAS-renews its lease `nodes/{node_id}` every TTL/5. That's 2 s at the
   default `--lease-ttl-ms 10000` and 12 s at the tiny profile's 60 s. The node's
   own validity ends `TTL - skew` = 0.8 x TTL (8 s / 48 s) after the send time of
-  its last successful renewal. A renewal round trip over `0.4 x TTL` (4 s / 24 s)
-  opens a validity gap, and the node fail-stops. If the whole object store browns
+  its last successful renewal. Renewals are sequential, so once a round trip takes
+  longer than the renew interval the next one goes out only when it returns. With
+  round trips over `0.4 x TTL` (4 s / 24 s), two in a row outlast the 0.8 x TTL of
+  validity, and the node fail-stops. If the whole object store browns
   out past that ceiling, every node stops. Each node exports its settings
   (`vlpds_lease_ttl_seconds`, `vlpds_lease_renew_interval_seconds`,
   `vlpds_lease_skew_seconds`) and its renewals as a fraction of the TTL
@@ -607,8 +609,9 @@ opens (store latency).
 **Means:** at least one lease renewal (one CAS PUT of `nodes/{node_id}`) took
 over 0.2 x TTL in the last 5 minutes (`vlpds_lease_renew_ttl_ratio`). That's 2 s
 at the default 10 s TTL and 12 s at 60 s. Validity ends TTL - skew (0.8 x TTL)
-after a renewal's send time, and renewals go out every 0.2 x TTL. So a round trip
-over 0.4 x TTL lapses the lease and the node fail-stops (exit 5). Several nodes
+after a renewal's send time, and renewals go out every 0.2 x TTL, one at a time. A
+round trip slower than that delays the next send until it returns, so round trips
+over 0.4 x TTL lapse the lease and the node fail-stops (exit 5). Several nodes
 at once means a store brownout that will stop the whole cluster past the ceiling.
 Thresholds follow each node's `vlpds_lease_ttl_seconds`.
 
@@ -1159,8 +1162,8 @@ failed shard-state requests in
 normal not-found polls), and `vlpds_commit_stage_seconds{stage="apply"}`.
 
 **Do:** fix store errors or latency, and check CPU for the compactor.
-**(unverified)** `--compaction-polling` is adaptive by default, and switching to
-fast polling may help.
+`--compaction-polling` is `adaptive` by default (500 ms polls only while a shard's
+L0 runs deep), and switching to `fast` may help.
 
 ### VlpdsSstMetaCacheTooSmall
 
@@ -1243,8 +1246,8 @@ Never delete log objects by hand to compensate.
 
 **Means:** no pass (ok or error) for 15 minutes on a scraped node. A pass runs
 every `--log-retention-interval` (default 60 s). A pass that hangs on a store
-call would look like this
-**(unverified: retention calls are not individually timed out)**.
+call would look like this. Retention sets no deadline of its own, so each call only
+has the store client's 30 s request timeout and its retries.
 `vlpds_retention_pass_seconds` shows how long the finished passes took, and a
 creeping p99 comes before a hang. For the store side, see
 `vlpds_object_store_requests_total{result="cancelled"}` and request latency for
@@ -1724,8 +1727,8 @@ out). Users with their own recovery key can still recover.
    instead (e.g. a reference PDS's `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX`).
    The did:key goes to stderr with the logs, so record it. stdout is only the
    wrapped key. Check that the file is one `vw1.` line
-   (`head -c 4 plc-rotation.key`), because builds before the deploy fixes logged
-   to stdout and put log lines in it.
+   (`head -c 4 plc-rotation.key`). Older builds logged to stdout and put log
+   lines in it.
 2. Distribute `plc-rotation.key` like the other secrets (sops / Ansible
    Vault), mode 0400, and start nodes with `--plc-rotation-key-file`
    (`VLPDS_PLC_ROTATION_KEY_FILE`). The file is useless without KMS decrypt
@@ -2051,8 +2054,9 @@ What to do:
 2. Make sure the supervisor keeps restarting nodes (with backoff) so they rejoin
    as soon as the store answers.
 3. Don't lower `--lease-ttl-ms` (smaller ceiling) and don't delete anything.
-   Raising the TTL during an incident isn't a supported live operation
-   **(unverified)**.
+   Raising the TTL during an incident isn't a live operation either.
+   `--lease-ttl-ms` is read at start, so it means restarting every node, and until
+   they all have, each node judges its peers' leases by its own TTL.
 4. After recovery, watch `VlpdsShardsUnowned`, replay time
    (`vlpds_shard_open_seconds{kind="replay"}`, `shards opened` `replayed_ms`),
    `vlpds_last_exit_reason_info` / `vlpds_peer_takeovers_total` (who fail-stopped),
@@ -2064,7 +2068,8 @@ The ctl client's reserved lane keeps lease renewals from queueing behind vlpds'
 own requests in the client. It can't keep them from queueing behind other
 requests in the store. When the store's disks or network saturate, a renewal
 waits like everything else. The 100M capacity run lost 3 of 4 nodes this way
-(renewals 35-48 s past a 30 s TTL). Metadata-cache misses had turned point reads
+(that bench ran a 30 s TTL, and the leases had lapsed 35-48 s by the time the
+nodes fail-stopped). Metadata-cache misses had turned point reads
 into 1-2.4 GB/s of SST GETs per node on one MinIO box. The signs, in order, are
 `VlpdsSstMetaRefetching` / `VlpdsSstMetaCacheTooSmall`, state SST download MB/s
 far above upload MB/s, `VlpdsObjectStorePermitsSaturated` (state client),

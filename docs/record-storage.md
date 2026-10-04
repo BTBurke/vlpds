@@ -36,7 +36,7 @@ diagram:
 facts:
   - { value: "+28 B", unit: /record, label: "for persisted interior nodes", note: "`M/`: about a quarter of the tree's nodes; leaves cost nothing" }
   - { value: "~10–20 KB", label: in memory per active repo, note: "its visited paths, whatever the repo's size; ~3 KB once idle", tone: blue }
-  - { value: "~1", unit: round trip, label: to open a cold repo, note: "one `M/` scan covers repos up to ~35k records", tone: violet }
+  - { value: "1", unit: "`M/` scan", label: to load a cold repo's tree, note: "covers repos up to ~35k records, after the head and account reads", tone: violet }
   - { value: "200", unit: ops, label: per coalesced commit, note: "queued writes to one repo share a commit; no added delay", tone: amber }
 ```
 
@@ -44,9 +44,10 @@ Each account's repo lives in its shard's SlateDB: the records, the Merkle Search
 them and the signed commit. How that's laid out decides what a node's memory is spent on, what a
 cold repo costs to open, and which metrics show trouble.
 
-Records are the source of truth. vlpds also stores the tree's interior nodes, so a cold repo opens
-in one or two round trips, and rebuilds the leaves from records when it needs them. A repo worker
-only keeps the paths that recent writes touched in memory.
+Records are the source of truth. vlpds also stores the tree's interior nodes, so after a few fixed
+reads (head, account) a cold repo's tree loads with one range scan, and the leaves are rebuilt from
+records when they're needed. A repo worker only keeps the paths that recent writes touched in
+memory.
 
 ## Repos, commits and the MST
 
@@ -147,10 +148,12 @@ The worker's cache has two limits:
 
 - Bytes, set by `--repo-cache-mb`. The default is half of the memory budget's cache pool after the
   SST metadata cache. Over budget, the least recently used idle repos drop back to their root
-  first, and then the least recently used repos are evicted. A repo charged over 1 MiB (an import,
-  a rebuild, or a repo written without pause) drops everything but the nodes its in-flight commits
+  first, and then the least recently used repos are evicted. Both steps skip a repo with a commit
+  or a fetch in flight, so it stays until that finishes. A repo charged over 1 MiB (an import, a
+  rebuild, or a repo written without pause) drops everything but the nodes its in-flight commits
   wrote.
-- Repo count, set by `--cache-per-worker` (50,000 repos per worker).
+- Repo count, set by `--cache-per-worker` (50,000 repos per worker). Past it, the least recently
+  used repos are evicted the same way.
 
 There are two more caches next to it. The process keeps loaded nodes by CID for readers and path
 fetches (`--lazy-mst-node-cache-mb`, 256 MiB). Each shard also remembers the 2,048 repos it wrote

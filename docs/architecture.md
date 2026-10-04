@@ -190,8 +190,8 @@ renewal changes the object, and that change is all peers look at:
 - The node itself. A node is valid until the send time of its last successful renewal plus
   TTL − skew (0.8 × TTL, 8 s). Past that it stops PUTting segments and acking, and it never renews a
   lapsed lease. A watchdog fail-stops it (exit 5) at about the time peers can first presume it dead.
-- The renewal ceiling. Renewals are sequential, so one round trip longer than 0.4 × TTL (4 s) leaves
-  a gap in validity and the node fail-stops. A cluster-wide object-store brownout past that point
+- The renewal ceiling. Renewals are sequential, so a slow one delays the next send. Round trips
+  longer than 0.4 × TTL (4 s) leave a gap in validity and the node fail-stops. A cluster-wide object-store brownout past that point
   stops every node, so keep the TTL at 10 s or more (`--lease-ttl-ms` warns below it).
 
 No node compares its wall clock with another's. The metrics are `vlpds_lease_renew_ttl_ratio` and

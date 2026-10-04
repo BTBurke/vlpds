@@ -205,7 +205,7 @@ edges:
 | SST metadata (filters, indexes) | what every owned SST needs × N/(N−1) for a failover × 1.25 for compactions | `--meta-cache-mb` |
 | SST block cache | half of the cache pool left after metadata | `--block-cache-mb` |
 | Repo cache (MST paths in the workers) | the other half | `--repo-cache-mb`, `--cache-per-worker` |
-| Local disk cache | the node's budget ÷ the layout's shard count, floor 64 MiB · 16 GiB per shard if no budget is set | `--cache-dir`, `--disk-cache-mb`, `--disk-cache-shard-mb` |
+| Local disk cache | `--disk-cache-mb` ÷ the layout's shard count, floor 64 MiB · an explicit `--disk-cache-shard-mb` wins · 16 GiB per shard with neither flag | `--cache-dir`, `--disk-cache-mb`, `--disk-cache-shard-mb` |
 
 The three memory caches are shared by every shard on the node. They're sized from its **memory
 budget**, which is the cgroup limit or physical RAM (`--memory-budget-mb` overrides it). Fixed costs
@@ -271,8 +271,8 @@ Afterwards, the parent is reclaimed in the background:
   touch a quiet child's bottom run. SlateDB then drops the parent from the child's manifest
   (`--slatedb-detach-interval`, 10 min).
 - Dir GC. The owner of slot 0 deletes retired `state/{id}/` directories once no live checkpoint
-  pins them and their manifest is older than `--reshard-gc-grace` (1 h). Then it deletes their
-  `assign/` record. An idle pass costs one GET.
+  pins them, no other manifest lists their SSTs, and their manifest is older than
+  `--reshard-gc-grace` (1 h). Then it deletes their `assign/` record. An idle pass costs one GET.
 - Alerts. `VlpdsRetiredStateGrowing`, `VlpdsRetiredStateReferenced`, `VlpdsForcedDetachFailing`,
   `VlpdsReshardGcFailing`.
 

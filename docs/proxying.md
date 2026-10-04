@@ -181,7 +181,8 @@ decoded, with at most two content codings. Large or compressed bodies decode on 
 At most 32 MiB of bodies are rewritten at once, and past that a response goes out unchanged. For
 these methods the client's `Accept-Encoding` is narrowed to codings vlpds can decode. The outcome
 is in `vlpds_proxy_read_after_write_total{result}`. On the no-merge path the measured cost is
-nothing above the noise (~43 µs CPU per request before and after).
+nothing above the noise. A laptop A/B at 64 in flight measured ~43 µs CPU per request both before
+and after (a separate run from the ~50 µs throughput bench below).
 
 ## Outbound safety
 

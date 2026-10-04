@@ -96,7 +96,7 @@ starts a new key, and the build reports it as an unknown key.
 ```yaml
 diagram: { …a diagram spec, below… }
 facts:
-  - { value: "~60k", unit: commits/s, label: per 16-core node, note: "measured; ~350/s is Bluesky's average", tone: amber }
+  - { value: "~60k", unit: commits/s, label: per 16-core node, note: "measured; ~330/s is Bluesky's average", tone: amber }
 ```
 
 ### facts (stat tiles)

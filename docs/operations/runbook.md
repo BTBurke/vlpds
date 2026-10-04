@@ -267,7 +267,7 @@ one cache's `--cache-entries`. Budget details: [Configuration](configuration.md#
 ## The full runbook
 
 ```facts
-- { value: "79", label: alert sections, note: "Means, Causes, Confirm, Do for the 80 rules in ops/alerts.yml" }
+- { value: "82", label: alert sections, note: "Means, Causes, Confirm, Do for the 83 alerts in ops/alerts.yml" }
 - { value: "19", label: procedures, note: "deploys, upgrades, keys, peer TLS, outages, users locked out", tone: blue }
 - { value: "1", label: "list of metric gaps", note: "signals the alerts would want that no metric exports", tone: muted }
 ```

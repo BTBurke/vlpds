@@ -42,7 +42,7 @@ diagram:
     - { from: n3.b85, to: kms.t, label: unwrap keys, dash: true }
 facts:
   - { value: "1", unit: bucket, label: is the whole database, note: "log, state, leases and blobs live in S3 / R2 / GCS" }
-  - { value: "~60k", unit: commits/s, label: per 16-core node, note: "measured; Bluesky averages ~350/s today", tone: amber }
+  - { value: "~60k", unit: commits/s, label: per 16-core node, note: "measured; Bluesky averages ~330/s today", tone: amber }
   - { value: "$0", unit: /mo, label: object store for a personal PDS, note: "on R2's free tier; ~$2–4 on S3", tone: blue }
   - { value: "~12 s", label: to notice a crashed node, note: "then fence, replay, serve; a planned handoff is ~0.2 s", tone: violet }
 ```
@@ -146,7 +146,7 @@ Here's how they compare for a personal server and for all of Bluesky:
 | | Personal | Bluesky today |
 |---|---|---|
 | Accounts | a handful | 56 M repos, 24 B records |
-| Commits/s | a few a day | ~350 avg, ~900 bursts |
+| Commits/s | a few a day | ~330 avg, ~900 bursts |
 | Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, NVMe |
 | Busy cores, fleet-wide | ~0 | ~3 |
 | Object store requests | $0 on R2, ~$2–4 on S3 | ~$1.7k/mo (S3), ~$1.5k (R2), modeled |

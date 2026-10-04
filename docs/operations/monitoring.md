@@ -14,7 +14,7 @@ diagram:
     - { id: console, label: Live metrics, sub: "/admin/metrics · 2 s", at: [0, 9.5], size: [10, 2.6], tone: accent }
     - { id: alloy, label: Alloy, sub: "scrape 10 s · logs", at: [16, 3.5], size: [8, 3], tone: muted }
     - { id: prom, label: Prometheus, sub: VictoriaMetrics, at: [28, 0], size: [9, 2.6], tone: muted }
-    - { id: vmalert, label: vmalert, sub: "80 rules · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
+    - { id: vmalert, label: vmalert, sub: "83 alerts · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
     - { id: loki, label: Loki, sub: JSON log lines, at: [28, 7.4], size: [9, 2.6], tone: muted }
     - { id: grafana, label: Grafana, sub: operator · internals, at: [41, 3.5], size: [8, 3], tone: blue }
   edges:
@@ -28,7 +28,7 @@ diagram:
     - { from: console.t, to: node.b, label: polls }
 facts:
   - { value: "~200", unit: metrics, label: "vlpds_* names per node", note: "Prometheus text; histograms for every latency that matters" }
-  - { value: "80", unit: alerts, label: in nine groups, note: "17 page, 63 ticket; each links its RUNBOOK section", tone: blue }
+  - { value: "83", unit: alerts, label: in nine groups, note: "17 page, 66 ticket; each links its RUNBOOK section", tone: blue }
   - { value: "0.4", unit: × TTL, label: lease renewal ceiling, note: "vlpds_lease_renew_ttl_ratio; past it the node fail-stops", tone: violet }
   - { value: "~150 ms", label: commit p99 on S3, note: "design target; alerts at 500 ms (ticket) and 2 s (page)", tone: amber }
 ```
@@ -132,7 +132,7 @@ edges:
   permit waits, restarts, fail-stops, firing alerts). Below that it has one collapsed row per
   subsystem: commit pipeline, log and retention, firehose, repo workers, HTTP and proxy, rate
   limits, leases and failover, forwarding and resharding, object-store clients, SlateDB, process and
-  runtime, KMS / PLC / mail, CPU profiles. Pick the cluster and node in the variables at the top.
+  runtime, KMS / PLC / mail, MinIO (bench only), CPU profiles. Pick the cluster and node in the variables at the top.
 - `bench/obs/grafana/gen_dashboard.py` generates both into `bench/obs/grafana/dashboards/`
   (`just dashboards`). `--check` fails if one is stale, and `VLPDS_PROM_UID` renders a copy for your
   Grafana's datasource. Edit the generator and leave the JSON alone.
@@ -147,7 +147,7 @@ edges:
 ```diagram
 caption: "Every rule carries a severity and a `runbook_url` whose anchor is the alert's own section in `ops/RUNBOOK.md`."
 nodes:
-  - { id: rules, label: "ops/alerts.yml", sub: 80 rules · 9 groups, at: [0, 2], size: [9, 3], tone: accent }
+  - { id: rules, label: "ops/alerts.yml", sub: 83 alerts · 9 groups, at: [0, 2], size: [9, 3], tone: accent }
   - { id: eval, label: vmalert, sub: or Prometheus, at: [13, 2], size: [8, 3], tone: muted }
   - { id: page, label: page, sub: "17: act now", at: [25, 0], size: [8, 2.6], tone: danger }
   - { id: ticket, label: ticket, sub: "63: act today", at: [25, 4], size: [8, 2.6], tone: amber }
@@ -165,7 +165,7 @@ edges:
 | `vlpds-liveness` | 11 | a node down, nothing scraped, a crash loop, format errors |
 | `vlpds-ownership` | 6 | shards unowned for 2 min |
 | `vlpds-leases` | 5 | a renewal past 0.4 × TTL |
-| `vlpds-writes` | 12 | commit p99 over 2 s, the commit log stalled, 5xx over 5% |
+| `vlpds-writes` | 15 | commit p99 over 2 s, the commit log stalled, 5xx over 5% |
 | `vlpds-forwarding` | 3 | (tickets only) |
 | `vlpds-firehose` | 6 | emit delay over 20 s, the firehose stalled |
 | `vlpds-object-store` | 10 | a brownout on two or more nodes |

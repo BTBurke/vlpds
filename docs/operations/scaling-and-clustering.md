@@ -49,7 +49,7 @@ after losing one node. That works out to (nodes − 1) × cores × 0.6 ≥ busy 
 
 | | Personal | Bluesky today | 10× Bluesky |
 |---|---|---|---|
-| Load | a few commits a day | ~350 commits/s avg, ~900 bursts · 20k proxied req/s (assumed) | ~3.5k avg, ~9k bursts · 200k req/s |
+| Load | a few commits a day | ~330 commits/s avg, ~900 bursts · 20k proxied req/s (assumed) | ~3.3k avg, ~9k bursts · 200k req/s |
 | Busy cores, fleet-wide | ~0 | ~3 | ~25 |
 | Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, ~1 TB NVMe | 3 × 24 cores / 128 GB, or ~8 small nodes |
 | Shards | 1 | 64 | 64, split the hot ones |
@@ -106,7 +106,7 @@ migration, because the lone node's prefix is already a cluster of one. The proce
 ```
 
 Give the supervisor a stop timeout of at least 60 s, since the close barrier may wait 30 s and the
-quiesce 10 s. A stop that times out into SIGKILL turns into a crash, which peers handle with a fence
+quiesce 10 s. The Ansible role defaults to 90 s (`vlpds_stop_grace_period`) and refuses less than 60 s. A stop that times out into SIGKILL turns into a crash, which peers handle with a fence
 and a replay. If the node can't fence its own log (store errors for min(TTL, 30 s)), it exits 8 and
 keeps its lease. Peers then presume it's dead and fence it themselves. A crashed node is noticed once
 its lease goes quiet. That takes ~12 s at the default 10 s TTL, or 3–5 s if its port refuses

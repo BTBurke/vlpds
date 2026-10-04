@@ -68,7 +68,7 @@ network (Tailscale here) that also reaches your monitoring stack. Four roles set
 - title: "roles/common: harden and join the private network"
   body: "It installs Docker from download.docker.com and sets up keys-only sshd, ufw (22, 80, 443 and everything on `tailscale0`), fail2ban, and security updates without automatic reboots. Give the node a Tailscale tag whose ACL lets it reach only your monitoring host. If the provider hands you a password login, run `playbooks/bootstrap.yml` once first to move to keys."
 - title: "roles/vlpds: the node"
-  body: "It sets up chrony, sysctls, the 4 GiB disk cache on the root disk, the secret files (0400, uid 10001, mounted read-only at `/run/vlpds`) and `/opt/vlpds/docker-compose.yml`. Then come the bucket probe, the start and the checks. With `vlpds_tailnet_console_port: 8443`, `tailscale serve` serves the console on the private network."
+  body: "It sets up chrony, sysctls, the 4 GiB disk cache on the root disk, the secret files (0400, uid 10001, mounted read-only at `/run/vlpds`) and `/opt/vlpds/docker-compose.yml`. Then it starts vlpds and checks it, after the bucket probe when you pass `-e vlpds_preflight_probe=true`. With `vlpds_tailnet_console_port: 8443`, `tailscale serve` serves the console on the private network."
 - title: "roles/caddy: TLS"
   body: "It builds Caddy with the caddy-dns/cloudflare module on the box. It holds a certificate for `pds.example.com` and one wildcard for `*.pds.example.com`, issued by ACME DNS-01 through a Cloudflare token scoped to the zone. Before proxying a handle request, `forward_auth` asks vlpds' `/tls-check`, so unknown names get an empty 404."
 - title: "roles/alloy: metrics and logs"
@@ -128,7 +128,7 @@ at any TTL. Details: [Configuration](configuration.md#shards-and-lease-ttl).
 - title: DNS
   body: "Add `A` records for the hostname and `*.<handle domain>`. Caddy gets the hostname's certificate at start, so it has to resolve first. For handles, prefer one wildcard certificate (`vlpds_caddy_wildcard_dns: cloudflare`). Per-handle on-demand certificates count against Let's Encrypt's ~50 per week, and a new handle's first request waits a few seconds, which is long enough for the AppView to cache `handle.invalid`."
 - title: Dry run, then run with the probe
-  body: "Run `ansible-playbook -i inventories/<inv>/hosts.yml playbooks/vlpds.yml --check --diff`, then the same with `-e vlpds_preflight_probe=true`. The role refuses to start vlpds unless the probe says `SAFE for vlpds`. On a fresh host `--check` stops at \"Install Docker\", because the apt repository doesn't exist yet."
+  body: "Run `ansible-playbook -i inventories/<inv>/hosts.yml playbooks/vlpds.yml --check --diff`, then the same with `-e vlpds_preflight_probe=true`. With the probe on, the role refuses to start vlpds unless it says `SAFE for vlpds`. On a fresh host `--check` stops at \"Install Docker\", because the apt repository doesn't exist yet."
 - title: First account
   body: "Run `docker exec vlpds vlpds admin create-invite-code`, then sign up or [migrate](../migration.md) an account. When it checks out, announce the server with `docker exec vlpds vlpds admin request-crawl bsky.network` and set `vlpds_crawlers` so restarts re-announce."
 ```

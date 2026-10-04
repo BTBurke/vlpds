@@ -94,7 +94,7 @@ metrics label.
 | Mail | Subject | `purpose` | Sent by |
 |---|---|---|---|
 | Email confirmation | Email Confirmation | `confirm_email` | `requestEmailConfirmation` |
-| Email update | Email Update Requested | `update_email` | `requestEmailUpdate` (confirmed address only), or turning email 2FA off |
+| Email update | Email Update Requested | `update_email` | `requestEmailUpdate` (confirmed address only), or `updateEmail` turning email 2FA off without a code |
 | Password reset | Password Reset Requested | `reset_password` | `requestPasswordReset` |
 | Sign-in code | Sign-in Confirmation | `auth_factor` | signing in to an account with email 2FA on |
 | Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
@@ -287,7 +287,9 @@ its quota, or ask the user to delete media). Its other uploads are held to both 
 The reference's reserved-handle list and slur filter are compiled in verbatim
 (`src/handle_policy/`), so updating them takes a release. They apply at createAccount, OAuth sign-up
 and updateHandle, with the reference's error names. An admin (`updateAccountHandle`) skips both,
-but a handle under `--handle-domain` must still be one 3–18 character label.
+but a handle under `--handle-domain` must still be one 3–18 character label. The slur filter also
+checks the record key of every create and update (createRecord, putRecord, applyWrites), the same
+as the reference. Deletes aren't checked.
 
 External handles (a domain outside `--handle-domain`) need proof, the same as in the reference.
 That's either a DNS TXT record `_atproto.<handle>` = `did=<the account's DID>`, or

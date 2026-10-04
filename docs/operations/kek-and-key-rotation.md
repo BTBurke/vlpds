@@ -83,11 +83,11 @@ Runbook: "KEK provisioning", "Secrets as files".
 - title: Rewrap the PLC rotation key file
   body: "The PLC rotation key is a file and not a row. Pipe the old `vw1.` file through `vlpds --wrap-plc-rotation-key` with the new KEK configured, and roll the result out."
 - title: Retire the old KEK
-  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed), because log segments still hold blobs wrapped under it until retention deletes them."
+  body: "Drop `--kek-old-file` / `--gcp-kms-old-key`, or disable the old KMS version. Keep the material (disabled, not destroyed), because log segments still hold secrets wrapped under it until retention deletes them."
 ```
 
 A signing-key rotation that's still pending keeps its new key wrapped under the KEK it started with, and
-`rewrap-secrets` doesn't touch it. So finish pending rotations before retiring a KEK. A blob under a KEK that no node
+`rewrap-secrets` doesn't touch it. So finish pending rotations before retiring a KEK. A secret wrapped under a KEK that no node
 has fails with `wrapped under unknown key-encryption key` and `VlpdsSecretUnwrapRejected`. Put the old KEK back on
 every node and rerun the rewrap. Never edit a row by hand.
 

@@ -113,10 +113,11 @@ edges:
   the node taking over its shards. Then they drop it as a source. Until that fence exists, the dead
   log's watermark holds every merge back, and that's usually what `VlpdsFirehoseStalled` means.
 - While one log holds the minimum back, the others queue. The queues share a budget
-  (`--firehose-merge-queue-mb`, 256 MiB). Past it, the merger stops queueing that log and reads it
-  back from its bucket segments in chunks as the watermark allows, until it meets the live stream
-  again. So memory stays bounded however long a stall lasts, and the cost is extra GETs
-  (`vlpds_firehose_merge_spills_total`, `VlpdsFirehoseMergeSpilling`).
+  (`--firehose-merge-queue-mb`, 256 MiB). Past it, the merger stops queueing each waiting log whose
+  next batch arrives over the budget. It reads that log back from its bucket segments in chunks as
+  the watermark allows, until it meets the live stream again. So memory stays bounded however long
+  a stall lasts, and the cost is extra GETs (`vlpds_firehose_merge_spills_total`,
+  `VlpdsFirehoseMergeSpilling`).
 - The merger is a critical task. A panic in it exits the process (exit 9), so a node never keeps
   serving a frozen firehose.
 
@@ -168,8 +169,8 @@ edges:
   (`--firehose-threads`, 4), so fan-out never competes with writes and API requests. Subscribers
   wake on a shared watch of the stream head, and there's no per-subscriber queue.
 - On a 16-core / 32-thread desktop-class box, 1,000 subscribers each kept up with 10k events/s
-  (~10M events/s, ~18 GB/s over loopback) while write p99 stayed under 70 ms (measured). Most of
-  the egress cost is copying memory, so CPU isn't the limit.
+  (~10M events/s, ~18 GB/s over loopback) while write p99 stayed under 70 ms (measured). Every
+  subscriber gets the same pre-framed batches, so egress is mostly memcpy into sockets.
 - A subscriber can fall at most `--firehose-max-lag-mb` (128 MiB) behind the head. Past that it
   gets `ConsumerTooSlow` and is closed, and it resumes from its cursor. Writes outside the live path
   (backfill chunks, info frames, pongs) that make no progress for 30 s drop the subscriber too.
