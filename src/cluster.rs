@@ -405,6 +405,10 @@ const JOIN_LEASE_RETRIES: u32 = 5;
 
 enum Recreate {
     Done,
+    /// The object is our own renewal: it landed, but its answer was lost
+    /// (a connection reset after the store applied it) and the client's
+    /// retry of the same If-Match failed. Its ETag is ours now.
+    Landed,
     /// Our lease is someone else's now, or our log is fenced: fail-stop.
     Lost,
     /// The next renewal tries again.
@@ -1482,6 +1486,10 @@ impl Cluster {
             let recreated = if moved { self.recreate_vanished_lease().await } else { Recreate::Retry };
             match (moved, recreated) {
                 (true, Recreate::Done) => {}
+                (true, Recreate::Landed) => {
+                    crate::metrics::LEASE_EVENTS.with_label_values(&["renewal_landed"]).inc();
+                    tracing::warn!("node lease renewal landed but its answer was lost: adopted it ({e:#})");
+                }
                 (true, Recreate::Lost) => {
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["conflict"]).inc();
                     tracing::error!("node lease lost (CAS conflict): {e:#}");
@@ -1509,7 +1517,19 @@ impl Cluster {
         let path = self.path(&format!("nodes/{}", self.cfg.node_id));
         match self.get_json::<serde_json::Value>(&path).await {
             Ok(None) => {}
-            Ok(Some(_)) => return Recreate::Lost,
+            // validity isn't extended: when the write was sent is unknown,
+            // and the next renewal (a fifth of the TTL away) does it
+            Ok(Some((l, etag))) => {
+                let mut cur = self.lease.write();
+                return match serde_json::from_value::<NodeLease>(l) {
+                    Ok(l) if l.log_id == cur.log_id && l.renewals > cur.renewals => {
+                        cur.renewals = l.renewals;
+                        *self.lease_etag.write() = etag;
+                        Recreate::Landed
+                    }
+                    _ => Recreate::Lost,
+                };
+            }
             Err(e) => {
                 tracing::warn!("reading our node lease after a failed renewal: {e:#}");
                 return Recreate::Retry;
@@ -3183,6 +3203,15 @@ mod tests {
             if self.take("fail", location.as_ref()) {
                 return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
+            if self.take("landed", location.as_ref()) {
+                // applied, answer lost, and the client's retry of the same
+                // conditional request refused
+                self.inner.put_opts(location, payload, opts).await?;
+                return Err(object_store::Error::Precondition {
+                    path: location.to_string(),
+                    source: "armed: landed, retry refused".into(),
+                });
+            }
             self.inner.put_opts(location, payload, opts).await
         }
         async fn put_multipart_opts(
@@ -3281,6 +3310,33 @@ mod tests {
         assert!(stalls.stalled.load(Ordering::SeqCst) >= 3, "the stalls were hit");
         assert!(b.fenced_logs().contains_key(&a.log_id));
         assert_eq!(hb.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A renewal that lands but whose answer is lost (a reset after the
+    /// store applied it; seen under the vlrelay chaos harness's bucket
+    /// resets, where every core fail-stopped within a second) comes back as
+    /// a conflict on the client's retry. The lease is still ours: adopt it.
+    #[tokio::test]
+    async fn a_renewal_whose_answer_was_lost_is_adopted() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        stalls.arm("landed", "nodes/a");
+        a.renew(&ha_dyn).await;
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the armed renewal ran");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a landed renewal is no lost lease");
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "the next renewal CASes on the adopted ETag");
+        assert!(a.lease_valid());
+
+        // a lease someone else rewrote is still a conflict
+        let mut l = a.lease.read().clone();
+        l.log_id = "someone-else".into();
+        a.put_json_unbounded(&a.path("nodes/a"), &l, PutMode::Overwrite).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 1);
     }
 
     /// A same-id restart whose previous incarnation's lease vanishes between
