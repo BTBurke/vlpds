@@ -2,6 +2,13 @@
 name = "vlpds"
 version = "1.0.0"
 edition = "2021"
+description = "An atproto Personal Data Server whose only durable storage is an object store, clustered across any number of nodes"
+license = "MIT"
+repository = "https://github.com/jazware/vlpds"
+readme = "README.md"
+keywords = ["atproto", "bluesky", "pds", "object-storage", "s3"]
+categories = ["network-programming", "web-programming::http-server"]
+publish = false
 # tests/ is one binary (tests/all/main.rs), declared below: one link per run
 # instead of one per file.
 autotests = false
@@ -161,7 +168,8 @@ slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0d
 
 # Fat LTO + 1 codegen unit: ~4 min of a release build is this crate's
 # single-threaded optimization and LTO, but cheaper settings cost runtime
-# (benchbox A/B 2026-10-03, 3 rounds, CPU/commit noise about +-1%): thin LTO
+# (A/B on a 16-core Zen 5 box, bench/results/buildspeed-ab-2026-10-03:
+# 3 rounds, CPU/commit noise about +-1%): thin LTO
 # with 16 units +2.5-3.4% CPU per commit and -3-4% read ops/s (x86-64-v3
 # wins back ~1 point); fat LTO with 16 units CPU/commit within noise but reads
 # -1.3%; no LTO +10-11% CPU/commit and -15% reads.
