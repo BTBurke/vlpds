@@ -26,11 +26,6 @@ RUN npm run build
 
 # --- rust release build -----------------------------------------------------
 FROM rust:1.98.1-bookworm AS build
-# Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for
-# --pyroscope-url (continuous CPU profiles).
-ARG VLPDS_FEATURES=""
-# vlpds_build_info's rev label: the build context has no .git to describe.
-ARG VLPDS_GIT_REV=""
 
 # cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C builds
 RUN apt-get update \
@@ -46,18 +41,28 @@ COPY lexicons ./lexicons
 # the manifest declares the test binary; it is never built here
 RUN mkdir -p tests/all && touch tests/all/main.rs
 COPY --from=ui /src/ui/dist ./ui/dist
+# Declared this late because every RUN after an ARG is keyed on its value,
+# and the rev changes on every build.
+# Extra cargo features, e.g. --build-arg VLPDS_FEATURES=profiling for
+# --pyroscope-url (continuous CPU profiles).
+ARG VLPDS_FEATURES=""
+# vlpds_build_info's rev label: the build context has no .git to describe.
+ARG VLPDS_GIT_REV=""
 # no debug info in the image (Cargo.toml keeps debug = 1 for local profiling;
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
 ENV CARGO_PROFILE_RELEASE_DEBUG=0 \
     VLPDS_GIT_REV=${VLPDS_GIT_REV}
+# Both binaries in one invocation: the probe reuses the crate's compiled lib
+# and its LTO link runs beside vlpds's (+3 s; its own profile recompiled
+# the lib after the vlpds build, +40-55 s).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --release --locked --bin vlpds ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
-    && cargo build --profile tool --locked --bin vlpds-bucket-probe \
+    cargo build --release --locked --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
     && mkdir -p /out \
-    && cp target/release/vlpds target/tool/vlpds-bucket-probe /out/
+    && cp target/release/vlpds target/release/vlpds-bucket-probe /out/ \
+    && /out/vlpds --help >/dev/null && /out/vlpds-bucket-probe --help >/dev/null
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime

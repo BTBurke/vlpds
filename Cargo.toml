@@ -159,20 +159,18 @@ slatedb = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c46
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
 slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "2a79077e0da057c4673137195409edfe7bb673c4" }
 
+# Fat LTO + 1 codegen unit: ~4 min of a release build is this crate's
+# single-threaded optimization and LTO, but cheaper settings cost runtime
+# (benchbox A/B 2026-10-03, 3 rounds, CPU/commit noise about +-1%): thin LTO
+# with 16 units +2.5-3.4% CPU per commit and -3-4% read ops/s (x86-64-v3
+# wins back ~1 point); fat LTO with 16 units CPU/commit within noise but reads
+# -1.3%; no LTO +10-11% CPU/commit and -15% reads.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
 # keep symbols for profiling (sample/perf/pprof)
 debug = 1
-
-# Small helper binaries in the image (vlpds-bucket-probe): fat LTO buys them
-# nothing and costs a full single-threaded optimization pass per binary.
-[profile.tool]
-inherits = "release"
-lto = "thin"
-codegen-units = 16
-debug = 0
 
 # fast iteration builds: `cargo build --profile dev-release`. No LTO and
 # incremental, so an edit recompiles only the crate; dependencies are built
