@@ -769,8 +769,10 @@ impl Secrets {
             ws.push(Arc::new(GcpKms::new(k, endpoint, token.clone())?));
         }
         let vault_key = |k: &str, current: bool| -> anyhow::Result<Arc<dyn KeyWrapper>> {
-            let t = VaultTransit::new(vault.clone().expect("checked"), k, current)?;
-            tracing::info!(kid = t.kid(), key = t.name(), current, "vault transit key");
+            let v = vault.clone().expect("checked");
+            let addr = v.addr().to_string();
+            let t = VaultTransit::new(v, k, current)?;
+            tracing::info!(kid = t.kid(), key = t.name(), addr, current, "vault transit key");
             Ok(Arc::new(t))
         };
         if let Some(k) = &cfg.vault_key {

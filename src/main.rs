@@ -444,8 +444,8 @@ struct Args {
     /// another mount or key; `rotate` inside one key needs none).
     #[arg(long, env = "VLPDS_VAULT_TRANSIT_OLD_KEY", value_delimiter = ',')]
     vault_transit_old_key: Vec<String>,
-    /// Vault server, http(s)://host[:port]. Its host name is part of each
-    /// Transit key's kid, so every node must use the same one.
+    /// Vault server, http(s)://host[:port]. Not part of the kid: it can
+    /// change without a rewrap.
     #[arg(long, env = "VLPDS_VAULT_ADDR")]
     vault_addr: Option<String>,
     /// Vault Enterprise / OpenBao namespace (X-Vault-Namespace).

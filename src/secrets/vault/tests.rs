@@ -29,6 +29,9 @@ struct MockVault {
     /// `keys/{key}`'s type; empty: 403.
     key_type: parking_lot::Mutex<String>,
     namespaces: parking_lot::Mutex<Vec<Option<String>>>,
+    /// Path -> status, after the token check (a policy without that path).
+    deny: parking_lot::Mutex<std::collections::HashMap<String, u16>>,
+    sealed: AtomicBool,
     last_encrypt: parking_lot::Mutex<(String, serde_json::Value)>,
 }
 
@@ -57,6 +60,8 @@ async fn mock_vault() -> Arc<MockVault> {
         silent_ignore_aad: AtomicBool::new(false),
         key_type: parking_lot::Mutex::new("aes256-gcm96".into()),
         namespaces: parking_lot::Mutex::new(Vec::new()),
+        deny: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        sealed: AtomicBool::new(false),
         last_encrypt: parking_lot::Mutex::new((String::new(), serde_json::Value::Null)),
     });
     fn err(status: StatusCode, msg: &str) -> axum::response::Response {
@@ -76,6 +81,9 @@ async fn mock_vault() -> Arc<MockVault> {
     ) -> axum::response::Response {
         let b64 = base64::engine::general_purpose::STANDARD;
         m.namespaces.lock().push(headers.get("x-vault-namespace").map(|v| v.to_str().unwrap().to_string()));
+        if m.sealed.load(Ordering::SeqCst) {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "Vault is sealed");
+        }
         let body: serde_json::Value =
             if body.is_empty() { serde_json::Value::Null } else { serde_json::from_str(&body).unwrap() };
         if let Some(mount) = rest.strip_prefix("auth/").and_then(|r| r.strip_suffix("/login")) {
@@ -93,6 +101,9 @@ async fn mock_vault() -> Arc<MockVault> {
         let token = headers.get("x-vault-token").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
         if !m.tokens.lock().contains(&token) {
             return err(StatusCode::FORBIDDEN, "permission denied");
+        }
+        if let Some(&st) = m.deny.lock().get(&rest) {
+            return err(StatusCode::from_u16(st).unwrap(), "permission denied");
         }
         if rest == "auth/token/renew-self" {
             m.renews.fetch_add(1, Ordering::SeqCst);
@@ -221,7 +232,7 @@ async fn request_shape_aad_and_namespace() {
     // another subject or purpose: Transit refuses (400), a Rejected
     assert!(matches!(s.unwrap(Purpose::SigningKey, "did:plc:b", &blob).await, Err(SecretError::Rejected(_))));
     assert!(matches!(s.unwrap(Purpose::Totp, "did:plc:a", &blob).await, Err(SecretError::Rejected(_))));
-    // the kid: namespace, mount and key count; the port and scheme don't
+    // the kid: namespace, mount and key count, the address doesn't
     let kid = |addr: &str, ns: Option<&str>, key: &str| {
         let c = VaultClient::new(&VaultConfig {
             addr: addr.into(),
@@ -234,7 +245,8 @@ async fn request_shape_aad_and_namespace() {
     };
     let k = kid("https://vault.example:8200", None, "transit/vlpds");
     assert_eq!(k, kid("http://vault.example/", None, "/transit/vlpds/"));
-    assert_ne!(k, kid("https://vault2.example:8200", None, "transit/vlpds"));
+    assert_eq!(k, kid("https://vault2.example:8200", None, "transit/vlpds"));
+    assert_eq!(k, kid("http://10.0.0.7:8200", None, "transit/vlpds"));
     assert_ne!(k, kid("https://vault.example:8200", Some("ns"), "transit/vlpds"));
     assert_ne!(k, kid("https://vault.example:8200", None, "transit/other"));
     assert_ne!(k, kid("https://vault.example:8200", None, "transit2/vlpds"));
@@ -520,4 +532,56 @@ fn config_checks() {
         auth: VaultAuth::Static("t".into()),
     };
     assert!(VaultClient::new(&bad).is_err());
+}
+
+/// At startup, an answer from Vault that retrying won't fix stops the node
+/// with the path and the likely cause: a policy without encrypt or decrypt,
+/// a missing mount, wrong AppRole credentials. Mid-run the same answers stay
+/// retryable, and a sealed or unreachable Vault never stops a start.
+#[tokio::test]
+async fn startup_refuses_config_mistakes_but_not_outages() {
+    let m = mock_vault().await;
+    let auth = m.static_token();
+    let start = |key: &str| {
+        let s = Secrets::from_config(&kek(m.cfg(auth.clone()), key, &[]), false).unwrap();
+        async move { (s.check_key_service().await, s) }
+    };
+    for (path, status, want) in [
+        ("transit/encrypt/vlpds", 403, "lacks update on transit/encrypt/vlpds"),
+        ("transit/decrypt/vlpds", 403, "lacks update on transit/decrypt/vlpds"),
+        ("transit/encrypt/vlpds", 404, "nothing at transit/encrypt/vlpds"),
+    ] {
+        m.deny.lock().insert(path.into(), status);
+        let e = start("transit/vlpds").await.0.unwrap_err().to_string();
+        assert!(e.contains(want) && e.contains("unusable"), "{path} {status}: {e}");
+        m.deny.lock().clear();
+    }
+    // wrong AppRole credentials
+    let sid = tmp_file("not-the-secret-id");
+    let ar = VaultAuth::AppRole { mount: "approle".into(), role_id: ROLE_ID.into(), secret_id_file: sid.clone() };
+    let s = Secrets::from_config(&kek(m.cfg(ar), "transit/vlpds", &[]), false).unwrap();
+    let e = s.check_key_service().await.unwrap_err().to_string();
+    assert!(e.contains("credentials are wrong") && !e.contains("not-the-secret-id"), "{e}");
+    std::fs::remove_file(sid).unwrap();
+    // sealed: starts, and the first use is a retryable failure, then works once unsealed
+    m.sealed.store(true, Ordering::SeqCst);
+    let (r, s) = start("transit/vlpds").await;
+    r.unwrap();
+    assert!(matches!(s.wrap(Purpose::Totp, "did:plc:a", b"x").await, Err(SecretError::Unavailable(_))));
+    m.sealed.store(false, Ordering::SeqCst);
+    tokio::time::sleep(crate::secrets::KMS_BACKOFF).await;
+    s.wrap(Purpose::Totp, "did:plc:a", b"x").await.unwrap();
+    // mid-run, a policy losing decrypt is an outage (503), not a rejection
+    let b = s.wrap(Purpose::Totp, "did:plc:a", b"x").await.unwrap();
+    m.deny.lock().insert("transit/decrypt/vlpds".into(), 403);
+    assert!(matches!(s.unwrap(Purpose::Totp, "did:plc:a", &b).await, Err(SecretError::Unavailable(_))));
+    // a check deferred at startup that then finds a 403 is retryable too
+    m.deny.lock().clear();
+    m.sealed.store(true, Ordering::SeqCst);
+    let (r, s) = start("transit/vlpds").await;
+    r.unwrap();
+    m.sealed.store(false, Ordering::SeqCst);
+    m.deny.lock().insert("transit/decrypt/vlpds".into(), 403);
+    tokio::time::sleep(crate::secrets::KMS_BACKOFF).await;
+    assert!(matches!(s.wrap(Purpose::Totp, "did:plc:a", b"x").await, Err(SecretError::Unavailable(_))));
 }

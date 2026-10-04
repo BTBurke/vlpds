@@ -125,11 +125,45 @@ struct AuthData {
     renewable: bool,
 }
 
+/// A failed Vault request. The status (when Vault answered) decides whether
+/// the startup check stops the node: an answer is a config mistake, no
+/// answer an outage.
+struct Fail {
+    e: SecretError,
+    status: Option<u16>,
+    path: String,
+}
+
+impl From<Fail> for SecretError {
+    fn from(f: Fail) -> SecretError {
+        f.e
+    }
+}
+
+/// No HTTP answer: a local file, a connection error, a bad body.
+fn local(e: SecretError) -> Fail {
+    Fail { e, status: None, path: String::new() }
+}
+
+/// Startup: Vault answered, so retrying won't help. Mid-run the same
+/// answers stay retryable (an operator can fix a policy without a restart).
+fn startup_error(f: Fail) -> SecretError {
+    let hint = match (f.status, f.path.ends_with("/login")) {
+        (Some(400 | 401 | 403), true) => "the auth role or its credentials are wrong".to_string(),
+        (Some(401 | 403), false) => format!(
+            "the token's policy lacks update on {}, or the key doesn't exist (the policy may not create it)",
+            f.path
+        ),
+        (Some(404), _) => format!("nothing at {}: check the mount and key names", f.path),
+        _ => return f.e,
+    };
+    SecretError::Rejected(format!("{} ({hint})", f.e))
+}
+
 /// One Vault server and identity; its token is shared by every Transit key
 /// using it.
 pub struct VaultClient {
     addr: String,
-    host: String,
     namespace: Option<String>,
     auth: VaultAuth,
     http: reqwest::Client,
@@ -156,7 +190,7 @@ impl VaultClient {
             matches!(u.scheme(), "http" | "https") && u.path() == "/" && u.query().is_none(),
             "--vault-addr must be http(s)://host[:port] with no path: {addr}"
         );
-        let host = u.host_str().ok_or_else(|| anyhow::anyhow!("--vault-addr has no host: {addr}"))?.to_string();
+        anyhow::ensure!(u.host_str().is_some(), "--vault-addr has no host: {addr}");
         let namespace = cfg.namespace.as_deref().map(|n| n.trim().trim_matches('/')).filter(|n| !n.is_empty());
         let http = crate::http::public_own(cfg.ca_pem.as_deref()).map_err(|e| e.context("--vault-ca-file"))?;
         match &cfg.auth {
@@ -172,7 +206,6 @@ impl VaultClient {
         }
         Ok(Arc::new(VaultClient {
             addr,
-            host,
             namespace: namespace.map(str::to_string),
             auth: cfg.auth.clone(),
             http,
@@ -180,6 +213,10 @@ impl VaultClient {
             logins: AtomicU64::new(0),
             renewals: AtomicU64::new(0),
         }))
+    }
+
+    pub fn addr(&self) -> &str {
+        &self.addr
     }
 
     /// Logins so far (tests).
@@ -200,7 +237,7 @@ impl VaultClient {
     }
 
     /// `force`: the last one got a 403 (expired, revoked or rotated away).
-    async fn token(&self, force: bool) -> Result<Zeroizing<String>, SecretError> {
+    async fn token(&self, force: bool) -> Result<Zeroizing<String>, Fail> {
         let mut g = self.session.lock().await;
         if let Some(s) = g.as_ref() {
             if !force && Instant::now() < s.refresh_at {
@@ -210,7 +247,7 @@ impl VaultClient {
         let next = match &self.auth {
             VaultAuth::Static(t) => return Ok(Zeroizing::new(t.clone())),
             VaultAuth::TokenFile(p) => Session {
-                token: read_secret(p, "vault token file")?,
+                token: read_secret(p, "vault token file").map_err(local)?,
                 refresh_at: Instant::now() + TOKEN_FILE_RELOAD,
                 renew: false,
                 login_ttl: 0,
@@ -220,7 +257,11 @@ impl VaultClient {
                     Some(s) if !force && s.renew => match self.renew(s).await {
                         Ok(n) => Some(n),
                         Err(e) => {
-                            tracing::warn!(method = self.auth.method(), "vault token renewal failed, logging in: {e}");
+                            tracing::warn!(
+                                method = self.auth.method(),
+                                "vault token renewal failed, logging in: {}",
+                                e.e
+                            );
                             None
                         }
                     },
@@ -237,15 +278,16 @@ impl VaultClient {
         Ok(t)
     }
 
-    async fn renew(&self, s: &Session) -> Result<Session, SecretError> {
+    async fn renew(&self, s: &Session) -> Result<Session, Fail> {
+        let path = "auth/token/renew-self";
         let r = self
-            .request(reqwest::Method::POST, "auth/token/renew-self")
+            .request(reqwest::Method::POST, path)
             .header("X-Vault-Token", s.token.as_str())
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|e| SecretError::Unavailable(format!("vault token renewal: {}", chain(&e))))?;
-        let a = auth_response(r, "token renewal").await?;
+            .map_err(|e| local(SecretError::Unavailable(format!("vault token renewal: {}", chain(&e)))))?;
+        let a = auth_response(r, "token renewal", path).await?;
         self.renewals.fetch_add(1, Ordering::Relaxed);
         let ttl = a.lease_duration;
         // a shorter TTL than the login's means max_ttl caps it: log in
@@ -254,10 +296,10 @@ impl VaultClient {
         Ok(Session::new(Zeroizing::new(a.client_token), ttl, renew, s.login_ttl))
     }
 
-    async fn login(&self) -> Result<Session, SecretError> {
+    async fn login(&self) -> Result<Session, Fail> {
         let (mount, body) = match &self.auth {
             VaultAuth::AppRole { mount, role_id, secret_id_file } => {
-                let secret_id = read_secret(secret_id_file, "vault AppRole secret ID file")?;
+                let secret_id = read_secret(secret_id_file, "vault AppRole secret ID file").map_err(local)?;
                 let body = Zeroizing::new(
                     serde_json::to_vec(&serde_json::json!({"role_id": role_id, "secret_id": &*secret_id}))
                         .expect("json"),
@@ -265,7 +307,7 @@ impl VaultClient {
                 (mount, body)
             }
             VaultAuth::Kubernetes { mount, role, jwt_file } => {
-                let jwt = read_secret(jwt_file, "kubernetes service-account token file")?;
+                let jwt = read_secret(jwt_file, "kubernetes service-account token file").map_err(local)?;
                 let body =
                     Zeroizing::new(serde_json::to_vec(&serde_json::json!({"role": role, "jwt": &*jwt})).expect("json"));
                 (mount, body)
@@ -273,14 +315,15 @@ impl VaultClient {
             VaultAuth::TokenFile(_) | VaultAuth::Static(_) => unreachable!("no login for a given token"),
         };
         let what = format!("{} login", self.auth.method());
+        let path = format!("auth/{mount}/login");
         let r = self
-            .request(reqwest::Method::POST, &format!("auth/{mount}/login"))
+            .request(reqwest::Method::POST, &path)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|e| SecretError::Unavailable(format!("vault {what}: {}", chain(&e))))?;
-        let a = auth_response(r, &what).await?;
+            .map_err(|e| local(SecretError::Unavailable(format!("vault {what}: {}", chain(&e)))))?;
+        let a = auth_response(r, &what, &path).await?;
         self.logins.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(method = self.auth.method(), ttl = a.lease_duration, renewable = a.renewable, "vault login");
         Ok(Session::new(Zeroizing::new(a.client_token), a.lease_duration, a.renewable, a.lease_duration))
@@ -295,19 +338,21 @@ impl VaultClient {
         op: &str,
         body: Option<&[u8]>,
         reauth: bool,
-    ) -> Result<serde_json::Value, SecretError> {
+    ) -> Result<serde_json::Value, Fail> {
+        let fail = |e, status| Fail { e, status: Some(status), path: path.to_string() };
         for attempt in 0..2 {
             let token = self.token(attempt > 0).await?;
             let mut req = self.request(method.clone(), path).header("X-Vault-Token", token.as_str());
             if let Some(b) = body {
                 req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b.to_vec());
             }
-            let r = req.send().await.map_err(|e| SecretError::Unavailable(format!("vault {op}: {}", chain(&e))))?;
+            let r =
+                req.send().await.map_err(|e| local(SecretError::Unavailable(format!("vault {op}: {}", chain(&e)))))?;
             let status = r.status();
             if status.is_success() {
                 let mut v: serde_json::Value =
-                    r.json().await.map_err(|e| SecretError::Unavailable(format!("vault {op}: {e}")))?;
-                check_warnings(&v, op)?;
+                    r.json().await.map_err(|e| local(SecretError::Unavailable(format!("vault {op}: {e}"))))?;
+                check_warnings(&v, op).map_err(local)?;
                 return Ok(v.get_mut("data").map(serde_json::Value::take).unwrap_or_default());
             }
             let text = r.text().await.unwrap_or_default();
@@ -315,11 +360,14 @@ impl VaultClient {
                 403 if reauth && attempt == 0 && !matches!(self.auth, VaultAuth::Static(_)) => continue,
                 // wrong AAD, a ciphertext of another key, one below
                 // min_decryption_version, or a missing key
-                400 => return Err(SecretError::Rejected(format!("vault {op}: {}", errors(&text)))),
-                _ => return Err(SecretError::Unavailable(format!("vault {op}: HTTP {status}: {}", errors(&text)))),
+                400 => return Err(fail(SecretError::Rejected(format!("vault {op}: {}", errors(&text))), 400)),
+                s => {
+                    let e = SecretError::Unavailable(format!("vault {op}: HTTP {status}: {}", errors(&text)));
+                    return Err(fail(e, s));
+                }
             }
         }
-        Err(SecretError::Unavailable(format!("vault {op}: permission denied")))
+        unreachable!("the second attempt returns")
     }
 }
 
@@ -352,16 +400,20 @@ fn read_secret(p: &std::path::Path, what: &str) -> Result<Zeroizing<String>, Sec
 
 /// Every login or renewal failure is retryable: wrong credentials look the
 /// same as a revoked identity, which an operator fixes without a restart.
-async fn auth_response(r: reqwest::Response, what: &str) -> Result<AuthData, SecretError> {
+async fn auth_response(r: reqwest::Response, what: &str, path: &str) -> Result<AuthData, Fail> {
     let status = r.status();
     if !status.is_success() {
         let text = r.text().await.unwrap_or_default();
-        return Err(SecretError::Unavailable(format!("vault {what}: HTTP {status}: {}", errors(&text))));
+        return Err(Fail {
+            e: SecretError::Unavailable(format!("vault {what}: HTTP {status}: {}", errors(&text))),
+            status: Some(status.as_u16()),
+            path: path.to_string(),
+        });
     }
-    let a: AuthResp = r.json().await.map_err(|e| SecretError::Unavailable(format!("vault {what}: {e}")))?;
+    let a: AuthResp = r.json().await.map_err(|e| local(SecretError::Unavailable(format!("vault {what}: {e}"))))?;
     a.auth
         .filter(|a| !a.client_token.is_empty())
-        .ok_or_else(|| SecretError::Unavailable(format!("vault {what}: no token in the response")))
+        .ok_or_else(|| local(SecretError::Unavailable(format!("vault {what}: no token in the response"))))
 }
 
 /// reqwest's own message stops at "error sending request".
@@ -409,8 +461,9 @@ fn ciphertext_version(ct: &str) -> Option<u64> {
     n.parse::<u64>().ok().filter(|&n| n >= 1 && ok)
 }
 
-/// One Transit key. Its kid hashes the server's host name, namespace, mount
-/// and key name but no version, so `rotate` keeps the kid.
+/// One Transit key. Its kid hashes the namespace, mount and key name: no
+/// version, so `rotate` keeps the kid, and no address, so the same Vault
+/// under another name (a new DNS name, a load balancer) keeps it too.
 pub struct VaultTransit {
     kid: String,
     name: String,
@@ -438,8 +491,8 @@ impl VaultTransit {
             anyhow::anyhow!("Vault Transit key must be <mount>/<key> (e.g. transit/vlpds): {mount_key:?}")
         })?;
         let name = match &client.namespace {
-            Some(ns) => format!("vault:{}/{ns}/{mount}/{key}", client.host),
-            None => format!("vault:{}/{mount}/{key}", client.host),
+            Some(ns) => format!("vault:{ns}/{mount}/{key}"),
+            None => format!("vault:{mount}/{key}"),
         };
         let h = Sha256::digest(name.as_bytes());
         Ok(VaultTransit {
@@ -455,7 +508,7 @@ impl VaultTransit {
         })
     }
 
-    /// `vault:{host}/[{namespace}/]{mount}/{key}`, what the kid hashes.
+    /// `vault:[{namespace}/]{mount}/{key}`, what the kid hashes.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -465,7 +518,7 @@ impl VaultTransit {
         self.latest.load(Ordering::Relaxed)
     }
 
-    async fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<String, SecretError> {
+    async fn encrypt(&self, aad: &[u8], plaintext: &[u8]) -> Result<String, Fail> {
         let pt = Zeroizing::new(b64(plaintext));
         // base64 needs no JSON escaping
         let body = Zeroizing::new(
@@ -475,15 +528,15 @@ impl VaultTransit {
         let data = self.client.call(reqwest::Method::POST, &path, "encrypt", Some(&body), true).await?;
         let ct = data["ciphertext"]
             .as_str()
-            .ok_or_else(|| SecretError::Unavailable("vault encrypt: no ciphertext".into()))?;
+            .ok_or_else(|| local(SecretError::Unavailable("vault encrypt: no ciphertext".into())))?;
         let v = ciphertext_version(ct)
-            .ok_or_else(|| SecretError::Unavailable("vault encrypt: ciphertext isn't vault:vN:…".into()))?;
+            .ok_or_else(|| local(SecretError::Unavailable("vault encrypt: ciphertext isn't vault:vN:…".into())))?;
         self.latest.fetch_max(v, Ordering::Relaxed);
         *self.latest_checked.lock() = Some(Instant::now());
         Ok(ct.to_string())
     }
 
-    async fn decrypt(&self, aad: &[u8], ct: &str) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    async fn decrypt(&self, aad: &[u8], ct: &str) -> Result<Zeroizing<Vec<u8>>, Fail> {
         let body =
             serde_json::to_vec(&serde_json::json!({"ciphertext": ct, "associated_data": b64(aad)})).expect("json");
         let path = format!("{}/decrypt/{}", self.mount, self.key);
@@ -495,11 +548,11 @@ impl VaultTransit {
         Ok(Zeroizing::new(
             base64::engine::general_purpose::STANDARD
                 .decode(pt.as_bytes())
-                .map_err(|_| SecretError::Unavailable("vault decrypt: bad plaintext".into()))?,
+                .map_err(|_| local(SecretError::Unavailable("vault decrypt: bad plaintext".into())))?,
         ))
     }
 
-    async fn verify(&self) -> Result<(), SecretError> {
+    async fn verify(&self) -> Result<(), Fail> {
         if !self.current {
             return Ok(());
         }
@@ -508,7 +561,7 @@ impl VaultTransit {
 
     /// The key's type, where the policy allows reading it; the AAD check
     /// catches the rest.
-    async fn check_key_type(&self) -> Result<(), SecretError> {
+    async fn check_key_type(&self) -> Result<(), Fail> {
         let path = format!("{}/keys/{}", self.mount, self.key);
         let data = match self.client.call(reqwest::Method::GET, &path, "read key", None, false).await {
             Ok(d) => d,
@@ -516,43 +569,43 @@ impl VaultTransit {
         };
         let ty = data["type"].as_str().unwrap_or("");
         if !AEAD_TYPES.contains(&ty) {
-            return Err(SecretError::Rejected(format!(
+            return Err(local(SecretError::Rejected(format!(
                 "Vault Transit key {} is {ty:?}: vlpds needs an AEAD key that takes associated_data ({})",
                 self.name,
                 AEAD_TYPES.join(", ")
-            )));
+            ))));
         }
         if data["derived"].as_bool() == Some(true) {
-            return Err(SecretError::Rejected(format!(
+            return Err(local(SecretError::Rejected(format!(
                 "Vault Transit key {} is derived: vlpds needs a plain (non-derived) key",
                 self.name
-            )));
+            ))));
         }
         Ok(())
     }
 
     /// Wraps a random value under AAD A, unwraps it under A, and requires
     /// the unwrap under AAD B to be refused.
-    async fn self_test_inner(&self) -> Result<(), SecretError> {
+    async fn self_test_inner(&self) -> Result<(), Fail> {
         self.check_key_type().await?;
         let pt = Zeroizing::new(rand::random::<[u8; 32]>().to_vec());
         let (a, b) = (b"vlpds-vault-aad-check\0a".as_slice(), b"vlpds-vault-aad-check\0b".as_slice());
         let ct = self.encrypt(a, &pt).await?;
         if self.decrypt(a, &ct).await?.as_slice() != pt.as_slice() {
-            return Err(SecretError::Rejected(format!(
+            return Err(local(SecretError::Rejected(format!(
                 "Vault Transit key {}: a decrypt returned other bytes",
                 self.name
-            )));
+            ))));
         }
         match self.decrypt(b, &ct).await {
-            Err(SecretError::Rejected(_)) => Ok(()),
+            Err(Fail { e: SecretError::Rejected(_), .. }) => Ok(()),
             Err(e) => Err(e),
-            Ok(_) => Err(SecretError::Rejected(format!(
+            Ok(_) => Err(local(SecretError::Rejected(format!(
                 "Vault Transit key {} decrypted with the wrong associated_data: the server or key type doesn't \
                  enforce AAD (needs Vault 1.13+ or OpenBao, and an {} key)",
                 self.name,
                 AEAD_TYPES.join(" / ")
-            ))),
+            )))),
         }
     }
 
@@ -570,7 +623,7 @@ impl VaultTransit {
         };
         if due {
             if let Err(e) = self.encrypt(b"vlpds-vault-version-probe", &[0]).await {
-                tracing::debug!(kid = self.kid, "vault key version probe: {e}");
+                tracing::debug!(kid = self.kid, "vault key version probe: {}", e.e);
             }
         }
         self.latest.load(Ordering::Relaxed)
@@ -589,7 +642,7 @@ impl KeyWrapper for VaultTransit {
         true
     }
     async fn self_test(&self) -> Result<(), SecretError> {
-        self.verify().await
+        self.verify().await.map_err(startup_error)
     }
     async fn wrap(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretError> {
         self.verify().await?;

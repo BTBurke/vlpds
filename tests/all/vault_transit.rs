@@ -164,6 +164,67 @@ async fn vault_roundtrip_wrong_aad_and_self_test() {
     std::fs::remove_file(tf).ok();
 }
 
+/// The kid doesn't depend on the address: blobs wrapped through one host
+/// name unwrap through another (here 127.0.0.1 and localhost, one server)
+/// with no rewrap.
+#[tokio::test]
+async fn vault_new_address_keeps_blobs() {
+    let Some(v) = vault() else { return };
+    if !v.addr.contains("127.0.0.1") {
+        eprintln!("skipping: VLPDS_TEST_VAULT_ADDR isn't on 127.0.0.1");
+        return;
+    }
+    let (mount, policy) = v.transit("aes256-gcm96").await;
+    let tf = v.token_file(&[&policy]).await;
+    let key = format!("{mount}/vlpds");
+    let a = Secrets::from_config(&kek(v.cfg(VaultAuth::TokenFile(tf.clone())), &key, &[]), false).unwrap();
+    let blob = a.wrap(Purpose::SigningKey, "did:plc:a", &[8u8; 32]).await.unwrap();
+    let moved =
+        VaultConfig { addr: v.addr.replace("127.0.0.1", "localhost"), ..v.cfg(VaultAuth::TokenFile(tf.clone())) };
+    let b = Secrets::from_config(&kek(moved, &key, &[]), false).unwrap();
+    b.check_key_service().await.unwrap();
+    assert_eq!(a.current_kid(), b.current_kid());
+    let u = b.unwrap(Purpose::SigningKey, "did:plc:a", &blob).await.unwrap();
+    assert_eq!(&u.plaintext[..], &[8u8; 32]);
+    assert!(!u.stale, "nothing to rewrap");
+    std::fs::remove_file(tf).ok();
+}
+
+/// A reachable Vault that refuses the key stops the node at startup: a key
+/// that doesn't exist (the policy can't create it), a policy without
+/// decrypt. An unreachable Vault doesn't: the node starts and checks again
+/// before first use.
+#[tokio::test]
+async fn vault_startup_refuses_missing_key_or_policy() {
+    let Some(v) = vault() else { return };
+    let mount = unique_name("transit");
+    v.post(&format!("sys/mounts/{mount}"), json!({"type": "transit"})).await;
+    let policy = unique_name("vlpds");
+    v.allow(&policy, &mount, "vlpds").await;
+    let tf = v.token_file(&[&policy]).await;
+    let cfg = kek(v.cfg(VaultAuth::TokenFile(tf.clone())), &format!("{mount}/vlpds"), &[]);
+    let e = Secrets::from_config(&cfg, false).unwrap().check_key_service().await.unwrap_err().to_string();
+    assert!(e.contains(&format!("{mount}/encrypt/vlpds")) && e.contains("doesn't exist"), "{e}");
+
+    // the key exists, the policy has encrypt only
+    v.key(&mount, "vlpds", "aes256-gcm96").await;
+    let enc_only = unique_name("vlpds");
+    let hcl = format!("path \"{mount}/encrypt/vlpds\" {{ capabilities = [\"update\"] }}\n");
+    v.post(&format!("sys/policies/acl/{enc_only}"), json!({"policy": hcl})).await;
+    let tf2 = v.token_file(&[&enc_only]).await;
+    let cfg = kek(v.cfg(VaultAuth::TokenFile(tf2.clone())), &format!("{mount}/vlpds"), &[]);
+    let e = Secrets::from_config(&cfg, false).unwrap().check_key_service().await.unwrap_err().to_string();
+    assert!(e.contains(&format!("lacks update on {mount}/decrypt/vlpds")), "{e}");
+
+    // nothing listening: starts, first use is a retryable failure
+    let dead = VaultConfig { addr: "http://127.0.0.1:18299".into(), ..v.cfg(VaultAuth::TokenFile(tf.clone())) };
+    let s = Secrets::from_config(&kek(dead, &format!("{mount}/vlpds"), &[]), false).unwrap();
+    s.check_key_service().await.unwrap();
+    assert!(matches!(s.wrap(Purpose::Totp, "did:plc:a", b"x").await, Err(SecretError::Unavailable(_))));
+    std::fs::remove_file(tf).ok();
+    std::fs::remove_file(tf2).ok();
+}
+
 /// A Vault on a private CA (`server -dev-tls`): refused without
 /// --vault-ca-file (a retryable failure, the check deferred), served with
 /// it. `just vault-test` sets VLPDS_TEST_VAULT_TLS_ADDR and _CA.
