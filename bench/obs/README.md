@@ -163,6 +163,11 @@ just dashboards          # python3 bench/obs/grafana/gen_dashboard.py
 just dashboards --check  # exit 1 if a copy is stale
 ```
 
-`VLPDS_PROM_UID` / `VLPDS_PYRO_UID` (with `VLPDS_DASH_OUT`) render a copy
-for your own Grafana, with its datasource uids. This stack reloads the file within 5 s. Edits
-made in the UI are allowed but get overwritten by the next file change.
+That copy is import-ready (any Grafana's Import dialog asks for the
+Prometheus) and `vlpds dashboards` prints it. This stack provisions it
+as is: Grafana picks the only Prometheus. `VLPDS_PROM_UID` /
+`VLPDS_PYRO_UID` with `VLPDS_DASH_OUT` render an extra copy pre-set to your
+own Grafana's datasource uids, for file provisioning.
+
+This stack reloads the file within 5 s. Edits made in the UI are allowed but
+get overwritten by the next file change.

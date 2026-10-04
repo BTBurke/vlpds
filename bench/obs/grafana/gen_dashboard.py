@@ -11,16 +11,25 @@ Dashboards:
 - vlpds-internals.json (uid `vlpds-internals`, "vlpds internals"): the
   engineer's view of every subsystem, built below.
 
-Copies:
-- bench/obs/grafana/dashboards/: the bench stack (datasource uids
-  `prom` / `pyroscope`; Grafana reloads them within 5 s).
-- deploy/ansible/roles/monitoring/files/dashboards/ in the monorepo this
-  was developed in, when that directory exists: a deployment's Grafana (its
-  Prometheus / Pyroscope datasource uids, PROD_* below).
+Datasources are dashboard variables (`ds_prometheus`, `ds_pyroscope`) and
+the scrape job is one too (`job`), so the dashboards fit any Grafana 10+.
 
-Only the datasource uids differ between the two. VLPDS_PROM_UID /
-VLPDS_PYRO_UID / VLPDS_DASH_OUT (a directory) render one extra copy of both
-for some other Grafana instead (the default copies are then left alone).
+Copies:
+- bench/obs/grafana/dashboards/: the import-ready copy, which `vlpds
+  dashboards` also prints (src/cli/dashboards.rs embeds it). `__inputs`
+  makes the Import dialog ask for a Prometheus and write it into
+  `ds_prometheus`. The bench stack provisions this same file: provisioning
+  leaves the literal ${DS_PROMETHEUS}, no datasource has that uid, and
+  Grafana selects the first Prometheus by name instead (the bench has one).
+- deploy/ansible/roles/monitoring/files/dashboards/ in the monorepo this
+  was developed in, when that directory exists: a deployment's Grafana, the
+  variables pre-set to its Prometheus / Pyroscope uids (PROD_* below), no
+  `__inputs`.
+
+VLPDS_PROM_UID (a uid, or `default`: the default datasource) /
+VLPDS_PYRO_UID / VLPDS_DASH_OUT (a directory) render one extra pre-set copy
+of both for some other Grafana instead (the default copies are then left
+alone).
 
 Internals layout: an always-open "Health" row read in seconds (stats
 coloured by the ops/alerts.yml thresholds, alert timeline, nodes table, the
@@ -39,12 +48,19 @@ PROD_DIR = os.path.normpath(os.path.join(HERE, "../../../../../deploy/ansible/ro
 PROD_PROM_UID = "P4169E866C3094E38"
 PROD_PYRO_UID = "P02E4190217B50628"
 
-# Panels are built against a placeholder datasource; render() swaps in the real uids.
-PLACEHOLDER = {"type": "prometheus", "uid": "__PROM__"}
-PROM = PLACEHOLDER
+PROM = {"type": "prometheus", "uid": "${ds_prometheus}"}
+PYRO = {"type": "grafana-pyroscope-datasource", "uid": "${ds_pyroscope}"}
+# the Import dialog replaces __inputs placeholders; file provisioning doesn't
+DS_INPUT = "${DS_PROMETHEUS}"
+# state-timeline and flamegraph panels
+GRAFANA_MIN = "10.0.0"
 
 RB = "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md"
 ALERTS_URL = "https://github.com/jazware/vlpds/blob/main/ops/alerts.yml"
+MONITORING_DOC = "https://github.com/jazware/vlpds/blob/main/docs/operations/monitoring.md"
+# ALERTS has series only while an alert is pending or firing: "rules not loaded" and "all quiet" look the same
+ALERTS_NOTE = ("Needs ops/alerts.yml loaded in the rule evaluator that writes ALERTS to this Prometheus; "
+               f"without it this stays empty ([monitoring docs]({MONITORING_DOC})).")
 
 
 def rb(anchor, text=None):
@@ -58,7 +74,9 @@ def rb(anchor, text=None):
 # are instance labels, its text the node ids).
 C = 'cluster=~"$cluster"'
 I = C + ', instance=~"$instance"'
-UP = f'up{{job="vlpds", {I}}}'
+# up is the one series a down node keeps, and every target in the Prometheus
+# has one: $job narrows it to the jobs that export vlpds_build_info
+UP = f'up{{job=~"$job", {I}}}'
 RI = "[$__rate_interval]"
 # MinIO is scraped every 5 s: rate windows need >= 2 samples
 MRI = "[20s]"
@@ -384,15 +402,15 @@ stat("Alerts firing", [t(f'count(ALERTS{{alertstate="firing", alertname=~"Vlpds.
      "short", [(1, "red")], text_mode="value_and_name", spark=False,
      overrides=[{"matcher": {"id": "byName", "options": "ticket"},
                  "properties": [{"id": "thresholds", "value": thresholds([(1, "orange")])}]}],
-     desc="Vlpds* alerts firing in this Prometheus, by severity. Reads 0 where ops/alerts.yml isn't loaded "
-          "(the bench stack doesn't load it). Which ones: the timeline below.")
+     desc="Vlpds* alerts firing in this Prometheus, by severity. Which ones: the timeline below. "
+          f"{ALERTS_NOTE} The bench stack doesn't load it.")
 D.newline()
 # row labels: alert name without "Vlpds", instance without the bench's 127.0.0.1 (prod instances are node ids)
 ts("Alerts firing", [t('max by (alert, where) (label_replace(label_replace('
                        f'ALERTS{{alertstate="firing", alertname=~"Vlpds.*", {C}}}, "alert", "$1", "alertname", "Vlpds(.*)"), '
                        '"where", "$1", "instance", "(?:127\\\\.0\\\\.0\\\\.1)?(.*)"))', "{{alert}} {{where}}")],
    w=24, h=6, desc=f"Vlpds* alerts from ops/alerts.yml ({ALERTS_URL}); each one's runbook section is {RB}#<alertname>. "
-                   "Filtered by cluster only, not by node. Empty = nothing firing, or the rules aren't loaded in this Prometheus.")
+                   f"Filtered by cluster only, not by node. Empty = nothing firing, or the rules aren't loaded. {ALERTS_NOTE}")
 # state timeline instead of the generic time series
 D.panels[-1].update(type="state-timeline", options={"showValue": "never", "rowHeight": 0.8, "mergeValues": True, "alignValue": "left",
                                                     "legend": {"showLegend": False, "displayMode": "list", "placement": "bottom"},
@@ -813,8 +831,9 @@ ts("Bucket usage", [t(f"sum by (instance) (minio_cluster_usage_total_bytes{{{C}}
 # ============================================================== profiles
 row("CPU profile (Pyroscope; nodes run with --pyroscope-url)")
 D.add({
-    "type": "flamegraph", "id": D.nid(), "title": "CPU flamegraph (dashboard time range, selected nodes)", "datasource": None, "gridPos": D.place(24, 16),
-    "targets": [{"datasource": None, "refId": "A", "queryType": "profile", "groupBy": [],
+    "type": "flamegraph", "id": D.nid(), "title": "CPU flamegraph (dashboard time range, selected nodes)", "datasource": PYRO, "gridPos": D.place(24, 16),
+    "description": "Needs a Pyroscope datasource (the Pyroscope picker at the top) and nodes started with --pyroscope-url.",
+    "targets": [{"datasource": PYRO, "refId": "A", "queryType": "profile", "groupBy": [],
                  "profileTypeId": "process_cpu:cpu:nanoseconds:cpu:nanoseconds",
                  "labelSelector": '{service_name="vlpds", node_id=~"$node"}'}],
     "options": {},
@@ -825,27 +844,51 @@ D.add({
 INTERNALS_PANELS = D.panels
 
 
-def var(name, label, query, hide=0, regex="", multi=True):
-    return {"name": name, "label": label, "type": "query", "datasource": PROM, "hide": hide,
-            "query": {"query": query, "refId": name, "qryType": 3 if query.startswith("query_result") else 1},
-            "definition": query, "refresh": 2, "multi": multi, "includeAll": True, "regex": regex,
-            "allValue": ".*", "current": {"selected": True, "text": ["All"], "value": ["$__all"]}, "sort": 1}
+def var(name, label, query, hide=0, regex="", multi=True, all_value=".*"):
+    v = {"name": name, "label": label, "type": "query", "datasource": PROM, "hide": hide,
+         "query": {"query": query, "refId": name, "qryType": 3 if query.startswith("query_result") else 1},
+         "definition": query, "refresh": 2, "multi": multi, "includeAll": True, "regex": regex,
+         "allValue": all_value, "current": {"selected": True, "text": ["All"], "value": ["$__all"]}, "sort": 1}
+    if all_value is None:
+        del v["allValue"]
+    return v
 
 
-def render(template, prom_uid, pyro_uid):
-    global PROM
-    PROM = {"type": "prometheus", "uid": prom_uid}
-    pyro = {"type": "grafana-pyroscope-datasource", "uid": pyro_uid}
-    s = json.dumps(template())
-    # panels were built with the placeholder datasource; swap in the real one
-    s = s.replace(json.dumps(PLACEHOLDER), json.dumps(PROM))
-    d = json.loads(s)
-    for p in d["panels"]:
-        for q in [p] + p.get("panels", []):
-            if q.get("type") == "flamegraph":
-                q["datasource"] = pyro
-                q["targets"][0]["datasource"] = pyro
-    return json.dumps(d, indent=1) + "\n"
+def ds_var(name, label, plugin):
+    """Datasource picker; render() sets which one is selected."""
+    return {"name": name, "label": label, "type": "datasource", "query": plugin, "hide": 0, "refresh": 1,
+            "regex": "", "multi": False, "includeAll": False, "options": []}
+
+
+def job_var():
+    # no custom All value: All = the jobs found, not ".*" (which would count every target's up)
+    return var("job", "job", f"label_values(vlpds_build_info{{{C}}}, job)", hide=2, all_value=None)
+
+
+PLUGIN_NAMES = {"prometheus": "Prometheus", "grafana-pyroscope-datasource": "Grafana Pyroscope", "row": "Row",
+                "stat": "Stat", "table": "Table", "text": "Text", "timeseries": "Time series",
+                "state-timeline": "State timeline", "flamegraph": "Flame Graph"}
+
+
+def render(template, prom_uid=None, pyro_uid=None):
+    """prom_uid None: the import-ready copy (__inputs). Otherwise both pickers
+    are pre-set (a uid, or `default`); an unset Pyroscope picker selects the
+    first Pyroscope datasource."""
+    d = template()
+    for v in d["templating"]["list"]:
+        uid = {"ds_prometheus": prom_uid or DS_INPUT, "ds_pyroscope": pyro_uid}.get(v["name"]) if v["type"] == "datasource" else None
+        if uid:
+            v["current"] = {"selected": False, "text": uid, "value": uid}
+    kinds = {p["type"] for p in d["panels"]} | {q["type"] for p in d["panels"] for q in p.get("panels", [])}
+    datasources = {v["query"] for v in d["templating"]["list"] if v["type"] == "datasource"}
+    head = {"__requires": [{"type": "grafana", "id": "grafana", "name": "Grafana", "version": GRAFANA_MIN}]
+            + [{"type": "datasource", "id": k, "name": PLUGIN_NAMES[k], "version": ""} for k in sorted(datasources)]
+            + [{"type": "panel", "id": k, "name": PLUGIN_NAMES[k], "version": ""} for k in sorted(kinds - {"row"})]}
+    if prom_uid is None:
+        # Pyroscope stays out: the Import dialog requires every datasource input
+        head = {"__inputs": [{"name": DS_INPUT[2:-1], "label": "Prometheus", "type": "datasource", "pluginId": "prometheus",
+                              "pluginName": "Prometheus", "description": "Pick the Prometheus that scrapes vlpds /metrics"}], **head}
+    return json.dumps({**head, **d}, indent=1) + "\n"
 
 
 def internals_template():
@@ -854,7 +897,7 @@ def internals_template():
         "title": "vlpds internals",
         "description": "vlpds internals, for engineers debugging the PDS cluster: health first, then one collapsed row "
                        "per subsystem. The operator's view is the 'vlpds' dashboard. Generated by "
-                       "bench/obs/grafana/gen_dashboard.py; edits in the UI are overwritten.",
+                       "bench/obs/grafana/gen_dashboard.py (also printed by `vlpds dashboards`).",
         "tags": ["vlpds"],
         "timezone": "browser",
         "editable": True,
@@ -874,17 +917,20 @@ def internals_template():
             {"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": True, "hide": True,
              "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"},
             # off by default: page regions shade every panel; the Health timeline is the main view
-            {"datasource": PLACEHOLDER, "enable": False, "iconColor": "red", "name": "Paging alerts",
+            {"datasource": PROM, "enable": False, "iconColor": "red", "name": "Paging alerts",
              "expr": f'max by (alertname, severity) (ALERTS{{alertstate="firing", alertname=~"Vlpds.*", severity="page", {C}}})',
              "step": "30s", "titleFormat": "{{alertname}}", "textFormat": "{{severity}}", "tagKeys": "severity", "useValueForTime": False},
-            {"datasource": PLACEHOLDER, "enable": True, "iconColor": "purple", "name": "Restarts",
+            {"datasource": PROM, "enable": True, "iconColor": "purple", "name": "Restarts",
              "expr": f"max by (instance) (changes(vlpds_process_start_time_seconds{{{I}}}[2m])) > 0",
              "step": "1m", "titleFormat": "restart", "textFormat": "{{instance}}", "tagKeys": "instance", "useValueForTime": False},
             {"datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": True, "iconColor": "#FF9830",
              "name": "bench steps", "target": {"type": "tags", "tags": ["vlpds-bench"], "matchAny": True, "limit": 500}},
         ]},
         "templating": {"list": [
+            ds_var("ds_prometheus", "Prometheus", "prometheus"),
+            ds_var("ds_pyroscope", "Pyroscope", "grafana-pyroscope-datasource"),
             var("cluster", "cluster", "label_values(vlpds_build_info, cluster)"),
+            job_var(),
             # text = node id, value = instance label (prod: the same; bench: 127.0.0.1:<port>)
             var("instance", "node", f'query_result(max by (instance, node_id) (vlpds_build_info{{{C}}}))',
                 # query_result prints labels sorted: instance before node_id
@@ -909,9 +955,12 @@ def main():
                   ("vlpds-internals.json", internals_template, INTERNALS_PANELS)]
     check = "--check" in sys.argv[1:]
     if os.environ.get("VLPDS_PROM_UID") or os.environ.get("VLPDS_PYRO_UID") or os.environ.get("VLPDS_DASH_OUT"):
-        outs = [(os.environ.get("VLPDS_DASH_OUT", BENCH_DIR), os.environ.get("VLPDS_PROM_UID", "prom"), os.environ.get("VLPDS_PYRO_UID", "pyroscope"))]
+        out = os.environ.get("VLPDS_DASH_OUT", "")
+        if not out or os.path.abspath(out) == BENCH_DIR:
+            sys.exit("VLPDS_DASH_OUT: a directory other than the import-ready copy's (bench/obs/grafana/dashboards)")
+        outs = [(out, os.environ.get("VLPDS_PROM_UID", "default"), os.environ.get("VLPDS_PYRO_UID"))]
     else:
-        outs = [(BENCH_DIR, "prom", "pyroscope")]
+        outs = [(BENCH_DIR, None, None)]
         if os.path.isdir(PROD_DIR):
             outs.append((PROD_DIR, PROD_PROM_UID, PROD_PYRO_UID))
     stale = []
