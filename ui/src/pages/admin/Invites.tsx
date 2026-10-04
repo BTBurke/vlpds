@@ -62,6 +62,7 @@ export function Invites() {
             {created.map((c) => (
               <div key={c}>
                 <CopyText text={c} />
+                <InviteLinks code={c} />
               </div>
             ))}
           </Notice>
@@ -127,6 +128,7 @@ export function Invites() {
                     </td>
                     <td className="nowrap">
                       <CopyText text={c.code} /> {c.disabled && <span className="pill danger">disabled</span>}
+                      {!c.disabled && c.available > 0 && <InviteLinks code={c.code} />}
                     </td>
                     <td className="num">{c.available}</td>
                     <td className="small">
@@ -159,5 +161,15 @@ export function Invites() {
         </div>
       )}
     </>
+  )
+}
+
+function InviteLinks({ code }: { code: string }) {
+  const q = `?invite=${encodeURIComponent(code)}`
+  return (
+    <div className="invite-links small">
+      <CopyText text={`${location.origin}/migrate${q}`} display="Migrate link" label="Copy migrate link" mono={false} />
+      <CopyText text={`${location.origin}/account/signup${q}`} display="Signup link" label="Copy signup link" mono={false} />
+    </div>
   )
 }

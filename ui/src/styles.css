@@ -682,6 +682,12 @@ table.data.compact .pill {
   width: 14px;
   height: 14px;
 }
+.invite-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 14px;
+  color: var(--ink2);
+}
 
 .empty {
   padding: 26px 18px;

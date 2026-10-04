@@ -65,7 +65,7 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   )
 }
 
-export function CopyText({ text, display, mono = true }: { text: string; display?: ReactNode; mono?: boolean }) {
+export function CopyText({ text, display, label, mono = true }: { text: string; display?: ReactNode; label?: string; mono?: boolean }) {
   const [done, setDone] = useState(false)
   const copy = async () => {
     try {
@@ -79,7 +79,7 @@ export function CopyText({ text, display, mono = true }: { text: string; display
   return (
     <span className="copy">
       <span className={mono ? 'mono' : ''}>{display ?? text}</span>
-      <button type="button" onClick={copy} aria-label={done ? 'Copied' : `Copy ${text}`} title={done ? 'Copied' : 'Copy'}>
+      <button type="button" onClick={copy} aria-label={done ? 'Copied' : (label ?? `Copy ${text}`)} title={done ? 'Copied' : (label ?? 'Copy')}>
         {done ? <I.Check /> : <I.Copy />}
       </button>
     </span>

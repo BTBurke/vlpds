@@ -43,7 +43,7 @@ page, and a `did:web` is refused.
 | User | an email address on the old account, and access to it | the old server emails the code that authorises the identity move |
 | User | an invite code, if this server requires one | `--invite-required`. A `/migrate?invite=<code>` link fills it in |
 | User | the tab open for the copy | the browser does the copying, and a reload resumes |
-| Operator | `vlpds admin create-invite-code` (or the console) | to hand out invites |
+| Operator | `vlpds admin create-invite-code` (or the console) | to hand out invites. The console's Invites page copies a code's `/migrate?invite=` link |
 | Operator | `--plc-recovery-did-key` set | so migrated accounts get the operator recovery key in their rotation keys (see [Keys and security](keys-security.md#plc-rotation-key-and-recovery-keys)) |
 | Operator | `--crawlers` set and the server announced | so relays pick up the account once it's active (see [Relays and crawling](operations/relays-and-crawling.md)) |
 
