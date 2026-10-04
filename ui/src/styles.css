@@ -2055,6 +2055,24 @@ div.rl-err {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.rl-copykey {
+  all: unset;
+  cursor: copy;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+  display: inline-block;
+}
+.rl-copykey:hover {
+  text-decoration: underline dotted;
+}
+.rl-copykey:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
 table.data.rl-side-table td {
   padding-top: 4px;
   padding-bottom: 4px;

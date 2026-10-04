@@ -468,6 +468,25 @@ function LimitInputs({ name, points, windowSecs, onPoints, onWindow, dirty }: { 
   )
 }
 
+// The whole (truncated) key is the click target: keys are long DIDs and IPs.
+function CopyKey({ text, title }: { text: string; title: string }) {
+  const [done, setDone] = useState(false)
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setDone(true)
+      setTimeout(() => setDone(false), 1400)
+    } catch {
+      /* clipboard blocked */
+    }
+  }
+  return (
+    <button type="button" className="rl-copykey" onClick={copy} title={done ? 'Copied' : `${title}\nClick to copy`} aria-label={done ? 'Copied' : `Copy ${text}`}>
+      {done ? 'Copied' : text}
+    </button>
+  )
+}
+
 function Busiest({ rows }: { rows?: Consumer[] }) {
   const r = busiest(rows)
   if (!r) return <span className="muted small">—</span>
@@ -1020,8 +1039,8 @@ function TopKeysPanel({ d, bucket, onSelect }: { d: RateLimits; bucket?: string;
                 const frac = r.limit ? Math.min(1, r.maxNodeUsed / r.limit) : 0
                 return (
                   <tr key={r.key}>
-                    <td className="mono small rl-trunc" title={`${r.key}${multi ? `\nCounted on ${r.nodes.join(', ')}` : ''}`}>
-                      {r.key}
+                    <td className="mono small rl-trunc">
+                      <CopyKey text={r.key} title={`${r.key}${multi ? `\nCounted on ${r.nodes.join(', ')}` : ''}`} />
                       {multi && r.nodes.length > 1 && <span className="muted"> ×{r.nodes.length}</span>}
                     </td>
                     <td>
