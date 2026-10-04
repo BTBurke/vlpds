@@ -96,6 +96,7 @@ under different prefixes.
 | `handle/{handle}`, `email/{sha256}` | uniqueness claims | create-only |
 | `blob/{did}/{cid}` | blob bytes, MIME type as Content-Type | streamed, multipart when large |
 | `config/ratelimits.json`, `config/crawlers.json` | settings changed in the console | on change; polled (rate limits every 10 s) |
+| `budget/mail.json` | the cluster's mail count for the current day (`mail-cluster-day`) | CAS per account mail; polled every minute |
 
 Never edit or delete objects by hand: `assign/` and `nodes/` are how nodes agree on ownership, and a
 missing segment is lost history. Details of each part: [Architecture](../architecture.md#shards-and-ownership),

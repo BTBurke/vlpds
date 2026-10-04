@@ -65,6 +65,7 @@ edges:
 | `--email-logo-url` | `PDS_LOGO_URL` | header logo and footer mark; default the Bluesky logo. vlpds serves its own as a PNG at `/og/email-logo.png` (mail clients don't render SVG) |
 | `--email-primary-color` | `PDS_PRIMARY_COLOR` | default `#067df7` |
 | `--email-disable-confirmation-link` | `PDS_EMAIL_DISABLE_CONFIRMATION_LINK` | drops the bsky.app "click here" link |
+| `--mail-daily-budget` | | account mails per UTC day for the whole cluster (default 900); keep it under the provider's daily quota ([Mail budgets](#mail-budgets)) |
 
 - **A URL without its address**, or the reverse, fails startup. With neither, mail is logged
   (recipient, subject, purpose) and not sent: sign-up still works but nobody receives codes. In
@@ -100,24 +101,37 @@ The reference's six account mails with its subjects and wording, each as plain t
 
 ### Mail budgets
 
-Besides each endpoint's own rate limit, every account mail spends two budgets before its code is
-minted, so no path mails around them. They protect recipients and the sender's reputation rather
-than the server: the bypass key, internal token, admin auth and IP overrides don't lift them; a DID
-override (console, Rate limits) does, and `--no-rate-limits` turns them off with everything else.
-Admin `sendEmail` is exempt.
+Besides each endpoint's own rate limit, every account mail spends three budgets before its code is
+minted, so no path mails around them: the recipient's, the node's and the cluster's. They protect
+recipients, the sender's reputation and the provider's quota rather than the server: the bypass
+key, internal token, admin auth and IP overrides don't lift them; a DID override (console, Rate
+limits) lifts a recipient's, and `--no-rate-limits` turns them off with everything else. Admin
+`sendEmail` is exempt from all three.
 
 | Bucket | Default | Keyed by | Over it |
 |---|---|---|---|
 | `mail-recipient-hour` / `-day` | 10 / hour, 30 / day | the recipient account's DID | 429 `RateLimitExceeded`; `vlpds_mail_suppressed_total{reason="recipient_limit"}` |
-| `mail-node-hour` | 500 / hour | the node | 429; `reason="node_limit"`; alert `VlpdsMailNodeBudgetExhausted` |
+| `mail-node-hour` | 200 / hour | the node | 429; `reason="node_limit"`; alert `VlpdsMailNodeBudgetExhausted` |
+| `mail-cluster-day` | `--mail-daily-budget` (900) / UTC day | the whole cluster, one count in the bucket | 429; `reason="cluster_limit"`; alerts `VlpdsMailClusterBudgetLow` (under 20% left), `VlpdsMailClusterBudgetExhausted` |
 | `password-reset-account-hour` / `-day` | 5 / hour, 15 / day | the account, from any IP | answered OK but not mailed (no account probing); `reason="account_limit"` |
 | `requestPlcOperationSignature` | 5 / hour, 15 / day | DID | 429 (the reference has no limit here) |
 | sign-in code de-dup | one new code per 60 s | DID | no new mail, the live code still works; `reason="dedup"` |
 
 The other mailing endpoints keep the reference's limits: `requestEmailConfirmation`,
 `requestEmailUpdate` and `requestAccountDelete` 5 / hour and 15 / day per DID,
-`requestPasswordReset` 15 / hour and 50 / day per IP. Keep the node budget under your provider's
-daily quota: a whole day at 500 / hour is 12,000 mails per node.
+`requestPasswordReset` 15 / hour and 50 / day per IP.
+
+**Match the cluster budget to your provider.** Mail providers cap sending per account per day, not
+per server, so a per-node budget would grow with every node added. `mail-cluster-day` is one count
+for the whole cluster, kept in the bucket (`budget/mail.json`) and spent by whichever node mails,
+so it holds when nodes join, leave or restart. Set `--mail-daily-budget` (`VLPDS_MAIL_DAILY_BUDGET`)
+below the provider's daily quota, leaving room for moderation mail, which isn't counted; the
+console's Rate limits tab changes it live (`points`, or `windowSecs` for another window; windows
+are aligned to the epoch, so a day is the UTC day). `vlpds_mail_budget_remaining{window="day"}` and
+`vlpds_mail_budget_limit{window="day"}` show where the day stands on every node (read at least once
+a minute). If the bucket can't be read or written, mail goes out uncounted rather than not at all,
+counted in `vlpds_mail_budget_errors_total` (alert `VlpdsMailBudgetUncounted`); `mail-node-hour`
+still bounds each node, and caps how fast one node can drain the day.
 
 ### Example: Cloudflare Email Service
 
@@ -137,7 +151,7 @@ Cloudflare's Email Sending relay speaks SMTP with an API token as the password.
 The relay's limits, which vlpds stays inside: 50 recipients per message (vlpds sends one), 5 MiB
 per message, 30 s to authenticate and 300 s for DATA, and an account daily quota that starts
 conservative on new accounts and grows with sending history (Cloudflare's limit-increase form raises
-it). A recipient on the account's **suppression list** (after a hard bounce or complaint) gets the
+it): set `--mail-daily-budget` below it, and raise both together. A recipient on the account's **suppression list** (after a hard bounce or complaint) gets the
 whole message rejected unless the domain's "drop suppressed recipients" setting is on; vlpds sees a
 5xx, counts the mail `failed` and doesn't retry.
 

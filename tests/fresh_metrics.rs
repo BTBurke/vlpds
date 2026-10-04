@@ -96,6 +96,8 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_mail_messages_total{purpose="reset_password",result="failed"}"#,
     r#"vlpds_mail_suppressed_total{purpose="auth_factor",reason="recipient_limit"}"#,
     r#"vlpds_mail_suppressed_total{purpose="confirm_email",reason="node_limit"}"#,
+    r#"vlpds_mail_suppressed_total{purpose="confirm_email",reason="cluster_limit"}"#,
+    "vlpds_mail_budget_errors_total",
     r#"vlpds_mail_suppressed_total{purpose="reset_password",reason="account_limit"}"#,
     r#"vlpds_mail_suppressed_total{purpose="auth_factor",reason="dedup"}"#,
 ];
@@ -119,6 +121,12 @@ const PRESENT: &[&str] = &[
     r#"vlpds_meta_cache_loads_total{kind="index",result="shared"}"#,
     r#"vlpds_sst_meta_bytes{kind="filter"}"#,
     "vlpds_meta_cache_capacity_bytes",
+];
+
+/// Gauges an alert compares, at their values on a fresh node.
+const AT_VALUE: &[(&str, f64)] = &[
+    (r#"vlpds_mail_budget_remaining{window="day"}"#, vlpds::ratelimit::DEFAULT_MAIL_DAILY_BUDGET as f64),
+    (r#"vlpds_mail_budget_limit{window="day"}"#, vlpds::ratelimit::DEFAULT_MAIL_DAILY_BUDGET as f64),
 ];
 
 /// A local relay stand-in that accepts every requestCrawl.
@@ -148,6 +156,9 @@ async fn fresh_node_exports_alerting_counters_at_zero() {
     }
     for name in PRESENT {
         assert!(series.contains_key(*name), "{name} exported on a fresh node");
+    }
+    for (name, v) in AT_VALUE {
+        assert_eq!(series.get(*name), Some(v), "{name} on a fresh node");
     }
     // cumulative CPU / busy time are counters (rate() over a gauge warns
     // and misreads resets)

@@ -448,7 +448,7 @@ groups:
           summary: "{{ $labels.instance }} is refusing {{ $value | humanize }} proxied requests/s at the per-account in-flight cap"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsproxyaccountcapsustained"
 
-      # Account mail refused because the node's mail-node-hour budget (500/h
+      # Account mail refused because the node's mail-node-hour budget (200/h
       # by default) is spent: users aren't getting confirmation, reset or
       # sign-in codes. Any refusal is worth a look.
       - alert: VlpdsMailNodeBudgetExhausted
@@ -458,6 +458,42 @@ groups:
         annotations:
           summary: "{{ $labels.instance }} refused {{ $value | humanize }} account mails in 15m: its mail-node-hour budget is spent"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmailnodebudgetexhausted"
+
+      # The cluster's daily mail budget (mail-cluster-day, --mail-daily-budget)
+      # is spent: no node mails accounts until the UTC day ends. Every node
+      # reads the one count from the bucket, so the lowest reading is the
+      # newest.
+      - alert: VlpdsMailClusterBudgetExhausted
+        expr: sum(increase(vlpds_mail_suppressed_total{job="vlpds",reason="cluster_limit"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "the cluster refused {{ $value | humanize }} account mails in 15m: its daily mail budget (mail-cluster-day) is spent"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmailclusterbudgetexhausted"
+
+      # Under 20% of the day's mail budget left: a signup wave or abuse is
+      # draining it, and mail stops when it runs out (guess: 20%).
+      - alert: VlpdsMailClusterBudgetLow
+        expr: >-
+          min(vlpds_mail_budget_remaining{job="vlpds",window="day"})
+            < 0.2 * max(vlpds_mail_budget_limit{job="vlpds",window="day"})
+        for: 5m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanize }} account mails left in the cluster's daily mail budget (under 20%)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmailclusterbudgetlow"
+
+      # The budget's bucket object couldn't be read or written, so mail went
+      # out uncounted: the provider's quota is unguarded beyond each node's
+      # mail-node-hour.
+      - alert: VlpdsMailBudgetUncounted
+        expr: sum by (instance) (increase(vlpds_mail_budget_errors_total{job="vlpds"}[15m])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }} sent {{ $value | humanize }} account mails in 15m without counting them in the cluster mail budget (store errors)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsmailbudgetuncounted"
 
       - alert: VlpdsWriteInternalErrors
         expr: sum by (instance, kind) (rate(vlpds_write_errors_total{job="vlpds",kind=~"internal|unavailable"}[5m])) > 0.5

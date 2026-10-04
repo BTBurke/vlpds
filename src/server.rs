@@ -109,6 +109,8 @@ pub struct Config {
     /// calls that fail.
     pub peer_tls: Option<Arc<crate::peer_tls::PeerTls>>,
     pub rate_limit_bypass_key: Option<String>,
+    /// `mail-cluster-day`'s default points.
+    pub mail_daily_budget: u32,
     /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
     /// Largest importRepo body.
@@ -280,6 +282,7 @@ impl Default for Config {
             peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,
             peer_tls: None,
             rate_limit_bypass_key: None,
+            mail_daily_budget: crate::ratelimit::DEFAULT_MAIL_DAILY_BUDGET,
             resolve_lexicons: None,
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             import_memory_bytes: None,

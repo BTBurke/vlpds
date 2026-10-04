@@ -191,7 +191,12 @@ fn check_note(errs: &mut Vec<String>, at: &str, n: &Option<String>) {
 
 /// Returns every problem found, each prefixed with its JSON path.
 pub fn compile(doc: Option<&Doc>) -> Result<Policy, Vec<String>> {
-    let mut p = Policy::default();
+    compile_with(doc, super::DEFAULT_MAIL_DAILY_BUDGET)
+}
+
+/// [`compile`] over [`Policy::defaults`].
+pub fn compile_with(doc: Option<&Doc>, mail_daily_budget: u32) -> Result<Policy, Vec<String>> {
+    let mut p = Policy::defaults(mail_daily_budget);
     let Some(doc) = doc else { return Ok(p) };
     let mut errs = Vec::new();
     p.version = doc.version;
@@ -337,14 +342,15 @@ fn ov_label(o: &OverrideCfg) -> String {
     format!("{who} {what} on {on}")
 }
 
-pub fn changes(old: Option<&Doc>, new: &Doc) -> Vec<String> {
+pub fn changes(old: Option<&Doc>, new: &Doc, mail_daily_budget: u32) -> Vec<String> {
     let def = Doc::default();
     let old = old.unwrap_or(&def);
     let mut out = Vec::new();
     if old.enabled != new.enabled {
         out.push(format!("rate limiting {}", if new.enabled { "enabled" } else { "disabled" }));
     }
-    let (po, pn) = (compile(Some(old)).unwrap_or_default(), compile(Some(new)).unwrap_or_default());
+    let compiled = |d| compile_with(Some(d), mail_daily_budget).unwrap_or_else(|_| Policy::defaults(mail_daily_budget));
+    let (po, pn) = (compiled(old), compiled(new));
     for (a, b) in po.builtin.iter().zip(&pn.builtin) {
         let mut d = Vec::new();
         if a.points != b.points {
@@ -533,7 +539,7 @@ mod tests {
             "overrides": [{"did": "did:plc:abc", "exempt": true}]
         }));
         assert_eq!(
-            changes(Some(&old), &new),
+            changes(Some(&old), &new, 900),
             vec![
                 "rate limiting disabled",
                 "global-ip: points 3000→10",
@@ -542,6 +548,6 @@ mod tests {
                 "+override did did:plc:abc exempt on all buckets",
             ]
         );
-        assert!(changes(Some(&new), &new).is_empty());
+        assert!(changes(Some(&new), &new, 900).is_empty());
     }
 }

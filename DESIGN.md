@@ -3684,11 +3684,24 @@ table):
   update code, and now spends requestEmailUpdate's buckets (it spent none).
 - `mail-recipient-hour` / `mail-recipient-day` (10 / 30) count every account
   mail to one recipient, all kinds together, keyed by DID (by the normalized
-  address if a mail ever has no account). `mail-node-hour` (500) counts
-  everything a node mails, to protect the sender's reputation. Admin
-  `sendEmail` is exempt from both.
+  address if a mail ever has no account). `mail-node-hour` (200) counts
+  everything a node mails, a burst guard. `mail-cluster-day`
+  (`--mail-daily-budget`, 900) counts everything the cluster mails per UTC
+  day: mail providers cap sending per account, so a per-node budget would
+  grow with the cluster. Admin `sendEmail` is exempt from all of them.
+- `mail-cluster-day` is one JSON object in the bucket (`budget/mail.json`:
+  window start, length, count), spent by compare-and-swap from whichever node
+  mails; a lost race re-reads and retries. No owner or leader holds it (an
+  in-memory count on slot 0's owner would start over at every restart and
+  takeover, and a per-node share would strand budget on idle nodes), and a
+  mail costs one conditional PUT, plus a GET when another node wrote since.
+  Windows are aligned to the epoch so nodes agree when a day ends; refusals
+  write nothing. A store error lets the mail through, counted in
+  `vlpds_mail_budget_errors_total`: the provider refusing past its quota is
+  no worse than refusing all mail during a store outage. Each node re-reads
+  the object every minute for `vlpds_mail_budget_remaining` and the console.
 - Enforced where mail is sent: `deliver` takes a `MailPermit`, which only
-  `mail_permit` makes, by spending the two budgets. Handlers take it before
+  `mail_permit` makes, by spending the budgets. Handlers take it before
   minting the token, so a refused request leaves the last mailed token
   valid. These buckets ignore the request's bypasses (internal token, bypass
   key, admin auth) and IP overrides; a DID override lifts a recipient's.
@@ -3704,7 +3717,9 @@ table):
   budget, createSession gets 429 and the OAuth sign-in page shows
   `rate_limited`, rather than prompting for a code that was never sent.
 - `vlpds_mail_suppressed_total{purpose,reason}` counts mail not sent;
-  `VlpdsMailNodeBudgetExhausted` fires when the node budget refuses any.
+  `VlpdsMailNodeBudgetExhausted` fires when the node budget refuses any,
+  `VlpdsMailClusterBudgetExhausted` when the cluster's does, and
+  `VlpdsMailClusterBudgetLow` under 20% of the day's left.
 
 Request bodies are decompressed after routing (the decompression layer
 sits inside the forwarding one). Routing therefore decodes a `gzip` or

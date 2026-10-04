@@ -613,6 +613,12 @@ struct Args {
     /// File holding --rate-limit-bypass-key.
     #[arg(long, env = "VLPDS_RATE_LIMIT_BYPASS_KEY_FILE", conflicts_with = "rate_limit_bypass_key")]
     rate_limit_bypass_key_file: Option<std::path::PathBuf>,
+    /// Account mails the whole cluster may send per UTC day
+    /// (`mail-cluster-day`'s default; the console can change it live). Set
+    /// it under the mail provider's daily quota: admin sendEmail isn't
+    /// counted.
+    #[arg(long, env = "VLPDS_MAIL_DAILY_BUDGET", default_value_t = vlpds::ratelimit::DEFAULT_MAIL_DAILY_BUDGET, value_parser = clap::value_parser!(u32).range(1..))]
+    mail_daily_budget: u32,
     /// Memory budget of the in-memory caches (verified tokens, proxy
     /// accounts and service JWTs, DID documents, lexicons, OAuth clients),
     /// split between them by weight (MiB). Default: 10% of the memory
@@ -1199,6 +1205,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         peer_connections: args.peer_connections,
         peer_tls,
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
+        mail_daily_budget: args.mail_daily_budget,
         cluster: Some(vlpds::cluster::ClusterConfig {
             node_id,
             addr: advertise_url,

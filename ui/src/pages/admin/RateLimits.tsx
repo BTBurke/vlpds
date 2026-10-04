@@ -8,7 +8,7 @@ import { useLive } from './Cluster'
 
 // ---------------------------------------------------------------- server shapes (src/xrpc/ratelimits.rs)
 
-type KeyKind = 'ip' | 'identifier-ip' | 'did' | 'node'
+type KeyKind = 'ip' | 'identifier-ip' | 'did' | 'node' | 'cluster'
 
 type Limiter = {
   name: string
@@ -87,8 +87,8 @@ function fmtWindow(s: number): string {
   return `${s} s`
 }
 
-const KEY_LABEL: Record<KeyKind, string> = { ip: 'client IP (IPv6: /64)', 'identifier-ip': 'identifier + IP', did: 'DID', node: 'whole node' }
-const KEY_SHORT: Record<KeyKind, string> = { ip: 'IP', 'identifier-ip': 'ID+IP', did: 'DID', node: 'node' }
+const KEY_LABEL: Record<KeyKind, string> = { ip: 'client IP (IPv6: /64)', 'identifier-ip': 'identifier + IP', did: 'DID', node: 'whole node', cluster: 'whole cluster (counted in the bucket)' }
+const KEY_SHORT: Record<KeyKind, string> = { ip: 'IP', 'identifier-ip': 'ID+IP', did: 'DID', node: 'node', cluster: 'cluster' }
 
 /** Bucket names without the com.atproto. prefix every method bucket carries. */
 const shortName = (n: string) => n.replace(/^(route:)?com\.atproto\./, '$1')
@@ -541,7 +541,7 @@ function BucketsPanel({
     <Panel
       title="Buckets"
       id="rl-edit"
-      desc="Each node counts on its own. A new points value keeps each key's live window; a new window length starts fresh windows. Click a bucket to see its top keys."
+      desc="Each node counts on its own, except cluster buckets (one count in the bucket, windows aligned to the epoch: a day is the UTC day). A new points value keeps each key's live window; a new window length starts fresh windows. Click a bucket to see its top keys."
       flush
       actions={
         <>

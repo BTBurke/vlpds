@@ -120,7 +120,7 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
                 crate::mail::MAIL_SUPPRESSED.with_label_values(&[PURPOSE, "dedup"]).inc();
                 return Err(factor_required());
             }
-            let permit = mail_permit(app, Some(did), email, PURPOSE, true)?;
+            let permit = mail_permit(app, Some(did), email, PURPOSE, true).await?;
             let token = create_email_token(app, did, PURPOSE).await?;
             deliver(app, permit, email, crate::mail::Email::SignInAuthFactor { handle: Some(&acct.handle), token: &token });
             return Err(factor_required());
@@ -175,7 +175,7 @@ pub(super) async fn disable(app: &App, acct: &Account, token: Option<&str>) -> X
             use crate::ratelimit::*;
             check(&[&REQUEST_EMAIL_UPDATE_DAY, &REQUEST_EMAIL_UPDATE_HOUR], did, 1)?;
         }
-        let permit = mail_permit(app, Some(did), &email, "update_email", true)?;
+        let permit = mail_permit(app, Some(did), &email, "update_email", true).await?;
         let otp = create_email_token(app, did, "update_email").await?;
         deliver(app, permit, &email, crate::mail::Email::UpdateEmail { token: &otp });
         return Err(XrpcError::bad("TokenRequired", "confirmation token required"));

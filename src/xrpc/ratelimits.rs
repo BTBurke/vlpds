@@ -30,6 +30,7 @@ pub fn internal_routes() -> Router<Arc<App>> {
 /// edits the cluster's config from any node.
 pub fn start(app: &Arc<App>) {
     runtime::spawn_refresher(&app.ratelimit, app.store.clone());
+    crate::ratelimit::mail_budget::spawn_refresher(&app.ratelimit, app.store.clone());
 }
 
 fn node_id(app: &App) -> String {
@@ -43,11 +44,12 @@ struct TopQ {
     local: bool,
 }
 
-/// The buckets in force on this node, with their defaults.
-fn limiter_rows(p: &crate::ratelimit::Policy) -> Vec<J> {
+/// The buckets in force on this node, with their defaults (`defaults`:
+/// this node's, flags included).
+fn limiter_rows(p: &crate::ratelimit::Policy, defaults: &crate::ratelimit::Policy) -> Vec<J> {
     p.specs()
         .map(|s| {
-            let def = crate::ratelimit::BUILTIN.iter().find(|l| *l.name == *s.name);
+            let def = crate::ratelimit::BUILTIN.iter().find(|l| *l.name == *s.name).map(|l| defaults.builtin(l));
             json!({
                 "name": &*s.name,
                 "key": s.key,
@@ -56,7 +58,7 @@ fn limiter_rows(p: &crate::ratelimit::Policy) -> Vec<J> {
                 "points": s.points,
                 "enabled": s.enabled,
                 "custom": def.is_none(),
-                "default": def.map(|l| json!({"windowSecs": l.window_ms / 1000, "points": l.points})),
+                "default": def.map(|d| json!({"windowSecs": d.window_ms / 1000, "points": d.points})),
             })
         })
         .collect()
@@ -80,7 +82,8 @@ fn node_row(s: &NodeSnapshot, me: &str, reachable: bool) -> J {
 #[serde(rename_all = "camelCase")]
 struct ClusterConsumer {
     key: String,
-    /// Summed over nodes (counters are per node).
+    /// Summed over nodes (counters are per node), except the cluster
+    /// budget's, which every node reads from the bucket.
     used: u32,
     /// What a node's limit is checked against.
     max_node_used: u32,
@@ -104,7 +107,7 @@ fn merge_top(snaps: &[NodeSnapshot], n: usize) -> BTreeMap<String, Vec<ClusterCo
                     reset_ms: *reset_ms,
                     nodes: Vec::new(),
                 });
-                c.used = c.used.saturating_add(*used);
+                c.used = if key == crate::ratelimit::CLUSTER_KEY { c.used.max(*used) } else { c.used.saturating_add(*used) };
                 c.max_node_used = c.max_node_used.max(*used);
                 c.reset_ms = c.reset_ms.max(*reset_ms);
                 c.nodes.push(s.node.clone());
@@ -181,7 +184,7 @@ async fn get_rate_limits(State(app): AppState, Auth(creds): Auth, Query(q): Quer
         "config": st.doc,
         "configError": st.error,
         "refreshSecs": runtime::REFRESH_EVERY.as_secs(),
-        "limiters": limiter_rows(&policy),
+        "limiters": limiter_rows(&policy, &limiter.defaults()),
         "nodes": nodes,
         "top": merge_top(&snaps, n),
         "rejections": merge_rejections(&snaps),
@@ -308,6 +311,10 @@ mod tests {
         assert_eq!((g[1].key.as_str(), g[1].used), ("1.1.1.1", 50));
         assert_eq!(t["repo-write-hour"][0].used, 9);
         assert_eq!(merge_top(&[a.clone(), b.clone()], 1)["global-ip"].len(), 1);
+        // every node reports the cluster budget's one count
+        let (x, y) = (snap("a", &[("mail-cluster-day", "cluster", 7)], &[]), snap("b", &[("mail-cluster-day", "cluster", 6)], &[]));
+        let c = &merge_top(&[x, y], 10)["mail-cluster-day"][0];
+        assert_eq!((c.used, c.max_node_used), (7, 7));
         let r = merge_rejections(&[a, b]);
         assert_eq!((r[0].limiter.as_str(), r[0].route.as_str(), r[0].total), ("global-ip", "x.y.z", 5));
         assert_eq!(r.len(), 2);
@@ -316,11 +323,14 @@ mod tests {
     #[test]
     fn rows_list_builtins_then_routes() {
         let d: Doc = serde_json::from_value(json!({"routes": [{"nsid": "a.b.c", "points": 1, "windowSecs": 2}]})).unwrap();
-        let p = crate::ratelimit::config::compile(Some(&d)).unwrap();
-        let rows = limiter_rows(&p);
+        let p = crate::ratelimit::config::compile_with(Some(&d), 40).unwrap();
+        let rows = limiter_rows(&p, &crate::ratelimit::Policy::defaults(40));
         assert_eq!(rows.len(), crate::ratelimit::BUILTIN.len() + 1);
         assert_eq!(rows[0]["name"], "global-ip");
         assert_eq!(rows[0]["default"]["points"], 3000);
+        // the flag sets the cluster mail budget's default
+        let mail = rows.iter().find(|r| r["name"] == "mail-cluster-day").unwrap();
+        assert_eq!((mail["points"].as_u64(), mail["default"]["points"].as_u64(), mail["key"].as_str()), (Some(40), Some(40), Some("cluster")));
         let last = rows.last().unwrap();
         assert_eq!((last["name"].as_str(), last["custom"].as_bool(), last["key"].as_str()), (Some("route:a.b.c"), Some(true), Some("ip")));
     }

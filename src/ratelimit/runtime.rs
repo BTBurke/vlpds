@@ -124,7 +124,7 @@ impl Limiter {
     /// policy in force stays and the error is recorded.
     fn apply(&self, doc: Option<Doc>, etag: Option<String>) -> Result<(), Vec<String>> {
         let now = super::now_ms();
-        let compiled = config::compile(doc.as_ref());
+        let compiled = config::compile_with(doc.as_ref(), self.mail_daily_budget);
         let mut st = self.runtime.status.lock();
         st.seen_etag = etag;
         st.checked_at_ms = Some(now);
@@ -273,7 +273,7 @@ pub async fn save(limiter: &Limiter, store: &Store, req: SaveReq) -> Result<Doc,
     if let Err(errs) = config::compile(Some(&doc)) {
         return Err(SaveError::Invalid(errs));
     }
-    let changes = config::changes(cur_doc.as_ref(), &doc);
+    let changes = config::changes(cur_doc.as_ref(), &doc, limiter.mail_daily_budget);
     let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let note = req.note.filter(|n| !n.trim().is_empty());
     if note.as_ref().is_some_and(|n| n.chars().count() > 280) {

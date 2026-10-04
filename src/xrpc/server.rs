@@ -597,8 +597,8 @@ impl Mailer for LogMailer {
     }
 }
 
-/// What [`deliver`] needs: the recipient's and the node's mail budgets
-/// spent ([`mail_permit`]).
+/// What [`deliver`] needs: the recipient's, the node's and the cluster's
+/// mail budgets spent ([`mail_permit`]).
 #[must_use]
 pub(super) struct MailPermit(&'static str);
 
@@ -611,7 +611,7 @@ pub(crate) fn is_mail_limited(e: &XrpcError) -> bool {
 /// Taken before the token is minted, so a refused request leaves the last
 /// mailed token working. The recipient is the account `did`, else the
 /// normalized address. `report`: see `Limiter::consume_unbypassable`.
-pub(super) fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose: &'static str, report: bool) -> XResult<MailPermit> {
+pub(super) async fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose: &'static str, report: bool) -> XResult<MailPermit> {
     use crate::ratelimit::{MAIL_NODE_HOUR, MAIL_RECIPIENT_DAY, MAIL_RECIPIENT_HOUR, NODE_KEY};
     let key = match did {
         Some(d) => d.to_string(),
@@ -627,6 +627,10 @@ pub(super) fn mail_permit(app: &App, did: Option<&str>, to: &str, purpose: &'sta
     rl.consume_unbypassable(&[&MAIL_NODE_HOUR], NODE_KEY, &route, report).map_err(|_| {
         tracing::warn!(purpose, "mail not sent: this node's mail budget (mail-node-hour) is spent");
         limited("node_limit")
+    })?;
+    rl.consume_cluster_mail(&app.store, &route, report).await.map_err(|_| {
+        tracing::warn!(purpose, "mail not sent: the cluster's mail budget (mail-cluster-day) is spent");
+        limited("cluster_limit")
     })?;
     Ok(MailPermit(purpose))
 }
@@ -1979,7 +1983,7 @@ async fn request_account_delete(State(app): AppState, Auth(creds): Auth) -> XRes
         check(&[&REQUEST_ACCOUNT_DELETE_DAY, &REQUEST_ACCOUNT_DELETE_HOUR], &did, 1)?;
     }
     let (_, email) = mailable_account(&app, &did).await?;
-    let permit = mail_permit(&app, Some(&did), &email, "delete_account", true)?;
+    let permit = mail_permit(&app, Some(&did), &email, "delete_account", true).await?;
     let token = create_email_token(&app, &did, "delete_account").await?;
     deliver(&app, permit, &email, crate::mail::Email::DeleteAccount { token: &token });
     Ok(StatusCode::OK)
@@ -2224,7 +2228,7 @@ async fn request_email_confirmation(State(app): AppState, Auth(creds): Auth) -> 
         check(&[&REQUEST_EMAIL_CONFIRMATION_DAY, &REQUEST_EMAIL_CONFIRMATION_HOUR], &did, 1)?;
     }
     let (_, email) = mailable_account(&app, &did).await?;
-    let permit = mail_permit(&app, Some(&did), &email, "confirm_email", true)?;
+    let permit = mail_permit(&app, Some(&did), &email, "confirm_email", true).await?;
     let token = create_email_token(&app, &did, "confirm_email").await?;
     deliver(&app, permit, &email, crate::mail::Email::ConfirmEmail { token: &token });
     Ok(StatusCode::OK)
@@ -2265,7 +2269,7 @@ async fn request_email_update(State(app): AppState, Auth(creds): Auth) -> XResul
     let (acct, email) = mailable_account(&app, &did).await?;
     let token_required = acct.email_confirmed;
     if token_required {
-        let permit = mail_permit(&app, Some(&did), &email, "update_email", true)?;
+        let permit = mail_permit(&app, Some(&did), &email, "update_email", true).await?;
         let token = create_email_token(&app, &did, "update_email").await?;
         deliver(&app, permit, &email, crate::mail::Email::UpdateEmail { token: &token });
     }
@@ -2386,7 +2390,7 @@ async fn request_password_reset(State(app): AppState, Json(inp): Json<RequestPas
         crate::mail::MAIL_SUPPRESSED.with_label_values(&["reset_password", "account_limit"]).inc();
         return Ok(StatusCode::OK);
     }
-    let Ok(permit) = mail_permit(&app, Some(&acct.did), &email, "reset_password", false) else {
+    let Ok(permit) = mail_permit(&app, Some(&acct.did), &email, "reset_password", false).await else {
         return Ok(StatusCode::OK);
     };
     let token = create_email_token(&app, &acct.did, "reset_password").await?;

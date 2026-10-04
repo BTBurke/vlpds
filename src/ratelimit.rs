@@ -26,12 +26,15 @@
 //!
 //! Mail (vlpds additions): besides each mailing endpoint's own buckets,
 //! every account mail spends its recipient's budget (`mail-recipient-*`,
-//! keyed by DID, so counted on its owner) and the node's (`mail-node-hour`)
-//! before its token is minted: `xrpc::server::deliver` takes the permit
-//! that spending yields, so no path can mail without it. Admin sendEmail
-//! is exempt.
+//! keyed by DID, so counted on its owner), the node's (`mail-node-hour`, a
+//! burst guard) and the cluster's (`mail-cluster-day`, [`mail_budget`]: the
+//! mail provider's quota is per account, so a per-node budget would grow
+//! with the cluster) before its token is minted: `xrpc::server::deliver`
+//! takes the permit that spending yields, so no path can mail without it.
+//! Admin sendEmail is exempt.
 
 pub mod config;
+pub mod mail_budget;
 pub mod runtime;
 
 use crate::xrpc::XrpcError;
@@ -61,9 +64,12 @@ pub enum KeyKind {
     Did,
     /// One counter for the whole node ([`NODE_KEY`]).
     Node,
+    /// One counter for the whole cluster ([`CLUSTER_KEY`]), in the bucket.
+    Cluster,
 }
 
 pub const NODE_KEY: &str = "node";
+pub const CLUSTER_KEY: &str = "cluster";
 
 /// A built-in bucket's defaults. `idx` is its position in [`BUILTIN`].
 #[derive(Debug)]
@@ -121,9 +127,13 @@ limit!(PASSWORD_RESET_ACCOUNT_DAY, 27, "password-reset-account-day", Did, "serve
 limit!(PASSWORD_RESET_ACCOUNT_HOUR, 28, "password-reset-account-hour", Did, "server.requestPasswordReset mails to one account, from any IP (over it: answered OK, not mailed)", HOUR, 5);
 limit!(MAIL_RECIPIENT_DAY, 29, "mail-recipient-day", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", DAY, 30);
 limit!(MAIL_RECIPIENT_HOUR, 30, "mail-recipient-hour", Did, "every account mail to one recipient (DID, else address), all kinds; admin sendEmail exempt", HOUR, 10);
-limit!(MAIL_NODE_HOUR, 31, "mail-node-hour", Node, "every account mail this node sends; admin sendEmail exempt", HOUR, 500);
+limit!(MAIL_NODE_HOUR, 31, "mail-node-hour", Node, "every account mail this node sends; admin sendEmail exempt", HOUR, 200);
+// Default points: --mail-daily-budget ([`Limiter::defaults`]).
+limit!(MAIL_CLUSTER_DAY, 32, "mail-cluster-day", Cluster, "every account mail the cluster sends (the mail provider's quota); admin sendEmail exempt", DAY, DEFAULT_MAIL_DAILY_BUDGET);
 
-pub const BUILTIN: [&Limit; 32] = [
+pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
+
+pub const BUILTIN: [&Limit; 33] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -156,6 +166,7 @@ pub const BUILTIN: [&Limit; 32] = [
     &MAIL_RECIPIENT_DAY,
     &MAIL_RECIPIENT_HOUR,
     &MAIL_NODE_HOUR,
+    &MAIL_CLUSTER_DAY,
 ];
 
 /// A confidential client's backend calls these for all of its users from
@@ -270,6 +281,13 @@ impl Default for Policy {
 }
 
 impl Policy {
+    /// The built-in defaults with the flag-set ones (`--mail-daily-budget`).
+    pub fn defaults(mail_daily_budget: u32) -> Policy {
+        let mut p = Policy::default();
+        p.builtin[MAIL_CLUSTER_DAY.idx].points = mail_daily_budget;
+        p
+    }
+
     pub fn builtin(&self, l: &Limit) -> &Spec {
         &self.builtin[l.idx]
     }
@@ -321,7 +339,7 @@ impl Policy {
         let ip = match spec.key {
             KeyKind::Ip => parse(key),
             KeyKind::IdentifierIp => key.rsplit_once('-').and_then(|(_, ip)| parse(ip)),
-            KeyKind::Did | KeyKind::Node => None,
+            KeyKind::Did | KeyKind::Node | KeyKind::Cluster => None,
         };
         match self.override_for(&spec.name, key, &self.ip_matches(ip)) {
             Some(Action::Exempt) => None,
@@ -749,6 +767,10 @@ pub struct Limiter {
     policy: RwLock<Arc<Policy>>,
     pub rejections: Rejections,
     pub runtime: runtime::Runtime,
+    /// `mail-cluster-day`'s default points.
+    pub mail_daily_budget: u32,
+    pub mail_budget: mail_budget::Budget,
+    mail_budget_started: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -771,6 +793,8 @@ impl Limiter {
         LazyLock::force(&CONFIG_VERSION);
         LazyLock::force(&CONFIG_ERRORS);
         LazyLock::force(&CONFIG_LOADS);
+        LazyLock::force(&mail_budget::ERRORS);
+        mail_budget::set_gauges(cfg.mail_daily_budget, 0);
         Limiter {
             counters: Counters::default(),
             trusted: cfg
@@ -787,10 +811,17 @@ impl Limiter {
             bypass_key: cfg.rate_limit_bypass_key.clone().filter(|k| !k.is_empty()),
             enabled_by_flag: cfg.rate_limits_enabled,
             cfg: cfg.clone(),
-            policy: RwLock::new(Arc::new(Policy::default())),
+            policy: RwLock::new(Arc::new(Policy::defaults(cfg.mail_daily_budget))),
             rejections: Rejections::default(),
             runtime: runtime::Runtime::default(),
+            mail_daily_budget: cfg.mail_daily_budget,
+            mail_budget: mail_budget::Budget::default(),
+            mail_budget_started: Default::default(),
         }
+    }
+
+    pub fn defaults(&self) -> Policy {
+        Policy::defaults(self.mail_daily_budget)
     }
 
     pub fn policy(&self) -> Arc<Policy> {
@@ -808,6 +839,12 @@ impl Limiter {
         let now = now_ms();
         let policy = self.policy();
         let st = self.runtime.status();
+        let mut top = self.counters.top(&policy, top, now);
+        let spec = policy.builtin(&MAIL_CLUSTER_DAY);
+        if let Some(used) = self.mail_budget.last().map(|s| s.used_in(spec.window_ms, now)).filter(|u| *u > 0) {
+            let reset_ms = mail_budget::window_start(spec.window_ms, now) + spec.window_ms;
+            top.insert(spec.name.to_string(), vec![Consumer { key: CLUSTER_KEY.into(), used, limit: Some(spec.points), reset_ms }]);
+        }
         NodeSnapshot {
             node: node.to_string(),
             enabled_by_flag: self.enabled_by_flag,
@@ -815,7 +852,7 @@ impl Limiter {
             config_error: st.error,
             loaded_at_ms: st.loaded_at_ms,
             checked_at_ms: st.checked_at_ms,
-            top: self.counters.top(&policy, top, now),
+            top,
             rejections: self.rejections.snapshot(now),
             live_windows: self.counters.len(),
         }
@@ -875,6 +912,54 @@ impl Limiter {
             }
         }
         if exceeded {
+            crate::metrics::RATE_LIMITED.inc();
+            return Err(exceeded_error());
+        }
+        Ok(())
+    }
+}
+
+impl Limiter {
+    /// Sets the gauges from the budget object as last read.
+    pub(crate) fn publish_mail_budget(&self) {
+        let policy = self.policy();
+        let spec = policy.builtin(&MAIL_CLUSTER_DAY);
+        let used = self.mail_budget.last().map_or(0, |s| s.used_in(spec.window_ms, now_ms()));
+        mail_budget::set_gauges(spec.points, used);
+    }
+
+    /// The cluster's `mail-cluster-day`, like [`Self::consume_unbypassable`]
+    /// but counted in the bucket ([`mail_budget`]). Overrides don't apply:
+    /// it stands for the mail provider's quota, which has none.
+    pub async fn consume_cluster_mail(&self, store: &crate::store::Store, route: &str, report: bool) -> Result<(), XrpcError> {
+        let policy = self.policy();
+        let spec = policy.builtin(&MAIL_CLUSTER_DAY);
+        if !self.enabled_by_flag || !policy.enabled || !spec.enabled {
+            return Ok(());
+        }
+        let now = now_ms();
+        let spent = match self.mail_budget.spend(store, spec.points, spec.window_ms, now).await {
+            Ok(s) => s,
+            Err(e) => {
+                mail_budget::ERRORS.inc();
+                tracing::warn!("cluster mail budget unavailable, mailing without spending it: {e}");
+                return Ok(());
+            }
+        };
+        mail_budget::set_gauges(spec.points, spent.used());
+        let exceeded = matches!(spent, mail_budget::Spend::Exhausted(_));
+        if report {
+            let s = Status {
+                limit: spec.points,
+                window_ms: spec.window_ms,
+                remaining: spec.points.saturating_sub(spent.used()),
+                reset_ms: mail_budget::window_start(spec.window_ms, now) + spec.window_ms,
+                exceeded,
+            };
+            let _ = CTX.try_with(|c| c.borrow_mut().record(s));
+        }
+        if exceeded {
+            self.rejections.record(&spec.name, route, now);
             crate::metrics::RATE_LIMITED.inc();
             return Err(exceeded_error());
         }

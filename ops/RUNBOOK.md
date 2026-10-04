@@ -773,7 +773,7 @@ upstream: follow the upstream's health; nothing to tune here.
 ### VlpdsMailNodeBudgetExhausted
 
 **Means:** this node refused account mail (confirmation, update, reset, delete,
-PLC operation, sign-in codes) because its `mail-node-hour` bucket (500 per hour
+PLC operation, sign-in codes) because its `mail-node-hour` bucket (200 per hour
 per node by default) is spent: `vlpds_mail_suppressed_total{reason="node_limit"}`
 and the warning `mail not sent: this node's mail budget (mail-node-hour) is
 spent`. Users get 429 `RateLimitExceeded` ("Too many emails sent to this
@@ -787,10 +787,58 @@ for which kind is surging; the console's Rate limits tab (top consumers of
 `vlpds_signups_total`.
 
 **Do:** a burst of real users (signups, a migration wave): raise `mail-node-hour`
-`points` in the console's Rate limits tab (live, no restart), within what the
-SMTP provider allows. Abuse (many fresh accounts asking for mail): find the
-accounts in the top consumers and take them down, or tighten the endpoint's
-buckets.
+`points` in the console's Rate limits tab (live, no restart); the day's total
+stays capped by `mail-cluster-day`. Abuse (many fresh accounts asking for
+mail): find the accounts in the top consumers and take them down, or tighten
+the endpoint's buckets.
+
+### VlpdsMailClusterBudgetExhausted
+
+**Means:** the cluster's daily mail budget (`mail-cluster-day`, default
+`--mail-daily-budget`, 900 per UTC day) is spent, so every node refuses account
+mail until the day ends (00:00 UTC):
+`vlpds_mail_suppressed_total{reason="cluster_limit"}` and the warning `mail not
+sent: the cluster's mail budget (mail-cluster-day) is spent`. Users get the same
+429 as for the node budget; password resets are answered OK but not mailed;
+admin `sendEmail` is exempt. The budget stands in for the mail provider's daily
+quota, which is per provider account: past it the provider rejects mail anyway.
+
+**Confirm:** `vlpds_mail_budget_remaining{window="day"}` at 0;
+`vlpds_mail_messages_total{result="sent"}` by `purpose` summed over nodes for
+which kind used it up; `vlpds_signups_total` for a signup wave; the console's
+Rate limits tab (the `mail-cluster-day` count, top consumers of
+`mail-recipient-*`).
+
+**Do:** real users: if the provider's quota has room (a higher plan, or the
+budget was set low), raise `mail-cluster-day` `points` in the console (live; to
+keep it, set `--mail-daily-budget` / `vlpds_mail_daily_budget` and drop the
+console change). Never set it above the provider's quota: the provider then
+rejects the mail instead, after the token is minted. Abuse: as for
+VlpdsMailNodeBudgetExhausted. Resetting the day's count is deleting
+`{prefix}/budget/mail.json`; only do that if the provider's own count was reset.
+
+### VlpdsMailClusterBudgetLow
+
+**Means:** under 20% of the day's `mail-cluster-day` budget is left
+(`vlpds_mail_budget_remaining{window="day"}` against
+`vlpds_mail_budget_limit`). At the current rate mail may stop before 00:00 UTC.
+
+**Confirm / Do:** as for VlpdsMailClusterBudgetExhausted, before it runs out.
+
+### VlpdsMailBudgetUncounted
+
+**Means:** a node mailed accounts without spending the cluster budget because
+its bucket object (`{prefix}/budget/mail.json`) couldn't be read or written
+within 5 s, or stayed contended (`vlpds_mail_budget_errors_total`, warning
+`cluster mail budget unavailable`). Mail goes out rather than being refused;
+only `mail-node-hour` bounds it meanwhile, so the provider's quota can be
+overrun.
+
+**Confirm:** object-store errors and latency on the node
+(`vlpds_cluster_store_timeouts_total`, the lease alerts); the warning's error.
+
+**Do:** fix the store path as for any store trouble. If it lasts and the quota
+matters more than delivery, lower `mail-node-hour` until the store is back.
 
 ### VlpdsWriteInternalErrors
 
@@ -1967,6 +2015,7 @@ works as is:
 | `--email-logo-url` | `VLPDS_EMAIL_LOGO_URL` | `PDS_LOGO_URL` | default: the Bluesky logo, as in the reference |
 | `--email-primary-color` | `VLPDS_EMAIL_PRIMARY_COLOR` | `PDS_PRIMARY_COLOR` | default `#067df7` |
 | `--email-disable-confirmation-link` | `VLPDS_EMAIL_DISABLE_CONFIRMATION_LINK` | `PDS_EMAIL_DISABLE_CONFIRMATION_LINK` | drops the bsky.app "click here" link |
+| `--mail-daily-budget` | `VLPDS_MAIL_DAILY_BUDGET` | | account mails per UTC day for the whole cluster (`mail-cluster-day`); default 900; keep it under the provider's daily quota |
 
 Setting a URL without its address (or the reverse) fails startup. If mail is
 not arriving, check `vlpds_mail_messages_total{result="failed"|"dropped"}` and
@@ -1976,20 +2025,24 @@ keeps every mail, with its HTML, in `vlpds.admin.getDevMail`.
 
 **Mail rate limits** (DESIGN "Rate limits", mail budgets). All are buckets in
 the console's Rate limits tab, editable live; per-DID ones are counted on the
-account's owner, so they hold cluster-wide.
+account's owner, so they hold cluster-wide, and `mail-cluster-day` is one count
+in the bucket (`budget/mail.json`) that every node spends.
 
 | Mail | Endpoint buckets | Shared budgets |
 |---|---|---|
-| confirm_email (requestEmailConfirmation) | 5/h, 15/day per DID | recipient + node |
-| update_email (requestEmailUpdate; updateEmail turning the email factor off without a token) | 5/h, 15/day per DID, shared | recipient + node |
-| delete_account (requestAccountDelete) | 5/h, 15/day per DID | recipient + node |
-| plc_operation (requestPlcOperationSignature) | 5/h, 15/day per DID | recipient + node |
-| reset_password (requestPasswordReset) | 15/h, 50/day per IP; `password-reset-account-*` 5/h, 15/day per account | recipient + node |
-| auth_factor (createSession / OAuth sign-in with the email factor) | sign-in buckets; no new code while the last is under a minute old | recipient + node |
+| confirm_email (requestEmailConfirmation) | 5/h, 15/day per DID | recipient + node + cluster |
+| update_email (requestEmailUpdate; updateEmail turning the email factor off without a token) | 5/h, 15/day per DID, shared | recipient + node + cluster |
+| delete_account (requestAccountDelete) | 5/h, 15/day per DID | recipient + node + cluster |
+| plc_operation (requestPlcOperationSignature) | 5/h, 15/day per DID | recipient + node + cluster |
+| reset_password (requestPasswordReset) | 15/h, 50/day per IP; `password-reset-account-*` 5/h, 15/day per account | recipient + node + cluster |
+| auth_factor (createSession / OAuth sign-in with the email factor) | sign-in buckets; no new code while the last is under a minute old | recipient + node + cluster |
 | admin (admin `sendEmail`) | moderator auth only | exempt |
 
-`mail-recipient-hour` / `-day` (10 / 30 per recipient, every kind together)
-and `mail-node-hour` (500 per node) apply even to bypassed requests (bypass
+`mail-recipient-hour` / `-day` (10 / 30 per recipient, every kind together),
+`mail-node-hour` (200 per node, a burst guard) and `mail-cluster-day`
+(`--mail-daily-budget`, 900 per UTC day for the whole cluster: the provider's
+quota is per account, so it must not grow with the node count) apply even to
+bypassed requests (bypass
 key, admin auth, internal token); a DID override lifts a recipient's.
 `--no-rate-limits` turns them off with the rest. Over a budget a user gets 429
 `RateLimitExceeded` "Too many emails sent to this account" (the sign-in page:
@@ -1997,7 +2050,8 @@ key, admin auth, internal token); a DID override lifts a recipient's.
 mailed still works. requestPasswordReset over any of its account or mail
 budgets answers 200 as if mailed. Mail not sent for a budget is counted in
 `vlpds_mail_suppressed_total{purpose,reason}` (`recipient_limit`,
-`node_limit`, `account_limit`, `dedup`). A user who says the code never came:
+`node_limit`, `cluster_limit`, `account_limit`, `dedup`); the day's remaining
+cluster budget is `vlpds_mail_budget_remaining{window="day"}`. A user who says the code never came:
 check that counter and the account in the tab's top consumers; a DID override
 (or waiting out the hour) fixes it.
 

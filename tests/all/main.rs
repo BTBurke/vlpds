@@ -80,6 +80,7 @@ mod link_previews;
 mod list_repos_scale;
 mod log_pipeline;
 mod log_retention;
+mod mail_budget;
 mod mail_limits;
 mod maintenance_coverage;
 mod memory_budget;

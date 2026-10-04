@@ -382,7 +382,7 @@ pub fn init_counters() {
             for r in ["sent", "failed", "dropped"] {
                 crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
             }
-            for reason in ["recipient_limit", "node_limit"] {
+            for reason in ["recipient_limit", "node_limit", "cluster_limit"] {
                 crate::mail::MAIL_SUPPRESSED.with_label_values(&[purpose, reason]);
             }
         }

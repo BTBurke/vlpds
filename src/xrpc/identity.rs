@@ -670,7 +670,7 @@ async fn request_plc_operation_signature(State(app): AppState, Auth(creds): Auth
     }
     let acct = app.account(&did).await.map_err(|_| XrpcError::bad("InvalidRequest", "account not found"))?;
     let email = acct.email.clone().ok_or_else(|| XrpcError::bad("InvalidRequest", "account does not have an email address"))?;
-    let permit = super::server::mail_permit(&app, Some(&did), &email, "plc_operation", true)?;
+    let permit = super::server::mail_permit(&app, Some(&did), &email, "plc_operation", true).await?;
     let token = super::server::create_email_token(&app, &did, "plc_operation").await?;
     super::server::deliver(&app, permit, &email, crate::mail::Email::PlcOperation { token: &token });
     Ok(StatusCode::OK)
