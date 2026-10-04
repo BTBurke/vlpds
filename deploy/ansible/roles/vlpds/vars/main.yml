@@ -1,0 +1,138 @@
+---
+# Derived values (not meant to be overridden; set the vlpds_* defaults).
+
+# Paths inside the container.
+_vlpds_secrets_dir_in_container: /run/vlpds
+_vlpds_cache_dir_in_container: /var/lib/vlpds/cache
+
+_vlpds_kek_files: >-
+  {{ ['kek'] if vlpds_kek_hex | length > 0 else [] }}
+_vlpds_kek_old_files: >-
+  {{ range(vlpds_kek_old_hex | length) | map('regex_replace', '^(.*)$', 'kek-old-\1') | list }}
+_vlpds_gcp_sa_files: >-
+  {{ ['gcp-sa.json'] if vlpds_gcp_credentials_json | length > 0 else [] }}
+# The service-account key as a mapping (the secret may be JSON text).
+_vlpds_gcp_credentials: >-
+  {{ (vlpds_gcp_credentials_json | from_json) if vlpds_gcp_credentials_json is string and vlpds_gcp_credentials_json | length > 0
+     else (vlpds_gcp_credentials_json or {}) }}
+_vlpds_plc_old_files: >-
+  {{ range(vlpds_plc_rotation_key_old | length) | map('regex_replace', '^(.*)$', 'plc-rotation-old-\1.key') | list }}
+
+# Every setting the node reads, as VLPDS_* environment (`vlpds --help`;
+# secrets in _vlpds_env_secrets below).
+# Empty strings are dropped when rendering, so an unset optional flag keeps
+# the binary's default (or its reference PDS_* fallback).
+_vlpds_env_base:
+  RUST_LOG: "{{ vlpds_rust_log }}"
+  # stderr; json: one object per line for docker logs / Loki (text never
+  # colours without a TTY)
+  VLPDS_LOG_FORMAT: "{{ vlpds_log_format }}"
+  VLPDS_LISTEN: "0.0.0.0:2583"
+  VLPDS_LISTEN_BACKLOG: "{{ vlpds_listen_backlog }}"
+  VLPDS_METRICS_LISTEN: "0.0.0.0:9583"
+  VLPDS_PUBLIC_URL: "{{ vlpds_public_url }}"
+  VLPDS_HANDLE_DOMAIN: "{{ vlpds_handle_domain }}"
+  VLPDS_SERVICE_DID: "{{ vlpds_service_did }}"
+  VLPDS_S3_ENDPOINT: "{{ vlpds_s3_endpoint }}"
+  VLPDS_S3_REGION: "{{ vlpds_s3_region }}"
+  VLPDS_S3_BUCKET: "{{ vlpds_s3_bucket }}"
+  VLPDS_PREFIX: "{{ vlpds_s3_prefix }}"
+  VLPDS_NODE_ID: "{{ vlpds_node_id }}"
+  VLPDS_SHARDS: "{{ vlpds_shards }}"
+  VLPDS_LEASE_TTL_MS: "{{ vlpds_lease_ttl_ms }}"
+  VLPDS_SLATEDB_MANIFEST_POLL: "{{ vlpds_slatedb_manifest_poll }}"
+  VLPDS_LOG_RETENTION: "{{ vlpds_log_retention }}"
+  VLPDS_CACHE_DIR: "{{ _vlpds_cache_dir_in_container }}"
+  # resolved from vlpds_disk_cache_mb ("auto" = measured) in tasks/deploy.yml
+  VLPDS_DISK_CACHE_MB: "{{ _vlpds_disk_cache_mb | default('') }}"
+  VLPDS_DISK_CACHE_SHARD_MB: "{{ vlpds_disk_cache_shard_mb }}"
+  VLPDS_MEMORY_BUDGET_MB: "{{ vlpds_memory_budget_mb }}"
+  VLPDS_REPO_CACHE_MB: "{{ vlpds_repo_cache_mb }}"
+  VLPDS_BLOCK_CACHE_MB: "{{ vlpds_block_cache_mb }}"
+  VLPDS_META_CACHE_MB: "{{ vlpds_meta_cache_mb }}"
+  VLPDS_CACHE_BUDGET_MB: "{{ vlpds_cache_budget_mb }}"
+  VLPDS_MAX_EXPORTS: "{{ vlpds_max_exports }}"
+  VLPDS_FIREHOSE_MAX_BACKFILLS: "{{ vlpds_firehose_max_backfills }}"
+  VLPDS_LAZY_MST_NODE_CACHE_MB: "{{ vlpds_lazy_mst_node_cache_mb }}"
+  VLPDS_FIREHOSE_MERGE_QUEUE_MB: "{{ vlpds_firehose_merge_queue_mb }}"
+  VLPDS_FIREHOSE_MAX_LAG_MB: "{{ vlpds_firehose_max_lag_mb }}"
+  VLPDS_LIVE_RING_MB: "{{ vlpds_live_ring_mb }}"
+  VLPDS_BACKFILL_READAHEAD_MB: "{{ vlpds_backfill_readahead_mb }}"
+  VLPDS_BACKFILL_CACHE_MB: "{{ vlpds_backfill_cache_mb }}"
+  VLPDS_FIREHOSE_THREADS: "{{ vlpds_firehose_threads }}"
+  VLPDS_IO_THREADS: "{{ vlpds_io_threads }}"
+  VLPDS_WORKERS: "{{ vlpds_workers }}"
+  VLPDS_KEK_FILE: "{{ (_vlpds_secrets_dir_in_container ~ '/kek') if vlpds_kek_hex | length > 0 else '' }}"
+  VLPDS_KEK_OLD_FILE: "{{ _vlpds_kek_old_files | map('regex_replace', '^', _vlpds_secrets_dir_in_container ~ '/') | join(',') }}"
+  VLPDS_GCP_KMS_KEY: "{{ vlpds_gcp_kms_key }}"
+  VLPDS_GCP_KMS_OLD_KEY: "{{ vlpds_gcp_kms_old_keys | join(',') }}"
+  VLPDS_GCP_CREDENTIALS_FILE: "{{ _vlpds_gcp_sa_files | map('regex_replace', '^', _vlpds_secrets_dir_in_container ~ '/') | join(',') }}"
+  VLPDS_PLC_URL: "{{ vlpds_plc_url }}"
+  VLPDS_PLC_MODE: directory
+  VLPDS_PLC_ROTATION_KEY_FILE: "{{ _vlpds_secrets_dir_in_container }}/plc-rotation.key"
+  VLPDS_PLC_ROTATION_KEY_OLD_FILE: "{{ _vlpds_plc_old_files | map('regex_replace', '^', _vlpds_secrets_dir_in_container ~ '/') | join(',') }}"
+  VLPDS_PLC_RECOVERY_DID_KEY: "{{ vlpds_plc_recovery_did_key }}"
+  VLPDS_APPVIEW: "{{ vlpds_appview }}"
+  VLPDS_REPORT_SERVICE: "{{ vlpds_report_service }}"
+  VLPDS_BSKY_APP_VIEW_CDN_URL_PATTERN: "{{ vlpds_appview_cdn_url_pattern }}"
+  VLPDS_CRAWLERS: "{{ vlpds_crawlers | join(',') }}"
+  VLPDS_MOD_SERVICE_DID: "{{ vlpds_mod_service_did }}"
+  VLPDS_RESOLVE_LEXICONS: "{{ 'true' if vlpds_resolve_lexicons | bool else '' }}"
+  VLPDS_EMAIL_FROM_ADDRESS: "{{ vlpds_email_from_address }}"
+  VLPDS_MODERATION_EMAIL_ADDRESS: "{{ vlpds_moderation_email_address }}"
+  VLPDS_EMAIL_BRAND_NAME: "{{ vlpds_email_brand_name }}"
+  VLPDS_EMAIL_HOME_URL: "{{ vlpds_email_home_url }}"
+  VLPDS_EMAIL_LOGO_URL: "{{ vlpds_email_logo_url }}"
+  VLPDS_EMAIL_PRIMARY_COLOR: "{{ vlpds_email_primary_color }}"
+  VLPDS_EMAIL_DISABLE_CONFIRMATION_LINK: "{{ 'true' if vlpds_email_disable_confirmation_link | bool else '' }}"
+  VLPDS_MAIL_DAILY_BUDGET: "{{ vlpds_mail_daily_budget }}"
+  VLPDS_PRIVACY_POLICY_URL: "{{ vlpds_privacy_policy_url }}"
+  VLPDS_TERMS_OF_SERVICE_URL: "{{ vlpds_terms_of_service_url }}"
+  VLPDS_CONTACT_EMAIL_ADDRESS: "{{ vlpds_contact_email_address }}"
+  VLPDS_INVITE_REQUIRED: "{{ 'true' if vlpds_invite_required | bool else '' }}"
+  VLPDS_INVITE_INTERVAL_MS: "{{ vlpds_invite_interval_ms }}"
+  VLPDS_INVITE_EPOCH_MS: "{{ vlpds_invite_epoch_ms }}"
+  VLPDS_MAX_BLOB_MB: "{{ vlpds_max_blob_mb }}"
+  VLPDS_NO_RATE_LIMITS: "{{ '' if vlpds_rate_limits | bool else 'true' }}"
+  VLPDS_TRUSTED_PROXIES: "{{ vlpds_trusted_proxies | join(',') }}"
+  VLPDS_PYROSCOPE_URL: "{{ vlpds_pyroscope_url }}"
+  # Cluster membership (vlpds_cluster_enabled); unset = a lone node.
+  VLPDS_PEER_LISTEN: "{{ ('0.0.0.0:2584') if vlpds_cluster_enabled | bool else '' }}"
+  VLPDS_ADVERTISE_URL: "{{ ('https://' ~ vlpds_peer_host ~ ':' ~ vlpds_peer_port) if vlpds_cluster_enabled | bool else '' }}"
+  VLPDS_PEER_TLS_DIR: "{{ (_vlpds_secrets_dir_in_container ~ '/peer-tls') if vlpds_cluster_enabled | bool else '' }}"
+
+# Secret settings: each non-empty one is written to <secrets>/<name>
+# (tasks/deploy.yml) and passed as <VAR>_FILE, so neither docker-compose.yml
+# nor `docker inspect` holds the value.
+_vlpds_env_secrets:
+  - { env: VLPDS_JWT_SECRET, name: jwt-secret, content: "{{ vlpds_jwt_secret }}" }
+  - { env: VLPDS_ADMIN_TOKEN, name: admin-token, content: "{{ vlpds_admin_token }}" }
+  - { env: VLPDS_INTERNAL_TOKEN, name: internal-token, content: "{{ vlpds_internal_token }}" }
+  - { env: VLPDS_S3_ACCESS_KEY, name: s3-access-key, content: "{{ vlpds_s3_access_key }}" }
+  - { env: VLPDS_S3_SECRET_KEY, name: s3-secret-key, content: "{{ vlpds_s3_secret_key }}" }
+  - { env: VLPDS_EMAIL_SMTP_URL, name: email-smtp-url, content: "{{ vlpds_email_smtp_url }}" }
+  - { env: VLPDS_MODERATION_EMAIL_SMTP_URL, name: moderation-email-smtp-url, content: "{{ vlpds_moderation_email_smtp_url }}" }
+  - { env: VLPDS_RATE_LIMIT_BYPASS_KEY, name: rate-limit-bypass-key, content: "{{ vlpds_rate_limit_bypass_key }}" }
+_vlpds_env_secrets_set: "{{ _vlpds_env_secrets | rejectattr('content', 'equalto', '') | list }}"
+_vlpds_env_secret_files: "{{ _vlpds_env_secrets_set | map(attribute='name') | list }}"
+_vlpds_env_secret_file_env: >-
+  {{ dict(_vlpds_env_secrets_set | map(attribute='env') | map('regex_replace', '$', '_FILE')
+          | zip(_vlpds_env_secret_files | map('regex_replace', '^', _vlpds_secrets_dir_in_container ~ '/'))) }}
+
+_vlpds_env: >-
+  {{ (_vlpds_env_base | combine(_vlpds_env_secret_file_env, vlpds_extra_env))
+     | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
+
+# Flags without an env var.
+_vlpds_args: >-
+  {{ ['--firehose-ring-mb', vlpds_firehose_ring_mb | string] + vlpds_extra_args }}
+
+_vlpds_caddy_upstream: vlpds:2583
+# Peer mTLS files, as vlpds reads them from --peer-tls-dir.
+_vlpds_peer_tls_files:
+  - { name: ca.crt, content: "{{ vlpds_peer_tls_ca_cert }}" }
+  - { name: "{{ vlpds_node_id }}.crt", content: "{{ vlpds_peer_tls_cert }}" }
+  - { name: "{{ vlpds_node_id }}.key", content: "{{ vlpds_peer_tls_key }}" }
+# Caddy's on-demand TLS `ask`: vlpds' native /tls-check, through the same
+# upstream Caddy proxies to (the container name on the vlpds network).
+_vlpds_tls_ask_url: "http://{{ _vlpds_caddy_upstream }}/tls-check"

@@ -1,0 +1,192 @@
+---
+# Main tasks for alloy role
+
+- name: Download Grafana Alloy GPG key
+  ansible.builtin.get_url:
+    url: https://apt.grafana.com/gpg.key
+    dest: /etc/apt/keyrings/grafana.asc
+    mode: "0644"
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Add Grafana repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main"
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Pin the Alloy package version
+  ansible.builtin.copy:
+    dest: /etc/apt/preferences.d/alloy
+    mode: "0644"
+    content: |
+      # Managed by ansible (roles/alloy: alloy_version)
+      Package: alloy
+      Pin: version {{ alloy_version }}
+      Pin-Priority: 1000
+  when:
+    - ansible_facts["os_family"] == "Debian"
+    - alloy_version | length > 0
+
+- name: Unpin the Alloy package
+  ansible.builtin.file:
+    path: /etc/apt/preferences.d/alloy
+    state: absent
+  when:
+    - ansible_facts["os_family"] == "Debian"
+    - alloy_version | length == 0
+
+- name: Install Grafana Alloy
+  ansible.builtin.apt:
+    name: "alloy{{ ('=' ~ alloy_version) if alloy_version else '' }}"
+    state: present
+    update_cache: true
+  when: ansible_facts["os_family"] == "Debian"
+  notify: Restart alloy
+
+- name: Check the Docker proxy settings
+  ansible.builtin.assert:
+    that:
+      - not (alloy_run_as_root | default(false))
+      - "'docker-monitoring' not in alloy_config_fragments"
+    fail_msg: >-
+      alloy_docker_socket_proxy is for an unprivileged Alloy: it rules out
+      alloy_run_as_root and the docker-monitoring fragment (cAdvisor needs
+      the raw Docker socket and containerd).
+  when: alloy_docker_socket_proxy | bool
+
+# The package does this on install; kept here so the groups survive a
+# reinstall or a hand edit.
+- name: Add alloy user to the log reader groups
+  ansible.builtin.user:
+    name: alloy
+    groups: [adm, systemd-journal]
+    append: true
+  notify: Restart alloy
+
+- name: Docker socket proxy
+  ansible.builtin.include_tasks: docker_proxy.yml
+  when: alloy_docker_socket_proxy | bool
+
+# The fragments hold the monitoring basic-auth password.
+- name: Create Alloy configuration directory
+  ansible.builtin.file:
+    path: "{{ alloy_config_dir }}"
+    state: directory
+    owner: root
+    group: alloy
+    mode: "0750"
+
+# Run as root where a collector needs it, e.g. docker-monitoring: with
+# Docker's containerd image store, cAdvisor names containers through
+# /run/containerd/containerd.sock, which only root can open.
+- name: Create Alloy systemd drop-in directory
+  ansible.builtin.file:
+    path: /etc/systemd/system/alloy.service.d
+    state: directory
+    mode: "0755"
+  when: alloy_run_as_root | default(false)
+
+- name: Run Alloy as root
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/alloy.service.d/run-as-root.conf
+    content: |
+      # Managed by ansible (alloy_run_as_root).
+      [Service]
+      User=root
+    mode: "0644"
+  when: alloy_run_as_root | default(false)
+  notify: Restart alloy
+
+- name: Stop running Alloy as root
+  ansible.builtin.file:
+    path: /etc/systemd/system/alloy.service.d/run-as-root.conf
+    state: absent
+  when: not (alloy_run_as_root | default(false))
+  register: _alloy_root_dropin_removed
+  notify: Restart alloy
+
+# Stopped before the chown below: a root Alloy would keep writing root-owned
+# WAL and positions files that the alloy user then cannot open.
+- name: Stop the root Alloy before handing its data back # noqa: no-handler
+  ansible.builtin.systemd:
+    name: alloy
+    state: stopped
+    daemon_reload: true
+  when: _alloy_root_dropin_removed is changed
+
+- name: Give the alloy user its data directory back
+  ansible.builtin.file:
+    path: /var/lib/alloy
+    state: directory
+    owner: alloy
+    group: alloy
+    recurse: true
+  when: not (alloy_run_as_root | default(false))
+  notify: Restart alloy
+
+- name: Deploy Alloy defaults file
+  ansible.builtin.template:
+    src: alloy.default.j2
+    dest: /etc/default/alloy
+    mode: "0644"
+  notify: Restart alloy
+
+- name: Deploy base Alloy configuration
+  ansible.builtin.template:
+    src: config.alloy.j2
+    dest: "{{ alloy_config_dir }}/config.alloy"
+    owner: root
+    group: alloy
+    mode: "0640"
+  notify: Restart alloy
+
+- name: Deploy Alloy configuration fragments
+  ansible.builtin.template:
+    src: "{{ item }}.alloy.j2"
+    dest: "{{ alloy_config_dir }}/{{ item }}.alloy"
+    owner: root
+    group: alloy
+    mode: "0640"
+  loop: "{{ alloy_config_fragments }}"
+  notify: Restart alloy
+
+# Alloy loads every file in the directory, so dropping the fragment from the
+# list is not enough.
+- name: Remove the cAdvisor fragment behind the Docker proxy
+  ansible.builtin.file:
+    path: "{{ alloy_config_dir }}/docker-monitoring.alloy"
+    state: absent
+  when: alloy_docker_socket_proxy | bool
+  notify: Restart alloy
+
+- name: Add alloy user to docker group for container log access
+  ansible.builtin.user:
+    name: alloy
+    groups: docker
+    append: true
+  when:
+    - alloy_enable_docker_logs | default(false)
+    - not (alloy_docker_socket_proxy | bool)
+  notify: Restart alloy
+
+- name: Look up the docker group's members
+  ansible.builtin.getent:
+    database: group
+    key: docker
+    fail_key: false
+  when: alloy_docker_socket_proxy | bool
+
+- name: Take alloy out of the docker group
+  ansible.builtin.command: gpasswd -d alloy docker
+  changed_when: true
+  when:
+    - alloy_docker_socket_proxy | bool
+    - (ansible_facts.getent_group.docker | default(none)) is not none
+    - "'alloy' in ansible_facts.getent_group.docker[2].split(',')"
+  notify: Restart alloy
+
+- name: Ensure Alloy service is started and enabled
+  ansible.builtin.service:
+    name: alloy
+    state: started
+    enabled: true

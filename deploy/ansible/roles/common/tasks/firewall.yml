@@ -1,0 +1,45 @@
+---
+# ufw: SSH (unless common_firewall_public_ssh is false), the listed ports,
+# and everything on the trusted interfaces (the tailnet); everything else
+# incoming is dropped. The allow rules go in before ufw is enabled, and
+# enabling keeps established connections (this play's SSH session).
+- name: Install ufw
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Firewall rules
+  # in check mode ufw may not be installed yet
+  ignore_errors: "{{ ansible_check_mode }}"
+  block:
+    - name: Allow SSH
+      community.general.ufw:
+        rule: allow
+        port: "{{ ssh_port | string }}"
+        proto: tcp
+        delete: "{{ not (common_firewall_public_ssh | bool) }}"
+
+    - name: Allow public ports
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port | string }}"
+        proto: "{{ item.proto }}"
+      loop: "{{ common_firewall_allow }}"
+
+    - name: Allow everything on trusted interfaces
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ item }}"
+      loop: "{{ common_firewall_trusted_interfaces }}"
+
+    - name: Deny other incoming traffic
+      community.general.ufw:
+        policy: deny
+        direction: incoming
+
+    - name: Enable ufw
+      community.general.ufw:
+        state: enabled

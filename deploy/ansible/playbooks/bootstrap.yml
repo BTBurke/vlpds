@@ -1,0 +1,196 @@
+---
+# First run on a fresh VPS that only has the provider's password login.
+# Secures the box; everything else is playbooks/vlpds.yml (as operator).
+#
+#   brew install sshpass        # Ansible's SSH password login needs it
+#   ansible-playbook -i inventories/example/hosts.yml playbooks/bootstrap.yml --limit <node> \
+#     -e bootstrap_password_file=/path/to/initial-password
+#
+# Play 1 logs in as `bootstrap_user` (inventory; `ubuntu` on many providers'
+# Ubuntu images, `root` where the image allows root) with the password from
+# `bootstrap_password_file` (default: .bootstrap-pw next to ansible.cfg, or
+# $BOOTSTRAP_PASSWORD_FILE), and only creates the operator account
+# (roles/common tasks/users.yml: operator, the inventory's SSH keys,
+# NOPASSWD sudo). The password is used by this play alone, never by a task.
+#
+# Play 2 logs in again as operator with public keys only (password and
+# keyboard-interactive disabled on the client side) and gets root through
+# sudo. Only once that works does it harden sshd (roles/common
+# tasks/ssh_hardening.yml: sshd -t before the reload, then a fresh key login
+# and a check that sshd offers publickey only), then locks the image
+# accounts' passwords, turns on ufw (SSH, 80, 443 public; the tailnet),
+# fail2ban and unattended security upgrades, each behind its common_* var.
+#
+# Re-running is safe: play 1 first tries a key login as operator and
+# skips the host when it works (its password login is refused by then);
+# play 2 is idempotent. playbooks/vlpds.yml's common role applies the same
+# settings on every later run.
+
+- name: "Bootstrap 1/2: operator account (password login)"
+  hosts: all
+  gather_facts: false
+  become: true
+  tags: [account]
+  vars:
+    bootstrap_password_file: >-
+      {{ lookup('ansible.builtin.env', 'BOOTSTRAP_PASSWORD_FILE')
+         | default(playbook_dir ~ '/../.bootstrap-pw', true) }}
+    ansible_user: "{{ bootstrap_user | default('ubuntu') }}"
+    ansible_password: "{{ lookup('ansible.builtin.file', bootstrap_password_file) }}"
+    ansible_become_password: "{{ lookup('ansible.builtin.file', bootstrap_password_file) }}"
+    # Password only: no agent keys spent against MaxAuthTries. First
+    # contact with a fresh host: its key is added to known_hosts (commit it
+    # after checking the fingerprint); a changed key is still refused.
+    ansible_ssh_common_args: >-
+      -o PubkeyAuthentication=no
+      -o PreferredAuthentications=password,keyboard-interactive
+      -o StrictHostKeyChecking=accept-new
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 600
+  pre_tasks:
+    # A re-run: once the operator's key works, play 1 has nothing to do
+    # (and its password login is refused by then).
+    - name: Try a key login as the operator first
+      ansible.builtin.command:
+        argv: >-
+          {{ ['ssh', '-o', 'BatchMode=yes', '-o', 'PasswordAuthentication=no',
+              '-o', 'StrictHostKeyChecking=accept-new', '-o', 'UserKnownHostsFile=' ~ playbook_dir ~ '/../known_hosts',
+              '-o', 'ConnectTimeout=15', '-p', ansible_port | default(22) | string]
+             + (['-i', ansible_ssh_private_key_file] if ansible_ssh_private_key_file is defined else [])
+             + [operator_user ~ '@' ~ ansible_host | default(inventory_hostname), 'sudo', '-n', 'true'] }}
+      register: _bootstrap_key_login
+      changed_when: false
+      failed_when: false
+      check_mode: false
+      delegate_to: localhost
+      become: false
+
+    - name: Skip play 1 where the operator account already works
+      ansible.builtin.meta: end_host
+      when: _bootstrap_key_login.rc == 0
+
+    - name: The password file exists
+      ansible.builtin.stat:
+        path: "{{ bootstrap_password_file }}"
+      register: _bootstrap_pw_file
+      delegate_to: localhost
+      become: false
+
+    - name: The password file is there and not empty
+      ansible.builtin.assert:
+        that:
+          - _bootstrap_pw_file.stat.exists
+          - _bootstrap_pw_file.stat.size > 0
+        fail_msg: >-
+          {{ bootstrap_password_file }} is missing or empty: put the provider's initial password in it
+          (one line, chmod 600), or pass -e bootstrap_password_file=<path>.
+        quiet: true
+
+    # Ubuntu >= 25.10's default sudo is sudo-rs, which wraps the password
+    # prompt Ansible sets (`[sudo: <prompt>] Password:`), so Ansible never
+    # sees it and times out. The original sudo stays installed as sudo.ws:
+    # use it for this password-authenticated play. (NOPASSWD sudo, as
+    # operator has, never prompts and works with either.)
+    - name: Log in with the password and find the sudo binary
+      ansible.builtin.raw: if [ -x /usr/bin/sudo.ws ]; then echo /usr/bin/sudo.ws; else echo sudo; fi
+      become: false
+      register: _bootstrap_sudo
+      changed_when: false
+      check_mode: false
+
+    - name: Use the original sudo when the image has it
+      ansible.builtin.set_fact:
+        ansible_become_exe: "{{ _bootstrap_sudo.stdout | trim }}"
+
+    - name: Gather facts (through sudo)
+      ansible.builtin.setup:
+
+    - name: Look for cloud-init
+      ansible.builtin.stat:
+        path: /usr/bin/cloud-init
+      register: _bootstrap_cloud_init_bin
+
+    - name: Wait for cloud-init's first boot to finish (it may hold apt)
+      ansible.builtin.command: cloud-init status --wait
+      register: _bootstrap_cloud_init
+      changed_when: false
+      # 2: finished with recoverable errors (still finished)
+      failed_when: _bootstrap_cloud_init.rc not in [0, 2]
+      when: _bootstrap_cloud_init_bin.stat.exists
+      check_mode: false
+
+  tasks:
+    - name: Operator account
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: users.yml
+
+- name: "Bootstrap 2/2: harden (key login as the operator)"
+  hosts: all
+  gather_facts: false
+  become: true
+  tags: [harden]
+  vars:
+    ansible_user: "{{ operator_user }}"
+    # Prove the key login: never fall back to a password here.
+    ansible_ssh_common_args: >-
+      -o PasswordAuthentication=no
+      -o KbdInteractiveAuthentication=no
+      -o PreferredAuthentications=publickey
+      -o StrictHostKeyChecking=yes
+  module_defaults:
+    ansible.builtin.apt:
+      lock_timeout: 600
+  tasks:
+    - name: Log in as the operator with a key
+      ansible.builtin.setup:
+
+    - name: The operator gets root through sudo
+      ansible.builtin.command: id -u
+      register: _bootstrap_id
+      changed_when: false
+      check_mode: false
+      failed_when: _bootstrap_id.stdout != '0'
+
+    - name: Harden sshd
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: ssh_hardening.yml
+      when: common_ssh_hardening_enabled | default(true) | bool
+
+    - name: Lock the image accounts' passwords
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: lock_passwords.yml
+      when: common_lock_password_users | default([]) | length > 0
+
+    - name: Firewall
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: firewall.yml
+      when: common_firewall_enabled | default(true) | bool
+
+    - name: Fail2ban
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: fail2ban.yml
+      when: common_fail2ban_enabled | default(true) | bool
+
+    - name: Unattended security upgrades
+      ansible.builtin.include_role:
+        name: common
+        tasks_from: unattended_upgrades.yml
+      when: common_unattended_upgrades_enabled | default(true) | bool
+
+    - name: Drop the SSH connection before the last check
+      ansible.builtin.meta: reset_connection
+
+    - name: A fresh key login still works (firewall on)
+      ansible.builtin.ping:
+
+    - name: Done
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }} is reachable only as {{ operator_user }} with an SSH key
+          (ssh {{ operator_user }}@{{ ansible_host }}). Next: secrets (sops), DNS, then playbooks/vlpds.yml.

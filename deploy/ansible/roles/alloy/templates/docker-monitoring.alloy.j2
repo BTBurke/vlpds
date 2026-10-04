@@ -1,0 +1,38 @@
+// Docker container metrics (cAdvisor), for per-container CPU, memory,
+// network and disk I/O. Series are labelled with the container `name`.
+prometheus.exporter.cadvisor "docker" {
+  docker_host            = "unix:///var/run/docker.sock"
+  docker_only            = true
+  store_container_labels = false
+  // Needs Alloy running as root (alloy_run_as_root) to name containers
+  // through containerd. Cgroup-based collectors only.
+  enabled_metrics        = ["cpu", "memory", "network", "diskIO"]
+}
+
+prometheus.scrape "containers" {
+  targets         = prometheus.exporter.cadvisor.docker.targets
+  forward_to      = [prometheus.relabel.containers.receiver]
+  scrape_interval = "{{ alloy_default_scrape_interval }}"
+}
+
+prometheus.relabel "containers" {
+  forward_to = [prometheus.relabel.add_agent_hostname.receiver]
+
+  // Keep the handful of series dashboards use.
+  rule {
+    source_labels = ["__name__"]
+    regex         = "container_(cpu_usage_seconds_total|memory_working_set_bytes|memory_rss|spec_memory_limit_bytes|network_(receive|transmit)_bytes_total)"
+    action        = "keep"
+  }
+  // Series without a container name are cgroup roll-ups.
+  rule {
+    source_labels = ["name"]
+    regex         = ""
+    action        = "drop"
+  }
+  // The raw cgroup path is high-cardinality and redundant with `name`.
+  rule {
+    regex  = "id"
+    action = "labeldrop"
+  }
+}

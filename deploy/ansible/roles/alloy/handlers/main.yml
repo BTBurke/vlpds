@@ -1,0 +1,8 @@
+---
+# Handlers for alloy role
+
+- name: Restart alloy
+  ansible.builtin.systemd:
+    name: alloy
+    state: restarted
+    daemon_reload: true

@@ -1,0 +1,77 @@
+---
+# Keep in step with defaults/main.yml. Validated at role start: a wrong type fails before any change.
+argument_specs:
+  main:
+    short_description: Caddy in Docker, with site snippets from templates and an optional Cloudflare DNS-01 build.
+    description:
+      - Caddy in Docker, with site snippets from templates and an optional Cloudflare DNS-01 build.
+      - Every option's default and meaning are in defaults/main.yml; this spec checks types at role start.
+    options:
+      operator_user:
+        description: Owner of the Caddy files; runs the container (docker group).
+        type: str
+      caddy_config_dir:
+        description: Caddy configuration directory
+        type: str
+      caddy_sites_dir:
+        description: See defaults/main.yml (caddy_sites_dir).
+        type: str
+      caddy_image:
+        description: "Caddy Docker image (without the Cloudflare DNS module); defaults/main.yml says why it is pinned there."
+        type: str
+      caddy_container_name:
+        description: See defaults/main.yml (caddy_container_name).
+        type: str
+      caddy_cloudflare_dns:
+        description: >-
+          Build and run Caddy with the caddy-dns/cloudflare module (ACME DNS-01, e.g. a wildcard certificate);
+          the token comes from caddy_env.CF_API_TOKEN (the container's environment), never from disk.
+        type: bool
+      caddy_cloudflare_caddy_version:
+        description: The module's v0.2 line needs libdns v1 (Caddy >= 2.10).
+        type: str
+      caddy_cloudflare_base_version:
+        description: >-
+          Tag of the caddy:<v>-builder / -alpine base images (they trail Caddy releases by days); the binary
+          itself is built from caddy_cloudflare_caddy_version.
+        type: str
+      caddy_cloudflare_module_version:
+        description: See defaults/main.yml (caddy_cloudflare_module_version).
+        type: str
+      caddy_cloudflare_image:
+        description: See defaults/main.yml (caddy_cloudflare_image).
+        type: str
+      caddy_cloudflare_build_dir:
+        description: See defaults/main.yml (caddy_cloudflare_build_dir).
+        type: str
+      caddy_env:
+        description: Environment for the Caddy container (e.g. CF_API_TOKEN).
+        type: dict
+      caddy_data_dir:
+        description: Data directories
+        type: str
+      caddy_config_data_dir:
+        description: See defaults/main.yml (caddy_config_data_dir).
+        type: str
+      caddy_sites:
+        description: Caddy sites to configure Each site should reference a template name (without .j2)
+        type: list
+        elements: dict
+      caddy_global_options:
+        description: Extra lines for the Caddyfile's global options block (e.g. `email`, `on_demand_tls { ask ... }`), as one multi-line string.
+        type: str
+      caddy_docker_networks:
+        description: Additional networks to connect Caddy to
+        type: list
+        elements: str
+      caddy_mount_tailscale_socket:
+        description: Mount the host's tailscaled socket (Caddy then can fetch *.ts.net certificates).
+        type: bool
+      caddy_extra_volumes:
+        description: Extra volumes to mount into the Caddy container
+        type: list
+        elements: str
+      caddy_ports:
+        description: Port bindings for Caddy container
+        type: list
+        elements: str

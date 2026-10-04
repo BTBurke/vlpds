@@ -1,0 +1,39 @@
+---
+# vlpds-bucket-probe from the deployed image, with the node's own VLPDS_S3_*
+# settings, credentials included (VLPDS_S3_*_KEY_FILE from the mounted secrets
+# directory; a one-off `compose run`: no ports published, the running node
+# untouched). It works under a fresh vlpds-probe/<random>/ prefix and
+# deletes what it wrote. Exit 0 SAFE, 1 UNSAFE (a conditional-write check
+# failed: do not run vlpds on this bucket), 2 could not run.
+
+- name: Run vlpds-bucket-probe
+  ansible.builtin.command:
+    cmd: >-
+      docker compose run --rm --no-deps -T
+      --entrypoint /usr/local/bin/vlpds-bucket-probe
+      vlpds {{ vlpds_preflight_probe_args | map('quote') | join(' ') }}
+    chdir: "{{ vlpds_deploy_path }}"
+  become: true
+  become_user: "{{ operator_user }}"
+  register: _vlpds_probe
+  changed_when: false
+  failed_when: false
+  when: not ansible_check_mode
+
+- name: Show the probe report
+  ansible.builtin.debug:
+    msg: "{{ _vlpds_probe.stdout_lines + (_vlpds_probe.stderr_lines | select('search', '(?i)unsafe|error|denied|failed') | list) }}"
+  when: _vlpds_probe is not skipped
+
+- name: The bucket is safe for vlpds
+  ansible.builtin.assert:
+    that:
+      - _vlpds_probe.rc == 0
+    fail_msg: >-
+      {% if 'UNSAFE' in _vlpds_probe.stdout %}vlpds-bucket-probe: UNSAFE, the store does not honour conditional
+      writes ({{ _vlpds_probe.stdout_lines | select('search', 'UNSAFE') | first | default('') }}).
+      {% else %}vlpds-bucket-probe could not run (exit {{ _vlpds_probe.rc }}: endpoint, credentials, network or
+      docker): {{ (_vlpds_probe.stderr_lines + _vlpds_probe.stdout_lines) | last | default('') }}.
+      {% endif %}Not starting vlpds against {{ vlpds_s3_endpoint }}/{{ vlpds_s3_bucket }}.
+    quiet: true
+  when: _vlpds_probe is not skipped

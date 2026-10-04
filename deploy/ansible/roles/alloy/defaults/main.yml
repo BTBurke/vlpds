@@ -1,0 +1,77 @@
+---
+# Default variables for alloy role
+
+# Pinned Alloy package version (apt.grafana.com Debian version), held by
+# /etc/apt/preferences.d/alloy so `apt upgrade` and unattended-upgrades
+# leave it alone; bump here and re-run the role. Empty: unpinned.
+alloy_version: "1.20.1-1"
+
+# Alloy configuration directory
+alloy_config_dir: /etc/alloy
+
+# Your monitoring stack. Metrics are remote-written (Prometheus remote_write:
+# VictoriaMetrics, Prometheus, Mimir, ...) and logs pushed to Loki; the
+# defaults assume both behind one reverse proxy at alloy_monitoring_url.
+alloy_monitoring_url: "https://monitoring.example.com"
+alloy_remote_write_url: "{{ alloy_monitoring_url }}/prometheus/api/v1/write"
+alloy_loki_push_url: "{{ alloy_monitoring_url }}/loki/api/v1/push"
+# Basic auth for both endpoints; an empty user sends none.
+monitoring_basic_auth_user: "" # noqa: var-naming[no-role-prefix]
+monitoring_basic_auth_password: "" # noqa: var-naming[no-role-prefix]
+# The `cluster` external label on every series and log line. vlpds' alert
+# rules and dashboards can select one deployment by it.
+deploy_env: prod # noqa: var-naming[no-role-prefix]
+
+# Default Prometheus scrape interval for all metrics
+alloy_default_scrape_interval: "15s"
+
+# node_exporter collectors to enable on top of its defaults.
+alloy_unix_collectors:
+  - systemd
+
+# Configuration fragments: template names (without .alloy.j2) rendered into
+# alloy_config_dir. host-monitoring defines the remote_write and Loki
+# endpoints the others forward to, so keep it in the list.
+#   host-monitoring    host metrics, journal, /var/log and container logs
+#   vlpds-monitoring   the vlpds node's metrics port (job="vlpds")
+#   docker-monitoring  per-container CPU/memory/network via cAdvisor (needs
+#                      alloy_run_as_root; not with alloy_docker_socket_proxy)
+alloy_config_fragments:
+  - host-monitoring
+  - vlpds-monitoring
+
+# Enable Docker container log collection
+# When enabled, adds the alloy user to the docker group for socket access
+# (ignored with alloy_docker_socket_proxy, which takes alloy out of it).
+alloy_enable_docker_logs: true
+
+# Reach Docker through a read-only, filtered proxy instead of the raw socket
+# (which is root-equivalent, and `docker inspect` returns every container's
+# environment: on a vlpds node, its secrets): an nginx container serving a
+# unix socket that only the alloy group can reach, allowing only container
+# list/inspect/logs, with Env, Cmd and Mounts stripped. Alloy then runs as
+# the plain alloy user, outside the docker group. Not compatible with
+# alloy_run_as_root or the docker-monitoring fragment (cAdvisor needs the
+# raw socket and containerd).
+alloy_docker_socket_proxy: true
+alloy_docker_proxy_image: "nginx:1.31.6-alpine@sha256:df221db836e1754089190208cee7eeda94f233197056426eda74a43ab1abeac2"
+alloy_docker_proxy_container: alloy-docker-proxy
+alloy_docker_proxy_user: alloy-docker-proxy
+alloy_docker_proxy_config_dir: /etc/alloy-docker-proxy
+alloy_docker_proxy_socket_dir: /var/lib/alloy-docker-proxy
+alloy_docker_host: >-
+  {{ ('unix://' ~ alloy_docker_proxy_socket_dir ~ '/docker.sock')
+     if alloy_docker_socket_proxy | bool else 'unix:///var/run/docker.sock' }}
+
+# Pyroscope: receive profiles on alloy_pyroscope_listen_port (vlpds images
+# built with profiling push there when vlpds_pyroscope_url is
+# http://host.docker.internal:<port>) and forward them to
+# alloy_pyroscope_url. The receiver listens on every interface: keep the
+# port closed in the firewall.
+alloy_pyroscope_enabled: false
+alloy_pyroscope_listen_port: 4100
+alloy_pyroscope_url: "{{ alloy_monitoring_url }}/pyroscope"
+
+# Run the Alloy service as root (a systemd drop-in). Needed by
+# docker-monitoring on Docker hosts using the containerd image store.
+alloy_run_as_root: false

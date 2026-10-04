@@ -1,0 +1,20 @@
+// {{ ansible_managed }}
+// The vlpds node's --metrics-listen port (published on 127.0.0.1) as
+// job="vlpds", the job vlpds' alert rules (ops/alerts.yml) select on; the
+// remote_write external label cluster="{{ deploy_env }}" tells deployments
+// apart. Container logs reach Loki through host-monitoring's
+// loki.source.docker.
+
+prometheus.scrape "vlpds" {
+  targets = [
+    {
+      __address__ = "127.0.0.1:{{ vlpds_metrics_host_port | default(9583) }}",
+      // the node id: stable across a hostname change (cutover)
+      instance    = "{{ vlpds_node_id | default(inventory_hostname) }}",
+    },
+  ]
+  job_name        = "vlpds"
+  forward_to      = [prometheus.relabel.add_agent_hostname.receiver]
+  scrape_interval = "{{ vlpds_scrape_interval | default('10s') }}"
+  scrape_timeout  = "5s"
+}

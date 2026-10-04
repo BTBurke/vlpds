@@ -1,0 +1,71 @@
+---
+# Group `vlpds`: the vlpds cluster's nodes (e.g. inventories/example). Operator
+# guide: roles/vlpds/README.md and ../README.md.
+#
+#   ansible-playbook -i inventories/example/hosts.yml playbooks/vlpds.yml --check --diff
+#   ansible-playbook -i inventories/example/hosts.yml playbooks/vlpds.yml
+#   ... --tags vlpds-deploy                 # only render + (re)start the node
+#   ... -e vlpds_force_restart=true         # graceful restart without changes
+#   ... -e vlpds_preflight_probe=true       # vlpds-bucket-probe before starting
+#
+# A fresh host goes through playbooks/bootstrap.yml first. Nodes with
+# vlpds_node_enabled: false (a host not provisioned yet) are skipped.
+
+- name: Vlpds nodes
+  hosts: vlpds
+  become: true
+  # A rolling deploy: one node at a time, so the others keep its shards.
+  serial: 1
+  pre_tasks:
+    - name: Skip nodes that are not enabled yet
+      ansible.builtin.meta: end_host
+      when: not (vlpds_node_enabled | default(true) | bool)
+      tags: [always]
+
+    # Two lone nodes on one bucket prefix would each run without peers.
+    - name: More than one enabled node needs clustering
+      ansible.builtin.assert:
+        that:
+          - >-
+            (vlpds_cluster_enabled | default(false) | bool)
+            or (groups['vlpds'] | map('extract', hostvars, 'vlpds_node_enabled')
+                | map('default', true) | map('bool') | select | list | length) <= 1
+        fail_msg: >-
+          {{ groups['vlpds'] | length }} vlpds nodes are enabled but vlpds_cluster_enabled is off:
+          set it (with the peer TLS material) first, roles/vlpds/README.md "Clustering".
+        quiet: true
+      tags: [always]
+  roles:
+    - role: common
+      tags: [common]
+    # Before Caddy: it creates the docker network Caddy joins.
+    - role: vlpds
+      tags: [vlpds]
+    - role: caddy
+      tags: [caddy]
+      vars:
+        caddy_cloudflare_dns: "{{ vlpds_caddy_wildcard_dns == 'cloudflare' }}"
+        caddy_env: "{{ {'CF_API_TOKEN': vlpds_cloudflare_dns_token} if vlpds_caddy_wildcard_dns == 'cloudflare' else {} }}"
+        caddy_docker_networks:
+          - "{{ vlpds_docker_network }}"
+        caddy_sites:
+          - name: vlpds
+            template: vlpds-site
+            enabled: true
+        caddy_global_options: |
+          {% if vlpds_acme_email | length > 0 %}
+          email {{ vlpds_acme_email }}
+          {% endif %}
+          {% if vlpds_caddy_wildcard_dns == '' %}
+          on_demand_tls {
+              ask {{ _vlpds_tls_ask_url }}
+          }
+          {% endif %}
+          {% if vlpds_caddy_trusted_proxies | length > 0 %}
+          servers {
+              trusted_proxies static {{ vlpds_caddy_trusted_proxies | join(' ') }}
+          }
+          {% endif %}
+          {{ vlpds_caddy_extra_global_options }}
+    - role: alloy
+      tags: [alloy]

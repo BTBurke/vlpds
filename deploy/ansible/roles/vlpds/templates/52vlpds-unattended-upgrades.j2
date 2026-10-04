@@ -1,0 +1,15 @@
+// {{ ansible_managed }} (roles/vlpds)
+// Security updates only (the Ubuntu default origins in 50unattended-upgrades),
+// and never an automatic reboot: rebooting a one-node vlpds cluster is an
+// outage, so reboots (/var/run/reboot-required) are the operator's call.
+Unattended-Upgrade::Automatic-Reboot "false";
+// Docker and containerd restart every container when upgraded: upgrade them
+// in a maintenance window instead (download.docker.com is not an allowed
+// origin anyway; this is belt and braces).
+Unattended-Upgrade::Package-Blacklist {
+    "docker-ce";
+    "docker-ce-cli";
+    "containerd.io";
+    "docker-compose-plugin";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";

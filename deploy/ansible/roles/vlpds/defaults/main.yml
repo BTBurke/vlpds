@@ -1,0 +1,375 @@
+---
+# Defaults for the vlpds role: one vlpds node (a one-node cluster) under
+# docker compose. Every VLPDS_* setting the node reads is rendered into
+# {{ vlpds_deploy_path }}/docker-compose.yml from the vars below; see
+# roles/vlpds/README.md for the operator procedures and `vlpds --help`
+# (src/main.rs) for the flags themselves.
+
+operator_user: operator # noqa: var-naming[no-role-prefix] (shared with roles/common)
+
+# ---------------------------------------------------------------------------
+# Profile
+# ---------------------------------------------------------------------------
+# tiny:     a personal PDS (a few accounts) on a small shared VM, e.g. 4 vCPU /
+#           7 GB. 1 shard and a 60 s lease keep the idle
+#           object-store request rate (and bill) minimal; small caches.
+# standard: the production defaults for a 6-8 core / 32 GB / NVMe node
+#           (DESIGN.md "Initial deployment sizing"): 64 shards, 10 s lease,
+#           caches sized from host RAM.
+vlpds_profile: standard
+
+# ---------------------------------------------------------------------------
+# Image and placement
+# ---------------------------------------------------------------------------
+# Built and pushed with `just docker-push <tag>` at the repo root (not by
+# ansible). Pin a tag; never :latest (a restart must not change the build).
+vlpds_image: "ghcr.io/jazware/vlpds:CHANGEME"
+# Registry login for a private image (empty: the image is public).
+vlpds_registry_username: ""
+vlpds_registry_password: ""
+vlpds_deploy_path: /opt/vlpds
+vlpds_secrets_path: "{{ vlpds_deploy_path }}/secrets"
+# SlateDB SST disk cache (+ the exit-state file). Local NVMe for standard
+# (the hot part of ~hundreds of GB of state); the root disk is fine for
+# tiny.
+vlpds_cache_dir: "{{ '/var/lib/vlpds-cache' if vlpds_profile == 'tiny' else '/data/vlpds/cache' }}"
+# --disk-cache-mb: the node's total SST disk cache (MiB), split evenly
+# across every shard of the layout (floor 64 MiB per shard), so it holds
+# even when this node owns all of them. "auto" = vlpds_disk_cache_auto_pct
+# percent of the cache filesystem's size, measured at deploy: meant for a
+# dedicated cache disk (the deploy refuses when the cache would not fit in
+# free space + what it already holds). tiny: 4 GiB on the shared root disk.
+vlpds_disk_cache_mb: "{{ 4096 if vlpds_profile == 'tiny' else 'auto' }}"
+vlpds_disk_cache_auto_pct: 80
+# --disk-cache-shard-mb: a per-shard cap instead (wins over the total;
+# for a disk sized for the failover case). Empty = derive from the total.
+vlpds_disk_cache_shard_mb: ""
+# Space (GiB) the cache filesystem must keep free beyond the full disk
+# cache, checked at deploy: the tiny root disk also holds the OS, Docker
+# images and logs (and the reference PDS during a migration).
+vlpds_cache_min_free_gb: "{{ 10 if vlpds_profile == 'tiny' else 0 }}"
+# Optional: format + mount a dedicated NVMe device at the cache dir's parent.
+# Leave empty when it is already mounted (or for the root disk). Only an
+# unformatted device is formatted (filesystem module, force: false).
+vlpds_cache_device: ""
+vlpds_cache_mountpoint: /data
+vlpds_cache_fstype: ext4
+
+# Host ports (bound to 127.0.0.1 only; Caddy and Alloy are local).
+vlpds_host_port: 2583
+vlpds_metrics_host_port: 9583
+# Docker network shared with a role-managed Caddy. Fixed subnet: it is what
+# --trusted-proxies trusts (Caddy's address on it, or its gateway when a
+# host-network Caddy reaches the published port).
+vlpds_docker_network: vlpds
+vlpds_docker_subnet: 172.31.83.0/24
+
+# Container memory limit (MiB). The node sizes its default cache budget
+# from it and exports it as vlpds_memory_limit_bytes (VlpdsMemoryHigh).
+vlpds_mem_limit_mb: "{{ 2560 if vlpds_profile == 'tiny' else (ansible_facts.memtotal_mb * 0.85) | int }}"
+vlpds_nofile_limit: 1048576
+# Graceful stop: SIGTERM, then this long before SIGKILL. RUNBOOK "Rolling
+# deploy": the close barrier may wait 30 s and the log quiesce 10 s, so at
+# least 60 s; a timeout into SIGKILL is a crash (replay on restart).
+vlpds_stop_grace_period: 90s
+vlpds_rust_log: "info,slatedb=warn"
+# --log-format: json = one object per line on stderr (Alloy's docker log
+# pipeline extracts `level`); text for reading `docker logs` by eye.
+vlpds_log_format: json
+vlpds_log_max_size: 50m
+vlpds_log_max_file: "5"
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+# Public hostname (no scheme). Required.
+vlpds_hostname: ""
+vlpds_public_url: "https://{{ vlpds_hostname }}"
+# did:web:<hostname>: vlpds serves its document at /.well-known/did.json
+# (Caddy passes it through), and the Bluesky app's video upload asks for
+# service auth with aud did:web:<pds host>. The role refuses anything else
+# unless vlpds_allow_other_service_did.
+vlpds_service_did: "did:web:{{ vlpds_hostname }}"
+vlpds_allow_other_service_did: false
+# Handles <name>.<handle domain> (no leading dot). Usually the hostname.
+vlpds_handle_domain: "{{ vlpds_hostname }}"
+# Stable across restarts and upgrades (a restarted node reclaims its shards
+# at once). Never run two processes with the same id.
+vlpds_node_id: "{{ inventory_hostname_short }}"
+
+# ---------------------------------------------------------------------------
+# Clustering
+# ---------------------------------------------------------------------------
+# Off: a lone node (no --peer-listen / --peer-tls-dir / --advertise-url: no
+# peer listener, no /internal/*, no peer calls). On: the node joins every
+# other node on the same bucket + prefix. Turning it on changes the node's
+# flags (a graceful restart); every node needs the same jwt/admin/internal
+# tokens, KEK (or KMS key) and PLC rotation key, and its own node id.
+# Procedure: README "Clustering".
+vlpds_cluster_enabled: false
+# Peers reach each other over the tailnet: `tailscale serve` forwards TCP
+# <tailnet address>:vlpds_peer_port to the node's loopback-published peer
+# port (vlpds_peer_host_port), so the peer port is never on a public
+# interface and Docker's port publishing needs no tailnet address at boot.
+# The tailnet policy must let the nodes reach each other on this port.
+vlpds_peer_port: 2584
+vlpds_peer_host_port: 2584
+# The address in this node's --advertise-url and its peer certificate (an
+# IP, or a DNS name the containers can resolve): its tailnet IPv4.
+vlpds_peer_host: ""
+# Peer mTLS (README "Clustering"): the cluster CA certificate (public; the
+# CA key stays offline), and this node's certificate and key from
+# `vlpds admin tls issue --node-id <vlpds_node_id> --host <vlpds_peer_host>`
+# (the key is a secret). Written to <secrets>/peer-tls/; vlpds re-reads them
+# when they change (renewal needs no restart).
+vlpds_peer_tls_ca_cert: ""
+vlpds_peer_tls_cert: ""
+vlpds_peer_tls_key: ""
+
+# ---------------------------------------------------------------------------
+# Object store (all durable state)
+# ---------------------------------------------------------------------------
+# Needs strongly consistent conditional writes (If-None-Match: * and
+# If-Match on ETags): AWS S3, GCS (S3 interop + HMAC keys), R2. Check a new
+# bucket with vlpds_preflight_probe. Path-style endpoints:
+#   S3   https://s3.<region>.amazonaws.com                 region <region>
+#   R2   https://<account>.r2.cloudflarestorage.com         region auto
+#   GCS  https://storage.googleapis.com                     region auto
+vlpds_s3_endpoint: ""
+vlpds_s3_region: "{{ 'auto' if 'r2.cloudflarestorage.com' in vlpds_s3_endpoint or 'storage.googleapis.com' in vlpds_s3_endpoint else 'us-east-1' }}"
+vlpds_s3_bucket: ""
+vlpds_s3_access_key: ""
+vlpds_s3_secret_key: ""
+# One prefix = one PDS. Never point two deployments at the same prefix.
+vlpds_s3_prefix: vlpds
+# Run vlpds-bucket-probe (from the image) before (re)starting the node:
+# conditional-write correctness + latency, under a throwaway
+# vlpds-probe/<random>/ prefix it deletes afterwards. Off by default: it
+# writes to the bucket (a few thousand requests).
+vlpds_preflight_probe: false
+vlpds_preflight_probe_args: ["--ops", "100"]
+vlpds_allow_http_s3: false
+
+# ---------------------------------------------------------------------------
+# Secrets (the inventory maps them from its sops file)
+# ---------------------------------------------------------------------------
+# >= 32 bytes each, all three different.
+vlpds_jwt_secret: ""
+vlpds_admin_token: ""
+vlpds_internal_token: ""
+# Key-encryption key for signing keys / TOTP secrets at rest: 32 random
+# bytes as 64 hex chars (`openssl rand -hex 32`), written to a 0400 file.
+# Or a Cloud KMS key; with both, the local KEK is unwrap-only.
+vlpds_kek_hex: ""
+vlpds_kek_old_hex: []
+vlpds_gcp_kms_key: ""
+vlpds_gcp_kms_old_keys: []
+# Cloud KMS credentials off GCE: a service-account JSON key (holding only
+# roles/cloudkms.cryptoKeyEncrypterDecrypter on the key), as a string or a
+# mapping. Written to <secrets>/gcp-sa.json (0400, uid 10001) and passed as
+# --gcp-credentials-file. Empty = the GCE metadata server.
+vlpds_gcp_credentials_json: ""
+# The server PLC rotation key file contents: `vw1.` (wrapped under the KEK by
+# `vlpds --wrap-plc-rotation-key`) or 64 hex chars. Required.
+vlpds_plc_rotation_key: ""
+vlpds_plc_rotation_key_old: []
+vlpds_plc_recovery_did_key: ""
+vlpds_plc_url: https://plc.directory
+vlpds_rate_limit_bypass_key: ""
+
+# ---------------------------------------------------------------------------
+# Sharding, leases (profile defaults)
+# ---------------------------------------------------------------------------
+# --shards only applies when the prefix is created; later the layout stored
+# in the prefix wins (split/merge online).
+vlpds_shards: "{{ 1 if vlpds_profile == 'tiny' else 64 }}"
+# >= 10 s in production. One node has no peer takeover to speed up, so tiny
+# uses 60 s: renewals (one CAS PUT) every 12 s instead of 2 s.
+vlpds_lease_ttl_ms: "{{ 60000 if vlpds_profile == 'tiny' else 10000 }}"
+# Trade-off: after a crash (not a graceful restart) the node waits about one
+# TTL before it writes again (its predecessor's published wm_cap), so tiny's
+# 60 s TTL means ~53 s of write downtime after a crash (measured; 0.8 s after
+# SIGTERM). bench/results/tiny-pds-idle-2026-10-02.
+# SlateDB manifest poll: each node is the only writer of its shards, so a
+# slower poll only delays picking up compaction results. 60 s cuts tiny's idle
+# Class B by ~30% (0.57 -> 0.41/s) with no measurable per-commit cost (same
+# bench). Tiny idle overall: 0.12 Class A + 0.41 Class B per s, $0 on R2 up to
+# ~3,000 commits/day, ~$2/mo on S3.
+vlpds_slatedb_manifest_poll: "{{ '60s' if vlpds_profile == 'tiny' else '10s' }}"
+vlpds_log_retention: 72h
+vlpds_listen_backlog: 16384
+
+# ---------------------------------------------------------------------------
+# Memory (MiB) and threads
+# ---------------------------------------------------------------------------
+# The node sizes its caches from its memory budget (vlpds_mem_limit_mb, the
+# container limit it reads from its cgroup; src/memory.rs):
+# the fixed costs below (rings, backfill, exports, in-memory caches at 10%)
+# and 15% headroom come off the top, the SST metadata cache gets what the
+# owned SSTs' filters and indexes need (with failover headroom), and the
+# SST block and repo caches split the rest evenly, resized as shards move.
+# `docker exec vlpds vlpds --memory-plan` prints the plan; a size set here
+# (MiB) pins that cache and is refused at start if it doesn't fit.
+#   standard (32 GB host, 27.2 GiB limit): ~16.8 GiB of SST + repo caches.
+#   tiny (2.5 GiB limit): ~0.9 GiB (block ~400 MiB, repo ~400 MiB, metadata
+#   ~100 MiB until measured); fits beside Caddy, Alloy and (during a
+#   migration) the reference PDS in 7 GB.
+vlpds_memory_budget_mb: ""
+vlpds_repo_cache_mb: ""
+vlpds_block_cache_mb: ""
+vlpds_meta_cache_mb: ""
+vlpds_cache_budget_mb: ""
+# Fixed costs the budget reserves at their worst case: getRepo exports
+# streaming at once (~8 MiB each + their M/ read-ahead pool, 16 MiB a slot up
+# to 512) and cursor backfills at once (vlpds_backfill_readahead_mb each).
+vlpds_max_exports: "{{ 4 if vlpds_profile == 'tiny' else '' }}"
+vlpds_firehose_max_backfills: "{{ 4 if vlpds_profile == 'tiny' else '' }}"
+vlpds_lazy_mst_node_cache_mb: "{{ 64 if vlpds_profile == 'tiny' else 256 }}"
+vlpds_firehose_ring_mb: "{{ 64 if vlpds_profile == 'tiny' else 512 }}"
+vlpds_firehose_merge_queue_mb: "{{ 32 if vlpds_profile == 'tiny' else 256 }}"
+vlpds_firehose_max_lag_mb: "{{ 64 if vlpds_profile == 'tiny' else 128 }}"
+vlpds_live_ring_mb: "{{ 32 if vlpds_profile == 'tiny' else 128 }}"
+vlpds_backfill_readahead_mb: "{{ 16 if vlpds_profile == 'tiny' else 64 }}"
+vlpds_backfill_cache_mb: "{{ 32 if vlpds_profile == 'tiny' else 256 }}"
+vlpds_firehose_threads: "{{ 1 if vlpds_profile == 'tiny' else 4 }}"
+# Empty = vlpds' defaults (io threads = cores, workers = cores / 2).
+vlpds_io_threads: ""
+vlpds_workers: ""
+
+# ---------------------------------------------------------------------------
+# Network services
+# ---------------------------------------------------------------------------
+# "<url>,<service did>" as the reference PDS's PDS_BSKY_APP_VIEW_* /
+# PDS_REPORT_SERVICE_*.
+vlpds_appview: "https://api.bsky.app,did:web:api.bsky.app"
+vlpds_report_service: "https://mod.bsky.app,did:plc:ar7c4by46qjdydhdevvrndac"
+vlpds_appview_cdn_url_pattern: "https://cdn.bsky.app/img/%s/plain/%s/%s@jpeg"
+# Relays asked to crawl (requestCrawl at startup and after new activity, at
+# most once per 20 min per relay, from one node). The console's Relays page
+# stores a list in the bucket that overrides this one until reset; [] = none.
+vlpds_crawlers: ["bsky.network"]
+# The Ozone DID allowed to call the moderator admin methods with a service
+# JWT. Empty = admin Basic auth only (as the reference installer).
+vlpds_mod_service_did: ""
+vlpds_resolve_lexicons: false
+
+# Email. Required in production (verification, password reset, 2FA codes)
+# unless vlpds_email_required is false (mail is then only logged).
+vlpds_email_required: true
+vlpds_email_smtp_url: "" # smtps://user:pass@host:465 or smtp://...:587 (secret)
+vlpds_email_from_address: "" # "Name <addr@host>"
+vlpds_moderation_email_smtp_url: "" # secret; empty = the main mailer
+vlpds_moderation_email_address: ""
+vlpds_email_brand_name: "" # default "{hostname} PDS"
+vlpds_email_home_url: ""
+vlpds_email_logo_url: ""
+vlpds_email_primary_color: ""
+vlpds_email_disable_confirmation_link: false
+# Account mails per UTC day for the whole cluster (mail-cluster-day); keep it
+# under the mail provider's daily quota. Empty = the flag default (900).
+vlpds_mail_daily_budget: ""
+vlpds_privacy_policy_url: ""
+vlpds_terms_of_service_url: ""
+vlpds_contact_email_address: ""
+
+# Sign-ups
+vlpds_invite_required: true
+vlpds_invite_interval_ms: "" # earned invites; empty = none
+vlpds_invite_epoch_ms: ""
+vlpds_max_blob_mb: 100
+
+# Rate limits (reference limits, keyed on the client IP from
+# X-Forwarded-For when the peer is a trusted proxy: Caddy).
+vlpds_rate_limits: true
+vlpds_trusted_proxies: ["{{ vlpds_docker_subnet }}"]
+
+# Continuous CPU profiles to Pyroscope (needs an image built with
+# features=profiling). Alloy's pyroscope.receive_http on the host:
+#   http://host.docker.internal:4100
+vlpds_pyroscope_url: ""
+
+# Extra VLPDS_* env vars / flags, for anything not covered above.
+vlpds_extra_env: {}
+vlpds_extra_args: []
+
+# ---------------------------------------------------------------------------
+# Front proxy (Caddy)
+# ---------------------------------------------------------------------------
+# This repo's roles/caddy runs Caddy (playbooks/vlpds.yml): a certificate for
+# the hostname, and on-demand or wildcard (vlpds_caddy_wildcard_dns)
+# certificates for *.<handle domain>.
+vlpds_acme_email: ""
+# How *.<handle domain> gets its certificate.
+#   "":         one on-demand certificate per handle, on its first request
+#               (Let's Encrypt allows ~50 new certificates/week per registered
+#               domain, and issuance holds that first request a few seconds).
+#   cloudflare: one wildcard certificate by ACME DNS-01 through Cloudflare
+#               (roles/caddy builds Caddy with caddy-dns/cloudflare). Each
+#               request is checked against /tls-check instead: unknown
+#               handles get an empty 404 and never reach vlpds.
+vlpds_caddy_wildcard_dns: ""
+# cloudflare: an API token with Zone:Zone:Read + Zone:DNS:Edit on the handle
+# domain's zone only (a secret). Caddy gets it as the env var CF_API_TOKEN.
+vlpds_cloudflare_dns_token: ""
+# cloudflare: where Caddy finds the zone and checks the challenge record.
+vlpds_caddy_dns_resolvers: ["1.1.1.1", "1.0.0.1"]
+# cloudflare: also get the hostname's certificate by DNS-01 (instead of
+# HTTP-01/TLS-ALPN, which need the hostname's DNS to point at this node):
+# lets a node hold a certificate before DNS sends it traffic (a new node
+# joining the cluster, DNS moving between nodes).
+vlpds_caddy_hostname_dns01: false
+# Requests Caddy refuses outright (node-to-node, metrics, operator-only).
+# Operators reach /admin and vlpds.admin.* over SSH:
+#   ssh -L 2583:127.0.0.1:2583 <host>
+# or, with vlpds_tailnet_console_port, at https://<tailnet name>:<port>/admin.
+vlpds_caddy_blocked_paths: ["/internal/*", "/metrics", "/debug/*", "/xrpc/vlpds.admin.*", "/admin", "/admin/*"]
+# Body caps, in binary units like vlpds' own (Caddy reads MB/GB as powers of
+# 10, so 1GB would refuse imports vlpds accepts). Everything but importRepo:
+# blobs, vlpds_max_blob_mb MiB + 5 MiB slack (MiB, as --max-blob-mb).
+# importRepo: vlpds' own cap is 1 GiB (src/xrpc/repo.rs MAX_IMPORT_BYTES);
+# Caddy allows 64 MiB more so vlpds, not Caddy, answers an oversized CAR.
+# `tailscale serve` port for the operator console (tailnet only; 0 = off).
+# Not 443: Docker's DNAT for Caddy takes 443 on every local address.
+vlpds_tailnet_console_port: 0
+vlpds_caddy_max_body_mb: "{{ vlpds_max_blob_mb | int + 5 }}"
+vlpds_caddy_import_max_body: 1088MiB
+# Upstream proxies in front of Caddy whose X-Forwarded-For Caddy may trust
+# (e.g. Cloudflare ranges). Empty = Caddy sets X-Forwarded-For to the peer.
+vlpds_caddy_trusted_proxies: []
+# Extra lines for Caddy's global options block, e.g. `acme_ca https://acme-staging-v02.api.letsencrypt.org/directory`
+# for a trial run, or `local_certs` for a test host.
+vlpds_caddy_extra_global_options: ""
+# On-demand TLS: Caddy asks vlpds' own GET /tls-check?domain= (200 for the
+# hostname and handles of active local accounts, 400 outside the handle
+# domain, 404 otherwise) at http://<upstream>/tls-check (vars/main.yml).
+
+# ---------------------------------------------------------------------------
+# Host prep
+# ---------------------------------------------------------------------------
+vlpds_manage_host: true
+vlpds_manage_firewall: true
+vlpds_ssh_port: "{{ ansible_port | default(22) }}"
+vlpds_firewall_trusted_interfaces: ["tailscale0"]
+vlpds_manage_chrony: true
+vlpds_chrony_servers: [] # empty = Ubuntu's NTP pools
+vlpds_chrony_pools: ["ntp.ubuntu.com", "0.ubuntu.pool.ntp.org", "1.ubuntu.pool.ntp.org"]
+vlpds_manage_unattended_upgrades: true
+vlpds_sysctls:
+  net.core.somaxconn: 16384
+  net.ipv4.tcp_max_syn_backlog: 16384
+  net.core.netdev_max_backlog: 16384
+  fs.file-max: 2097152
+  fs.nr_open: 2097152
+  net.ipv4.ip_local_port_range: "1024 65535"
+  net.ipv4.tcp_fin_timeout: 15
+  net.netfilter.nf_conntrack_max: "{{ 262144 if vlpds_profile == 'tiny' else 1048576 }}"
+
+# ---------------------------------------------------------------------------
+# Deploy behaviour
+# ---------------------------------------------------------------------------
+# Force a graceful restart even when nothing changed (-e vlpds_force_restart=true).
+vlpds_force_restart: false
+vlpds_health_retries: 60
+vlpds_health_delay: 5
+# After start: getClusterStatus must show a valid lease and every shard owned.
+vlpds_verify_cluster: true

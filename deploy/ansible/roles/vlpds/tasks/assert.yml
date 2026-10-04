@@ -1,0 +1,168 @@
+---
+# Refuse to deploy a node that would not start, or would start unsafe.
+# Mirrors vlpds' own startup checks (Config::check_secrets, KEK, PLC, mail)
+# so bad secrets fail here instead of in a restart loop.
+
+- name: Profile is known
+  ansible.builtin.assert:
+    that:
+      - vlpds_profile in ['tiny', 'standard']
+    fail_msg: "vlpds_profile must be tiny or standard"
+    quiet: true
+
+- name: Image is pinned
+  ansible.builtin.assert:
+    that:
+      - vlpds_image | length > 0
+      - "'CHANGEME' not in vlpds_image"
+      - not vlpds_image.endswith(':latest')
+      - "':' in (vlpds_image | regex_replace('^.*/', ''))"
+    fail_msg: "Set vlpds_image to a pinned tag (just docker-push <tag>), not :latest"
+    quiet: true
+
+- name: Identity is set
+  ansible.builtin.assert:
+    that:
+      - vlpds_hostname | length > 0
+      - vlpds_hostname is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+      - vlpds_public_url is match('^https://')
+      - vlpds_service_did is match('^did:(web|plc):')
+      - vlpds_handle_domain | length > 0
+      - not vlpds_handle_domain.startswith('.')
+      - vlpds_node_id | length > 0
+    fail_msg: "vlpds_hostname (lowercase, no scheme), an https public URL, a did:web/did:plc service DID and a handle domain without a leading dot are required"
+    quiet: true
+
+# vlpds serves /.well-known/did.json only for a did:web service DID, and the
+# Bluesky app asks for service auth with aud did:web:<pds host> (video
+# uploads): anything else breaks that unless the operator says otherwise.
+- name: The service DID is did:web of the public hostname
+  ansible.builtin.assert:
+    that:
+      - (vlpds_allow_other_service_did | bool) or vlpds_service_did == 'did:web:' ~ (vlpds_public_url | urlsplit('hostname'))
+    fail_msg: >-
+      vlpds_service_did is {{ vlpds_service_did }}, not did:web:{{ vlpds_public_url | urlsplit('hostname') }}:
+      video uploads (service auth aud did:web:<pds host>) and /.well-known/did.json need that.
+      Set vlpds_allow_other_service_did: true to override.
+    quiet: true
+
+- name: Log format and disk cache size are valid
+  ansible.builtin.assert:
+    that:
+      - vlpds_log_format in ['json', 'text']
+      - vlpds_disk_cache_mb | string == 'auto' or (vlpds_disk_cache_mb | string is match('^[0-9]+$') and vlpds_disk_cache_mb | int >= 64)
+      - vlpds_disk_cache_auto_pct | int >= 1
+      - vlpds_disk_cache_auto_pct | int <= 95
+      - vlpds_disk_cache_shard_mb | string == '' or (vlpds_disk_cache_shard_mb | string is match('^[0-9]+$') and vlpds_disk_cache_shard_mb | int >= 64)
+    fail_msg: "vlpds_log_format json|text; vlpds_disk_cache_mb 'auto' or >= 64 (MiB); vlpds_disk_cache_auto_pct 1-95; vlpds_disk_cache_shard_mb empty or >= 64"
+    quiet: true
+
+- name: Object store is configured
+  ansible.builtin.assert:
+    that:
+      - vlpds_s3_endpoint | length > 0
+      - vlpds_s3_endpoint is match('^https://') or (vlpds_allow_http_s3 | bool)
+      - vlpds_s3_bucket | length > 0
+      - vlpds_s3_region | length > 0
+      - vlpds_s3_access_key | length > 0
+      - vlpds_s3_secret_key | length > 0
+      - vlpds_s3_access_key != 'minioadmin'
+      - vlpds_s3_prefix | length > 0
+    fail_msg: "Set vlpds_s3_endpoint (https), bucket, region, prefix and vlpds_s3_access_key / vlpds_s3_secret_key"
+    quiet: true
+
+- name: Node secrets are set, long enough and distinct
+  ansible.builtin.assert:
+    that:
+      - vlpds_jwt_secret | length >= 32
+      - vlpds_admin_token | length >= 32
+      - vlpds_internal_token | length >= 32
+      - vlpds_jwt_secret != vlpds_admin_token
+      - vlpds_jwt_secret != vlpds_internal_token
+      - vlpds_admin_token != vlpds_internal_token
+    fail_msg: "vlpds_jwt_secret, vlpds_admin_token and vlpds_internal_token must each be >= 32 bytes and all different (openssl rand -hex 32)"
+    quiet: true
+
+- name: A key-encryption key is configured
+  ansible.builtin.assert:
+    that:
+      - (vlpds_kek_hex | length > 0) or (vlpds_gcp_kms_key | length > 0)
+      - vlpds_gcp_credentials_json | length == 0 or vlpds_gcp_kms_key | length > 0
+      - >-
+        vlpds_gcp_credentials_json | length == 0
+        or (_vlpds_gcp_credentials.type | default('')) == 'service_account'
+      - vlpds_kek_hex | length == 0 or vlpds_kek_hex is match('^[0-9a-fA-F]{64}$')
+      - vlpds_kek_old_hex | select('match', '^[0-9a-fA-F]{64}$') | list | length == vlpds_kek_old_hex | length
+      - vlpds_gcp_kms_key | length == 0 or vlpds_gcp_kms_key is match('^projects/[^/]+/locations/[^/]+/keyRings/[^/]+/cryptoKeys/[^/]+$')
+    fail_msg: >-
+      Set vlpds_kek_hex (openssl rand -hex 32) or vlpds_gcp_kms_key (GCE metadata server, or off GCE
+      vlpds_gcp_credentials_json: a "type": "service_account" JSON key); old KEKs as 64 hex chars
+
+    quiet: true
+
+- name: A PLC rotation key is configured
+  ansible.builtin.assert:
+    that:
+      - vlpds_plc_rotation_key is match('^(vw1\.\S+|[0-9a-fA-F]{64})$')
+      - vlpds_plc_rotation_key_old | reject('match', '^(vw1\.\S+|[0-9a-fA-F]{64})$') | list | length == 0
+      - vlpds_plc_url is match('^https://')
+      - vlpds_plc_recovery_did_key | length == 0 or vlpds_plc_recovery_did_key is match('^did:key:')
+    fail_msg: "Set vlpds_plc_rotation_key to the output of `vlpds --wrap-plc-rotation-key` (vw1.…) or 64 hex chars; PLC URL must be https"
+    quiet: true
+
+- name: Email is configured
+  ansible.builtin.assert:
+    that:
+      - (vlpds_email_smtp_url | length > 0) or not (vlpds_email_required | bool)
+      - (vlpds_email_smtp_url | length > 0) == (vlpds_email_from_address | length > 0)
+      - (vlpds_moderation_email_smtp_url | length > 0) == (vlpds_moderation_email_address | length > 0)
+      - vlpds_email_smtp_url | length == 0 or vlpds_email_smtp_url is match('^smtps?://')
+      - vlpds_moderation_email_smtp_url | length == 0 or vlpds_moderation_email_smtp_url is match('^smtps?://')
+    fail_msg: "Set vlpds_email_smtp_url + vlpds_email_from_address (or vlpds_email_required: false); the moderation URL and address go together"
+    quiet: true
+
+- name: Leases and shards are production-safe
+  ansible.builtin.assert:
+    that:
+      - vlpds_lease_ttl_ms | int >= 10000
+      - vlpds_shards | int >= 1
+      - vlpds_shards | int <= 65536
+      - vlpds_stop_grace_period is match('^[0-9]+s$')
+      - (vlpds_stop_grace_period | regex_replace('s$', '') | int) >= 60
+    fail_msg: "--lease-ttl-ms must be >= 10000 in production, 1 <= shards <= 65536, and the stop grace period >= 60s (RUNBOOK Rolling deploy)"
+    quiet: true
+
+- name: The wildcard handle certificate has what it needs
+  ansible.builtin.assert:
+    that:
+      - vlpds_caddy_wildcard_dns in ['', 'cloudflare']
+      - vlpds_caddy_wildcard_dns == '' or vlpds_cloudflare_dns_token | length > 0
+      - not (vlpds_caddy_hostname_dns01 | bool) or vlpds_caddy_wildcard_dns == 'cloudflare'
+    fail_msg: >-
+      vlpds_caddy_wildcard_dns is '' or cloudflare (vlpds_caddy_hostname_dns01 needs
+      cloudflare). cloudflare needs
+      vlpds_cloudflare_dns_token: a Cloudflare API token with Zone:Zone:Read + Zone:DNS:Edit
+      on the handle domain's zone (a secret: the inventory's sops file)
+    quiet: true
+
+- name: Clustering has what it needs
+  ansible.builtin.assert:
+    that:
+      - vlpds_peer_host | length > 0
+      - vlpds_peer_tls_ca_cert is search('BEGIN CERTIFICATE')
+      - vlpds_peer_tls_cert is search('BEGIN CERTIFICATE')
+      - vlpds_peer_tls_key is search('PRIVATE KEY')
+      - vlpds_node_id is match('^[A-Za-z0-9._-]+$')
+    fail_msg: >-
+      vlpds_cluster_enabled needs vlpds_peer_host (the node's tailnet address), the cluster CA
+      certificate (vlpds_peer_tls_ca_cert) and this node's certificate and key
+      (vlpds_peer_tls_cert, vlpds_peer_tls_key) from `vlpds admin tls issue`; README "Clustering"
+    quiet: true
+  when: vlpds_cluster_enabled | bool
+
+- name: Rendered settings contain no line breaks
+  ansible.builtin.assert:
+    that:
+      - _vlpds_env.values() | map('string') | select('search', '[\r\n]') | list | length == 0
+    fail_msg: "A vlpds setting contains a line break"
+    quiet: true

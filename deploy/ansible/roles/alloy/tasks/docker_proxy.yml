@@ -1,0 +1,69 @@
+---
+# Read-only, filtered Docker API for Alloy (alloy_docker_socket_proxy):
+# files/docker-proxy-nginx.conf and files/docker-proxy-filter.js.
+
+- name: Create the Docker proxy's system user
+  ansible.builtin.user:
+    name: "{{ alloy_docker_proxy_user }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+  register: _alloy_docker_proxy_user
+
+- name: Look up the docker group
+  ansible.builtin.getent:
+    database: group
+    key: docker
+
+- name: Create the Docker proxy configuration directory
+  ansible.builtin.file:
+    path: "{{ alloy_docker_proxy_config_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Deploy the Docker proxy configuration
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ alloy_docker_proxy_config_dir }}/{{ item.dest }}"
+    mode: "0644"
+  loop:
+    - { src: docker-proxy-nginx.conf, dest: nginx.conf }
+    - { src: docker-proxy-filter.js, dest: docker-proxy-filter.js }
+  register: _alloy_docker_proxy_config
+
+# The proxy creates its socket here (world-writable, as nginx makes unix
+# sockets); the directory is what keeps everyone but the alloy group out.
+- name: Create the Docker proxy socket directory
+  ansible.builtin.file:
+    path: "{{ alloy_docker_proxy_socket_dir }}"
+    state: directory
+    owner: "{{ alloy_docker_proxy_user }}"
+    group: alloy
+    mode: "0750"
+
+- name: Start the Docker proxy container
+  community.docker.docker_container:
+    name: "{{ alloy_docker_proxy_container }}"
+    image: "{{ alloy_docker_proxy_image }}"
+    state: started
+    restart: "{{ _alloy_docker_proxy_config is changed }}"
+    restart_policy: unless-stopped
+    user: "{{ _alloy_docker_proxy_user.uid }}:{{ _alloy_docker_proxy_user.group }}"
+    groups:
+      - "{{ ansible_facts.getent_group.docker[1] }}"
+    # nginx refuses to start on a socket file left by an unclean stop.
+    entrypoint: ["/bin/sh", "-c", "rm -f /sock/docker.sock; exec nginx"]
+    network_mode: none
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opts:
+      - no-new-privileges
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - "{{ alloy_docker_proxy_config_dir }}/nginx.conf:/etc/nginx/nginx.conf:ro"
+      - "{{ alloy_docker_proxy_config_dir }}/docker-proxy-filter.js:/etc/nginx/docker-proxy-filter.js:ro"
+      - "{{ alloy_docker_proxy_socket_dir }}:/sock"
+  when: _alloy_docker_proxy_user.uid is defined

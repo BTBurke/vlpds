@@ -1,0 +1,7 @@
+# {{ ansible_managed }}
+FROM caddy:{{ caddy_cloudflare_base_version }}-builder AS builder
+RUN xcaddy build v{{ caddy_cloudflare_caddy_version }} \
+    --with github.com/caddy-dns/cloudflare@v{{ caddy_cloudflare_module_version }}
+
+FROM caddy:{{ caddy_cloudflare_base_version }}-alpine
+COPY --from=builder /usr/bin/caddy /usr/bin/caddy

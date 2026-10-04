@@ -1,0 +1,245 @@
+---
+# Render and (re)start the node. A restart only happens when the compose
+# file, a secret file or the image changed (or vlpds_force_restart), and it
+# is graceful: compose stops the old container with SIGTERM and waits
+# vlpds_stop_grace_period before starting the new one (same --node-id, so
+# the new process fences its previous incarnation and reclaims its shards).
+
+- name: Create the deployment directory
+  ansible.builtin.file:
+    path: "{{ vlpds_deploy_path }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0750"
+
+# The image runs as vlpds (uid/gid 10001).
+- name: Create the secrets directory
+  ansible.builtin.file:
+    path: "{{ vlpds_secrets_path }}"
+    state: directory
+    owner: "10001"
+    group: "10001"
+    mode: "0500"
+
+- name: Create the disk cache directory
+  ansible.builtin.file:
+    path: "{{ vlpds_cache_dir }}"
+    state: directory
+    owner: "10001"
+    group: "10001"
+    mode: "0750"
+
+# The cache filesystem: its size (what "auto" is a share of: stable across
+# runs, so it never restarts the node by itself), its free space and what
+# the cache already holds (together what the cache can grow into). The
+# nearest existing parent in check mode.
+- name: Measure the cache filesystem
+  ansible.builtin.shell:
+    executable: /bin/bash
+    cmd: |
+      set -euo pipefail
+      d={{ vlpds_cache_dir | quote }}
+      while [ ! -e "$d" ]; do d=$(dirname "$d"); done
+      read -r size avail < <(df --output=size,avail -BM "$d" | tail -n 1 | tr -d M)
+      used=0
+      if [ -d {{ vlpds_cache_dir | quote }} ]; then used=$(du -sm {{ vlpds_cache_dir | quote }} | cut -f1); fi
+      echo "$size $avail $used"
+  register: _vlpds_cache_df
+  changed_when: false
+  check_mode: false
+
+- name: Resolve the disk cache size
+  vars:
+    _fs: "{{ _vlpds_cache_df.stdout.split() | map('int') | list }}"
+  ansible.builtin.set_fact:
+    _vlpds_cache_capacity_mb: "{{ _fs[1] + _fs[2] }}"
+    _vlpds_disk_cache_mb: >-
+      {{ ((_fs[0] * (vlpds_disk_cache_auto_pct | int) / 100 / 1024) | int * 1024)
+         if vlpds_disk_cache_mb | string == 'auto' else vlpds_disk_cache_mb | int }}
+
+# The total the shards can fill: --disk-cache-shard-mb x shards when set
+# (--shards as configured; a reshard changes it), else --disk-cache-mb.
+- name: The cache filesystem has room for the SST disk cache
+  ansible.builtin.assert:
+    that:
+      - >-
+        (_vlpds_cache_capacity_mb | int) >=
+        ((vlpds_disk_cache_shard_mb | int * vlpds_shards | int) if vlpds_disk_cache_shard_mb | string | length > 0 else _vlpds_disk_cache_mb | int)
+        + (vlpds_cache_min_free_gb | int) * 1024
+    fail_msg: >-
+      {{ vlpds_cache_dir }} can hold {{ _vlpds_cache_capacity_mb }} MiB (free + current cache), below the disk cache
+      ({{ (vlpds_disk_cache_shard_mb ~ ' MiB/shard x ' ~ vlpds_shards) if vlpds_disk_cache_shard_mb | string | length > 0 else _vlpds_disk_cache_mb ~ ' MiB' }})
+      + vlpds_cache_min_free_gb={{ vlpds_cache_min_free_gb }} GiB. Lower vlpds_disk_cache_mb.
+    quiet: true
+
+# --- secret files -----------------------------------------------------------
+- name: Write secret files
+  ansible.builtin.copy:
+    dest: "{{ vlpds_secrets_path }}/{{ item.name }}"
+    content: "{{ item.content }}\n"
+    owner: "10001"
+    group: "10001"
+    mode: "0400"
+  loop: >-
+    {{ ([{'name': 'kek', 'content': vlpds_kek_hex}] if vlpds_kek_hex | length > 0 else [])
+       + [{'name': 'plc-rotation.key', 'content': vlpds_plc_rotation_key}]
+       + ([{'name': 'gcp-sa.json', 'content': _vlpds_gcp_credentials | to_json}] if _vlpds_gcp_sa_files else [])
+       + _vlpds_env_secrets_set }}
+  loop_control:
+    label: "{{ item.name }}"
+  register: _vlpds_secret_files
+  no_log: true
+  diff: false
+
+- name: Write retired KEK files (unwrap only)
+  ansible.builtin.copy:
+    dest: "{{ vlpds_secrets_path }}/{{ item.0 }}"
+    content: "{{ item.1 }}\n"
+    owner: "10001"
+    group: "10001"
+    mode: "0400"
+  loop: "{{ _vlpds_kek_old_files | zip(vlpds_kek_old_hex) | list }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  register: _vlpds_kek_old_written
+  no_log: true
+  diff: false
+
+- name: Write retired PLC rotation key files
+  ansible.builtin.copy:
+    dest: "{{ vlpds_secrets_path }}/{{ item.0 }}"
+    content: "{{ item.1 }}\n"
+    owner: "10001"
+    group: "10001"
+    mode: "0400"
+  loop: "{{ _vlpds_plc_old_files | zip(vlpds_plc_rotation_key_old) | list }}"
+  loop_control:
+    label: "{{ item.0 }}"
+  register: _vlpds_plc_old_written
+  no_log: true
+  diff: false
+
+- name: Find secret files
+  ansible.builtin.find:
+    paths: "{{ vlpds_secrets_path }}"
+    file_type: file
+  register: _vlpds_secret_found
+  check_mode: false
+
+# Peer mTLS files (vlpds_cluster_enabled). vlpds re-reads them when they
+# change (60 s poll, or SIGHUP), so a renewal needs no restart.
+- name: Create the peer TLS directory
+  ansible.builtin.file:
+    path: "{{ vlpds_secrets_path }}/peer-tls"
+    state: directory
+    owner: "10001"
+    group: "10001"
+    mode: "0500"
+  when: vlpds_cluster_enabled | bool
+
+- name: Write the peer TLS files
+  ansible.builtin.copy:
+    dest: "{{ vlpds_secrets_path }}/peer-tls/{{ item.name }}"
+    content: "{{ item.content | trim }}\n"
+    owner: "10001"
+    group: "10001"
+    mode: "0400"
+  loop: "{{ _vlpds_peer_tls_files }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: vlpds_cluster_enabled | bool
+  no_log: true
+  diff: false
+
+- name: Remove the peer TLS files of a lone node
+  ansible.builtin.file:
+    path: "{{ vlpds_secrets_path }}/peer-tls"
+    state: absent
+  when: not (vlpds_cluster_enabled | bool)
+
+# A secret dropped from the inventory (or set empty) must not linger on disk.
+- name: Remove secret files no longer configured
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ _vlpds_secret_found.files | map(attribute='path')
+       | reject('in', (_vlpds_kek_files + _vlpds_kek_old_files + _vlpds_plc_old_files + _vlpds_gcp_sa_files + _vlpds_env_secret_files + ['plc-rotation.key'])
+                      | map('regex_replace', '^', vlpds_secrets_path ~ '/') | list)
+       | list }}
+  register: _vlpds_secret_removed
+
+# --- compose ----------------------------------------------------------------
+- name: Create the vlpds docker network
+  community.docker.docker_network:
+    name: "{{ vlpds_docker_network }}"
+    driver: bridge
+    ipam_config:
+      - subnet: "{{ vlpds_docker_subnet }}"
+    state: present
+
+- name: Render docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.yml.j2
+    dest: "{{ vlpds_deploy_path }}/docker-compose.yml"
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0600"
+  register: _vlpds_compose_file
+  diff: false
+
+# The common role logs in already as the same user; this keeps the role
+# usable on its own.
+- name: Log in to the image registry
+  community.docker.docker_login:
+    registry: "{{ vlpds_image.split('/')[0] }}"
+    username: "{{ vlpds_registry_username }}"
+    password: "{{ vlpds_registry_password }}"
+    state: present
+  become: true
+  become_user: "{{ operator_user }}"
+  no_log: true
+  when:
+    - vlpds_registry_username | length > 0
+    - vlpds_registry_password | length > 0
+
+# Check mode can't dry-run compose against a compose file it did not write.
+- name: Note what a check run can show
+  ansible.builtin.set_fact:
+    _vlpds_compose_dry: >-
+      {{ ansible_check_mode and (_vlpds_compose_file is changed
+         or _vlpds_secret_files is changed or _vlpds_secret_removed is changed) }}
+
+- name: "Check mode: vlpds would be (re)started"
+  ansible.builtin.debug:
+    msg: "docker-compose.yml or a secret file would change: vlpds would be pulled and gracefully restarted."
+  when: _vlpds_compose_dry | bool
+
+- name: Pull the image before stopping anything
+  community.docker.docker_compose_v2_pull:
+    project_src: "{{ vlpds_deploy_path }}"
+    policy: missing
+  become: true
+  become_user: "{{ operator_user }}"
+  when: not _vlpds_compose_dry | bool
+
+- name: Bucket pre-flight (vlpds-bucket-probe)
+  ansible.builtin.import_tasks: probe.yml
+  when: vlpds_preflight_probe | bool
+
+- name: Start vlpds (graceful restart when its configuration changed)
+  community.docker.docker_compose_v2:
+    project_src: "{{ vlpds_deploy_path }}"
+    state: present
+    recreate: >-
+      {{ 'always' if (vlpds_force_restart | bool
+                      or _vlpds_secret_files is changed
+                      or _vlpds_kek_old_written is changed
+                      or _vlpds_plc_old_written is changed
+                      or _vlpds_secret_removed is changed)
+         else 'auto' }}
+  become: true
+  become_user: "{{ operator_user }}"
+  register: _vlpds_up
+  when: not _vlpds_compose_dry | bool

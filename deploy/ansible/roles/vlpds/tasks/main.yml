@@ -1,0 +1,31 @@
+---
+# One vlpds node under docker compose. Order: refuse bad config, prepare the
+# host, render + start the node (graceful restart only when something
+# changed), expose the console and the peer port on the tailnet, verify.
+
+- name: Validate configuration
+  ansible.builtin.import_tasks: assert.yml
+  tags: [vlpds, vlpds-assert]
+
+- name: Prepare the host
+  ansible.builtin.import_tasks: host.yml
+  when: vlpds_manage_host | bool
+  tags: [vlpds, vlpds-host]
+
+- name: Deploy the node
+  ansible.builtin.import_tasks: deploy.yml
+  tags: [vlpds, vlpds-deploy]
+
+- name: Operator console on the tailnet
+  ansible.builtin.import_tasks: console.yml
+  when: vlpds_tailnet_console_port | int > 0
+  tags: [vlpds, vlpds-console]
+
+- name: Peer port on the tailnet
+  ansible.builtin.import_tasks: peer.yml
+  when: vlpds_cluster_enabled | bool
+  tags: [vlpds, vlpds-peer]
+
+- name: Verify the node
+  ansible.builtin.import_tasks: verify.yml
+  tags: [vlpds, vlpds-verify]

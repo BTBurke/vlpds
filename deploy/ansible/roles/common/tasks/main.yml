@@ -1,0 +1,291 @@
+---
+# Main tasks for common role
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Install common packages
+  ansible.builtin.apt:
+    name: "{{ common_packages }}"
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Ensure locale is generated
+  community.general.locale_gen:
+    name: "{{ system_locale }}"
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Set system locale
+  ansible.builtin.copy:
+    dest: /etc/default/locale
+    content: |
+      LANG={{ system_locale }}
+      LC_ALL={{ system_locale }}
+    mode: "0644"
+  when: ansible_facts["os_family"] == "Debian"
+
+# The operator account (also run alone by playbooks/bootstrap.yml).
+- name: Operator account
+  ansible.builtin.import_tasks: users.yml
+
+- name: Remove additional SSH config files that might override settings
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/ssh/sshd_config.d/50-cloud-init.conf
+    - /etc/ssh/sshd_config.d/60-cloudimg-settings.conf
+  notify: Restart ssh
+
+- name: Configure SSH - disable password authentication
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PasswordAuthentication"
+    line: "PasswordAuthentication {{ ssh_password_authentication }}"
+    state: present
+  notify: Restart ssh
+
+- name: Configure SSH - disable root login
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PermitRootLogin"
+    line: "PermitRootLogin {{ ssh_permit_root_login }}"
+    state: present
+  notify: Restart ssh
+
+- name: Configure SSH - enable pubkey authentication
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: "^#?PubkeyAuthentication"
+    line: "PubkeyAuthentication {{ ssh_pubkey_authentication }}"
+    state: present
+  notify: Restart ssh
+
+# Host hardening, each part behind its common_* switch. Each file is also
+# run on its own by playbooks/bootstrap.yml.
+- name: Harden sshd
+  ansible.builtin.import_tasks: ssh_hardening.yml
+  when: common_ssh_hardening_enabled | bool
+
+- name: Lock console passwords
+  ansible.builtin.import_tasks: lock_passwords.yml
+  when: common_lock_password_users | length > 0
+
+- name: Firewall
+  ansible.builtin.import_tasks: firewall.yml
+  when: common_firewall_enabled | bool
+
+- name: Fail2ban
+  ansible.builtin.import_tasks: fail2ban.yml
+  when: common_fail2ban_enabled | bool
+
+- name: Unattended security upgrades
+  ansible.builtin.import_tasks: unattended_upgrades.yml
+  when: common_unattended_upgrades_enabled | bool
+
+- name: Set hostname
+  ansible.builtin.hostname:
+    name: "{{ inventory_hostname }}"
+
+- name: Update /etc/hosts with hostname
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "^127\\.0\\.1\\.1"
+    line: "127.0.1.1 {{ inventory_hostname }} {{ inventory_hostname_short }}"
+    state: present
+
+- name: Install Docker dependencies
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Create keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Download Docker GPG key
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/{{ ansible_facts["distribution"] | lower }}/gpg
+    dest: /etc/apt/keyrings/docker.asc
+    mode: "0644"
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Add Docker repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [arch={{ {'x86_64': 'amd64', 'aarch64': 'arm64'}[ansible_facts['architecture']] | default(ansible_facts['architecture']) }}
+      signed-by=/etc/apt/keyrings/docker.asc]
+      https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }} {{ common_docker_apt_release }} stable
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+# Written before the installs below so a bumped pin is the apt candidate.
+- name: Pin Docker and Tailscale package versions
+  ansible.builtin.template:
+    src: apt-pins.j2
+    dest: /etc/apt/preferences.d/common-pins
+    mode: "0644"
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Install Docker
+  ansible.builtin.apt:
+    name:
+      - "docker-ce{{ ('=' ~ common_docker_version ~ '~*') if common_docker_version else '' }}"
+      - "docker-ce-cli{{ ('=' ~ common_docker_version ~ '~*') if common_docker_version else '' }}"
+      - "containerd.io{{ ('=' ~ common_containerd_version ~ '~*') if common_containerd_version else '' }}"
+      - "docker-compose-plugin{{ ('=' ~ common_docker_compose_version ~ '~*') if common_docker_compose_version else '' }}"
+      - "docker-buildx-plugin{{ ('=' ~ common_docker_buildx_version ~ '~*') if common_docker_buildx_version else '' }}"
+    state: present
+    update_cache: true
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Install Python Docker library
+  ansible.builtin.apt:
+    name:
+      - python3-docker
+      - python3-requests
+    state: present
+  when: ansible_facts["os_family"] == "Debian"
+
+- name: Ensure Docker service is started and enabled
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
+
+- name: Add users to docker group
+  ansible.builtin.user:
+    name: "{{ item }}"
+    groups: docker
+    append: true
+  loop: "{{ docker_users }}"
+  register: _common_docker_group
+
+# Tasks with become_user: <operator_user> run in the SSH login itself (no sudo
+# when the login user is the become user), whose groups predate the line
+# above: log in again so the docker group applies on a fresh host.
+- name: Log in again for the new docker group # noqa: no-handler
+  ansible.builtin.meta: reset_connection
+  when: _common_docker_group is changed
+
+- name: Create Docker daemon configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: "0755"
+
+- name: Configure Docker daemon logging
+  ansible.builtin.template:
+    src: daemon.json.j2
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+  notify: Restart docker
+
+- name: Configure syslog rotation
+  ansible.builtin.template:
+    src: rsyslog-logrotate.j2
+    dest: /etc/logrotate.d/rsyslog
+    mode: "0644"
+
+- name: Install Tailscale GPG key
+  ansible.builtin.get_url:
+    url: https://pkgs.tailscale.com/stable/{{ ansible_facts["distribution"] | lower }}/{{ common_tailscale_apt_release }}.noarmor.gpg
+    dest: /usr/share/keyrings/tailscale-archive-keyring.gpg
+    mode: "0644"
+  when:
+    - ansible_facts["os_family"] == "Debian"
+    - tailscale_enabled | default(false)
+
+- name: Add Tailscale repository
+  ansible.builtin.apt_repository:
+    repo: >-
+      deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg]
+      https://pkgs.tailscale.com/stable/{{ ansible_facts['distribution'] | lower }} {{ common_tailscale_apt_release }} main
+    state: present
+  when:
+    - ansible_facts["os_family"] == "Debian"
+    - tailscale_enabled | default(false)
+
+- name: Install Tailscale
+  ansible.builtin.apt:
+    name: "tailscale{{ ('=' ~ common_tailscale_version) if common_tailscale_version else '' }}"
+    state: present
+    update_cache: true
+  when:
+    - ansible_facts["os_family"] == "Debian"
+    - tailscale_enabled | default(false)
+
+- name: Check if Tailscale is already authenticated
+  ansible.builtin.command: tailscale status --json
+  register: _common_tailscale_status
+  changed_when: false
+  failed_when: false
+  # read-only; in check mode a skipped result has no rc for the next task
+  check_mode: false
+  when: tailscale_enabled | default(false)
+
+- name: Authenticate Tailscale
+  ansible.builtin.command: >-
+    tailscale up --auth-key={{ tailscale_auth_key }}
+    --hostname={{ tailscale_hostname | default(inventory_hostname) }}
+    {{ tailscale_extra_args | default('') }}
+  changed_when: true
+  when:
+    - tailscale_enabled | default(false)
+    - tailscale_auth_key | default('') | length > 0
+    - _common_tailscale_status.rc != 0 or (_common_tailscale_status.stdout | from_json).BackendState != "Running"
+  # the command line holds the auth key
+  no_log: true
+
+- name: Configure Tailscale environment variables
+  ansible.builtin.lineinfile:
+    path: /etc/default/tailscaled
+    regexp: "^{{ item.key }}="
+    line: "{{ item.key }}={{ item.value }}"
+    create: true
+    mode: "0644"
+  loop: "{{ tailscale_env_vars | dict2items }}"
+  when:
+    - tailscale_enabled | default(false)
+    - tailscale_env_vars is defined
+    - tailscale_env_vars | length > 0
+  notify: Restart tailscaled
+
+- name: Enable and start Tailscale service
+  ansible.builtin.service:
+    name: tailscaled
+    state: started
+    enabled: true
+  when: tailscale_enabled | default(false)
+
+# `tailscale up --ssh` only applies at first login: keep Tailscale SSH (which
+# bypasses sshd and its AllowUsers; the tailnet ACLs decide who gets in) in
+# line with common_tailscale_ssh on hosts that are already up.
+- name: Read Tailscale's preferences
+  ansible.builtin.command: tailscale debug prefs
+  register: _common_tailscale_prefs
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  when: tailscale_enabled | default(false)
+
+- name: Tailscale SSH follows common_tailscale_ssh
+  ansible.builtin.command: "tailscale set --ssh={{ 'true' if common_tailscale_ssh | bool else 'false' }}"
+  changed_when: true
+  when:
+    - tailscale_enabled | default(false)
+    - _common_tailscale_prefs.rc | default(1) == 0
+    - ((_common_tailscale_prefs.stdout | from_json).RunSSH | default(false) | bool) != (common_tailscale_ssh | bool)

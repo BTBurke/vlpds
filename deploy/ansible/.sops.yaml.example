@@ -1,0 +1,7 @@
+# Copy to .sops.yaml: sops then encrypts every *.sops.yaml under inventories/
+# to these recipients. `age-keygen -o ~/.config/sops/age/keys.txt` makes a key;
+# put its public half here (and a second, offline one for recovery).
+creation_rules:
+  - path_regex: inventories/.*\.sops\.ya?ml$
+    age: >-
+      age1replacewithyourpublickey

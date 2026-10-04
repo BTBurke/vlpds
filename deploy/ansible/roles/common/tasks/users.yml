@@ -1,0 +1,37 @@
+---
+# The operator account: login user with the inventory's SSH keys and
+# passwordless sudo. Imported by tasks/main.yml; playbooks/bootstrap.yml runs
+# it alone (tasks_from: users) over the image's password login.
+
+- name: Create the operator user
+  ansible.builtin.user:
+    name: "{{ operator_user }}"
+    shell: "{{ operator_shell }}"
+    groups: sudo
+    append: true
+    create_home: true
+    state: present
+
+- name: Set up authorized keys for the operator
+  ansible.posix.authorized_key:
+    user: "{{ operator_user }}"
+    state: present
+    key: "{{ item }}"
+  loop: "{{ operator_ssh_keys }}"
+  when: operator_ssh_keys | length > 0
+
+- name: Remove retired authorized keys for the operator
+  ansible.posix.authorized_key:
+    user: "{{ operator_user }}"
+    state: absent
+    key: "{{ item }}"
+  loop: "{{ operator_ssh_keys_absent | default([]) }}"
+
+- name: Allow the operator passwordless sudo
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers.d/{{ operator_user }}
+    state: present
+    create: true
+    mode: "0440"
+    line: "{{ operator_user }} ALL=(ALL) NOPASSWD:ALL"
+    validate: "/usr/sbin/visudo -cf %s"

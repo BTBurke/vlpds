@@ -1,0 +1,439 @@
+---
+# Generated from defaults/main.yml (types and descriptions); keep in step
+# with it. Validated at role start: a wrong type fails before any change.
+argument_specs:
+  main:
+    short_description: One vlpds node under docker compose, with host prep, the tailnet console and (clustered) the peer port.
+    description:
+      - One vlpds node under docker compose, with host prep, the tailnet console and (clustered) the peer port.
+      - Every option's default and meaning are in defaults/main.yml; this spec checks types at role start.
+    options:
+      operator_user:
+        description: See defaults/main.yml (operator_user).
+        type: str
+      vlpds_profile:
+        description: "tiny:     a personal PDS (a few accounts) on a small shared VM, e.g. 4 vCPU / 7 GB. 1 shard and a 60 s lease keep the idle object-store request rate (and bill) minimal; small caches. standard: the production defaults for a 6-8 core / 32 GB / NVMe node (DESIGN.md \"Initial deployment sizing\"): 64 shards, 10 s lease, caches sized from host RAM."
+        type: str
+        choices:
+          - tiny
+          - standard
+      vlpds_image:
+        description: "Built and pushed with `just docker-push <tag>` at the repo root (not by ansible). Pin a tag; never :latest (a restart must not change the build)."
+        type: str
+      vlpds_registry_username:
+        description: "Registry login for a private image (empty: the image is public)."
+        type: str
+      vlpds_registry_password:
+        description: See defaults/main.yml (vlpds_registry_password).
+        type: str
+      vlpds_deploy_path:
+        description: See defaults/main.yml (vlpds_deploy_path).
+        type: str
+      vlpds_secrets_path:
+        description: See defaults/main.yml (vlpds_secrets_path).
+        type: str
+      vlpds_cache_dir:
+        description: SlateDB SST disk cache (+ the exit-state file). Local NVMe for standard (the hot part of ~hundreds of GB of state); the root disk is fine for tiny.
+        type: str
+      vlpds_disk_cache_mb:
+        description: "--disk-cache-mb: the node's total SST disk cache (MiB), split evenly across every shard of the layout (floor 64 MiB per shard), so it holds even when this node owns all of them. \"auto\" = vlpds_disk_cache_auto_pct percent of the cache filesystem's size, measured at deploy: meant for a dedicated cache disk (the deploy refuses when the cache would not fit in free space + what it already holds). tiny: 4 GiB on the shared root disk"
+        type: raw
+      vlpds_disk_cache_auto_pct:
+        description: See defaults/main.yml (vlpds_disk_cache_auto_pct).
+        type: int
+      vlpds_disk_cache_shard_mb:
+        description: "--disk-cache-shard-mb: a per-shard cap instead (wins over the total; for a disk sized for the failover case). Empty = derive from the total."
+        type: str
+      vlpds_cache_min_free_gb:
+        description: "Space (GiB) the cache filesystem must keep free beyond the full disk cache, checked at deploy: the tiny root disk also holds the OS, Docker images and logs (and the reference PDS during a migration)."
+        type: raw
+      vlpds_cache_device:
+        description: "Optional: format + mount a dedicated NVMe device at the cache dir's parent. Leave empty when it is already mounted (or for the root disk). Only an unformatted device is formatted (filesystem module, force: false)."
+        type: str
+      vlpds_cache_mountpoint:
+        description: See defaults/main.yml (vlpds_cache_mountpoint).
+        type: str
+      vlpds_cache_fstype:
+        description: See defaults/main.yml (vlpds_cache_fstype).
+        type: str
+      vlpds_host_port:
+        description: Host ports (bound to 127.0.0.1 only; Caddy and Alloy are local).
+        type: int
+      vlpds_metrics_host_port:
+        description: See defaults/main.yml (vlpds_metrics_host_port).
+        type: int
+      vlpds_docker_network:
+        description: "Docker network shared with a role-managed Caddy. Fixed subnet: it is what --trusted-proxies trusts (Caddy's address on it, or its gateway when a host-network Caddy reaches the published port)."
+        type: str
+      vlpds_docker_subnet:
+        description: See defaults/main.yml (vlpds_docker_subnet).
+        type: str
+      vlpds_mem_limit_mb:
+        description: Container memory limit (MiB). The node sizes its default cache budget from it and exports it as vlpds_memory_limit_bytes (VlpdsMemoryHigh).
+        type: raw
+      vlpds_nofile_limit:
+        description: See defaults/main.yml (vlpds_nofile_limit).
+        type: int
+      vlpds_stop_grace_period:
+        description: "Graceful stop: SIGTERM, then this long before SIGKILL. RUNBOOK \"Rolling deploy\": the close barrier may wait 30 s and the log quiesce 10 s, so at least 60 s; a timeout into SIGKILL is a crash (replay on restart)."
+        type: str
+      vlpds_rust_log:
+        description: See defaults/main.yml (vlpds_rust_log).
+        type: str
+      vlpds_log_format:
+        description: "--log-format: json = one object per line on stderr (Alloy's docker log pipeline extracts `level`); text for reading `docker logs` by eye."
+        type: str
+        choices:
+          - json
+          - text
+      vlpds_log_max_size:
+        description: See defaults/main.yml (vlpds_log_max_size).
+        type: str
+      vlpds_log_max_file:
+        description: See defaults/main.yml (vlpds_log_max_file).
+        type: str
+      vlpds_hostname:
+        description: Public hostname (no scheme). Required.
+        type: str
+      vlpds_public_url:
+        description: See defaults/main.yml (vlpds_public_url).
+        type: str
+      vlpds_service_did:
+        description: "did:web:<hostname>: vlpds serves its document at /.well-known/did.json (Caddy passes it through), and the Bluesky app's video upload asks for service auth with aud did:web:<pds host>. The role refuses anything else unless vlpds_allow_other_service_did."
+        type: str
+      vlpds_allow_other_service_did:
+        description: See defaults/main.yml (vlpds_allow_other_service_did).
+        type: bool
+      vlpds_handle_domain:
+        description: Handles <name>.<handle domain> (no leading dot). Usually the hostname.
+        type: str
+      vlpds_node_id:
+        description: Stable across restarts and upgrades (a restarted node reclaims its shards at once). Never run two processes with the same id.
+        type: str
+      vlpds_cluster_enabled:
+        description: "Off: a lone node (no --peer-listen / --peer-tls-dir / --advertise-url: no peer listener, no /internal/*, no peer calls). On: the node joins every other node on the same bucket + prefix. Turning it on changes the node's flags (a graceful restart); every node needs the same jwt/admin/internal tokens, KEK (or KMS key) and PLC rotation key, and its own node id. Procedure: README \"Clustering\"."
+        type: bool
+      vlpds_peer_port:
+        description: "Peers reach each other over the tailnet: `tailscale serve` forwards TCP <tailnet address>:vlpds_peer_port to the node's loopback-published peer port (vlpds_peer_host_port), so the peer port is never on a public interface and Docker's port publishing needs no tailnet address at boot. The tailnet policy must let the nodes reach each other on this port."
+        type: int
+      vlpds_peer_host_port:
+        description: See defaults/main.yml (vlpds_peer_host_port).
+        type: int
+      vlpds_peer_host:
+        description: "The address in this node's --advertise-url and its peer certificate (an IP, or a DNS name the containers can resolve): its tailnet IPv4."
+        type: str
+      vlpds_peer_tls_ca_cert:
+        description: "Peer mTLS (README \"Clustering\"): the cluster CA certificate (public; the CA key stays offline), and this node's certificate and key from `vlpds admin tls issue --node-id <vlpds_node_id> --host <vlpds_peer_host>` (the key is a secret). Written to <secrets>/peer-tls/; vlpds re-reads them when they change (renewal needs no restart)."
+        type: str
+      vlpds_peer_tls_cert:
+        description: See defaults/main.yml (vlpds_peer_tls_cert).
+        type: str
+      vlpds_peer_tls_key:
+        description: See defaults/main.yml (vlpds_peer_tls_key).
+        type: str
+      vlpds_s3_endpoint:
+        description: "Needs strongly consistent conditional writes (If-None-Match: * and If-Match on ETags): AWS S3, GCS (S3 interop + HMAC keys), R2. Check a new bucket with vlpds_preflight_probe. Path-style endpoints: S3   https://s3.<region>.amazonaws.com                 region <region> R2   https://<account>.r2.cloudflarestorage.com         region auto GCS  https://storage.googleapis.com                     region auto"
+        type: str
+      vlpds_s3_region:
+        description: See defaults/main.yml (vlpds_s3_region).
+        type: raw
+      vlpds_s3_bucket:
+        description: See defaults/main.yml (vlpds_s3_bucket).
+        type: str
+      vlpds_s3_access_key:
+        description: See defaults/main.yml (vlpds_s3_access_key).
+        type: str
+      vlpds_s3_secret_key:
+        description: See defaults/main.yml (vlpds_s3_secret_key).
+        type: str
+      vlpds_s3_prefix:
+        description: One prefix = one PDS. Never point two deployments at the same prefix.
+        type: str
+      vlpds_preflight_probe:
+        description: "Run vlpds-bucket-probe (from the image) before (re)starting the node: conditional-write correctness + latency, under a throwaway vlpds-probe/<random>/ prefix it deletes afterwards. Off by default: it writes to the bucket (a few thousand requests)."
+        type: bool
+      vlpds_preflight_probe_args:
+        description: See defaults/main.yml (vlpds_preflight_probe_args).
+        type: list
+        elements: str
+      vlpds_allow_http_s3:
+        description: See defaults/main.yml (vlpds_allow_http_s3).
+        type: bool
+      vlpds_jwt_secret:
+        description: '>= 32 bytes each, all three different.'
+        type: str
+      vlpds_admin_token:
+        description: See defaults/main.yml (vlpds_admin_token).
+        type: str
+      vlpds_internal_token:
+        description: See defaults/main.yml (vlpds_internal_token).
+        type: str
+      vlpds_kek_hex:
+        description: "Key-encryption key for signing keys / TOTP secrets at rest: 32 random bytes as 64 hex chars (`openssl rand -hex 32`), written to a 0400 file. Or a Cloud KMS key; with both, the local KEK is unwrap-only."
+        type: str
+      vlpds_kek_old_hex:
+        description: See defaults/main.yml (vlpds_kek_old_hex).
+        type: list
+        elements: str
+      vlpds_gcp_kms_key:
+        description: See defaults/main.yml (vlpds_gcp_kms_key).
+        type: str
+      vlpds_gcp_kms_old_keys:
+        description: See defaults/main.yml (vlpds_gcp_kms_old_keys).
+        type: list
+        elements: str
+      vlpds_gcp_credentials_json:
+        description: "Cloud KMS credentials off GCE: a service-account JSON key (holding only roles/cloudkms.cryptoKeyEncrypterDecrypter on the key), as a string or a mapping. Written to <secrets>/gcp-sa.json (0400, uid 10001) and passed as --gcp-credentials-file. Empty = the GCE metadata server."
+        type: raw
+      vlpds_plc_rotation_key:
+        description: "The server PLC rotation key file contents: `vw1.` (wrapped under the KEK by `vlpds --wrap-plc-rotation-key`) or 64 hex chars. Required."
+        type: str
+      vlpds_plc_rotation_key_old:
+        description: See defaults/main.yml (vlpds_plc_rotation_key_old).
+        type: list
+        elements: str
+      vlpds_plc_recovery_did_key:
+        description: See defaults/main.yml (vlpds_plc_recovery_did_key).
+        type: str
+      vlpds_plc_url:
+        description: See defaults/main.yml (vlpds_plc_url).
+        type: str
+      vlpds_rate_limit_bypass_key:
+        description: See defaults/main.yml (vlpds_rate_limit_bypass_key).
+        type: str
+      vlpds_shards:
+        description: --shards only applies when the prefix is created; later the layout stored in the prefix wins (split/merge online).
+        type: raw
+      vlpds_lease_ttl_ms:
+        description: ">= 10 s in production. One node has no peer takeover to speed up, so tiny uses 60 s: renewals (one CAS PUT) every 12 s instead of 2 s."
+        type: raw
+      vlpds_slatedb_manifest_poll:
+        description: "Trade-off: after a crash (not a graceful restart) the node waits about one TTL before it writes again (its predecessor's published wm_cap), so tiny's 60 s TTL means ~53 s of write downtime after a crash (measured; 0.8 s after SIGTERM). bench/results/tiny-pds-idle-2026-10-02. SlateDB manifest poll: each node is the only writer of its shards, so a slower poll only delays picking up compaction results. 60 s cuts tiny's idle"
+        type: str
+      vlpds_log_retention:
+        description: See defaults/main.yml (vlpds_log_retention).
+        type: str
+      vlpds_listen_backlog:
+        description: See defaults/main.yml (vlpds_listen_backlog).
+        type: int
+      vlpds_memory_budget_mb:
+        description: "The node sizes its caches from its memory budget (vlpds_mem_limit_mb, the container limit it reads from its cgroup; src/memory.rs): the fixed costs below (rings, backfill, exports, in-memory caches at 10%) and 15% headroom come off the top, the SST metadata cache gets what the owned SSTs' filters and indexes need (with failover headroom), and the SST block and repo caches split the rest evenly, resized as shards move."
+        type: str
+      vlpds_repo_cache_mb:
+        description: See defaults/main.yml (vlpds_repo_cache_mb).
+        type: str
+      vlpds_block_cache_mb:
+        description: See defaults/main.yml (vlpds_block_cache_mb).
+        type: str
+      vlpds_meta_cache_mb:
+        description: See defaults/main.yml (vlpds_meta_cache_mb).
+        type: str
+      vlpds_cache_budget_mb:
+        description: See defaults/main.yml (vlpds_cache_budget_mb).
+        type: str
+      vlpds_max_exports:
+        description: "Fixed costs the budget reserves at their worst case: getRepo exports streaming at once (~8 MiB each + their M/ read-ahead pool, 16 MiB a slot up to 512) and cursor backfills at once (vlpds_backfill_readahead_mb each)."
+        type: raw
+      vlpds_firehose_max_backfills:
+        description: See defaults/main.yml (vlpds_firehose_max_backfills).
+        type: raw
+      vlpds_lazy_mst_node_cache_mb:
+        description: See defaults/main.yml (vlpds_lazy_mst_node_cache_mb).
+        type: raw
+      vlpds_firehose_ring_mb:
+        description: See defaults/main.yml (vlpds_firehose_ring_mb).
+        type: raw
+      vlpds_firehose_merge_queue_mb:
+        description: See defaults/main.yml (vlpds_firehose_merge_queue_mb).
+        type: raw
+      vlpds_firehose_max_lag_mb:
+        description: See defaults/main.yml (vlpds_firehose_max_lag_mb).
+        type: raw
+      vlpds_live_ring_mb:
+        description: See defaults/main.yml (vlpds_live_ring_mb).
+        type: raw
+      vlpds_backfill_readahead_mb:
+        description: See defaults/main.yml (vlpds_backfill_readahead_mb).
+        type: raw
+      vlpds_backfill_cache_mb:
+        description: See defaults/main.yml (vlpds_backfill_cache_mb).
+        type: raw
+      vlpds_firehose_threads:
+        description: See defaults/main.yml (vlpds_firehose_threads).
+        type: raw
+      vlpds_io_threads:
+        description: Empty = vlpds' defaults (io threads = cores, workers = cores / 2).
+        type: str
+      vlpds_workers:
+        description: See defaults/main.yml (vlpds_workers).
+        type: str
+      vlpds_appview:
+        description: '"<url>,<service did>" as the reference PDS''s PDS_BSKY_APP_VIEW_* / PDS_REPORT_SERVICE_*.'
+        type: str
+      vlpds_report_service:
+        description: See defaults/main.yml (vlpds_report_service).
+        type: str
+      vlpds_appview_cdn_url_pattern:
+        description: See defaults/main.yml (vlpds_appview_cdn_url_pattern).
+        type: str
+      vlpds_crawlers:
+        description: Relays asked to crawl (requestCrawl at startup and after new activity, at most once per 20 min per relay, from one node). The console's Relays page stores a list in the bucket that overrides this one until reset; [] = none.
+        type: list
+        elements: str
+      vlpds_mod_service_did:
+        description: The Ozone DID allowed to call the moderator admin methods with a service JWT. Empty = admin Basic auth only (as the reference installer).
+        type: str
+      vlpds_resolve_lexicons:
+        description: See defaults/main.yml (vlpds_resolve_lexicons).
+        type: bool
+      vlpds_email_required:
+        description: Email. Required in production (verification, password reset, 2FA codes) unless vlpds_email_required is false (mail is then only logged).
+        type: bool
+      vlpds_email_smtp_url:
+        description: "smtps://user:pass@host:465 or smtp://...:587 (secret)"
+        type: str
+      vlpds_email_from_address:
+        description: '"Name <addr@host>"'
+        type: str
+      vlpds_moderation_email_smtp_url:
+        description: secret; empty = the main mailer
+        type: str
+      vlpds_moderation_email_address:
+        description: See defaults/main.yml (vlpds_moderation_email_address).
+        type: str
+      vlpds_email_brand_name:
+        description: default "{hostname} PDS"
+        type: str
+      vlpds_email_home_url:
+        description: See defaults/main.yml (vlpds_email_home_url).
+        type: str
+      vlpds_email_logo_url:
+        description: See defaults/main.yml (vlpds_email_logo_url).
+        type: str
+      vlpds_email_primary_color:
+        description: See defaults/main.yml (vlpds_email_primary_color).
+        type: str
+      vlpds_email_disable_confirmation_link:
+        description: See defaults/main.yml (vlpds_email_disable_confirmation_link).
+        type: bool
+      vlpds_mail_daily_budget:
+        description: Account mails per UTC day for the whole cluster (mail-cluster-day); keep it under the mail provider's daily quota. Empty = the flag default (900).
+        type: str
+      vlpds_privacy_policy_url:
+        description: See defaults/main.yml (vlpds_privacy_policy_url).
+        type: str
+      vlpds_terms_of_service_url:
+        description: See defaults/main.yml (vlpds_terms_of_service_url).
+        type: str
+      vlpds_contact_email_address:
+        description: See defaults/main.yml (vlpds_contact_email_address).
+        type: str
+      vlpds_invite_required:
+        description: Sign-ups
+        type: bool
+      vlpds_invite_interval_ms:
+        description: earned invites; empty = none
+        type: str
+      vlpds_invite_epoch_ms:
+        description: See defaults/main.yml (vlpds_invite_epoch_ms).
+        type: str
+      vlpds_max_blob_mb:
+        description: See defaults/main.yml (vlpds_max_blob_mb).
+        type: int
+      vlpds_rate_limits:
+        description: "Rate limits (reference limits, keyed on the client IP from X-Forwarded-For when the peer is a trusted proxy: Caddy)."
+        type: bool
+      vlpds_trusted_proxies:
+        description: See defaults/main.yml (vlpds_trusted_proxies).
+        type: list
+      vlpds_pyroscope_url:
+        description: "Continuous CPU profiles to Pyroscope (needs an image built with features=profiling). Alloy's pyroscope.receive_http on the host: http://host.docker.internal:4100"
+        type: str
+      vlpds_extra_env:
+        description: Extra VLPDS_* env vars / flags, for anything not covered above.
+        type: dict
+      vlpds_extra_args:
+        description: See defaults/main.yml (vlpds_extra_args).
+        type: list
+        elements: str
+      vlpds_acme_email:
+        description: "This repo's roles/caddy runs Caddy (playbooks/vlpds.yml): a certificate for the hostname, and on-demand or wildcard (vlpds_caddy_wildcard_dns) certificates for *.<handle domain>."
+        type: str
+      vlpds_caddy_wildcard_dns:
+        description: "How *.<handle domain> gets its certificate. \"\":         one on-demand certificate per handle, on its first request (Let's Encrypt allows ~50 new certificates/week per registered domain, and issuance holds that first request a few seconds). cloudflare: one wildcard certificate by ACME DNS-01 through Cloudflare (roles/caddy builds Caddy with caddy-dns/cloudflare). Each"
+        type: str
+        choices:
+          - ""
+          - cloudflare
+      vlpds_cloudflare_dns_token:
+        description: "cloudflare: an API token with Zone:Zone:Read + Zone:DNS:Edit on the handle domain's zone only (a secret). Caddy gets it as the env var CF_API_TOKEN."
+        type: str
+      vlpds_caddy_dns_resolvers:
+        description: "cloudflare: where Caddy finds the zone and checks the challenge record."
+        type: list
+        elements: str
+      vlpds_caddy_hostname_dns01:
+        description: "cloudflare: also get the hostname's certificate by DNS-01 (instead of HTTP-01/TLS-ALPN, which need the hostname's DNS to point at this node): lets a node hold a certificate before DNS sends it traffic (a new node joining the cluster, DNS moving between nodes)."
+        type: bool
+      vlpds_caddy_blocked_paths:
+        description: "Requests Caddy refuses outright (node-to-node, metrics, operator-only). Operators reach /admin and vlpds.admin.* over SSH: ssh -L 2583:127.0.0.1:2583 <host> or, with vlpds_tailnet_console_port, at https://<tailnet name>:<port>/admin."
+        type: list
+        elements: str
+      vlpds_tailnet_console_port:
+        description: "Body caps, in binary units like vlpds' own (Caddy reads MB/GB as powers of 10, so 1GB would refuse imports vlpds accepts). Everything but importRepo: blobs, vlpds_max_blob_mb MiB + 5 MiB slack (MiB, as --max-blob-mb). importRepo: vlpds' own cap is 1 GiB (src/xrpc/repo.rs MAX_IMPORT_BYTES); Caddy allows 64 MiB more so vlpds, not Caddy, answers an oversized CAR. `tailscale serve` port for the operator console (tailnet only; 0 = off)."
+        type: int
+      vlpds_caddy_max_body_mb:
+        description: See defaults/main.yml (vlpds_caddy_max_body_mb).
+        type: raw
+      vlpds_caddy_import_max_body:
+        description: See defaults/main.yml (vlpds_caddy_import_max_body).
+        type: str
+      vlpds_caddy_trusted_proxies:
+        description: Upstream proxies in front of Caddy whose X-Forwarded-For Caddy may trust (e.g. Cloudflare ranges). Empty = Caddy sets X-Forwarded-For to the peer.
+        type: list
+        elements: str
+      vlpds_caddy_extra_global_options:
+        description: "Extra lines for Caddy's global options block, e.g. `acme_ca https://acme-staging-v02.api.letsencrypt.org/directory` for a trial run, or `local_certs` for a test host."
+        type: str
+      vlpds_manage_host:
+        description: See defaults/main.yml (vlpds_manage_host).
+        type: bool
+      vlpds_manage_firewall:
+        description: See defaults/main.yml (vlpds_manage_firewall).
+        type: bool
+      vlpds_ssh_port:
+        description: See defaults/main.yml (vlpds_ssh_port).
+        type: raw
+      vlpds_firewall_trusted_interfaces:
+        description: See defaults/main.yml (vlpds_firewall_trusted_interfaces).
+        type: list
+        elements: str
+      vlpds_manage_chrony:
+        description: See defaults/main.yml (vlpds_manage_chrony).
+        type: bool
+      vlpds_chrony_servers:
+        description: empty = Ubuntu's NTP pools
+        type: list
+        elements: str
+      vlpds_chrony_pools:
+        description: See defaults/main.yml (vlpds_chrony_pools).
+        type: list
+        elements: str
+      vlpds_manage_unattended_upgrades:
+        description: See defaults/main.yml (vlpds_manage_unattended_upgrades).
+        type: bool
+      vlpds_sysctls:
+        description: See defaults/main.yml (vlpds_sysctls).
+        type: dict
+      vlpds_force_restart:
+        description: Force a graceful restart even when nothing changed (-e vlpds_force_restart=true).
+        type: bool
+      vlpds_health_retries:
+        description: See defaults/main.yml (vlpds_health_retries).
+        type: int
+      vlpds_health_delay:
+        description: See defaults/main.yml (vlpds_health_delay).
+        type: int
+      vlpds_verify_cluster:
+        description: "After start: getClusterStatus must show a valid lease and every shard owned."
+        type: bool

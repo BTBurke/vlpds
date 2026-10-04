@@ -1,0 +1,93 @@
+---
+# After a (re)start: liveness, then the cluster view RUNBOOK "Rolling deploy"
+# step 4 asks for (valid lease, every shard owned, the expected build, how
+# the previous process ended).
+
+- name: Wait for /xrpc/_health
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_host_port }}/xrpc/_health"
+    status_code: 200
+    return_content: true
+  register: _vlpds_health
+  until: _vlpds_health.status == 200
+  retries: "{{ vlpds_health_retries }}"
+  delay: "{{ vlpds_health_delay }}"
+  when: not ansible_check_mode
+
+- name: Read the cluster status
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_host_port }}/xrpc/vlpds.admin.getClusterStatus"
+    url_username: admin
+    url_password: "{{ vlpds_admin_token }}"
+    force_basic_auth: true
+    status_code: 200
+    return_content: true
+  register: _vlpds_status
+  # shards open (and replay) after the listener is up
+  until: >-
+    _vlpds_status.status == 200
+    and _vlpds_status.json.leaseValid | default(false)
+    and (_vlpds_status.json.table | default([None]) | select('none') | list | length == 0)
+  retries: "{{ vlpds_health_retries }}"
+  delay: "{{ vlpds_health_delay }}"
+  no_log: true
+  when:
+    - vlpds_verify_cluster | bool
+    - not ansible_check_mode
+
+# What Caddy depends on: its on-demand TLS ask (the hostname is always
+# approved; an unknown handle never is) and the service DID's document.
+- name: The TLS ask endpoint answers for the hostname
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_host_port }}/tls-check?domain={{ vlpds_public_url | urlsplit('hostname') | urlencode }}"
+    status_code: 200
+  when: not ansible_check_mode
+
+- name: The TLS ask endpoint refuses an unknown handle
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_host_port }}/tls-check?domain={{ ('no-such-handle-zz9.' ~ vlpds_handle_domain) | urlencode }}"
+    status_code: 404
+  when: not ansible_check_mode
+
+- name: Read the service DID document
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_host_port }}/.well-known/did.json"
+    status_code: 200
+    return_content: true
+  register: _vlpds_did_doc
+  failed_when: _vlpds_did_doc.status != 200 or (_vlpds_did_doc.json.id | default('')) != vlpds_service_did
+  when:
+    - not ansible_check_mode
+    - vlpds_service_did.startswith('did:web:')
+
+- name: Read the node's metrics
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ vlpds_metrics_host_port }}/metrics"
+    return_content: true
+  register: _vlpds_metrics
+  when: not ansible_check_mode
+
+- name: Summarize the node
+  ansible.builtin.debug:
+    msg:
+      node: "{{ _vlpds_status.json.node | default('?') }}"
+      lease_valid: "{{ _vlpds_status.json.leaseValid | default('?') }}"
+      shards_owned: "{{ _vlpds_status.json.owned | default([]) | length }} / {{ _vlpds_status.json.shards | default('?') }}"
+      feature_level: "{{ _vlpds_status.json.version.active | default('?') }}"
+      disk_cache: >-
+        {{ (vlpds_disk_cache_shard_mb ~ ' MiB/shard') if vlpds_disk_cache_shard_mb | string | length > 0
+           else (_vlpds_disk_cache_mb | default('?')) ~ ' MiB total' }}
+      build: "{{ _vlpds_metrics.content | default('') | regex_search('vlpds_build_info\\{[^}]*\\}') }}"
+      previous_exit: "{{ _vlpds_metrics.content | default('') | regex_search('vlpds_last_exit_reason_info\\{[^}]*\\}') }}"
+  when: not ansible_check_mode
+
+- name: The previous process ended cleanly
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: the previous vlpds process did not stop cleanly
+      ({{ _vlpds_metrics.content | regex_search('vlpds_last_exit_reason_info\{[^}]*\}') }}).
+      See RUNBOOK "VlpdsNodeFailStopped" / exit codes.
+  when:
+    - not ansible_check_mode
+    - _vlpds_metrics.content is defined
+    - _vlpds_metrics.content is search('vlpds_last_exit_reason_info\{[^}]*reason="(?!clean|none)')

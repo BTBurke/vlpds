@@ -1,0 +1,10 @@
+{
+    # Global options
+    admin off
+{% if caddy_global_options | default('') | length > 0 %}
+{{ caddy_global_options | trim | indent(4, first=true) }}
+{% endif %}
+}
+
+# Import all site configurations
+import /etc/caddy/sites/*.Caddyfile

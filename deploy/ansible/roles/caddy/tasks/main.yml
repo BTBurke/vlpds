@@ -1,0 +1,128 @@
+---
+# Main tasks for caddy role
+
+- name: The Cloudflare DNS token is set
+  ansible.builtin.assert:
+    that:
+      - caddy_env.CF_API_TOKEN | default('') | length > 0
+    fail_msg: "caddy_cloudflare_dns needs a Cloudflare API token (Zone:Zone:Read + Zone:DNS:Edit) in caddy_env.CF_API_TOKEN"
+    quiet: true
+  when: caddy_cloudflare_dns | bool
+
+- name: Create Caddy configuration directory
+  ansible.builtin.file:
+    path: "{{ caddy_config_dir }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+- name: Create Caddy sites directory
+  ansible.builtin.file:
+    path: "{{ caddy_sites_dir }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+
+- name: Create Caddy data directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0755"
+  loop:
+    - "{{ caddy_data_dir }}"
+    - "{{ caddy_config_data_dir }}"
+
+- name: Deploy Caddy site configurations
+  ansible.builtin.template:
+    src: "{{ item.template }}.Caddyfile.j2"
+    dest: "{{ caddy_sites_dir }}/{{ item.name }}.Caddyfile"
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0644"
+  loop: "{{ caddy_sites }}"
+  when: item.enabled | default(true)
+  notify: Reload caddy
+
+- name: Remove disabled site configurations
+  ansible.builtin.file:
+    path: "{{ caddy_sites_dir }}/{{ item.name }}.Caddyfile"
+    state: absent
+  loop: "{{ caddy_sites }}"
+  when: not (item.enabled | default(true))
+  notify: Reload caddy
+
+- name: Deploy main Caddyfile
+  ansible.builtin.template:
+    src: Caddyfile.j2
+    dest: "{{ caddy_config_dir }}/Caddyfile"
+    owner: "{{ operator_user }}"
+    group: "{{ operator_user }}"
+    mode: "0644"
+  notify: Reload caddy
+
+- name: Create Docker networks for Caddy
+  community.docker.docker_network:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ caddy_docker_networks }}"
+
+- name: Build Caddy with the Cloudflare DNS module
+  when: caddy_cloudflare_dns | bool
+  block:
+    - name: Create the Caddy build directory
+      ansible.builtin.file:
+        path: "{{ caddy_cloudflare_build_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Render the Caddy Dockerfile
+      ansible.builtin.template:
+        src: cloudflare.Dockerfile.j2
+        dest: "{{ caddy_cloudflare_build_dir }}/Dockerfile"
+        mode: "0644"
+      register: _caddy_cloudflare_dockerfile
+
+    # A few minutes on 2 vCPU; only when the image is missing or the
+    # Dockerfile changed.
+    - name: Build the Caddy image
+      community.docker.docker_image:
+        name: "{{ caddy_cloudflare_image }}"
+        source: build
+        build:
+          path: "{{ caddy_cloudflare_build_dir }}"
+          pull: true
+        force_source: "{{ _caddy_cloudflare_dockerfile is changed }}"
+
+- name: Start Caddy container
+  community.docker.docker_container:
+    name: "{{ caddy_container_name }}"
+    image: "{{ caddy_cloudflare_image if caddy_cloudflare_dns | bool else caddy_image }}"
+    env: "{{ caddy_env if caddy_env | length > 0 else omit }}"
+    state: started
+    restart_policy: unless-stopped
+    ports: "{{ caddy_ports }}"
+    volumes: >-
+      {{
+        (['/var/run/tailscale/tailscaled.sock:/var/run/tailscale/tailscaled.sock:ro']
+         if caddy_mount_tailscale_socket | bool else [])
+        + [
+          caddy_config_dir ~ '/Caddyfile:/etc/caddy/Caddyfile',
+          caddy_sites_dir ~ ':/etc/caddy/sites',
+          caddy_data_dir ~ ':/data',
+          caddy_config_data_dir ~ ':/config'
+        ] + caddy_extra_volumes
+      }}
+    networks: "{{ [{'name': 'bridge'}] + caddy_docker_networks | map('regex_replace', '^(.*)$', '{\"name\": \"\\1\"}') | map('from_json') | list }}"
+    security_opts:
+      - "apparmor=unconfined"
+    capabilities:
+      - NET_BIND_SERVICE
+      - NET_ADMIN
+  become: true
+  become_user: "{{ operator_user }}"
+  # --diff and failures would print caddy_env (the DNS API token).
+  no_log: "{{ caddy_env | length > 0 }}"

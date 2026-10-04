@@ -1,0 +1,22 @@
+# {{ ansible_managed }} (roles/vlpds)
+# vlpds: leases are safe without clocks, but host clock offsets delay the
+# merged firehose and a shard's next owner waits out the previous owner's
+# seq floor (RUNBOOK "What NOT to do"). Keep the clock tight.
+{% for s in vlpds_chrony_servers %}
+server {{ s }} iburst
+{% endfor %}
+{% if vlpds_chrony_servers | length == 0 %}
+{% for p in vlpds_chrony_pools %}
+pool {{ p }} iburst maxsources {{ 4 if loop.first else 2 }}
+{% endfor %}
+{% endif %}
+
+keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+ntsdumpdir /var/lib/chrony
+logdir /var/log/chrony
+maxupdateskew 100.0
+rtcsync
+# step at boot (first 3 updates) if off by more than 1 s; slew afterwards
+makestep 1 3
+leapsectz right/UTC

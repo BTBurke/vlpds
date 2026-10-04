@@ -1,0 +1,25 @@
+---
+# Operator console (/admin, vlpds.admin.*) on the tailnet. Caddy can't do
+# this: tailscaled masquerades what it forwards into Docker, so tailnet
+# clients reach the Caddy container from the bridge gateway, not a 100.x
+# address. `tailscale serve` terminates TLS in tailscaled and listens on the
+# tailnet only; the config persists in tailscaled's state. /metrics is mounted
+# from the metrics listener because the console's live charts scrape it.
+
+- name: Read the tailscale serve config
+  ansible.builtin.command: tailscale serve status --json
+  register: _vlpds_ts_serve
+  changed_when: false
+  check_mode: false
+  become: true
+
+- name: Serve the console on the tailnet
+  ansible.builtin.command: >-
+    tailscale serve --bg --https={{ vlpds_tailnet_console_port }}
+    {{ ('--set-path=' ~ item.path) if item.path != '/' else '' }} {{ item.target }}
+  loop:
+    - { path: /, target: "http://127.0.0.1:{{ vlpds_host_port }}" }
+    - { path: /metrics, target: "http://127.0.0.1:{{ vlpds_metrics_host_port }}/metrics" }
+  changed_when: true
+  when: item.target not in _vlpds_ts_serve.stdout
+  become: true

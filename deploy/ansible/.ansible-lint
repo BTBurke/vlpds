@@ -1,0 +1,16 @@
+---
+profile: production
+
+exclude_paths:
+  - collections/
+  # sops ciphertext; --fix would rewrite it
+  - "**/*.sops.yaml"
+  - "**/*.sops.yaml.example"
+  # deployed verbatim to hosts: a reformat would change them on the hosts
+  - roles/*/files/
+
+skip_list:
+  # Deliberately shared across roles and inventories (operator_user,
+  # deploy_env, tailscale_*, monitoring_basic_auth_*): prefixing them per
+  # role would rename every inventory variable for no behaviour gain.
+  - var-naming[no-role-prefix]

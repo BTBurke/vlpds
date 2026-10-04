@@ -1,0 +1,26 @@
+---
+# Daily unattended upgrades from Ubuntu's default origins (security), never
+# an automatic reboot: /var/run/reboot-required is the operator's call.
+- name: Install unattended-upgrades
+  ansible.builtin.apt:
+    name: unattended-upgrades
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Enable periodic unattended upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    mode: "0644"
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+
+- name: Unattended upgrades never reboot
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/51common-unattended-upgrades
+    mode: "0644"
+    content: |
+      // Managed by ansible (roles/common, common_unattended_upgrades_enabled)
+      Unattended-Upgrade::Automatic-Reboot "{{ 'true' if common_unattended_upgrades_reboot | bool else 'false' }}";
+      Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";

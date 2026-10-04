@@ -1,0 +1,85 @@
+# {{ ansible_managed }} (roles/caddy/templates/vlpds-site.Caddyfile.j2, vars from roles/vlpds)
+# vlpds (managed): {{ vlpds_hostname }} -> {{ _vlpds_caddy_upstream }}
+{% set _wildcard = vlpds_caddy_wildcard_dns == 'cloudflare' %}
+
+(vlpds_proxy) {
+	# Node-to-node, metrics and operator-only paths never leave the host.
+	@vlpds_blocked path {{ vlpds_caddy_blocked_paths | join(' ') }}
+	respond @vlpds_blocked 404
+
+	# Body caps in binary units (MB/GB are decimal in Caddy): blobs
+	# (--max-blob-mb MiB + slack); importRepo above vlpds' own 1 GiB cap.
+	@vlpds_import path /xrpc/com.atproto.repo.importRepo
+	request_body @vlpds_import {
+		max_size {{ vlpds_caddy_import_max_body }}
+	}
+	@vlpds_not_import not path /xrpc/com.atproto.repo.importRepo
+	request_body @vlpds_not_import {
+		max_size {{ vlpds_caddy_max_body_mb }}MiB
+	}
+
+	# Everything else goes to vlpds, including /.well-known/did.json (the
+	# did:web service DID's document) and /tls-check (the on-demand TLS ask
+	# endpoint, which Caddy itself calls at {{ _vlpds_tls_ask_url }}).
+	# Caddy sets X-Forwarded-For to the client address (incoming XFF is only
+	# kept from trusted_proxies); vlpds trusts XFF from Caddy alone
+	# (--trusted-proxies {{ vlpds_trusted_proxies | join(',') }}). WebSocket
+	# upgrades (subscribeRepos, subscribeLabels) need nothing extra.
+	reverse_proxy {{ _vlpds_caddy_upstream }} {
+		# firehose frames go out as they arrive
+		flush_interval -1
+		# keep firehose subscribers connected across config reloads
+		stream_close_delay 5m
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}
+
+{{ vlpds_hostname }} {
+{% if _wildcard and vlpds_caddy_hostname_dns01 | bool %}
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		resolvers {{ vlpds_caddy_dns_resolvers | join(' ') }}
+	}
+{% endif %}
+	import vlpds_proxy
+}
+{% if _wildcard %}
+
+# Handles: <name>.{{ vlpds_handle_domain }}, one wildcard certificate (ACME
+# DNS-01 through Cloudflare; token from the container's environment).
+*.{{ vlpds_handle_domain }} {
+	tls {
+		dns cloudflare {env.CF_API_TOKEN}
+		resolvers {{ vlpds_caddy_dns_resolvers | join(' ') }}
+	}
+
+	# The certificate covers every name, so ask vlpds per request what the
+	# on-demand `ask` used to decide per certificate: 2xx only for active
+	# local handles. Anything else gets an empty response, never the upstream.
+	forward_auth {{ _vlpds_caddy_upstream }} {
+		uri /tls-check?domain={host}
+		@vlpds_unknown_handle status 4xx
+		handle_response @vlpds_unknown_handle {
+			respond 404
+		}
+		handle_response {
+			respond 503
+		}
+	}
+	import vlpds_proxy
+}
+{% else %}
+
+# Handles: <name>.{{ vlpds_handle_domain }}/.well-known/atproto-did (and anything
+# else clients send there).
+*.{{ vlpds_handle_domain }} {
+	tls {
+		on_demand
+	}
+	import vlpds_proxy
+}
+{% endif %}

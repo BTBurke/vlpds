@@ -1,0 +1,14 @@
+# {{ ansible_managed }} (roles/common: common_*_version)
+{% set pins = [
+     ('docker-ce docker-ce-cli', common_docker_version ~ '~*' if common_docker_version else ''),
+     ('containerd.io', common_containerd_version ~ '~*' if common_containerd_version else ''),
+     ('docker-compose-plugin', common_docker_compose_version ~ '~*' if common_docker_compose_version else ''),
+     ('docker-buildx-plugin', common_docker_buildx_version ~ '~*' if common_docker_buildx_version else ''),
+     ('tailscale', common_tailscale_version),
+   ] %}
+{% for packages, version in pins if version %}
+
+Package: {{ packages }}
+Pin: version {{ version }}
+Pin-Priority: 1000
+{% endfor %}

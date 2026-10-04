@@ -1,0 +1,152 @@
+---
+# Default variables for the common role. Shared names (operator_user,
+# ssh_port, docker_*, tailscale_*) are read by other roles too, hence no
+# common_ prefix.
+
+# --- operator account ----------------------------------------------------------
+# The login user Ansible runs as: SSH keys, NOPASSWD sudo, docker group.
+operator_user: operator # noqa: var-naming[no-role-prefix] (shared with the vlpds, caddy and alloy roles)
+operator_shell: /bin/bash # noqa: var-naming[no-role-prefix]
+# Public keys for operator_user's authorized_keys (set in the inventory).
+operator_ssh_keys: [] # noqa: var-naming[no-role-prefix]
+# Keys to remove from operator_user's authorized_keys (adding never removes:
+# a key dropped from operator_ssh_keys stays until it is listed here).
+operator_ssh_keys_absent: [] # noqa: var-naming[no-role-prefix]
+
+# --- sshd (sshd_config itself) ---------------------------------------------------
+ssh_port: 22 # noqa: var-naming[no-role-prefix]
+ssh_permit_root_login: "no" # noqa: var-naming[no-role-prefix]
+ssh_password_authentication: "no" # noqa: var-naming[no-role-prefix]
+ssh_pubkey_authentication: "yes" # noqa: var-naming[no-role-prefix]
+
+# --- packages and locale ---------------------------------------------------------
+common_packages:
+  - curl
+  - jq
+  - htop
+  - vim
+system_locale: "en_US.UTF-8" # noqa: var-naming[no-role-prefix]
+
+# --- Docker ------------------------------------------------------------------------
+docker_users: # noqa: var-naming[no-role-prefix]
+  - "{{ operator_user }}"
+# Daemon-wide container log rotation (/etc/docker/daemon.json).
+docker_log_driver: json-file # noqa: var-naming[no-role-prefix]
+docker_log_max_size: 10m # noqa: var-naming[no-role-prefix]
+docker_log_max_file: "4" # noqa: var-naming[no-role-prefix]
+# Published ports go through iptables directly instead of a docker-proxy
+# process per port.
+docker_userland_proxy: false # noqa: var-naming[no-role-prefix]
+
+# --- syslog rotation -----------------------------------------------------------------
+syslog_rotate_count: 7 # noqa: var-naming[no-role-prefix]
+syslog_rotate_frequency: daily # noqa: var-naming[no-role-prefix]
+
+# --- Tailscale (optional) ---------------------------------------------------------------
+# vlpds' operator console (vlpds_tailnet_console_port) and the cluster peer
+# port (vlpds_cluster_enabled) are served with `tailscale serve`, so either
+# needs Tailscale on the node. A single node without them can leave it off.
+tailscale_enabled: false # noqa: var-naming[no-role-prefix]
+# Empty: tailscaled is installed and `sudo tailscale up` is left to you.
+# With a key (e.g. a tagged, pre-approved key), the role runs `tailscale up`.
+tailscale_auth_key: "" # noqa: var-naming[no-role-prefix]
+# tailscale_hostname: ""  # defaults to inventory_hostname
+# Tailscale SSH (`tailscale up --ssh`; kept in line on running hosts with
+# `tailscale set --ssh=`). It bypasses sshd (and the common_ssh_* hardening):
+# the tailnet ACLs decide who may log in.
+common_tailscale_ssh: false
+# Extra `tailscale up` flags, e.g. "--advertise-tags=tag:vlpds".
+tailscale_extra_args: "{{ '--ssh' if common_tailscale_ssh | bool else '' }}" # noqa: var-naming[no-role-prefix]
+# Lines for /etc/default/tailscaled, e.g. {TS_PERMIT_CERT_UID: caddy} to let
+# a Caddy that mounts the tailscaled socket fetch *.ts.net certificates.
+tailscale_env_vars: {} # noqa: var-naming[no-role-prefix]
+
+# apt suites for the Docker and Tailscale repositories: the host's codename.
+# Set e.g. "noble" for a release whose suite is not published yet.
+common_docker_apt_release: "{{ ansible_facts['distribution_release'] }}"
+common_tailscale_apt_release: "{{ ansible_facts['distribution_release'] }}"
+
+# --- package pins ----------------------------------------------------------------------
+# Debian version without the distro suffix, so one value covers several
+# Ubuntu releases. Installed at exactly this version and held there by
+# /etc/apt/preferences.d/common-pins (priority 1000), so neither `apt
+# upgrade` nor unattended-upgrades moves them. Docker and containerd
+# upgrades restart every container on the host. Empty: unpinned. A host
+# already newer than the pin fails the install (apt refuses the downgrade):
+# raise the pin instead.
+common_docker_version: "5:29.8.2-1"
+common_containerd_version: "2.3.6-1"
+common_docker_compose_version: "5.6.0-1"
+common_docker_buildx_version: "0.37.1-1"
+common_tailscale_version: "1.102.4"
+
+# --- host hardening ----------------------------------------------------------------------
+# playbooks/bootstrap.yml runs the same task files on a fresh host.
+
+# sshd drop-in /etc/ssh/sshd_config.d/00-hardening.conf. sshd keeps the first
+# value it reads, and Ubuntu's sshd_config Includes sshd_config.d/*.conf
+# first, so 00-* wins over the image's 50-cloud-init.conf. Checked with
+# `sshd -t` before a reload; a new key login is verified afterwards.
+common_ssh_hardening_enabled: true
+common_ssh_allow_users: ["{{ operator_user }}"]
+# An agent offering several keys uses one try per key: keep room for that.
+common_ssh_max_auth_tries: 4
+common_ssh_login_grace_time: 30
+# -L / -D for operator tunnels (ssh -L 2583:127.0.0.1:2583 <host>); no -R.
+common_ssh_allow_tcp_forwarding: local
+# OpenSSH 10 (Ubuntu 26.04) / 9.6 (24.04): post-quantum hybrids first, then
+# curve25519. Clients older than OpenSSH 7.4 cannot connect.
+common_ssh_kex_algorithms:
+  - mlkem768x25519-sha256
+  - sntrup761x25519-sha512
+  - sntrup761x25519-sha512@openssh.com
+  - curve25519-sha256
+  - curve25519-sha256@libssh.org
+common_ssh_ciphers:
+  - chacha20-poly1305@openssh.com
+  - aes256-gcm@openssh.com
+  - aes128-gcm@openssh.com
+  - aes256-ctr
+  - aes128-ctr
+common_ssh_macs:
+  - hmac-sha2-512-etm@openssh.com
+  - hmac-sha2-256-etm@openssh.com
+  - umac-128-etm@openssh.com
+# After the reload, ask sshd from the controller which methods it offers
+# (no credentials sent) and fail unless it is publickey only.
+common_ssh_verify_from_controller: true
+# The controller's known_hosts file for that check (host keys must match).
+common_ssh_known_hosts_file: "{{ playbook_dir }}/../known_hosts"
+
+# Accounts whose passwords are locked (`usermod -L`; the accounts, their
+# keys and sudo rights stay), e.g. [ubuntu, root]. Only accounts that exist
+# are touched. With every password locked the provider's web console cannot
+# log in either: recovery is then the provider's rescue boot.
+common_lock_password_users: []
+
+# ufw: deny incoming except SSH (common_firewall_public_ssh), the ports
+# below and everything on the trusted interfaces. Docker-published ports
+# bypass ufw (Docker's own iptables chains).
+common_firewall_enabled: true
+common_firewall_public_ssh: true
+common_firewall_allow:
+  - { port: "80", proto: tcp }
+  - { port: "443", proto: tcp }
+  - { port: "443", proto: udp }
+# Interfaces that may reach every port (missing ones are harmless).
+common_firewall_trusted_interfaces: ["tailscale0"]
+
+# fail2ban sshd jail (journal backend). With key-only SSH it mostly cuts log
+# noise and scanner load.
+common_fail2ban_enabled: true
+common_fail2ban_bantime: 1h
+common_fail2ban_findtime: 10m
+common_fail2ban_maxretry: 5
+# Never banned: loopback and the tailnet (CGNAT range); add your own
+# addresses here.
+common_fail2ban_ignoreip: ["127.0.0.1/8", "::1", "100.64.0.0/10"]
+
+# unattended-upgrades: Ubuntu's default origins (security), daily. Reboots
+# stay an operator decision unless this is turned on.
+common_unattended_upgrades_enabled: true
+common_unattended_upgrades_reboot: false

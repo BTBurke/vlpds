@@ -1,0 +1,185 @@
+---
+# Keep in step with defaults/main.yml (which has the defaults and longer
+# explanations). Validated at role start: a wrong type fails before any change.
+argument_specs:
+  main:
+    short_description: "Base host: operator account, sshd hardening, ufw, fail2ban, unattended upgrades, Docker CE, optional Tailscale."
+    description:
+      - "Base host: packages, locale, the operator account, sshd hardening, ufw, fail2ban, unattended upgrades, Docker CE and optional Tailscale."
+      - Every option's default and meaning are in defaults/main.yml; this spec checks types at role start.
+    options:
+      operator_user:
+        description: The login user Ansible runs as (SSH keys, NOPASSWD sudo, docker group).
+        type: str
+      operator_shell:
+        description: Login shell of operator_user.
+        type: str
+      operator_ssh_keys:
+        description: Public keys added to operator_user's authorized_keys.
+        type: list
+        elements: str
+      operator_ssh_keys_absent:
+        description: >-
+          Keys removed from operator_user's authorized_keys (adding never removes: a key dropped from
+          operator_ssh_keys stays until it is listed here).
+        type: list
+        elements: str
+      ssh_port:
+        description: sshd port (firewall and fail2ban use it too).
+        type: int
+      ssh_permit_root_login:
+        description: PermitRootLogin in sshd_config.
+        type: str
+      ssh_password_authentication:
+        description: PasswordAuthentication in sshd_config.
+        type: str
+      ssh_pubkey_authentication:
+        description: PubkeyAuthentication in sshd_config.
+        type: str
+      common_packages:
+        description: Packages installed on every host.
+        type: list
+        elements: str
+      system_locale:
+        description: Locale generated and set as LANG / LC_ALL.
+        type: str
+      docker_users:
+        description: Users added to the docker group.
+        type: list
+        elements: str
+      docker_log_driver:
+        description: Docker daemon log driver.
+        type: str
+      docker_log_max_size:
+        description: Docker daemon log-opts max-size.
+        type: str
+      docker_log_max_file:
+        description: Docker daemon log-opts max-file.
+        type: str
+      docker_userland_proxy:
+        description: "Docker's userland-proxy (off: published ports go through iptables only)."
+        type: bool
+      syslog_rotate_count:
+        description: Rotated syslog files kept.
+        type: int
+      syslog_rotate_frequency:
+        description: Syslog rotation frequency (daily, weekly, ...).
+        type: str
+      tailscale_enabled:
+        description: Install tailscaled. Needed for vlpds' tailnet console and the cluster peer port (`tailscale serve`).
+        type: bool
+      tailscale_auth_key:
+        description: "Auth key for `tailscale up`; empty: tailscaled is installed and `tailscale up` is left to the operator."
+        type: str
+      common_tailscale_ssh:
+        description: "Tailscale SSH (`--ssh`), kept in line on running hosts. It bypasses sshd and its hardening: the tailnet ACLs decide who may log in."
+        type: bool
+      tailscale_extra_args:
+        description: Extra `tailscale up` flags, e.g. "--advertise-tags=tag:vlpds".
+        type: str
+      tailscale_env_vars:
+        description: KEY=value lines for /etc/default/tailscaled.
+        type: dict
+      common_docker_apt_release:
+        description: apt suite of the Docker repository (default the host's codename).
+        type: str
+      common_tailscale_apt_release:
+        description: apt suite of the Tailscale repository (default the host's codename).
+        type: str
+      common_docker_version:
+        description: "Pinned docker-ce / docker-ce-cli version (Debian version without the distro suffix); empty: unpinned."
+        type: str
+      common_containerd_version:
+        description: Pinned containerd.io version; empty unpinned.
+        type: str
+      common_docker_compose_version:
+        description: Pinned docker-compose-plugin version; empty unpinned.
+        type: str
+      common_docker_buildx_version:
+        description: Pinned docker-buildx-plugin version; empty unpinned.
+        type: str
+      common_tailscale_version:
+        description: Pinned tailscale version; empty unpinned.
+        type: str
+      common_ssh_hardening_enabled:
+        description: >-
+          Key-only sshd drop-in (/etc/ssh/sshd_config.d/00-hardening.conf), checked with `sshd -t` before a
+          reload and with a fresh key login after it.
+        type: bool
+      common_ssh_allow_users:
+        description: sshd AllowUsers.
+        type: list
+        elements: str
+      common_ssh_max_auth_tries:
+        description: "sshd MaxAuthTries (an agent offering several keys uses one try per key)."
+        type: int
+      common_ssh_login_grace_time:
+        description: sshd LoginGraceTime, seconds.
+        type: int
+      common_ssh_allow_tcp_forwarding:
+        description: "sshd AllowTcpForwarding: local allows -L / -D operator tunnels, no -R."
+        type: str
+        choices:
+          - 'yes'
+          - 'no'
+          - local
+          - remote
+          - all
+      common_ssh_kex_algorithms:
+        description: sshd KexAlgorithms.
+        type: list
+        elements: str
+      common_ssh_ciphers:
+        description: sshd Ciphers.
+        type: list
+        elements: str
+      common_ssh_macs:
+        description: sshd MACs.
+        type: list
+        elements: str
+      common_ssh_verify_from_controller:
+        description: After a reload, ask sshd from the controller which methods it offers (no credentials sent) and fail unless it is publickey only.
+        type: bool
+      common_ssh_known_hosts_file:
+        description: Controller-side known_hosts file used by that check.
+        type: str
+      common_lock_password_users:
+        description: "Accounts whose passwords are locked (`usermod -L`); only existing accounts are touched."
+        type: list
+        elements: str
+      common_firewall_enabled:
+        description: "ufw: deny incoming except SSH, common_firewall_allow and the trusted interfaces."
+        type: bool
+      common_firewall_public_ssh:
+        description: Allow SSH from anywhere (false removes the rule; SSH then only via trusted interfaces).
+        type: bool
+      common_firewall_allow:
+        description: "Public ports, as {port, proto} items."
+        type: list
+        elements: dict
+      common_firewall_trusted_interfaces:
+        description: Interfaces allowed to reach every port.
+        type: list
+        elements: str
+      common_fail2ban_enabled:
+        description: fail2ban sshd jail (journal backend).
+        type: bool
+      common_fail2ban_bantime:
+        description: fail2ban bantime.
+        type: str
+      common_fail2ban_findtime:
+        description: fail2ban findtime.
+        type: str
+      common_fail2ban_maxretry:
+        description: fail2ban maxretry.
+        type: int
+      common_fail2ban_ignoreip:
+        description: Addresses never banned.
+        type: list
+        elements: str
+      common_unattended_upgrades_enabled:
+        description: Daily unattended upgrades from Ubuntu's default (security) origins.
+        type: bool
+      common_unattended_upgrades_reboot:
+        description: Let unattended-upgrades reboot the host when an update needs it.
+        type: bool

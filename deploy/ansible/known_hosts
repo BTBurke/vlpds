@@ -1,0 +1,2 @@
+# Host keys of your nodes. playbooks/bootstrap.yml adds a fresh host's key on
+# first contact: check its fingerprint, then commit this file.

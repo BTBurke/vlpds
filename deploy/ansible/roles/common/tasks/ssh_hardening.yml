@@ -1,0 +1,135 @@
+---
+# sshd: public keys only, for common_ssh_allow_users only, no root, modern
+# crypto. Run over a key login as the operator (playbooks/bootstrap.yml
+# proves that login works before it gets here), so nothing below can lock
+# the operator out:
+#   1. the drop-in is checked on its own (`sshd -t -f`) before it is written;
+#   2. the whole configuration is checked (`sshd -t`) before a reload, and
+#      the drop-in is removed again if that fails;
+#   3. a reload never drops existing sessions; then a brand-new key login
+#      is made (the multiplexed connection is closed first), sshd -T must
+#      show key-only settings, and after a reload the controller asks the
+#      running sshd which methods it offers.
+
+# Socket-activated sshd (Ubuntu >= 22.10) only creates its privilege
+# separation directory while running; `sshd -t` needs it.
+- name: The sshd privilege separation directory exists
+  ansible.builtin.file:
+    path: /run/sshd
+    state: directory
+    mode: "0755"
+
+- name: Harden sshd with a drop-in
+  block:
+    - name: Install the sshd hardening drop-in
+      ansible.builtin.template:
+        src: sshd-hardening.conf.j2
+        dest: /etc/ssh/sshd_config.d/00-hardening.conf
+        owner: root
+        group: root
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+      register: _common_sshd_dropin
+
+    - name: The full sshd configuration is valid
+      ansible.builtin.command: /usr/sbin/sshd -t
+      changed_when: false
+      check_mode: false
+
+  rescue:
+    - name: Remove the drop-in that broke the sshd configuration # noqa: no-handler
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d/00-hardening.conf
+        state: absent
+      when: _common_sshd_dropin is changed
+
+    - name: Stop here (sshd was not reloaded)
+      ansible.builtin.fail:
+        msg: >-
+          sshd -t rejected the configuration with the hardening drop-in, which is not in place
+          and sshd was not reloaded. Fix the common_ssh_* vars and run again.
+
+# Inline, not a handler: the checks below must run against the new config.
+- name: Reload sshd # noqa: no-handler
+  ansible.builtin.service:
+    name: ssh
+    state: reloaded
+  when: _common_sshd_dropin is changed
+
+# Close the multiplexed SSH connection so the next task logs in afresh
+# under the new configuration.
+- name: Drop the existing SSH connection
+  ansible.builtin.meta: reset_connection
+
+- name: A new key login works under the new sshd configuration
+  ansible.builtin.ping:
+
+# The effective settings for an outside connection to the operator account
+# (Match blocks included), on every run.
+- name: Read sshd's effective settings for an outside login
+  ansible.builtin.command: /usr/sbin/sshd -T -C user={{ operator_user }},host=probe.invalid,addr=192.0.2.1
+  register: _common_sshd_effective
+  changed_when: false
+  check_mode: false
+
+- name: The effective settings are public keys only
+  ansible.builtin.assert:
+    that:
+      - _common_sshd_effective.stdout_lines is contains('authenticationmethods publickey')
+      - _common_sshd_effective.stdout_lines is contains('passwordauthentication no')
+      - _common_sshd_effective.stdout_lines is contains('kbdinteractiveauthentication no')
+      - _common_sshd_effective.stdout_lines is contains('permitrootlogin no')
+    fail_msg: >-
+      sshd's effective configuration is not key-only: look for another sshd_config.d
+      file or a Match block that overrides 00-hardening.conf.
+    quiet: true
+
+# Right after a reload only (bootstrap, or a changed drop-in): ask the
+# running daemon from outside which methods it offers. Not on every run: the
+# disconnect is logged ("Connection closed by authenticating user ...
+# [preauth]") and fail2ban counts such lines.
+- name: Ask sshd which authentication methods it offers (no credentials sent)
+  ansible.builtin.command:
+    argv:
+      - ssh
+      - -F
+      - /dev/null
+      - -o
+      - BatchMode=yes
+      - -o
+      - PubkeyAuthentication=no
+      - -o
+      - StrictHostKeyChecking=yes
+      - -o
+      - UserKnownHostsFile={{ common_ssh_known_hosts_file }}
+      - -o
+      - ControlPath=none
+      - -o
+      - ConnectTimeout=15
+      - -p
+      - "{{ ansible_port | default(22) | string }}"
+      - "{{ operator_user }}@{{ ansible_host | default(inventory_hostname) }}"
+      - "true"
+  register: _common_ssh_methods
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  when:
+    - common_ssh_verify_from_controller | bool
+    - _common_sshd_dropin is changed
+    - not ansible_check_mode
+
+- name: The server offers public keys only
+  ansible.builtin.assert:
+    that:
+      - _common_ssh_methods.stderr is search('Permission denied \\(publickey\\)')
+    fail_msg: >-
+      sshd still offers more than publickey ({{ _common_ssh_methods.stderr | trim }}).
+      Look for another sshd_config.d file or a Match block that overrides 00-hardening.conf.
+    quiet: true
+  when:
+    - common_ssh_verify_from_controller | bool
+    - _common_sshd_dropin is changed
+    - not ansible_check_mode

@@ -1,0 +1,9 @@
+---
+# Handlers for caddy role. They run at the end of the play, after "Start Caddy
+# container" has created it on a first run.
+
+- name: Reload caddy
+  ansible.builtin.command: docker restart {{ caddy_container_name }}
+  changed_when: true
+  become: true
+  become_user: "{{ operator_user }}"

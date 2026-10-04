@@ -1,0 +1,19 @@
+---
+# The peer port on the tailnet (vlpds_cluster_enabled): tailscaled forwards
+# TCP <tailnet address>:vlpds_peer_port to the loopback-published peer port.
+# TLS passes through untouched (mTLS is end to end between the nodes); the
+# forward persists in tailscaled's state.
+
+- name: Read the tailscale serve config
+  ansible.builtin.command: tailscale serve status --json
+  register: _vlpds_ts_serve_peer
+  changed_when: false
+  check_mode: false
+
+- name: Forward the peer port from the tailnet
+  ansible.builtin.command: >-
+    tailscale serve --bg --tcp {{ vlpds_peer_port }} tcp://127.0.0.1:{{ vlpds_peer_host_port }}
+  changed_when: true
+  when: >-
+    ((_vlpds_ts_serve_peer.stdout | default('{}', true) | from_json).TCP | default({}))
+    .get(vlpds_peer_port | string, {}).get('TCPForward') != '127.0.0.1:' ~ vlpds_peer_host_port

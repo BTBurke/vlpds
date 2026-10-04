@@ -1,0 +1,7 @@
+---
+- name: Restart chrony
+  ansible.builtin.service:
+    name: chrony
+    state: restarted
+  # in check mode the package may not be installed yet
+  ignore_errors: "{{ ansible_check_mode }}"

@@ -1,0 +1,29 @@
+# {{ ansible_managed }} (roles/common, common_ssh_hardening_enabled)
+# sshd keeps the first value it reads for each keyword, and sshd_config
+# Includes sshd_config.d/*.conf before its own lines, so this file (00-)
+# wins over the image's 50-cloud-init.conf and over sshd_config itself.
+
+# Keys only, for the operator account only.
+PubkeyAuthentication yes
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+PermitRootLogin no
+AllowUsers {{ common_ssh_allow_users | join(' ') }}
+
+MaxAuthTries {{ common_ssh_max_auth_tries }}
+LoginGraceTime {{ common_ssh_login_grace_time }}
+MaxStartups 10:30:60
+ClientAliveInterval 300
+ClientAliveCountMax 2
+
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding {{ common_ssh_allow_tcp_forwarding }}
+PermitTunnel no
+GatewayPorts no
+
+KexAlgorithms {{ common_ssh_kex_algorithms | join(',') }}
+Ciphers {{ common_ssh_ciphers | join(',') }}
+MACs {{ common_ssh_macs | join(',') }}

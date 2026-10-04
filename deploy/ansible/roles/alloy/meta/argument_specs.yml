@@ -1,0 +1,83 @@
+---
+# Keep in step with defaults/main.yml (which has the defaults and longer
+# explanations). Validated at role start: a wrong type fails before any change.
+argument_specs:
+  main:
+    short_description: "Grafana Alloy from the Grafana apt repository: host, container and vlpds metrics and logs to your monitoring stack."
+    description:
+      - "Grafana Alloy from the Grafana apt repository: host, container and vlpds metrics and logs to your monitoring stack."
+      - Every option's default and meaning are in defaults/main.yml; this spec checks types at role start.
+    options:
+      alloy_version:
+        description: "Pinned Alloy package version (apt.grafana.com Debian version), held by /etc/apt/preferences.d/alloy. Empty: unpinned."
+        type: str
+      alloy_config_dir:
+        description: Alloy configuration directory (Alloy loads every file in it).
+        type: str
+      alloy_monitoring_url:
+        description: Base URL of your monitoring stack; the endpoint URLs below default to paths under it.
+        type: str
+      alloy_remote_write_url:
+        description: Prometheus remote_write endpoint for metrics.
+        type: str
+      alloy_loki_push_url:
+        description: Loki push endpoint for logs.
+        type: str
+      monitoring_basic_auth_user:
+        description: Basic-auth user for the monitoring endpoints; empty sends no auth.
+        type: str
+      monitoring_basic_auth_password:
+        description: Basic-auth password for the monitoring endpoints.
+        type: str
+      deploy_env:
+        description: The `cluster` external label on every series, log line and profile.
+        type: str
+      alloy_default_scrape_interval:
+        description: Default Prometheus scrape interval.
+        type: str
+      alloy_unix_collectors:
+        description: node_exporter collectors enabled on top of its defaults.
+        type: list
+        elements: str
+      alloy_config_fragments:
+        description: "Fragments rendered from templates/<name>.alloy.j2: host-monitoring (required by the others), vlpds-monitoring, docker-monitoring."
+        type: list
+        elements: str
+      alloy_enable_docker_logs:
+        description: Add alloy to the docker group for container logs (ignored with alloy_docker_socket_proxy).
+        type: bool
+      alloy_docker_socket_proxy:
+        description: >-
+          Reach Docker through a read-only, filtered proxy (container list/inspect/logs only, no Env/Cmd/Mounts)
+          instead of the root-equivalent raw socket. Rules out alloy_run_as_root and docker-monitoring.
+        type: bool
+      alloy_docker_proxy_image:
+        description: nginx (with njs) image of the Docker proxy, pinned by digest.
+        type: str
+      alloy_docker_proxy_container:
+        description: Docker proxy container name.
+        type: str
+      alloy_docker_proxy_user:
+        description: System user the Docker proxy container runs as.
+        type: str
+      alloy_docker_proxy_config_dir:
+        description: Docker proxy configuration directory.
+        type: str
+      alloy_docker_proxy_socket_dir:
+        description: Directory of the proxy's socket (alloy group only).
+        type: str
+      alloy_docker_host:
+        description: Docker endpoint Alloy uses (the proxy socket or the raw one).
+        type: str
+      alloy_pyroscope_enabled:
+        description: Receive profiles on alloy_pyroscope_listen_port and forward them to alloy_pyroscope_url.
+        type: bool
+      alloy_pyroscope_listen_port:
+        description: Port of Alloy's Pyroscope receiver (all interfaces).
+        type: int
+      alloy_pyroscope_url:
+        description: Pyroscope endpoint profiles are forwarded to.
+        type: str
+      alloy_run_as_root:
+        description: Run the Alloy service as root (a systemd drop-in). Needed by docker-monitoring on Docker hosts using the containerd image store.
+        type: bool

@@ -1,0 +1,22 @@
+---
+# Handlers for common role
+
+- name: Restart ssh
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+
+- name: Restart docker
+  ansible.builtin.service:
+    name: docker
+    state: restarted
+
+- name: Restart fail2ban
+  ansible.builtin.service:
+    name: fail2ban
+    state: restarted
+
+- name: Restart tailscaled
+  ansible.builtin.service:
+    name: tailscaled
+    state: restarted

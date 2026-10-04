@@ -1,0 +1,163 @@
+// {{ ansible_managed }}
+// Host monitoring: node metrics, the journal, /var/log and container logs,
+// plus the remote_write and Loki endpoints every other fragment forwards to.
+
+// Linux host metrics collection
+prometheus.exporter.unix "default" {
+  include_exporter_metrics = true
+  enable_collectors = {{ alloy_unix_collectors | to_json }}
+}
+
+// Scrape local metrics from node exporter
+prometheus.scrape "host_metrics" {
+  targets         = prometheus.exporter.unix.default.targets
+  forward_to      = [prometheus.relabel.add_agent_hostname.receiver]
+  scrape_interval = "{{ alloy_default_scrape_interval }}"
+}
+
+// Add agent_hostname label to all Prometheus metrics
+// All scrape jobs should forward to this component
+prometheus.relabel "add_agent_hostname" {
+  forward_to = [prometheus.remote_write.default.receiver]
+
+  rule {
+    target_label = "agent_hostname"
+    replacement  = "{{ inventory_hostname }}"
+  }
+}
+
+// Prometheus remote_write to your metrics store
+prometheus.remote_write "default" {
+  endpoint {
+    url = "{{ alloy_remote_write_url }}"
+{% if monitoring_basic_auth_user | length > 0 %}
+    basic_auth {
+      username = "{{ monitoring_basic_auth_user }}"
+      password = "{{ monitoring_basic_auth_password }}"
+    }
+{% endif %}
+  }
+  external_labels = {
+    cluster = "{{ deploy_env }}",
+    hostname = "{{ inventory_hostname }}",
+  }
+}
+
+// Loki log collection - systemd journal
+loki.source.journal "system_logs" {
+  forward_to = [loki.write.default.receiver]
+  labels = {
+    job = "systemd-journal",
+  }
+}
+
+// Loki log collection - file-based logs
+loki.source.file "application_logs" {
+  targets = [
+    {__path__ = "/var/log/*.log", job = "varlogs"},
+    {__path__ = "/var/log/syslog", job = "syslog"},
+  ]
+  forward_to = [loki.write.default.receiver]
+}
+
+// Docker container discovery
+discovery.docker "docker" {
+  host             = "{{ alloy_docker_host }}"
+  refresh_interval = "5s"
+}
+
+// Docker log processing pipeline
+loki.process "docker" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.static_labels {
+    values = {
+      agent_hostname = "{{ inventory_hostname }}",
+    }
+  }
+
+  stage.json {
+    expressions = {
+      level = "level",
+      time  = "time",
+    }
+  }
+
+  stage.timestamp {
+    source           = "time"
+    format           = "RFC3339Nano"
+    fallback_formats = ["UnixMs", "UnixUs", "UnixNano"]
+  }
+
+  stage.labels {
+    values = {
+      level = null,
+    }
+  }
+}
+
+// Relabel Docker container metadata
+discovery.relabel "docker" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+}
+
+// Docker container log collection
+loki.source.docker "docker" {
+  host             = "{{ alloy_docker_host }}"
+  targets          = discovery.docker.docker.targets
+  forward_to       = [loki.process.docker.receiver]
+  relabel_rules    = discovery.relabel.docker.rules
+  refresh_interval = "5s"
+  labels = {
+    job = "docker",
+  }
+}
+
+loki.write "default" {
+  endpoint {
+    url = "{{ alloy_loki_push_url }}"
+{% if monitoring_basic_auth_user | length > 0 %}
+    basic_auth {
+      username = "{{ monitoring_basic_auth_user }}"
+      password = "{{ monitoring_basic_auth_password }}"
+    }
+{% endif %}
+  }
+  external_labels = {
+    cluster = "{{ deploy_env }}",
+    hostname = "{{ inventory_hostname }}",
+  }
+}
+
+{% if alloy_pyroscope_enabled | bool %}
+// Pyroscope profiling receiver
+pyroscope.receive_http "default" {
+  http {
+    listen_address = "0.0.0.0"
+    listen_port = {{ alloy_pyroscope_listen_port }}
+  }
+  forward_to = [pyroscope.write.default.receiver]
+}
+
+pyroscope.write "default" {
+  endpoint {
+    url = "{{ alloy_pyroscope_url }}"
+{% if monitoring_basic_auth_user | length > 0 %}
+    basic_auth {
+      username = "{{ monitoring_basic_auth_user }}"
+      password = "{{ monitoring_basic_auth_password }}"
+    }
+{% endif %}
+  }
+  external_labels = {
+    cluster = "{{ deploy_env }}",
+    hostname = "{{ inventory_hostname }}",
+  }
+}
+{% endif %}

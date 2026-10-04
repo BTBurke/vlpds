@@ -1,0 +1,160 @@
+---
+# Host prep for a vlpds node: Docker present, clock sync (leases and the
+# merged firehose want sane clocks), kernel limits for --listen-backlog and
+# many connections, a firewall that only exposes SSH + HTTP(S), security
+# updates without automatic reboots, and the disk cache directory.
+
+- name: Docker and the compose plugin are installed
+  ansible.builtin.command: docker compose version
+  register: _vlpds_compose_version
+  changed_when: false
+  check_mode: false
+  failed_when: _vlpds_compose_version.rc != 0 and not ansible_check_mode
+
+# Owns /opt/vlpds and runs compose (the common role creates it with sudo and
+# SSH keys; this only makes sure it exists on hosts that skip that role).
+- name: The deploy user exists and can use Docker
+  ansible.builtin.user:
+    name: "{{ operator_user }}"
+    groups: docker
+    append: true
+    create_home: true
+    state: present
+  when: operator_user != 'root'
+
+- name: Install host packages
+  ansible.builtin.apt:
+    name:
+      - chrony
+      - ufw
+      - unattended-upgrades
+      - curl
+      - jq
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+# --- time sync -------------------------------------------------------------
+# chrony replaces systemd-timesyncd (Ubuntu 24.04's default): makestep at
+# boot, then slews; RUNBOOK "What NOT to do": don't let clocks drift.
+- name: Configure chrony
+  ansible.builtin.template:
+    src: chrony.conf.j2
+    dest: /etc/chrony/chrony.conf
+    mode: "0644"
+  when: vlpds_manage_chrony | bool
+  notify: Restart chrony
+
+- name: Chrony is running and enabled
+  ansible.builtin.service:
+    name: chrony
+    state: started
+    enabled: true
+  when: vlpds_manage_chrony | bool
+  # in check mode the package may not be installed yet
+  ignore_errors: "{{ ansible_check_mode }}"
+
+# --- kernel limits ---------------------------------------------------------
+# The host's values; the container gets its own net.core.somaxconn /
+# tcp_max_syn_backlog through compose `sysctls` (they are per network
+# namespace).
+- name: Load the conntrack module at boot (its sysctls need it)
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/vlpds.conf
+    content: "nf_conntrack\n"
+    mode: "0644"
+
+- name: Load the conntrack module now
+  community.general.modprobe:
+    name: nf_conntrack
+    state: present
+  failed_when: false
+
+- name: Kernel settings for vlpds
+  ansible.posix.sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/90-vlpds.conf
+    sysctl_set: true
+    reload: true
+  loop: "{{ vlpds_sysctls | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}={{ item.value }}"
+
+# --- updates ---------------------------------------------------------------
+# Security origins only (Ubuntu's default), never an automatic reboot: a
+# reboot of a one-node cluster is an outage, so it is an operator decision.
+- name: Configure unattended-upgrades
+  ansible.builtin.template:
+    src: 52vlpds-unattended-upgrades.j2
+    dest: /etc/apt/apt.conf.d/52vlpds-unattended-upgrades
+    mode: "0644"
+  when: vlpds_manage_unattended_upgrades | bool
+
+- name: Enable periodic unattended-upgrades
+  ansible.builtin.copy:
+    dest: /etc/apt/apt.conf.d/20auto-upgrades
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Unattended-Upgrade "1";
+    mode: "0644"
+  when: vlpds_manage_unattended_upgrades | bool
+
+# --- firewall --------------------------------------------------------------
+# Public: SSH, 80/443 (443/udp for HTTP/3). Everything else (vlpds' ports are
+# on 127.0.0.1 anyway; Alloy's OTLP/pyroscope receivers listen on 0.0.0.0)
+# only over the tailnet. Docker-published ports bypass ufw: vlpds publishes
+# on 127.0.0.1 only, Caddy publishes 80/443 on purpose.
+- name: Firewall rules
+  when: vlpds_manage_firewall | bool
+  # in check mode ufw may not be installed yet
+  ignore_errors: "{{ ansible_check_mode }}"
+  block:
+    - name: Allow SSH
+      community.general.ufw:
+        rule: allow
+        port: "{{ vlpds_ssh_port | string }}"
+        proto: tcp
+
+    - name: Allow HTTP and HTTPS
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop:
+        - { port: "80", proto: tcp }
+        - { port: "443", proto: tcp }
+        - { port: "443", proto: udp }
+
+    - name: Allow everything on trusted interfaces (tailnet)
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: "{{ item }}"
+      loop: "{{ vlpds_firewall_trusted_interfaces }}"
+
+    - name: Deny other incoming traffic
+      community.general.ufw:
+        policy: deny
+        direction: incoming
+
+    - name: Enable ufw
+      community.general.ufw:
+        state: enabled
+
+# --- disk cache --------------------------------------------------------------
+- name: Format the cache device (only if it has no filesystem)
+  community.general.filesystem:
+    dev: "{{ vlpds_cache_device }}"
+    fstype: "{{ vlpds_cache_fstype }}"
+    force: false
+  when: vlpds_cache_device | length > 0
+
+- name: Mount the cache device
+  ansible.posix.mount:
+    path: "{{ vlpds_cache_mountpoint }}"
+    src: "{{ vlpds_cache_device }}"
+    fstype: "{{ vlpds_cache_fstype }}"
+    opts: noatime,nodiratime
+    state: mounted
+  when: vlpds_cache_device | length > 0

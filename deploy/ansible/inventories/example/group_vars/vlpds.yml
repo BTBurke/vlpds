@@ -1,0 +1,66 @@
+---
+# A new single-node PDS at pds.example.com with handles <name>.pds.example.com.
+# Every variable and its meaning: roles/vlpds/defaults/main.yml. Secrets come
+# from vlpds.sops.yaml (sops-encrypted; start from vlpds.sops.yaml.example).
+
+vlpds_profile: tiny
+# Pinned build: `just docker-push <tag> <registry>/vlpds` at the repo root.
+vlpds_image: "registry.example.com/vlpds:CHANGEME"
+
+# --- identity ------------------------------------------------------------------
+# DNS: A pds.example.com and A *.pds.example.com -> the host.
+vlpds_hostname: pds.example.com
+vlpds_handle_domain: pds.example.com
+
+# --- proxy: roles/caddy, one certificate for the hostname and a wildcard for
+# handles (DNS-01 through Cloudflare). Set "" to use on-demand certificates.
+vlpds_caddy_wildcard_dns: cloudflare
+# Operator console on the tailnet: https://<node>.<your-tailnet>.ts.net:8443/admin
+# (0 = off; then reach it through an SSH tunnel to 127.0.0.1:2583).
+vlpds_tailnet_console_port: 8443
+vlpds_acme_email: ""
+
+# --- object store ----------------------------------------------------------------
+# Any store with strongly consistent conditional writes (S3, R2, GCS). Add a
+# lifecycle rule that aborts incomplete multipart uploads after 1 day, and a
+# key pair scoped to this bucket.
+vlpds_s3_endpoint: "https://<account-id>.r2.cloudflarestorage.com"
+vlpds_s3_region: auto
+vlpds_s3_bucket: my-pds-bucket
+# One prefix = one PDS: never reuse it for another deployment.
+vlpds_s3_prefix: pds-example-com
+# Run once on a new bucket: -e vlpds_preflight_probe=true.
+vlpds_preflight_probe: false
+
+# --- email ---------------------------------------------------------------------
+# Off until SMTP credentials exist: mail is logged instead.
+vlpds_email_required: false
+# vlpds_email_smtp_url: "{{ secrets.vlpds_email_smtp_url }}"
+# vlpds_email_from_address: "pds.example.com <noreply@pds.example.com>"
+# vlpds_contact_email_address: "abuse@pds.example.com"
+
+# --- sign-ups and relays ---------------------------------------------------------
+vlpds_invite_required: true
+# Set once the first account checks out, so restarts re-announce.
+vlpds_crawlers: []
+
+# --- host prep (roles/vlpds tasks/host.yml) ------------------------------------
+vlpds_manage_firewall: true
+vlpds_manage_chrony: true
+vlpds_manage_unattended_upgrades: true
+
+# --- secrets (vlpds.sops.yaml) ---------------------------------------------------
+vlpds_s3_access_key: "{{ secrets.vlpds_s3_access_key }}"
+vlpds_s3_secret_key: "{{ secrets.vlpds_s3_secret_key }}"
+vlpds_jwt_secret: "{{ secrets.vlpds_jwt_secret }}"
+vlpds_admin_token: "{{ secrets.vlpds_admin_token }}"
+vlpds_internal_token: "{{ secrets.vlpds_internal_token }}"
+# KEK: a local hex key (back it up offline), or Cloud KMS with
+# vlpds_gcp_kms_key + vlpds_gcp_credentials_json instead.
+vlpds_kek_hex: "{{ secrets.vlpds_kek_hex }}"
+vlpds_plc_rotation_key: "{{ secrets.vlpds_plc_rotation_key }}"
+vlpds_cloudflare_dns_token: "{{ secrets.vlpds_cloudflare_dns_token | default('') }}"
+
+# --- cluster ---------------------------------------------------------------------
+# Off for one node. To add nodes: docs/operations/scaling-and-clustering.md.
+vlpds_cluster_enabled: false

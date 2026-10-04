@@ -1,0 +1,39 @@
+---
+# Host setup for every node (roles/common, roles/alloy).
+
+# --- operator account (roles/common tasks/users.yml): login shell, sudo,
+# NOPASSWD sudoers drop-in. playbooks/vlpds.yml runs as this user.
+operator_user: operator
+operator_ssh_keys:
+  - "ssh-ed25519 AAAA...replace-with-your-public-key you@laptop"
+
+# --- host hardening (roles/common; playbooks/bootstrap.yml applies it first) ----
+common_ssh_hardening_enabled: true
+# The image's login accounts: passwords locked, accounts kept.
+common_lock_password_users: [ubuntu, root]
+# ufw: SSH (key-only), 80 and 443 public, everything on the tailnet.
+common_firewall_enabled: true
+common_firewall_public_ssh: true
+common_fail2ban_enabled: true
+common_unattended_upgrades_enabled: true
+
+# --- Tailscale: the private network for the console, metrics and (clustered)
+# the peer port. Join with an auth key, or `sudo tailscale up` by hand.
+tailscale_enabled: true
+tailscale_auth_key: ""
+tailscale_extra_args: "--advertise-tags=tag:vlpds"
+
+# --- metrics and logs (roles/alloy) to your Prometheus-compatible / Loki stack
+alloy_monitoring_url: "https://monitoring.example.com"
+monitoring_basic_auth_user: alloy
+monitoring_basic_auth_password: "{{ secrets.monitoring_basic_auth_password | default('') }}"
+# Alloy runs as its own user and reads Docker only through a filtered,
+# read-only proxy: root or the docker group would hand it the node's secrets.
+alloy_config_fragments:
+  - host-monitoring
+  - vlpds-monitoring
+alloy_run_as_root: false
+alloy_docker_socket_proxy: true
+# The `cluster` label remote_write adds; ops/alerts.yml and the dashboards
+# select on it.
+deploy_env: pds-example

@@ -1,0 +1,71 @@
+# {{ ansible_managed }} (roles/vlpds)
+# One vlpds node ({{ vlpds_profile }} profile). Secrets are files in
+# {{ vlpds_secrets_path }} (read-only at {{ _vlpds_secrets_dir_in_container }}, named by VLPDS_*_FILE), not
+# values here; mode 0600 anyway (vlpds_extra_env).
+# Restart/upgrade through ansible (playbooks/vlpds.yml), or by hand:
+#   docker compose up -d        (recreates with SIGTERM + {{ vlpds_stop_grace_period }} grace)
+# Never `docker kill` / `docker compose kill`, and never a second copy of
+# this service: two processes with one --node-id fence each other.
+name: vlpds
+
+services:
+  vlpds:
+    image: {{ vlpds_image | to_json }}
+    container_name: vlpds
+    # vlpds fail-stops on purpose (exit 2-8) and expects the supervisor to
+    # restart it; docker backs off between restarts.
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: {{ vlpds_stop_grace_period }}
+{% if _vlpds_args | length > 0 %}
+    command: {{ _vlpds_args | map('string') | list | to_json }}
+{% endif %}
+    environment:
+{% for k, v in _vlpds_env | dictsort %}
+      {{ k }}: {{ (v | string | replace('$', '$$')) | to_json }}
+{% endfor %}
+    ports:
+      - "127.0.0.1:{{ vlpds_host_port }}:2583"
+      - "127.0.0.1:{{ vlpds_metrics_host_port }}:9583"
+{% if vlpds_cluster_enabled | bool %}
+      # peer mTLS; reached over the tailnet through `tailscale serve`
+      - "127.0.0.1:{{ vlpds_peer_host_port }}:2584"
+{% endif %}
+    volumes:
+      - "{{ vlpds_secrets_path }}:{{ _vlpds_secrets_dir_in_container }}:ro"
+      - "{{ vlpds_cache_dir }}:{{ _vlpds_cache_dir_in_container }}"
+    ulimits:
+      nofile:
+        soft: {{ vlpds_nofile_limit }}
+        hard: {{ vlpds_nofile_limit }}
+    # Per network namespace, so not inherited from the host: the accept
+    # queue for --listen-backlog (RUNBOOK / DESIGN "HTTP").
+    sysctls:
+      net.core.somaxconn: {{ vlpds_sysctls['net.core.somaxconn'] | default(16384) }}
+      net.ipv4.tcp_max_syn_backlog: {{ vlpds_sysctls['net.ipv4.tcp_max_syn_backlog'] | default(16384) }}
+    mem_limit: {{ vlpds_mem_limit_mb }}m
+    memswap_limit: {{ vlpds_mem_limit_mb }}m
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:2583/xrpc/_health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # shards open (replaying their log tail) before the node serves
+      start_period: 120s
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      # A host running Watchtower (the reference PDS installer's) must never
+      # restart or swap this container on its own.
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "{{ vlpds_log_max_size }}"
+        max-file: "{{ vlpds_log_max_file }}"
+    networks:
+      - {{ vlpds_docker_network }}
+
+networks:
+  {{ vlpds_docker_network }}:
+    external: true

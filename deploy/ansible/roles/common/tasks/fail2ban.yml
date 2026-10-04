@@ -1,0 +1,42 @@
+---
+# fail2ban's sshd jail, reading the journal (no /var/log/auth.log needed).
+- name: Install fail2ban
+  ansible.builtin.apt:
+    name:
+      - fail2ban
+      - python3-systemd
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Configure the sshd jail
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/sshd.local
+    mode: "0644"
+    content: |
+      # Managed by ansible (roles/common, common_fail2ban_enabled)
+      [DEFAULT]
+      ignoreip = {{ common_fail2ban_ignoreip | join(' ') }}
+      bantime = {{ common_fail2ban_bantime }}
+      findtime = {{ common_fail2ban_findtime }}
+      maxretry = {{ common_fail2ban_maxretry }}
+
+      [sshd]
+      enabled = true
+      backend = systemd
+      # normal mode: invalid users, refused users, too many auth failures.
+      # Not aggressive: that also counts every preauth disconnect of a
+      # valid user ("Connection closed by authenticating user ..."), which
+      # an operator's own tooling produces and which banned the controller
+      # in testing.
+      mode = normal
+      port = {{ ssh_port }}
+  notify: Restart fail2ban
+
+- name: Fail2ban is running and enabled
+  ansible.builtin.service:
+    name: fail2ban
+    state: started
+    enabled: true
+  # in check mode the package may not be installed yet
+  ignore_errors: "{{ ansible_check_mode }}"

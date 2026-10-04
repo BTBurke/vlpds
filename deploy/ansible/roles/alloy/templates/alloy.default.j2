@@ -1,0 +1,17 @@
+## Path:
+## Description: Grafana Alloy settings
+## Type:        string
+## Default:     ""
+## ServiceRestart: alloy
+#
+# Command line options for Alloy.
+#
+# The configuration Alloy loads: the whole directory (config.alloy plus the
+# fragments). Given as CONFIG_FILE, the last argument of both the old unit
+# (`alloy run $CUSTOM_ARGS ... $CONFIG_FILE`) and the newer packages'
+# /usr/lib/alloy/alloy-wrapper, which always appends CONFIG_FILE (a directory
+# in CUSTOM_ARGS as well made it exit "accepts 1 arg(s), received 2").
+CONFIG_FILE="{{ alloy_config_dir }}/"
+
+# Command line arguments for alloy
+CUSTOM_ARGS=""

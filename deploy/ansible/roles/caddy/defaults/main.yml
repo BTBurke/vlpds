@@ -1,0 +1,65 @@
+---
+# Default variables for caddy role
+
+# Owner of the Caddy files; runs the container (docker group).
+operator_user: operator # noqa: var-naming[no-role-prefix] (shared with the common role)
+
+# Caddy configuration directory
+caddy_config_dir: /etc/caddy
+caddy_sites_dir: /etc/caddy/sites
+
+# Caddy Docker image
+# 2.11.4, not 2.11.6: 2.11.6's new idle timeouts panic on HTTP/2 request
+# bodies and cut SSE streams (fixed in 2.11.7, not yet on Docker Hub).
+caddy_image: caddy:2.11.4-alpine
+caddy_container_name: caddy
+
+# Opt-in: build and run Caddy with the caddy-dns/cloudflare module (ACME
+# DNS-01, e.g. a wildcard certificate), from templates/cloudflare.Dockerfile.j2
+# on the host. The site's `tls { dns cloudflare {env.CF_API_TOKEN} }` reads
+# the token from caddy_env (the container's environment), never from disk.
+caddy_cloudflare_dns: false
+# The module's v0.2 line needs libdns v1 (Caddy >= 2.10).
+caddy_cloudflare_caddy_version: "2.11.7"
+# Docker Hub's caddy:<v>-builder/-alpine images trail Caddy releases by days.
+# The base only supplies xcaddy and the Alpine runtime; the binary is built
+# from caddy_cloudflare_caddy_version.
+caddy_cloudflare_base_version: "2.11.6"
+caddy_cloudflare_module_version: "0.2.4"
+caddy_cloudflare_image: "local/caddy-cloudflare:{{ caddy_cloudflare_caddy_version }}-{{ caddy_cloudflare_module_version }}"
+caddy_cloudflare_build_dir: /opt/caddy-cloudflare
+
+# Environment for the Caddy container (e.g. CF_API_TOKEN).
+caddy_env: {}
+
+# Data directories
+caddy_data_dir: /data/caddy/data
+caddy_config_data_dir: /data/caddy/config
+
+# Caddy sites to configure
+# Each site should reference a template name (without .j2)
+caddy_sites: []
+#   - name: vlpds
+#     template: vlpds-site
+#     enabled: true
+
+# Extra lines for the Caddyfile's global options block (e.g. `email`,
+# `on_demand_tls { ask ... }`), as one multi-line string.
+caddy_global_options: ""
+
+# Additional networks to connect Caddy to
+caddy_docker_networks: []
+
+# Mount the host's tailscaled socket, so Caddy can fetch certificates for
+# *.ts.net names (also set tailscale_env_vars: {TS_PERMIT_CERT_UID: caddy}
+# in the common role). Needs Tailscale on the host.
+caddy_mount_tailscale_socket: false
+
+# Extra volumes to mount into the Caddy container
+caddy_extra_volumes: []
+
+# Port bindings for Caddy container
+caddy_ports:
+  - "80:80"
+  - "443:443"
+  - "443:443/udp"

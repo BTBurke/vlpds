@@ -1,0 +1,18 @@
+# The secrets group_vars/vlpds.yml and group_vars/all/main.yml read. Never
+# commit this filled in as plain text: copy it to vlpds.sops.yaml (beside, not
+# inside, group_vars/vlpds/), fill it in, then `sops encrypt -i vlpds.sops.yaml`
+# with the recipients from ../../../.sops.yaml (see .sops.yaml.example). The
+# community.sops vars plugin decrypts it at run time.
+#
+# Three different random values: openssl rand -hex 32
+# PLC rotation key: docker run --rm -i -e VLPDS_KEK=<kek> <image> --wrap-plc-rotation-key </dev/null
+secrets:
+  vlpds_s3_access_key: "<bucket-scoped access key id>"
+  vlpds_s3_secret_key: "<bucket-scoped secret>"
+  vlpds_jwt_secret: "<openssl rand -hex 32>"
+  vlpds_admin_token: "<openssl rand -hex 32>"
+  vlpds_internal_token: "<openssl rand -hex 32>"
+  vlpds_kek_hex: "<openssl rand -hex 32; back it up offline>"
+  vlpds_plc_rotation_key: "<vw1.… from --wrap-plc-rotation-key>"
+  vlpds_cloudflare_dns_token: "<Zone:Read + DNS:Edit on the handle domain's zone>"
+  monitoring_basic_auth_password: "<your monitoring endpoint's password>"

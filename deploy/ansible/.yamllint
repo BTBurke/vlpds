@@ -1,0 +1,23 @@
+---
+extends: default
+
+ignore: |
+  collections/
+  *.sops.yaml
+  roles/*/files/
+
+rules:
+  # ansible-lint's yaml rule wants these
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
+  # Long lines are mostly Jinja expressions, URLs and SSH keys.
+  line-length: disable
+  truthy:
+    allowed-values: ["true", "false"]
+    check-keys: false
