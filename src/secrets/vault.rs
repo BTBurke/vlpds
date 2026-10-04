@@ -158,10 +158,7 @@ impl VaultClient {
         );
         let host = u.host_str().ok_or_else(|| anyhow::anyhow!("--vault-addr has no host: {addr}"))?.to_string();
         let namespace = cfg.namespace.as_deref().map(|n| n.trim().trim_matches('/')).filter(|n| !n.is_empty());
-        let http = match &cfg.ca_pem {
-            Some(pem) => crate::http::public_with_roots(pem).map_err(|e| e.context("--vault-ca-file"))?,
-            None => crate::http::public().clone(),
-        };
+        let http = crate::http::public_own(cfg.ca_pem.as_deref()).map_err(|e| e.context("--vault-ca-file"))?;
         match &cfg.auth {
             VaultAuth::AppRole { mount, role_id, .. } => {
                 check_mount(mount, "--vault-approle-mount")?;
@@ -247,7 +244,7 @@ impl VaultClient {
             .json(&serde_json::json!({}))
             .send()
             .await
-            .map_err(|e| SecretError::Unavailable(format!("vault token renewal: {e}")))?;
+            .map_err(|e| SecretError::Unavailable(format!("vault token renewal: {}", chain(&e))))?;
         let a = auth_response(r, "token renewal").await?;
         self.renewals.fetch_add(1, Ordering::Relaxed);
         let ttl = a.lease_duration;
@@ -282,7 +279,7 @@ impl VaultClient {
             .body(body.to_vec())
             .send()
             .await
-            .map_err(|e| SecretError::Unavailable(format!("vault {what}: {e}")))?;
+            .map_err(|e| SecretError::Unavailable(format!("vault {what}: {}", chain(&e))))?;
         let a = auth_response(r, &what).await?;
         self.logins.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(method = self.auth.method(), ttl = a.lease_duration, renewable = a.renewable, "vault login");
@@ -305,7 +302,7 @@ impl VaultClient {
             if let Some(b) = body {
                 req = req.header(reqwest::header::CONTENT_TYPE, "application/json").body(b.to_vec());
             }
-            let r = req.send().await.map_err(|e| SecretError::Unavailable(format!("vault {op}: {e}")))?;
+            let r = req.send().await.map_err(|e| SecretError::Unavailable(format!("vault {op}: {}", chain(&e))))?;
             let status = r.status();
             if status.is_success() {
                 let mut v: serde_json::Value =
@@ -365,6 +362,18 @@ async fn auth_response(r: reqwest::Response, what: &str) -> Result<AuthData, Sec
     a.auth
         .filter(|a| !a.client_token.is_empty())
         .ok_or_else(|| SecretError::Unavailable(format!("vault {what}: no token in the response")))
+}
+
+/// reqwest's own message stops at "error sending request".
+fn chain(e: &reqwest::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(x) = src {
+        s.push_str(": ");
+        s.push_str(&x.to_string());
+        src = x.source();
+    }
+    s
 }
 
 /// Vault's `{"errors": [...]}`, or the raw body.
