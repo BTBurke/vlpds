@@ -2374,6 +2374,14 @@ impl Cluster {
         }
     }
 
+    /// Writes our lease as draining ahead of `shutdown`, for a node with
+    /// its own work to hand over first: peers stop handing it shards, and
+    /// its own steps stop taking them.
+    pub async fn announce_drain(&self, host: &Arc<dyn ShardHost>) {
+        self.lease.write().draining = true;
+        self.renew(host).await;
+    }
+
     /// Closes and releases every shard, fences our log, drops our lease.
     /// Err if our log could not be fenced: our lease is then left in place
     /// (renewals stopped) and the caller must exit nonzero, so peers presume
