@@ -330,6 +330,9 @@ pub struct Cluster {
     pub(crate) list_every_step: AtomicBool,
     /// `TRIM_SPANS` unless the host set its own (`set_trim_spans`).
     trim_spans: std::sync::atomic::AtomicUsize,
+    /// `set_revalidate`: a lapsed lease is renewed (if our log is unfenced)
+    /// instead of fail-stopping.
+    revalidate: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -496,6 +499,7 @@ impl Cluster {
             nodes_listed: parking_lot::Mutex::new((None, 0)),
             list_every_step: AtomicBool::new(false),
             trim_spans: std::sync::atomic::AtomicUsize::new(TRIM_SPANS),
+            revalidate: AtomicBool::new(false),
             cfg,
         };
         let v = c.ensure_version().await?;
@@ -878,6 +882,60 @@ impl Cluster {
         self.trim_spans.load(Ordering::Acquire)
     }
 
+    /// Opt-in for a host whose log holds (rather than fails) while the
+    /// lease is lapsed: a node that wakes from a pause with its lease lapsed
+    /// renews it by CAS on its own lease and goes on if its log is still
+    /// unfenced, instead of fail-stopping. Safety still rests on the fence:
+    /// a peer that presumed us dead fenced our log before taking anything,
+    /// so we see the fence and fail-stop, and a fence landing after our
+    /// check fails our next segment PUT. The watchdog then fail-stops only
+    /// past `revalidate_window`.
+    pub fn set_revalidate(&self, on: bool) {
+        self.revalidate.store(on, Ordering::Release);
+    }
+
+    /// How long past its validity a lapsed lease may still be revalidated.
+    /// Peers presume us dead 2 x skew after it; a TTL more is when the
+    /// slowest of them has surely fenced us.
+    fn revalidate_window(&self) -> Duration {
+        self.cfg.skew * 2 + self.cfg.ttl
+    }
+
+    /// Our lapsed lease: renew it by CAS and check our log isn't fenced.
+    /// False means fail-stop.
+    async fn try_revalidate(&self) -> bool {
+        let etag = self.lease_etag.read().clone();
+        if let Err(e) = self.write_lease(if_match(etag)).await {
+            let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
+            if moved {
+                tracing::error!("lapsed node lease was rewritten under us: fail-stop ({e:#})");
+                return false;
+            }
+            // still lapsed (no validity from a failed write): the next
+            // renewal retries, the watchdog bounds it
+            tracing::warn!("revalidating our lapsed node lease failed (will retry): {e:#}");
+            return true;
+        }
+        self.count("list");
+        match self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, &self.log_id)).await {
+            Ok((_, false)) => {
+                crate::metrics::LEASE_EVENTS.with_label_values(&["revalidated"]).inc();
+                tracing::warn!("node lease had lapsed (a pause?) but our log is unfenced: renewed it and carry on");
+                true
+            }
+            Ok((_, true)) => {
+                tracing::error!("node lease lapsed and our log is fenced: fail-stop");
+                false
+            }
+            Err(e) => {
+                // can't tell: give up the validity we just took
+                *self.valid_until.write() = Instant::now();
+                tracing::warn!("checking our log for a fence after revalidating: {e:#}");
+                true
+            }
+        }
+    }
+
     pub fn layout(&self) -> Arc<Layout> {
         self.layout.read().0.clone()
     }
@@ -1250,7 +1308,9 @@ impl Cluster {
                     return;
                 }
                 let lapsed_for = Instant::now().saturating_duration_since(*me.valid_until.read());
-                if lapsed_for > me.cfg.skew * 2 {
+                let limit =
+                    if me.revalidate.load(Ordering::Acquire) { me.revalidate_window() } else { me.cfg.skew * 2 };
+                if lapsed_for > limit {
                     tracing::error!(
                         lapsed_ms = lapsed_for.as_millis() as u64,
                         "node lease lapsed past takeover: fail-stop"
@@ -1484,6 +1544,14 @@ impl Cluster {
         // a renewal landing now would make them count us live again and
         // release shards they just took.
         if !self.lease_valid() {
+            let lapsed_for = Instant::now().saturating_duration_since(*self.valid_until.read());
+            if self.revalidate.load(Ordering::Acquire) && lapsed_for <= self.revalidate_window() {
+                if !self.try_revalidate().await {
+                    crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
+                    host.lost();
+                }
+                return;
+            }
             crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
             tracing::error!("node lease lapsed before renewal: fail-stop");
             host.lost();
@@ -3067,6 +3135,46 @@ mod tests {
             None,
             "the dead log is no longer needed"
         );
+    }
+
+    /// A pause that lapsed our lease (as `set_revalidate` hosts see it):
+    /// unfenced, the next renewal takes the lease back; fenced, it
+    /// fail-stops; without the opt-in it fail-stops as before.
+    #[tokio::test]
+    async fn lapsed_lease_is_revalidated_only_while_unfenced() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.set_revalidate(true);
+        let lapse = |c: &Cluster| *c.valid_until.write() = Instant::now() - c.cfg.skew;
+        lapse(&a);
+        assert!(!a.lease_valid());
+        let renewals = a.own_lease().renewals;
+        a.renew(&ha_dyn).await;
+        assert!(a.lease_valid(), "revalidated");
+        assert!(a.own_lease().renewals > renewals);
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
+
+        // a peer presumed us dead and fenced our log
+        lapse(&a);
+        let b = join(cfg("b"), store.clone()).await.unwrap();
+        b.fence(&a.log_id).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 1, "fenced: fail-stop");
+
+        // past the window, or without the opt-in: fail-stop as before
+        let c = join(cfg("c"), store.clone()).await.unwrap();
+        let (hc, hc_dyn) = host();
+        c.set_revalidate(true);
+        *c.valid_until.write() = Instant::now() - c.revalidate_window() - Duration::from_millis(10);
+        c.renew(&hc_dyn).await;
+        assert_eq!(hc.lost.load(Ordering::SeqCst), 1, "past the window");
+        let d = join(cfg("d"), store.clone()).await.unwrap();
+        let (hd, hd_dyn) = host();
+        lapse(&d);
+        d.renew(&hd_dyn).await;
+        assert_eq!(hd.lost.load(Ordering::SeqCst), 1, "no opt-in");
     }
 
     /// With `set_trim_spans(1)` one checkpointed takeover is enough: the
