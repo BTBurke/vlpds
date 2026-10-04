@@ -616,9 +616,9 @@ for many nodes go straight to [Object-store outage](#object-store-outage).
 
 ### VlpdsLeaseRenewalSlow
 
-**Means:** renewal p99 over 500 ms for 10 minutes (normal: one small PUT,
-~25-50 ms). Not dangerous yet at any supported TTL; the trend toward the
-0.4 x TTL ceiling is.
+**Means:** renewal p99 over 0.1 x TTL for 10 minutes (normal: one small PUT,
+~25-50 ms on S3, a few hundred ms on R2). Not dangerous yet; the trend toward
+the 0.4 x TTL ceiling is.
 
 **Do:** as [VlpdsLeaseRenewalNearCeiling](#vlpdsleaserenewalnearceiling), without
 the urgency.

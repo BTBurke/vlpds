@@ -295,17 +295,18 @@ groups:
           summary: "{{ $labels.instance }}: {{ $value | printf \"%.0f\" }} lease renewal(s) took over 0.4 x TTL in 5 minutes: past the fail-stop ceiling"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalatceiling"
 
-      # A renewal is one small CAS PUT (~25-50 ms on S3). p99 over 500 ms for
-      # 10 minutes is store or network trouble building up, whatever the TTL
-      # (guess).
+      # Relative to the TTL, not absolute: a renewal is one small CAS PUT,
+      # ~25-50 ms on S3 but routinely 250-600 ms on R2, which is harmless
+      # against a 60 s TTL. p99 past a quarter of the fail-stop ceiling for
+      # 10 minutes is store or network trouble building up.
       - alert: VlpdsLeaseRenewalSlow
         expr: >-
-          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_lease_renew_seconds_bucket{job="vlpds"}[5m]))) > 0.5
+          histogram_quantile(0.99, sum by (instance, le) (rate(vlpds_lease_renew_ttl_ratio_bucket{job="vlpds"}[5m]))) > 0.1
         for: 10m
         labels:
           severity: ticket
         annotations:
-          summary: "Lease renewal p99 on {{ $labels.instance }} is {{ $value | humanizeDuration }} (fail-stop ceiling 0.4 x TTL)"
+          summary: "Lease renewal p99 on {{ $labels.instance }} is {{ $value | humanizePercentage }} of the TTL (fail-stop ceiling 40%)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalslow"
 
       # Renewals that failed with an error or a client timeout (retried at
