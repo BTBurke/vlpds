@@ -44,8 +44,20 @@ export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 let pausedUntil = 0
 
-export async function retry<T>(fn: () => Promise<T>, onPause: (until: number) => void, tries = 4, signal?: AbortSignal): Promise<T> {
+/** Errors matching `when` get only `delays` (one retry each), not `tries`. */
+export type Quick = { when: (e: unknown) => boolean; delays: number[] }
+
+/** A 5xx for a blob: the reference PDS answers 500, every time, for one
+ * whose row it has but whose bytes are gone, so a long schedule only parks
+ * the worker. */
+export const quickServerErrors = (delays = [500, 2000]): Quick => ({
+  when: (e) => e instanceof XrpcError && e.status >= 500,
+  delays,
+})
+
+export async function retry<T>(fn: () => Promise<T>, onPause: (until: number) => void, tries = 4, signal?: AbortSignal, quick?: Quick): Promise<T> {
   let failures = 0
+  let quickFailures = 0
   for (let limited = 0; ; ) {
     const wait = pausedUntil - Date.now()
     if (wait > 0) await sleep(wait)
@@ -62,6 +74,11 @@ export async function retry<T>(fn: () => Promise<T>, onPause: (until: number) =>
       }
       // a definite "no" doesn't change on retry
       if (e instanceof XrpcError && e.status >= 400 && e.status < 500 && e.status !== 408) throw e
+      if (quick?.when(e)) {
+        if (quickFailures >= quick.delays.length) throw e
+        await sleep(quick.delays[quickFailures++])
+        continue
+      }
       if (++failures >= tries) throw e
       await sleep(500 * 2 ** failures)
     }

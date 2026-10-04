@@ -5,7 +5,7 @@
 // passwords never leave memory.
 
 import { call, XrpcError, type CallOpts, type Session } from '../../lib/xrpc'
-import { fetchOk, httpError, retry } from '../../lib/backoff'
+import { fetchOk, httpError, quickServerErrors, retry, sleep } from '../../lib/backoff'
 import type { RecordCounts } from './count'
 
 export type Tokens = { accessJwt: string; refreshJwt: string }
@@ -49,6 +49,8 @@ export type Saved = {
   counts?: RecordCounts
   /** Blobs the old server couldn't produce; reported, not retried forever. */
   unavailableBlobs?: string[]
+  /** Failed in an earlier run of the copy (a reload, a Retry): tried once more each. */
+  failedBlobs?: string[]
   startedAt: number
   finishedAt?: number
 }
@@ -343,8 +345,23 @@ export async function copyRepo(
 
 export type BlobResult = { copied: number; failed: { cid: string; reason: string }[]; remaining: number }
 
+/** A 429, a 502/503/504 or a dropped connection from either server. Not a
+ * 500: that is how the reference PDS answers for one blob it can't read. */
+const strained = (e: unknown) => !(e instanceof XrpcError) || e.status === 429 || (e.status >= 502 && e.status <= 504)
+
+export type CopyBlobsOpts = {
+  /** Failed in an earlier run: one more try each, no retries. */
+  once?: Set<string>
+  onFailed?: (cid: string) => void
+  concurrency?: number
+}
+
 /** One pass over listMissingBlobs: copy each blob the new server lacks.
- * Safe to stop and re-run at any point; the list shrinks as blobs land. */
+ * Safe to stop and re-run at any point; the list shrinks as blobs land.
+ * Each blob is latency-bound (a fetch there, a store here), so many run at
+ * once; a strained server halves the workers, and they grow back one per
+ * round of clean copies. A blob the old server answers 5xx for gets two
+ * quick retries, then is reported failed so its worker moves on. */
 export async function copyBlobs(
   oldPds: Pds,
   newPds: Pds,
@@ -352,7 +369,7 @@ export async function copyBlobs(
   onCopied: (cid: string, bytes: number) => void,
   shouldStop: () => boolean,
   onPause: (until: number) => void,
-  concurrency = 4,
+  { once, onFailed, concurrency = 12 }: CopyBlobsOpts = {},
 ): Promise<BlobResult> {
   const failed: { cid: string; reason: string }[] = []
   let copied = 0
@@ -364,24 +381,54 @@ export async function copyBlobs(
     cursor = page.cursor
     if (!cursor || !page.blobs.length) break
   }
+  let active = concurrency
+  let clean = 0
+  // only the old server's answers: an upload's 5xx here keeps the full schedule
+  const fromOld = new WeakSet<object>()
+  const { when, delays } = quickServerErrors()
+  const quick = { when: (e: unknown) => fromOld.has(e as object) && when(e), delays }
   const one = async (cid: string) => {
+    const again = once?.has(cid)
     try {
       await retry(async () => {
-        const r = await fetchOk(`${oldPds.base}/xrpc/com.atproto.sync.getBlob?did=${encodeURIComponent(oldPds.did)}&cid=${encodeURIComponent(cid)}`)
-        const body = await r.blob()
-        const type = r.headers.get('content-type') || 'application/octet-stream'
-        const out = await upload('com.atproto.repo.uploadBlob', body, type, await newPds.auth(), () => {})
+        let body: Blob, out: any
+        try {
+          let r: Response
+          try {
+            r = await fetchOk(`${oldPds.base}/xrpc/com.atproto.sync.getBlob?did=${encodeURIComponent(oldPds.did)}&cid=${encodeURIComponent(cid)}`)
+          } catch (e) {
+            if (e instanceof Object) fromOld.add(e)
+            throw e
+          }
+          body = await r.blob()
+          const type = r.headers.get('content-type') || 'application/octet-stream'
+          out = await upload('com.atproto.repo.uploadBlob', body, type, await newPds.auth(), () => {})
+        } catch (e) {
+          if (strained(e)) {
+            active = Math.max(1, Math.floor(active / 2))
+            clean = 0
+          }
+          throw e
+        }
         const got = out?.blob?.ref?.$link
         if (got && got !== cid) throw new Error(`the copy hashed to ${got}, not ${cid}`)
         copied++
         onCopied(cid, body.size)
-      }, onPause)
+        if (active < concurrency && ++clean >= active) {
+          active++
+          clean = 0
+        }
+      }, onPause, again ? 1 : 4, undefined, again ? { ...quick, delays: [] } : quick)
     } catch (e) {
       failed.push({ cid, reason: e instanceof Error ? e.message : String(e) })
+      onFailed?.(cid)
     }
   }
-  const workers = Array.from({ length: concurrency }, async () => {
-    while (queue.length && !shouldStop()) await one(queue.shift()!)
+  const workers = Array.from({ length: concurrency }, async (_, i) => {
+    while (queue.length && !shouldStop()) {
+      if (i >= active) await sleep(250)
+      else await one(queue.shift()!)
+    }
   })
   await Promise.all(workers)
   return { copied, failed, remaining: queue.length }

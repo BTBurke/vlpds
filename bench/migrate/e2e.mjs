@@ -505,7 +505,47 @@ async function driveOne(ctx, a, state, opts) {
     await page.route(`${REF}/xrpc/com.atproto.sync.getBlob*`, async (r) => (await blobGate.p, r.continue()))
     await page.route(`${REF}/xrpc/app.bsky.actor.getPreferences*`, async (r) => (await prefsGate.p, r.continue()))
   }
+  // first getBlob there to the last uploadBlob here (across a reload)
+  const blobCopy = {}
+  page.on('request', (r) => r.url().startsWith(`${REF}/xrpc/com.atproto.sync.getBlob`) && (blobCopy.first ??= Date.now()))
+  page.on('response', (r) => r.url().includes('/xrpc/com.atproto.repo.uploadBlob') && (blobCopy.last = Date.now()))
+  const logBlobCopy = () =>
+    blobCopy.first && log(`  ${a.name}: blob copy ${(((blobCopy.last ?? blobCopy.first) - blobCopy.first) / 1000).toFixed(1)} s for ${want.nBlobs} blobs`)
+  // the reference PDS answers 500, every time, for a blob whose row it has but whose bytes are gone
+  const broken = new Set(opts.brokenBlobs ? Object.keys(a.blobs).slice(0, opts.brokenBlobs) : [])
+  let brokenHits = 0
+  const breakBlobs = async (r) => {
+    if (!broken.has(new URL(r.request().url()).searchParams.get('cid'))) return r.continue()
+    brokenHits++
+    await r.fulfill({
+      status: 500,
+      headers: { 'access-control-allow-origin': '*' },
+      contentType: 'application/json',
+      body: JSON.stringify({ error: 'InternalServerError', message: 'Internal Server Error' }),
+    })
+  }
+  if (broken.size) await page.route(`${REF}/xrpc/com.atproto.sync.getBlob*`, breakBlobs)
+  const brokenStart = Date.now()
   await waitHeading(page, /Copying your data/)
+  if (broken.size) {
+    const n = broken.size
+    const listed = new RegExp(`${n} (files couldn't be copied|photos or videos couldn't be copied)`)
+    const retryBtn = page.locator('.mig-card .notice button', { hasText: 'Retry' })
+    await waitCardText(page, listed, 30_000)
+    const secs = (Date.now() - brokenStart) / 1000
+    check(secs < 20, `${n} blobs answering 500 are listed as failed quickly, not after a long retry schedule`, `${secs.toFixed(1)} s`)
+    check(brokenHits === 3 * n, 'each got two quick retries, then the worker moved on', `${brokenHits} fetches for ${n} blobs`)
+    await shot(page, `${a.name}-copy-broken-blobs`)
+    // a reload resumes with one more try each, not the whole schedule
+    await page.reload()
+    await waitHeading(page, /Copying your data/)
+    await retryBtn.waitFor({ timeout: 30_000 })
+    await waitCardText(page, listed, 30_000)
+    check(brokenHits === 4 * n, 'after a reload the failed blobs were tried once more each', `${brokenHits} fetches for ${n} blobs`)
+    // the old server recovers: Retry copies them
+    await page.unroute(`${REF}/xrpc/com.atproto.sync.getBlob*`, breakBlobs)
+    await retryBtn.click()
+  }
   if (opts.holdBlobs) {
     await waitCardText(page, new RegExp(`${esc(repoLine)}.*0 of ${want.nBlobs} photos & videos copied`))
     check(true, `simple copy step: "${repoLine}" and "0 of ${want.media} copied"`)
@@ -543,9 +583,11 @@ async function driveOne(ctx, a, state, opts) {
       check(after.includes(repoLine), 'after the reload, the repo counts are still shown (kept with the progress)', after)
     }
     await waitHeading(page, BACKUP_HEADING, 300_000)
+    logBlobCopy()
     check(imports === 0, 'the resumed copy did not import the repository again', `imports=${imports}`)
   } else {
     await waitHeading(page, BACKUP_HEADING, 300_000)
+    logBlobCopy()
   }
 
   // 7. the optional backup, from the old server
@@ -729,7 +771,7 @@ async function drive(state) {
       // backups: bob saves one at the step (streamed to a picked file), the
       // others skip it; alice also takes one from the welcome screen (with
       // her new recovery key) and dave from the account page (in memory)
-      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate', backupAtWelcome: 'memory' },
+      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate', backupAtWelcome: 'memory', brokenBlobs: 3 },
       bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true, fakeProfile: true, holdBlobs: true, backupAtStep: 'stream' },
       carol: { reloadMidBlobs: true, newTabBeforePlc: true },
       dave: { keepHandle: true, advanced: true, ownKey: 'paste', backupOnAccount: 'memory' },

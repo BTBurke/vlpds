@@ -6,7 +6,7 @@
 // collected in memory and saved as a blob: download.
 
 import { makeZip } from 'client-zip'
-import { fetchOk, retry } from './backoff'
+import { fetchOk, quickServerErrors, retry } from './backoff'
 import { call, type CallOpts } from './xrpc'
 
 /** The server the backup is read from, signed in as the account. */
@@ -107,7 +107,7 @@ function saveBlobAs(blob: Blob, name: string) {
 const enc = new TextEncoder()
 const json = (v: unknown) => enc.encode(`${JSON.stringify(v, null, 2)}\n`)
 
-const PREFETCH = 4
+const PREFETCH = 8
 
 async function* entries(o: BackupOptions, sum: BackupSummary, report: (p?: Partial<BackupProgress>) => void) {
   const { source: src, signal } = o
@@ -189,7 +189,7 @@ async function* entries(o: BackupOptions, sum: BackupSummary, report: (p?: Parti
       : fetchOk(`${src.base}/xrpc/com.atproto.sync.getBlob?did=${encodeURIComponent(did)}&cid=${encodeURIComponent(cid)}`, { signal })
   const fetchOne = async (cid: string): Promise<{ cid: string; bytes?: Uint8Array; reason?: string }> => {
     try {
-      const bytes = await retry(async () => new Uint8Array(await (await getBlob(cid)).arrayBuffer()), onPause, 4, signal)
+      const bytes = await retry(async () => new Uint8Array(await (await getBlob(cid)).arrayBuffer()), onPause, 4, signal, quickServerErrors())
       const want = cidSha256(cid)
       if (!want) return { cid, bytes }
       const got = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))

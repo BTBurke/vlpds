@@ -1148,8 +1148,14 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
             update({ repoDone: true, counts: found && found.total === b.indexedRecords ? found : undefined })
           }
           if (!s().blobsDone) {
-            const skip = new Set(s().unavailableBlobs ?? [])
-            let failed: { cid: string; reason: string }[] = []
+            const unavailable = new Set(s().unavailableBlobs ?? [])
+            const before = new Set(s().failedBlobs ?? [])
+            // "Continue without them": what already failed isn't fetched again
+            if (opts.skipFailed) for (const c of before) unavailable.add(c)
+            // a blob gets its retries in one pass; later passes are for the rest
+            const skip = new Set(unavailable)
+            const failedNow = new Map<string, { cid: string; reason: string }>()
+            const seen = new Set(before)
             for (let pass = 0; pass < 5 && !stop.current; pass++) {
               const st = await newPds.call<AccountStatus>('com.atproto.server.checkAccountStatus')
               set((x) => ({ ...x, blobs: { ...x.blobs, done: st.importedBlobs, total: st.expectedBlobs } }))
@@ -1160,14 +1166,30 @@ function CopyStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds
                 (_cid, bytes) => set((x) => ({ ...x, blobs: { ...x.blobs, done: x.blobs.done + 1, bytes: x.blobs.bytes + bytes, pausedUntil: undefined } })),
                 () => stop.current,
                 (until) => set((x) => ({ ...x, blobs: { ...x.blobs, pausedUntil: until } })),
+                {
+                  once: before,
+                  onFailed: (cid) => {
+                    // kept as they happen, so a reload mid-copy doesn't give them the full schedule again
+                    if (!seen.has(cid)) {
+                      seen.add(cid)
+                      update({ failedBlobs: [...seen] })
+                    }
+                  },
+                },
               )
-              failed = r.failed
+              for (const f of r.failed) {
+                failedNow.set(f.cid, f)
+                skip.add(f.cid)
+              }
               if (r.copied === 0) break
             }
             if (stop.current) return
+            const failed = [...failedNow.values()]
             set((x) => ({ ...x, blobs: { ...x.blobs, failed } }))
+            update({ failedBlobs: failed.map((f) => f.cid) })
             if (failed.length && !opts.skipFailed) return
-            update({ blobsDone: true, unavailableBlobs: failed.length ? [...skip, ...failed.map((f) => f.cid)] : s().unavailableBlobs })
+            for (const f of failed) unavailable.add(f.cid)
+            update({ blobsDone: true, failedBlobs: undefined, unavailableBlobs: unavailable.size ? [...unavailable] : undefined })
           }
           if (!s().prefsDone) {
             const p = await oldPds.call('app.bsky.actor.getPreferences')

@@ -94,7 +94,7 @@ caption: "The copy step, in order. Each part is marked done only when it checks 
 nodes:
   - { id: acct, label: createAccount, sub: "service auth from old\nstarts deactivated", at: [0, 0], size: [10, 3.6], tone: accent }
   - { id: repo, label: repo, sub: "getRepo → importRepo\nrecord count checked", at: [13, 0], size: [10, 3.6], tone: accent }
-  - { id: blobs, label: blobs, sub: "listMissingBlobs loop\n4 at a time", at: [26, 0], size: [10, 3.6], tone: accent }
+  - { id: blobs, label: blobs, sub: "listMissingBlobs loop\nup to 12 at a time", at: [26, 0], size: [10, 3.6], tone: accent }
   - { id: prefs, label: preferences, sub: "get → putPreferences", at: [39, 0], size: [10, 3.6], tone: accent }
 edges:
   - acct -> repo
@@ -112,9 +112,14 @@ edges:
    compares `checkAccountStatus.indexedRecords` on both sides and stops on a mismatch (advanced mode
    can accept it). Re-running replaces the copy.
 3. **Blobs.** `listMissingBlobs` here lists what the repo references and this server lacks. The browser
-   fetches each from the old server and uploads it, four at a time, checking that each upload hashes
-   to the same CID. A 429 pauses every worker until the rate-limit window resets. It makes up to five
-   passes; blobs the old server can't produce are reported, and the user can continue without them.
+   fetches each from the old server and uploads it, up to twelve at a time, checking that each upload
+   hashes to the same CID. A 429 pauses every worker until the rate-limit window resets, and a 429,
+   502–504 or dropped connection from either server halves the workers; they grow back as copies
+   succeed. These uploads don't count against this server's per-IP limits. A blob the old server
+   answers with a 5xx gets two quick retries (0.5 s, 2 s) and is then set aside: the reference PDS
+   answers 500 every time for a blob whose bytes it has lost. It makes up to five passes over the
+   rest; blobs the old server can't produce are reported, and the user can retry them (a reload or
+   Retry tries each once more) or continue without them.
 4. **Preferences.** `app.bsky.actor.getPreferences` there, `putPreferences` here.
 
 Not copied: sessions, app passwords and OAuth authorisations (the user signs in again), and any
@@ -148,7 +153,8 @@ The browser builds the ZIP itself (stored, not compressed: blobs are already-com
 the File System Access API exists (desktop Chrome and Edge), it streams straight into the file the
 user picks, so account size doesn't matter. Elsewhere it is assembled in memory and saved as a
 download; the page shows a size estimate first and warns when it looks too large for the tab. Blob
-fetches run four at a time and back off on a 429 like the copy does.
+fetches run eight at a time and back off on a 429 like the copy does; a blob answering 5xx gets
+two quick retries and then goes to `missing-blobs.txt`.
 
 To restore elsewhere: create the account with the DID, `importRepo` the CAR, upload each blob,
 `putPreferences`, then point the DID at the new server (the README gives the calls).
