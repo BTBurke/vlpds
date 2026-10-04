@@ -2524,7 +2524,7 @@ impl Cluster {
         }
         // Peers following our log drop its firehose source only at a fence;
         // without one every peer's merged firehose stalls at our watermark.
-        if let Err(e) = self.fence_own_log().await {
+        if let Err(e) = self.fence_own_log(host).await {
             {
                 let _r = self.renew_lock.lock().await;
                 self.gone.store(true, Ordering::Release);
@@ -2554,6 +2554,32 @@ impl Cluster {
         host.nudge(nudges).await;
     }
 
+    /// Ok(true): our log is fenced at `end` (by us, or a peer before us).
+    /// Ok(false): a segment holds `end`.
+    async fn fence_own_at(&self, end: u64, last_seq: i64) -> anyhow::Result<bool> {
+        let path = crate::nodelog::segment_path(&self.store, &self.log_id, end);
+        self.count("put");
+        let put = self.store.raw.put_opts(
+            &path,
+            PutPayload::from_bytes(crate::segment::fence_object(&self.cfg.node_id)),
+            PutOptions { mode: PutMode::Create, ..Default::default() },
+        );
+        match self.bounded("fence", put).await {
+            Ok(_) => {}
+            Err(e) if is_conflict(&e) => {
+                self.count("get");
+                let b = self.bounded("get", async { self.store.raw.get(&path).await?.bytes().await }).await?;
+                if !matches!(crate::segment::parse(b, false, None)?, crate::segment::LogObject::Fence { .. }) {
+                    return Ok(false);
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+        self.fenced.write().insert(self.log_id.clone(), (end, last_seq));
+        tracing::info!(log_id = %self.log_id, fence_ordinal = end, "fenced our log at its end");
+        Ok(true)
+    }
+
     /// A TTL, at most 30 s (inside a supervisor's stop timeout).
     fn shutdown_fence_budget(&self) -> Duration {
         self.cfg.ttl.min(Duration::from_secs(30))
@@ -2561,10 +2587,18 @@ impl Cluster {
 
     /// Retries with backoff for `shutdown_fence_budget`. A fence PUT that
     /// timed out but landed is found by the next attempt's scan.
-    async fn fence_own_log(&self) -> anyhow::Result<()> {
+    async fn fence_own_log(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.shutdown_fence_budget();
         let mut backoff = Duration::from_millis(200);
         let mut attempt = 1u32;
+        // Quiesced, our log's end is known: fence there without the scan,
+        // whose LIST of a long-lived log outlasted the whole budget under
+        // load. Anything else at that ordinal falls back to the scan.
+        match self.fence_own_at(host.durable_end(), host.seq_high()).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("fencing our log at its end failed (scanning it instead): {e:#}"),
+        }
         loop {
             let e = match self.fence(&self.log_id).await {
                 Ok(_) => return Ok(()),
@@ -3804,6 +3838,27 @@ mod tests {
         assert_eq!(stalls.stalled.load(Ordering::SeqCst), 2, "two failed fence PUTs, then one that landed");
         assert!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap().1, "our log is fenced");
         assert!(a.get_json::<NodeLease>(&a.path("nodes/a")).await.unwrap().is_none(), "lease dropped");
+    }
+
+    /// Quiesced, shutdown fences our log at its known end without a LIST.
+    #[tokio::test]
+    async fn shutdown_fences_our_log_at_its_end_without_a_scan() {
+        let store = Store::memory(None);
+        let a = lone_join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        for ord in 0..3 {
+            store
+                .raw
+                .put(&crate::nodelog::segment_path(&store, &a.log_id, ord), segment(&a.log_id, ord, 100 + ord as i64))
+                .await
+                .unwrap();
+        }
+        ha.ord.store(3, Ordering::SeqCst);
+        let lists = a.store_lists();
+        a.shutdown(&ha_dyn).await.unwrap();
+        assert_eq!(a.store_lists(), lists, "no fence scan");
+        assert_eq!(crate::nodelog::first_free(&store, &a.log_id).await.unwrap(), (3, true));
     }
 
     /// A fence that keeps failing: shutdown gives up after its budget and
