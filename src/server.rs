@@ -386,6 +386,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     crate::mst_store::NODE_CACHE.set_bytes(cfg.lazy_mst_node_cache_bytes);
     let secrets = Arc::new(crate::secrets::Secrets::from_config(&cfg.kek, cfg.dev_mode)?);
     tracing::info!(kek = secrets.current_kid(), unwrap_keks = ?secrets.kids(), dev = secrets.is_dev(), "secrets at rest");
+    secrets.check_key_service().await?;
     let workers =
         worker::spawn_with_secrets(cfg.workers, limits, lookup, tokio::runtime::Handle::current(), secrets.clone());
     let plc = crate::plc::Plc::from_config(&cfg.plc, &cfg.plc_url, cfg.dev_mode, &secrets).await?;

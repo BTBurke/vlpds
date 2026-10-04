@@ -59,6 +59,18 @@ pub fn public() -> &'static reqwest::Client {
     &C
 }
 
+/// Like [`public`], also trusting `ca_pem` (one or more PEM certificates)
+/// for an upstream on a private PKI. Built per caller: few use it.
+pub fn public_with_roots(ca_pem: &[u8]) -> anyhow::Result<reqwest::Client> {
+    let certs = reqwest::Certificate::from_pem_bundle(ca_pem).map_err(|e| anyhow::anyhow!("CA bundle: {e}"))?;
+    anyhow::ensure!(!certs.is_empty(), "CA bundle holds no PEM certificate");
+    let mut b = outbound("public", 64);
+    for c in certs {
+        b = b.add_root_certificate(c);
+    }
+    Ok(b.build()?)
+}
+
 /// The proxy client for `https://` upstreams (plain `http://` uses [`h1`]),
 /// one per IO thread: a single pool is one mutex that every proxied request
 /// takes twice (checkout, return), and that contention showed up in proxy

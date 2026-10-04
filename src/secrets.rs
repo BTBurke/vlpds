@@ -19,6 +19,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use zeroize::{Zeroize, Zeroizing};
 
+mod vault;
+pub use vault::{
+    VaultAuth, VaultClient, VaultConfig, VaultTransit, DEFAULT_APPROLE_MOUNT, DEFAULT_K8S_JWT_FILE, DEFAULT_K8S_MOUNT,
+};
+
 const WRAP_VERSION: &str = "vw1";
 /// Per KMS request, token fetch included.
 const KMS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -35,7 +40,7 @@ fn wrap_concurrency(n: usize) -> usize {
 static KMS_REQUESTS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     register_int_counter_vec!(
         "vlpds_kms_requests_total",
-        "Key-encryption-key operations by backend (local, gcpkms), op (wrap, unwrap) and result (ok, unavailable, rejected)",
+        "Key-encryption-key operations by backend (local, gcpkms, vault), op (wrap, unwrap) and result (ok, unavailable, rejected)",
         &["backend", "op", "result"]
     )
     .unwrap()
@@ -117,6 +122,11 @@ pub trait KeyWrapper: Send + Sync {
     fn backend(&self) -> &'static str;
     /// A network round trip: limited and failing fast.
     fn remote(&self) -> bool;
+    /// Checks a remote key service can serve as the KEK at all (Vault:
+    /// that it enforces the AAD). Startup runs it on the current KEK.
+    async fn self_test(&self) -> Result<(), SecretError> {
+        Ok(())
+    }
     async fn wrap(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretError>;
     async fn unwrap(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Unwrapped, SecretError>;
 }
@@ -593,8 +603,8 @@ impl KeyWrapper for GcpKms {
     }
 }
 
-/// The current KEK wraps (the Cloud KMS key if set, else the local KEK,
-/// else [`dev_kek`]); every configured one unwraps.
+/// The current KEK wraps (the Cloud KMS or Vault Transit key if set, else
+/// the local KEK, else [`dev_kek`]); every configured one unwraps.
 #[derive(Clone, Debug, Default)]
 pub struct KekConfig {
     pub local: Option<KekBytes>,
@@ -605,23 +615,41 @@ pub struct KekConfig {
     pub gcp_old_keys: Vec<String>,
     pub gcp_endpoint: Option<String>,
     pub gcp_token: Option<GcpToken>,
+    /// `<mount>/<key>`.
+    pub vault_key: Option<String>,
+    /// Unwrap only, on the same server.
+    pub vault_old_keys: Vec<String>,
+    pub vault: Option<VaultConfig>,
     /// 0: default.
     pub kms_concurrency: usize,
 }
 
 impl KekConfig {
     pub fn check(&self, dev_mode: bool) -> anyhow::Result<()> {
+        self.check_backends()?;
         if dev_mode {
             return Ok(());
         }
         anyhow::ensure!(
-            self.local.is_some() || self.gcp_key.is_some(),
-            "a key-encryption key is required outside --dev-mode: set --kek-file / VLPDS_KEK (32 random bytes) or --gcp-kms-key"
+            self.local.is_some() || self.gcp_key.is_some() || self.vault_key.is_some(),
+            "a key-encryption key is required outside --dev-mode: set --kek-file / VLPDS_KEK (32 random bytes), --gcp-kms-key or --vault-transit-key"
         );
         let dev = dev_kek();
         anyhow::ensure!(
             self.local.as_ref() != Some(&dev) && !self.local_old.contains(&dev),
             "the dev-mode KEK is not accepted outside --dev-mode"
+        );
+        Ok(())
+    }
+
+    fn check_backends(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.gcp_key.is_none() || self.vault_key.is_none(),
+            "set one current key service, --gcp-kms-key or --vault-transit-key, not both (the other one's key can stay as --gcp-kms-old-key / --vault-transit-old-key)"
+        );
+        anyhow::ensure!(
+            self.vault.is_some() || (self.vault_key.is_none() && self.vault_old_keys.is_empty()),
+            "a Vault Transit key needs --vault-addr and a Vault auth method"
         );
         Ok(())
     }
@@ -732,11 +760,21 @@ impl Secrets {
     /// that outside dev mode first ([`KekConfig::check`]); in-process tests
     /// may run non-dev servers without a KEK.
     pub fn from_config(cfg: &KekConfig, dev_mode: bool) -> anyhow::Result<Secrets> {
+        cfg.check_backends()?;
         let endpoint = cfg.gcp_endpoint.as_deref().unwrap_or(GCP_KMS_ENDPOINT);
         let token = cfg.gcp_token.clone().unwrap_or_default();
+        let vault = cfg.vault.as_ref().map(VaultClient::new).transpose()?;
         let mut ws: Vec<Arc<dyn KeyWrapper>> = Vec::new();
         if let Some(k) = &cfg.gcp_key {
             ws.push(Arc::new(GcpKms::new(k, endpoint, token.clone())?));
+        }
+        let vault_key = |k: &str, current: bool| -> anyhow::Result<Arc<dyn KeyWrapper>> {
+            let t = VaultTransit::new(vault.clone().expect("checked"), k, current)?;
+            tracing::info!(kid = t.kid(), key = t.name(), current, "vault transit key");
+            Ok(Arc::new(t))
+        };
+        if let Some(k) = &cfg.vault_key {
+            ws.push(vault_key(k, true)?);
         }
         let mut dev = false;
         match &cfg.local {
@@ -749,6 +787,9 @@ impl Secrets {
         }
         for k in &cfg.gcp_old_keys {
             ws.push(Arc::new(GcpKms::new(k, endpoint, token.clone())?));
+        }
+        for k in &cfg.vault_old_keys {
+            ws.push(vault_key(k, false)?);
         }
         for k in &cfg.local_old {
             ws.push(Arc::new(LocalKek::new(k)));
@@ -771,6 +812,24 @@ impl Secrets {
             Arc::new(s)
         });
         DEV.clone()
+    }
+
+    /// The current KEK's [`KeyWrapper::self_test`]. A key service that is
+    /// unreachable only logs: the check runs again before its first use.
+    pub async fn check_key_service(&self) -> anyhow::Result<()> {
+        let w = &self.wrappers[0];
+        let r = match tokio::time::timeout(KMS_TIMEOUT * 3, w.self_test()).await {
+            Ok(r) => r,
+            Err(_) => Err(SecretError::Unavailable(format!("{} self-test timed out", w.backend()))),
+        };
+        match r {
+            Ok(()) => Ok(()),
+            Err(e) if e.retryable() => {
+                tracing::warn!(kid = w.kid(), backend = w.backend(), "key service check deferred to first use: {e}");
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!("key-encryption key {} ({}) is unusable: {e}", w.kid(), w.backend())),
+        }
     }
 
     pub fn is_dev(&self) -> bool {

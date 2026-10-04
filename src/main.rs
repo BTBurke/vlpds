@@ -404,7 +404,8 @@ struct Args {
     /// Key-encryption key for secrets at rest (signing keys, TOTP secrets;
     /// DESIGN.md "Secrets at rest"): a file of 32 random bytes (raw, hex or
     /// base64), the same on every node. Required outside --dev-mode unless
-    /// --gcp-kms-key is set (then it is accepted for unwrap only).
+    /// --gcp-kms-key or --vault-transit-key is set (then it is accepted for
+    /// unwrap only).
     #[arg(long, env = "VLPDS_KEK_FILE")]
     kek_file: Option<std::path::PathBuf>,
     /// The KEK itself (hex or base64), instead of --kek-file.
@@ -433,6 +434,54 @@ struct Args {
     /// Cloud KMS API base URL.
     #[arg(long, env = "VLPDS_GCP_KMS_ENDPOINT", default_value = vlpds::secrets::GCP_KMS_ENDPOINT)]
     gcp_kms_endpoint: String,
+    /// Vault (or OpenBao) Transit key that wraps secrets, as <mount>/<key>
+    /// (e.g. transit/vlpds): an aes256-gcm96, aes128-gcm96 or
+    /// chacha20-poly1305 key on Vault 1.13+. Takes precedence over
+    /// --kek-file for new wraps; not with --gcp-kms-key.
+    #[arg(long, env = "VLPDS_VAULT_TRANSIT_KEY", conflicts_with = "gcp_kms_key")]
+    vault_transit_key: Option<String>,
+    /// Previous Transit keys on the same server, unwrap only (moving to
+    /// another mount or key; `rotate` inside one key needs none).
+    #[arg(long, env = "VLPDS_VAULT_TRANSIT_OLD_KEY", value_delimiter = ',')]
+    vault_transit_old_key: Vec<String>,
+    /// Vault server, http(s)://host[:port]. Its host name is part of each
+    /// Transit key's kid, so every node must use the same one.
+    #[arg(long, env = "VLPDS_VAULT_ADDR")]
+    vault_addr: Option<String>,
+    /// Vault Enterprise / OpenBao namespace (X-Vault-Namespace).
+    #[arg(long, env = "VLPDS_VAULT_NAMESPACE")]
+    vault_namespace: Option<String>,
+    /// PEM CA bundle to trust for --vault-addr (a private PKI), on top of
+    /// the public roots.
+    #[arg(long, env = "VLPDS_VAULT_CA_FILE")]
+    vault_ca_file: Option<std::path::PathBuf>,
+    /// Vault auth: a file holding a token, re-read every minute and after a
+    /// 403 (a Vault Agent sink).
+    #[arg(long, env = "VLPDS_VAULT_TOKEN_FILE")]
+    vault_token_file: Option<std::path::PathBuf>,
+    /// Vault auth: AppRole role ID (with --vault-approle-secret-id-file).
+    #[arg(long, env = "VLPDS_VAULT_APPROLE_ROLE_ID", hide_env_values = true)]
+    vault_approle_role_id: Option<String>,
+    /// File holding --vault-approle-role-id.
+    #[arg(long, env = "VLPDS_VAULT_APPROLE_ROLE_ID_FILE", conflicts_with = "vault_approle_role_id")]
+    vault_approle_role_id_file: Option<std::path::PathBuf>,
+    /// File holding the AppRole secret ID, read at every login.
+    #[arg(long, env = "VLPDS_VAULT_APPROLE_SECRET_ID_FILE")]
+    vault_approle_secret_id_file: Option<std::path::PathBuf>,
+    /// Where the AppRole auth method is mounted.
+    #[arg(long, env = "VLPDS_VAULT_APPROLE_MOUNT", default_value = vlpds::secrets::DEFAULT_APPROLE_MOUNT)]
+    vault_approle_mount: String,
+    /// Vault auth: Kubernetes auth role, logging in with the pod's
+    /// service-account token.
+    #[arg(long, env = "VLPDS_VAULT_K8S_ROLE")]
+    vault_k8s_role: Option<String>,
+    /// Where the Kubernetes auth method is mounted.
+    #[arg(long, env = "VLPDS_VAULT_K8S_MOUNT", default_value = vlpds::secrets::DEFAULT_K8S_MOUNT)]
+    vault_k8s_mount: String,
+    /// The service-account token, read at every login (projected tokens
+    /// rotate).
+    #[arg(long, env = "VLPDS_VAULT_K8S_JWT_FILE", default_value = vlpds::secrets::DEFAULT_K8S_JWT_FILE)]
+    vault_k8s_jwt_file: std::path::PathBuf,
     /// Remote KMS unwraps in flight per node (cold signing-key loads); wraps
     /// get a separate pool of a quarter of this.
     #[arg(long, env = "VLPDS_KMS_CONCURRENCY", default_value_t = vlpds::secrets::DEFAULT_KMS_CONCURRENCY)]
@@ -532,8 +581,8 @@ struct Args {
     #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX", hide_env_values = true)]
     plc_rotation_key: Option<String>,
     /// A file holding the PLC rotation key wrapped under the KEK (`vw1.`,
-    /// from --wrap-plc-rotation-key; unwrapped at startup, via Cloud KMS
-    /// with --gcp-kms-key) or as 64 hex chars (a mounted secret).
+    /// from --wrap-plc-rotation-key; unwrapped at startup, via Cloud KMS or
+    /// Vault when the KEK is there) or as 64 hex chars (a mounted secret).
     #[arg(long, env = "VLPDS_PLC_ROTATION_KEY_FILE", conflicts_with = "plc_rotation_key")]
     plc_rotation_key_file: Option<std::path::PathBuf>,
     /// Retired PLC rotation keys (files as --plc-rotation-key-file): they
@@ -939,6 +988,7 @@ fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
         &mut args.moderation_email_smtp_url,
     )?;
     resolve("rate-limit-bypass-key-file", &args.rate_limit_bypass_key_file, &mut args.rate_limit_bypass_key)?;
+    resolve("vault-approle-role-id-file", &args.vault_approle_role_id_file, &mut args.vault_approle_role_id)?;
     if let Some(p) = &args.s3_access_key_file {
         args.s3_access_key = read("s3-access-key-file", p)?;
     }
@@ -1065,6 +1115,7 @@ async fn wrap_plc_rotation_key(args: &Args) -> anyhow::Result<()> {
     let kek = kek_config(args)?;
     kek.check(args.dev_mode)?;
     let secrets = vlpds::secrets::Secrets::from_config(&kek, args.dev_mode)?;
+    secrets.check_key_service().await?;
     let mut input = zeroize::Zeroizing::new(String::new());
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)?;
     let t = input.trim();
@@ -1101,6 +1152,9 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     } else {
         None
     };
+    let vault_key = args.vault_transit_key.clone().filter(|k| !k.is_empty());
+    let vault_old_keys: Vec<String> = args.vault_transit_old_key.iter().filter(|k| !k.is_empty()).cloned().collect();
+    let vault = if vault_key.is_some() || !vault_old_keys.is_empty() { Some(vault_config(args)?) } else { None };
     Ok(vlpds::secrets::KekConfig {
         local,
         local_old,
@@ -1108,8 +1162,48 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
         gcp_old_keys,
         gcp_endpoint: Some(args.gcp_kms_endpoint.clone()),
         gcp_token,
+        vault,
+        vault_key,
+        vault_old_keys,
         kms_concurrency: args.kms_concurrency,
     })
+}
+
+fn vault_config(args: &Args) -> anyhow::Result<vlpds::secrets::VaultConfig> {
+    use vlpds::secrets::VaultAuth;
+    let addr = args
+        .vault_addr
+        .clone()
+        .filter(|a| !a.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("--vault-transit-key needs --vault-addr"))?;
+    let role_id = args.vault_approle_role_id.clone().filter(|r| !r.trim().is_empty());
+    let k8s_role = args.vault_k8s_role.clone().filter(|r| !r.trim().is_empty());
+    let given = [args.vault_token_file.is_some(), role_id.is_some(), k8s_role.is_some()];
+    anyhow::ensure!(
+        given.iter().filter(|g| **g).count() == 1,
+        "set exactly one Vault auth method: --vault-token-file, --vault-approle-role-id[-file] (with --vault-approle-secret-id-file) or --vault-k8s-role"
+    );
+    let auth = if let Some(p) = &args.vault_token_file {
+        VaultAuth::TokenFile(p.clone())
+    } else if let Some(role_id) = role_id {
+        let secret_id_file = args
+            .vault_approle_secret_id_file
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("--vault-approle-role-id needs --vault-approle-secret-id-file"))?;
+        VaultAuth::AppRole { mount: args.vault_approle_mount.clone(), role_id, secret_id_file }
+    } else {
+        VaultAuth::Kubernetes {
+            mount: args.vault_k8s_mount.clone(),
+            role: k8s_role.expect("counted"),
+            jwt_file: args.vault_k8s_jwt_file.clone(),
+        }
+    };
+    let ca_pem = args
+        .vault_ca_file
+        .as_ref()
+        .map(|p| std::fs::read(p).map_err(|e| anyhow::anyhow!("--vault-ca-file {}: {e}", p.display())))
+        .transpose()?;
+    Ok(vlpds::secrets::VaultConfig { addr, namespace: args.vault_namespace.clone(), ca_pem, auth })
 }
 
 fn peer_tls(
