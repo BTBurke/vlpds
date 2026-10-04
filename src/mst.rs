@@ -943,14 +943,14 @@ pub fn decode_node_reference(data: &[u8], c: Cid) -> Result<Node> {
 /// node reached twice is rejected, and every node's keys must fall strictly
 /// between its parent's separators (else lookups by key order would miss
 /// them). Load work and memory are linear in the input.
-struct Loader<'a, B> {
-    blocks: &'a HashMap<Cid, B>,
+struct Loader<'a, B, S> {
+    blocks: &'a HashMap<Cid, B, S>,
     seen: std::collections::HashSet<Cid>,
     /// Only the nodes on the key-order path to this key (proofs).
     path: Option<&'a [u8]>,
 }
 
-impl<B: AsRef<[u8]>> Loader<'_, B> {
+impl<B: AsRef<[u8]>, S: std::hash::BuildHasher> Loader<'_, B, S> {
     /// The subtree at `c`, whose keys must lie strictly between `lo` and
     /// `hi`. Children missing from `blocks` or off `path` stay unloaded. A
     /// node without keys takes its height from its child.
@@ -1211,18 +1211,29 @@ impl Tree {
     }
 
     /// A (possibly partial) tree. Linear in the input (see [`Loader`]).
-    pub fn load_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid) -> Result<Tree> {
+    pub fn load_from_blocks<B: AsRef<[u8]>, S: std::hash::BuildHasher>(
+        blocks: &HashMap<Cid, B, S>,
+        root: Cid,
+    ) -> Result<Tree> {
         Self::load_with(blocks, root, None)
     }
 
     /// Only the nodes on the key-order path to `key`: enough for
     /// [`Tree::get`] of `key` without decoding the rest of an untrusted
     /// block set.
-    pub fn load_path_from_blocks<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid, key: &[u8]) -> Result<Tree> {
+    pub fn load_path_from_blocks<B: AsRef<[u8]>, S: std::hash::BuildHasher>(
+        blocks: &HashMap<Cid, B, S>,
+        root: Cid,
+        key: &[u8],
+    ) -> Result<Tree> {
         Self::load_with(blocks, root, Some(key))
     }
 
-    fn load_with<B: AsRef<[u8]>>(blocks: &HashMap<Cid, B>, root: Cid, path: Option<&[u8]>) -> Result<Tree> {
+    fn load_with<B: AsRef<[u8]>, S: std::hash::BuildHasher>(
+        blocks: &HashMap<Cid, B, S>,
+        root: Cid,
+        path: Option<&[u8]>,
+    ) -> Result<Tree> {
         let mut l = Loader { blocks, seen: Default::default(), path };
         let mut r = l.load(root, 0, None, None)?.ok_or(MstError::Partial)?;
         ensure_heights(&mut r, 0)?;
