@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "check-docs": "node docs-build/check.mjs && node scripts/check-docs-private.mjs"
+    "check-docs": "node docs-build/check.mjs && node scripts/check-docs-private.mjs && node scripts/check-docs-ratelimits.mjs"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",

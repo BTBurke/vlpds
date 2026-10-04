@@ -229,12 +229,10 @@ A node sheds load before it runs out of memory. Each limit returns an error the 
 | `--blob-quarantine-days` | 30 | How long a taken-down blob's bytes are kept (restorable) before they're deleted. |
 | Argon2 permits | one per core, at most 16 | Password hashing. Sign-ins wait at most 2 s for a turn, then get 503 `Overloaded` with Retry-After. |
 
-Rate limits are the reference PDS's buckets by default. You can change them on a live cluster from
-the console's "Rate limits" tab (stored in `config/ratelimits.json`, re-read every 10 s). That covers
-per-bucket points and windows, extra per-route limits, and exemptions for an IP, CIDR or DID.
-`--trusted-proxies` lists the proxies whose `X-Forwarded-For` is trusted (Caddy's address). Without
-it, every client looks like the proxy. `--rate-limit-bypass-key` sets a header value that skips the
-limits, and `--no-rate-limits` turns them off for benchmarks.
+Rate limits are the reference PDS's buckets plus a few of vlpds's own, tunable live from the
+console. Set `--trusted-proxies` to your TLS proxy's address, or every client looks like the proxy.
+`--rate-limit-bypass-key` and `--no-rate-limits` are for trusted services and benchmarks. Every
+bucket, the flags and the live config are on [Rate limits](rate-limits.md).
 
 Two flags size the threads. `--workers` is the number of repo workers that build and sign commits
 (default half the cores), and `--io-threads` sizes the request runtime (default all cores). On a
