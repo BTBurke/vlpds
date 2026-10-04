@@ -15,7 +15,7 @@
 //! [`Tree::remove`]: super::Tree::remove
 //! [`Tree::root_cid`]: super::Tree::root_cid
 
-use super::{MAX_DEPTH, encode_entry, height_for_key, valid_key};
+use super::{encode_entry, height_for_key, valid_key, MAX_DEPTH};
 use crate::cbor::{self, Cursor};
 use crate::cid::Cid;
 use std::cell::RefCell;

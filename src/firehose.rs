@@ -197,7 +197,7 @@ impl MergedBatch {
         skip: Option<&[bool]>,
     ) -> (Vec<std::io::IoSlice<'_>>, usize) {
         let slots = range.map(|r| (r, self.slots()));
-        let keep = |j: usize| slots.map_or(true, |(r, s)| r.contains(s[j])) && skip.map_or(true, |s| !s[j]);
+        let keep = |j: usize| slots.is_none_or(|(r, s)| r.contains(s[j])) && skip.is_none_or(|s| !s[j]);
         let end = |j: usize| self.offs.get(j).copied().unwrap_or(self.wire.len());
         let len = self.events.len();
         let (mut runs, mut n, mut j) = (Vec::new(), 0, i);
