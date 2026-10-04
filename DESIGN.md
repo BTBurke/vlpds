@@ -3659,8 +3659,9 @@ for it.
   send them to another node, where the account's counters were fresh. More
   generally, POST requests never route by query parameters, since
   procedures take their input in the body. The cost is that anyone can hold
-  an account's password sign-ins off for up to an hour; app passwords and
-  live sessions keep working.
+  an account's sign-ins off for up to an hour, app-password createSession
+  included (the bucket is spent before the password is checked, so before
+  it is known which kind it is); live sessions keep working.
 - `com.atproto.server.reserveSigningKey-0` caps reservations at 100 per
   hour per IP. `reserve-signing-key-node` caps new reservations (each one a
   KMS wrap plus a row kept 24 h) at 5000 per day per node, which bounds

@@ -1347,6 +1347,28 @@ async fn sign_in_rate_limited() {
     assert!(html.contains("Too many sign-in attempts"), "{html}");
 }
 
+/// OAuth sign-up posts spend createAccount's per-IP bucket, as the XRPC does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_up_rate_limited() {
+    let s = spawn().await;
+    let d: vlpds::ratelimit::config::Doc =
+        serde_json::from_value(json!({"limiters": {"com.atproto.server.createAccount-0": {"points": 3}}})).unwrap();
+    s.app.ratelimit.install(vlpds::ratelimit::config::compile(Some(&d)).unwrap());
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto", &key).with("prompt", "create");
+    let mut b = Browser::default();
+    let ru = f.request_uri(&s, &pkce(), "su").await;
+    let csrf = csrf_of(&b.authorize(&s, &f, &ru).await.2);
+    let form = sign_up_form(&ru, &csrf, "no spaces", "x@example.com", None);
+    for _ in 0..3 {
+        let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &form).await;
+        assert_eq!(st, 400, "{html}");
+    }
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &form).await;
+    assert_eq!(st, 429, "{html}");
+    assert!(html.contains("Too many sign-up attempts"), "{html}");
+}
+
 /// The email factor over its recipient's mail budget: rate_limited, not a
 /// prompt for a code that never comes (nor a wrong-code strike).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

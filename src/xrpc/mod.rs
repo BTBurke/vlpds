@@ -334,7 +334,7 @@ pub fn router(app: Arc<App>) -> Router {
         let limiter = app.ratelimit.clone();
         r.layer(axum::middleware::from_fn_with_state(limiter, crate::ratelimit::layer))
     } else {
-        r
+        r.layer(axum::middleware::from_fn(crate::ratelimit::unlimited))
     };
     r.layer(axum::middleware::from_fn(incorrect_method))
         .layer(axum::middleware::from_fn(track_http))

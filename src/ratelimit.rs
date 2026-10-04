@@ -6,8 +6,9 @@
 //! vlpds adds a per-IP and a cross-IP per-account cap to both createSession
 //! and the OAuth sign-in (password guessing is Argon2 CPU; the reference's
 //! oauth-provider has no sign-in limits of its own). The per-account cap
-//! lets anyone hold an account's password sign-ins off for up to an hour;
-//! app passwords and live sessions keep working. reserveSigningKey is
+//! lets anyone hold an account's sign-ins off for up to an hour, app
+//! password ones included: createSession spends it before it knows which
+//! password it was given. Live sessions keep working. reserveSigningKey is
 //! unauthenticated and costs a KMS wrap and a stored row per new key, hence
 //! its per-IP and per-node caps. IPv6 clients are keyed by their /64.
 //!
@@ -360,7 +361,7 @@ pub const BUILTIN: [&Limit; 33] = [
 const OAUTH_IP_PATHS: [&str; 3] = ["/oauth/par", "/oauth/token", "/oauth/revoke"];
 
 /// Checked by the handler, which renders its own page on a 429.
-const OAUTH_SIGN_IN_PATHS: [&str; 2] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in"];
+const OAUTH_FORM_PATHS: [&str; 3] = ["/oauth/authorize/sign-in", "/oauth/account/sign-in", "/oauth/authorize/sign-up"];
 
 pub const CREATE_POINTS: u32 = 3;
 pub const UPDATE_POINTS: u32 = 2;
@@ -1244,6 +1245,8 @@ impl Ctx {
 
 tokio::task_local! {
     static CTX: RefCell<Ctx>;
+    /// Set by [`unlimited`]: a request [`layer`] was never going to see.
+    static UNLIMITED: ();
 }
 
 fn exceeded_error() -> XrpcError {
@@ -1256,7 +1259,17 @@ fn exceeded_error() -> XrpcError {
 
 /// Outside a rate-limited request: Ok.
 fn with_ctx(f: impl FnOnce(&mut Ctx) -> Result<(), XrpcError>) -> Result<(), XrpcError> {
-    CTX.try_with(|c| f(&mut c.borrow_mut())).unwrap_or(Ok(()))
+    CTX.try_with(|c| f(&mut c.borrow_mut())).unwrap_or_else(|_| {
+        // a handler's check on a path [`layer`] passes through would
+        // silently allow everything
+        debug_assert!(UNLIMITED.try_with(|_| ()).is_ok(), "rate-limit check on a path ratelimit::layer skips");
+        Ok(())
+    })
+}
+
+/// Stands in for [`layer`] with rate limits off.
+pub async fn unlimited(req: Request, next: axum::middleware::Next) -> Response {
+    UNLIMITED.scope((), next.run(req)).await
 }
 
 /// No-op when rate limiting is off or bypassed.
@@ -1315,16 +1328,16 @@ pub async fn layer(
 ) -> Response {
     let path = req.uri().path();
     let post = req.method() == axum::http::Method::POST;
-    let sign_in_form = post && OAUTH_SIGN_IN_PATHS.contains(&path);
+    let oauth_form = post && OAUTH_FORM_PATHS.contains(&path);
     let oauth_endpoint = post && OAUTH_IP_PATHS.contains(&path);
-    if !sign_in_form && !oauth_endpoint && (!path.starts_with("/xrpc/") || unlimited_path(path)) {
+    if !oauth_form && !oauth_endpoint && (!path.starts_with("/xrpc/") || unlimited_path(path)) {
         return next.run(req).await;
     }
     let bypass = limiter.bypassed(req.headers());
     let ip_addr = request_client_ip(req.headers(), req.extensions(), &limiter.trusted);
     let ip = ip_addr.map(ip_key).unwrap_or_else(|| "unknown".into());
     let route: &[&Limit] = if oauth_endpoint { &[&OAUTH_IP] } else { ip_route_limits(path) };
-    let global = !sign_in_form && !oauth_endpoint && path != "/xrpc/com.atproto.sync.getRepo";
+    let global = !oauth_form && !oauth_endpoint && path != "/xrpc/com.atproto.sync.getRepo";
     let policy = limiter.policy();
     let custom = policy.routes.get(path).cloned();
     let ctx = Ctx {

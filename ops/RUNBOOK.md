@@ -2203,7 +2203,8 @@ vlpds TOTP. With both on, only TOTP is asked for.
 - Too many wrong passwords from anywhere (429 on createSession or the sign-in
   page for one account, from every address). The `sign-in-account` bucket (100
   attempts per hour per account) is spent, e.g. by someone guessing. It clears
-  within the hour. App passwords and live sessions keep working. To lift it
+  within the hour. App-password createSession is refused too (the bucket is
+  checked before the password); live sessions keep working. To lift it
   early, add a DID override for `sign-in-account` in the console's Rate limits
   tab.
 - An OAuth client app gets 429 `rate_limit_exceeded` from `/oauth/token` or
