@@ -76,6 +76,7 @@ mod invites_optional;
 mod join_follow;
 mod key_rotation;
 mod lexicons;
+mod link_previews;
 mod list_repos_scale;
 mod log_pipeline;
 mod log_retention;
