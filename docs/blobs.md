@@ -125,6 +125,10 @@ last reference went away. An image removed from a post an hour after upload is q
 next pass and deleted about one pass later. In between it sits in `blob-gc/`, which is the
 only window to recover a blob deleted by mistake.
 
+A blob **taken down** by the operator is separate: its bytes move to `blob-quarantine/` and stay
+there for `--blob-quarantine-days` (30) whatever references it; the GC never sees them. See
+[Email and moderation](operations/email-and-moderation.md#what-a-takedown-does).
+
 The same pass deletes completed temp objects under `blob-tmp/` older than 24 h (or the grace
 period, if longer), left by a crash between the multipart upload and the copy. The GC has no
 metrics: it logs `blob gc` with the counts at info level when it deleted something, and warnings

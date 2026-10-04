@@ -223,6 +223,8 @@ A node sheds load before it runs out of memory. Each limit answers with an error
 | `--max-exports`, `--export-stall-secs` | 32, 60 | getRepo streams at once (more wait 10 s, then 503); a stream whose client reads nothing for 60 s is ended. |
 | `--max-import-mb`, `--import-memory-mb` | 1,024, 1/16 of the budget | Largest CAR importRepo takes, and the memory imports may hold at once. |
 | `--max-blob-mb` | 100 | Largest uploadBlob. |
+| `--blob-quota-gb`, `--blob-uploads-per-day` | 25, 500 | Per-account blob bytes stored and uploads per UTC day (0: unlimited); the console overrides them per account. See [Email and moderation](email-and-moderation.md#upload-quotas). |
+| `--blob-quarantine-days` | 30 | How long a taken-down blob's bytes are kept (restorable) before they are deleted. |
 | Argon2 permits | one per core, at most 16 | Password hashing; sign-ins wait at most 2 s for a turn, then get 503 `Overloaded` with Retry-After. |
 
 **Rate limits** are the reference PDS's buckets by default. Operators can change them on a live
@@ -258,6 +260,6 @@ table covers what the sections above don't.
 | Resharding | `--reshard-split-mb`, `--reshard-split-writes`, `--reshard-gc-grace` (1 h), `--forced-detach-after` (5 min), `--full-compaction-every` (off) |
 | Takeover | `--preload-recent` (2,048 repos per shard), `--forwarded-write-start-ms` (1,000), `--retry-unapplied-writes` (on), `--checkpoint-stagger` (on) |
 | Repo cache | `--cache-per-worker` (50,000 repos), `--lazy-mst-prefetch-kb` (1,024) |
-| Blobs | `--max-blob-mb`, `--blob-gc-grace-secs` (6 h) |
+| Blobs | `--max-blob-mb`, `--blob-gc-grace-secs` (6 h), `--blob-quota-gb`, `--blob-uploads-per-day`, `--blob-quarantine-days` |
 | Logging | `--log-format` (`text`, `json`), `RUST_LOG` (`info,slatedb=warn`), `--exit-state-file`, `--pyroscope-url` (profiling builds) |
 | Development | `--dev-mode`, `--memory` (in-memory store), `--allow-bulk-create`, `--no-rate-limits`, `--inject-put-ms` |

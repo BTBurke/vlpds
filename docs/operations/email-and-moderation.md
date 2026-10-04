@@ -3,7 +3,7 @@ title: Email and moderation
 section: Operations
 order: 112
 status: ready
-summary: "Outgoing mail (SMTP, branding, disposable-address policy), the moderation service, earned invites and external handles."
+summary: "Outgoing mail (SMTP, branding, disposable-address policy), the moderation service, operator takedowns and cases, blob quarantine and upload quotas, earned invites and external handles."
 ---
 
 ```hero
@@ -188,6 +188,87 @@ node that answered; `BadJwtSignature` means Ozone's DID document doesn't list th
 (vlpds re-resolves once first, so a just-rotated key works); `BadJwtAudience` means the token wasn't
 addressed to this PDS's `--service-did`. Takedowns from either path take effect on every node; see
 [Admin console and CLI](admin-console.md#common-tasks).
+
+## Operator moderation
+
+```facts
+- { value: "3", unit: kinds, label: of takedown, note: "account, record, blob; each needs a reason and is audited" }
+- { value: "30", unit: days, label: blob quarantine, note: "`--blob-quarantine-days`; restorable until then", tone: amber }
+- { value: "25 GB", label: per-account blob quota, note: "`--blob-quota-gb`; per-account override in the console", tone: blue }
+- { value: "500", unit: uploads, label: per account per day, note: "`--blob-uploads-per-day`", tone: violet }
+```
+
+What a PDS operator does with a notice that reaches them directly: a copyright (DMCA) notice, an abuse
+report, a request from law enforcement. Reports users file in their apps go to the moderation
+service, not here (see above).
+
+### Intake
+
+Publish an address people can write to. `--contact-email-address` (reference
+`PDS_CONTACT_EMAIL_ADDRESS`) is returned by `describeServer` as `contact.email`, and the landing
+page's footer shows it as "Report abuse: abuse@pds.example.com". vlpds doesn't read that mailbox:
+route it to a person (with Cloudflare Email Routing, a rule forwarding `abuse@pds.example.com` to
+your inbox; enabling routing on the PDS's subdomain adds its MX and SPF records and leaves an Email
+Sending bounce subdomain alone).
+
+### Workflow
+
+```steps
+- title: Open a case
+  body: "Console, Moderation, Cases: one case per notice, with its source (\"DMCA notice from Example Studios, received by email\") and a first note. Cases are open, actioned, restored or dismissed, with a notes timeline and the subjects they concern."
+- title: Look up what the notice points at
+  body: "Paste what it names into Look up: a bsky.app profile or post URL (handle or DID form), an at:// URI, a handle or DID, a CDN image or video URL, or a DID and a blob CID. Content on another PDS is refused with an explanation: only what this PDS stores can be taken down here. The record's JSON and its blobs show on request; image previews stay blurred until clicked and video never autoplays."
+- title: Act
+  body: "Take down (or restore) the account, the record or a single blob. Every action needs a reason and can be filed under a case; an open case becomes actioned, an actioned one restored when you reverse it. Takedowns by a moderation service (`updateSubjectStatus`) take the same path, so they are listed and audited too."
+- title: Track
+  body: "Active takedowns lists everything in force, filterable by kind, with a restore button; the Audit log has every takedown, restore, purge, case and quota change with who (admin, or the moderation service's DID), the client address and why. Add notes to the case as it develops: a counter-notice and the restore window (DMCA: 10 to 14 business days) belong there."
+```
+
+The audit log, cases and the list of active takedowns are objects in the bucket under
+`moderation/` (one per entry), so any node shows them and they survive restarts, failovers and the
+account itself. Each action is also logged on the node (`target=vlpds::audit`).
+
+### What a takedown does
+
+| Kind | Effect on this PDS | What stays |
+|---|---|---|
+| Account | Repo, records and blobs stop being served; a `#account` event tells relays and AppViews; sessions and OAuth tokens are revoked. Restore reverses it (sessions stay revoked) | The repo and blobs, untouched |
+| Record | Hidden from this PDS's record reads (`getRecord`, `listRecords`), as in the reference PDS | The record stays in the signed repo: `sync.getRepo`, `sync.getRecord` and the firehose still carry it, so relays and AppViews keep showing it until the user deletes it |
+| Blob | `getBlob` answers BlobNotFound at once; it can't be uploaded again or referenced by a new record, and its bytes move to `blob-quarantine/{did}/{cid}` | Only the quarantined copy, until it is purged; the operator can still preview it from the console |
+
+**Blob quarantine.** A taken-down blob's bytes are deleted `--blob-quarantine-days` (30) after the
+takedown unless it is restored first; until then a restore moves them back and the blob is served
+again. After the purge a restore only lifts the takedown: the user can upload the blob again. The
+unreferenced-blob GC never touches quarantined bytes, `listMissingBlobs` doesn't ask the user to
+re-upload a taken-down blob, and the bytes count toward the account's quota until purged.
+`vlpds_blob_quarantine_total{event}` counts quarantined, restored and purged blobs.
+
+### What the operator can't do
+
+- **Copies elsewhere.** Relays, AppViews and their CDNs (Bluesky's image and video CDNs) fetch and
+  cache content from this PDS. A takedown here stops new fetches, but cached images can stay up for a
+  while and records already indexed stay in the AppView. Report the content to Bluesky Trust & Safety
+  (or the AppView's operator) so they act on their copy.
+- **Records in the repo.** A record takedown hides it here only. Deleting it from the signed repo
+  is the user's decision; a takedown of the whole account is the operator's way to stop serving it.
+- **Content on other servers.** A bsky.app link to an account hosted elsewhere is refused; report
+  it to its PDS (its `describeServer` `contact.email`) or to Bluesky.
+
+### Upload quotas
+
+Each account may store `--blob-quota-gb` (25 GB, decimal) of blobs and make `--blob-uploads-per-day`
+(500) uploads per UTC day; 0 turns either off. The console's Look up page shows an account's usage
+and sets a per-account override (or back to the defaults). Over them, `uploadBlob` answers:
+
+| Limit | Answer | Metric |
+|---|---|---|
+| Stored bytes | 413 `BlobQuotaExceeded`, with the account's usage in the message. A blob the account already stores adds nothing | `vlpds_blob_quota_rejections_total{reason="bytes"}` |
+| Uploads per day | 429 `RateLimitExceeded`, until 00:00 UTC | `vlpds_blob_quota_rejections_total{reason="uploads"}` |
+
+An **account migrating in** uploads the blobs its imported repo references without counting toward
+the daily limit and without being refused for size: they still count toward its bytes, and an
+account that arrives over its quota is listed on the console's Quotas view until it is under (raise
+its quota, or ask it to delete media). Its other uploads are held to both limits.
 
 ## Handle policy
 
