@@ -2372,8 +2372,11 @@ async fn request_password_reset(State(app): AppState, Json(inp): Json<RequestPas
         Some(did) => account_if_exists(&app, &did).await?.filter(|a| a.email.as_deref() == Some(email.as_str())),
         None => None,
     };
+    // An unknown address answers like a mailed one so the endpoint can't be
+    // used to learn which addresses have accounts (the reference errors here).
     let Some(acct) = acct else {
-        return Err(invalid_request("account does not have an email address"));
+        crate::metrics::PASSWORD_RESETS.with_label_values(&["unknown_email"]).inc();
+        return Ok(StatusCode::OK);
     };
     // Over a budget it answers exactly as a mailed request does (no headers
     // from these buckets either): the caller is unauthenticated, and an

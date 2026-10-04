@@ -141,7 +141,7 @@ async fn recipient_budget_spans_mail_kinds() {
 
 /// Over its per-account or the recipient budget, requestPasswordReset
 /// answers exactly as when it mails (status, body, headers) and mails
-/// nothing; an unknown address still gets the reference's error.
+/// nothing; an unknown address answers the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn password_reset_over_budget_answers_like_a_mailed_one() {
     let s = limited().await;
@@ -174,8 +174,8 @@ async fn password_reset_over_budget_answers_like_a_mailed_one() {
     // the account's own requests over the budget get a clear 429
     let (r, _) = mailed_n(&s, &a.email, 0, s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &a.auth())).await;
     mail_limited(&r);
-    // unknown addresses: as before (and as the reference)
-    reset("nobody-mlw@example.com".into()).await.err(400, "InvalidRequest");
+    // unknown addresses answer like known ones (the reference errors instead)
+    reset("nobody-mlw@example.com".into()).await.ok();
 }
 
 fn scraped(text: &str, series: &str) -> f64 {
