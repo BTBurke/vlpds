@@ -110,7 +110,7 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
         /// Also unwrap blobs already under the current KEK id (finds older
-        /// Cloud KMS key versions).
+        /// Cloud KMS or Vault Transit key versions).
         #[arg(long)]
         check_versions: bool,
         #[arg(long)]

@@ -122,10 +122,20 @@ pub trait KeyWrapper: Send + Sync {
     fn backend(&self) -> &'static str;
     /// A network round trip: limited and failing fast.
     fn remote(&self) -> bool;
-    /// Checks a remote key service can serve as the KEK at all (Vault:
-    /// that it enforces the AAD). Startup runs it on the current KEK.
+    /// Checks a remote key service can serve as this KEK at all (Vault:
+    /// that it enforces the AAD and the policy allows the calls). Startup
+    /// runs it on every KEK: a non-retryable error stops the node.
     async fn self_test(&self) -> Result<(), SecretError> {
         Ok(())
+    }
+    /// Asks the key service for the current key's latest version, where
+    /// staleness depends on it (Vault Transit).
+    async fn refresh_version(&self) -> Result<(), SecretError> {
+        Ok(())
+    }
+    /// The key version a ciphertext names, read without unwrapping it.
+    fn ciphertext_version(&self, _ct: &[u8]) -> Option<u64> {
+        None
     }
     async fn wrap(&self, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, SecretError>;
     async fn unwrap(&self, aad: &[u8], ciphertext: &[u8]) -> Result<Unwrapped, SecretError>;
@@ -763,7 +773,8 @@ impl Secrets {
         cfg.check_backends()?;
         let endpoint = cfg.gcp_endpoint.as_deref().unwrap_or(GCP_KMS_ENDPOINT);
         let token = cfg.gcp_token.clone().unwrap_or_default();
-        let vault = cfg.vault.as_ref().map(VaultClient::new).transpose()?;
+        let n = if cfg.kms_concurrency == 0 { DEFAULT_KMS_CONCURRENCY } else { cfg.kms_concurrency };
+        let vault = cfg.vault.as_ref().map(|v| VaultClient::new(v, dev_mode, n + wrap_concurrency(n))).transpose()?;
         let mut ws: Vec<Arc<dyn KeyWrapper>> = Vec::new();
         if let Some(k) = &cfg.gcp_key {
             ws.push(Arc::new(GcpKms::new(k, endpoint, token.clone())?));
@@ -816,22 +827,42 @@ impl Secrets {
         DEV.clone()
     }
 
-    /// The current KEK's [`KeyWrapper::self_test`]. A key service that is
-    /// unreachable only logs: the check runs again before its first use.
+    /// Every KEK's [`KeyWrapper::self_test`]. A key service that doesn't
+    /// answer only logs: the check runs again before the key's first use.
     pub async fn check_key_service(&self) -> anyhow::Result<()> {
-        let w = &self.wrappers[0];
-        let r = match tokio::time::timeout(KMS_TIMEOUT * 3, w.self_test()).await {
-            Ok(r) => r,
-            Err(_) => Err(SecretError::Unavailable(format!("{} self-test timed out", w.backend()))),
-        };
-        match r {
-            Ok(()) => Ok(()),
-            Err(e) if e.retryable() => {
-                tracing::warn!(kid = w.kid(), backend = w.backend(), "key service check deferred to first use: {e}");
-                Ok(())
+        for w in &self.wrappers {
+            let r = match tokio::time::timeout(KMS_TIMEOUT * 6, w.self_test()).await {
+                Ok(r) => r,
+                Err(_) => Err(SecretError::Unavailable(format!("{} self-test timed out", w.backend()))),
+            };
+            match r {
+                Ok(()) => {}
+                Err(e) if e.retryable() => {
+                    tracing::warn!(
+                        kid = w.kid(),
+                        backend = w.backend(),
+                        "key service check deferred to first use: {e}"
+                    );
+                }
+                Err(e) => anyhow::bail!("key-encryption key {} ({}) is unusable: {e}", w.kid(), w.backend()),
             }
-            Err(e) => Err(anyhow::anyhow!("key-encryption key {} ({}) is unusable: {e}", w.kid(), w.backend())),
         }
+        Ok(())
+    }
+
+    /// Before a rewrap: the current key's latest version, from the key
+    /// service, so stale blobs aren't missed. Fails if it can't be asked.
+    pub async fn refresh_versions(&self) -> Result<(), SecretError> {
+        let w = &self.wrappers[0];
+        self.run(w, "wrap", w.refresh_version()).await
+    }
+
+    /// (kid, key version) for a blob whose KEK has versions it can read
+    /// without unwrapping (Vault Transit).
+    pub fn blob_version(&self, blob: &str) -> Option<(String, u64)> {
+        let (kid, ct) = parse_blob(blob).ok()?;
+        let v = self.wrapper(kid)?.ciphertext_version(&ct)?;
+        Some((kid.to_string(), v))
     }
 
     pub fn is_dev(&self) -> bool {
@@ -925,8 +956,8 @@ impl Secrets {
         Ok(u)
     }
 
-    /// A cheap pre-filter for rewraps: a Cloud KMS version rotation only
-    /// shows on unwrap.
+    /// A cheap pre-filter for rewraps: a key version rotation inside one
+    /// Cloud KMS or Vault Transit key only shows on unwrap.
     pub fn is_current(&self, blob: &str) -> bool {
         parse_blob(blob).is_ok_and(|(kid, _)| kid == self.current_kid())
     }

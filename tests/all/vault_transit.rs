@@ -79,7 +79,7 @@ impl Vault {
     }
 
     fn cfg(&self, auth: VaultAuth) -> VaultConfig {
-        VaultConfig { addr: self.addr.clone(), namespace: None, ca_pem: None, auth }
+        VaultConfig { addr: self.addr.clone(), namespace: None, ca_pem: None, ca_only: false, auth }
     }
 }
 
@@ -215,6 +215,32 @@ async fn vault_startup_refuses_missing_key_or_policy() {
     let cfg = kek(v.cfg(VaultAuth::TokenFile(tf2.clone())), &format!("{mount}/vlpds"), &[]);
     let e = Secrets::from_config(&cfg, false).unwrap().check_key_service().await.unwrap_err().to_string();
     assert!(e.contains(&format!("lacks update on {mount}/decrypt/vlpds")), "{e}");
+
+    // unwrap-only keys: the policy must allow decrypt and the key exist
+    let (m2, p2) = v.transit("aes256-gcm96").await;
+    let tf3 = v.token_file(&[&p2]).await;
+    let with_old = |old: String| kek(v.cfg(VaultAuth::TokenFile(tf3.clone())), &format!("{m2}/vlpds"), &[&old]);
+    let e = Secrets::from_config(&with_old(format!("{mount}/vlpds")), false)
+        .unwrap()
+        .check_key_service()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains(&format!("lacks update on {mount}/decrypt/vlpds")), "{e}");
+    let p3 = unique_name("vlpds");
+    v.allow(&p3, &mount, "nokey").await;
+    let tf4 = v.token_file(&[&p2, &p3]).await;
+    let cfg = kek(v.cfg(VaultAuth::TokenFile(tf4.clone())), &format!("{m2}/vlpds"), &[&format!("{mount}/nokey")]);
+    let e = Secrets::from_config(&cfg, false).unwrap().check_key_service().await.unwrap_err().to_string();
+    assert!(e.contains(&format!("no such key at {mount}/decrypt/nokey")), "{e}");
+    let p4 = unique_name("vlpds");
+    v.allow(&p4, &mount, "vlpds").await;
+    let tf5 = v.token_file(&[&p2, &p4]).await;
+    let cfg = kek(v.cfg(VaultAuth::TokenFile(tf5.clone())), &format!("{m2}/vlpds"), &[&format!("{mount}/vlpds")]);
+    Secrets::from_config(&cfg, false).unwrap().check_key_service().await.unwrap();
+    for f in [&tf3, &tf4, &tf5] {
+        std::fs::remove_file(f).ok();
+    }
 
     // nothing listening: starts, first use is a retryable failure
     let dead = VaultConfig { addr: "http://127.0.0.1:18299".into(), ..v.cfg(VaultAuth::TokenFile(tf.clone())) };
@@ -378,6 +404,20 @@ async fn vault_rewrap_local_to_vault_and_back() {
     assert_eq!((dry["stale"].clone(), dry["failed"].clone()), (json!(5), json!(0)), "{dry}");
     let done = rewrap(&b, false).await;
     assert_eq!((done["stale"].clone(), done["failed"].clone()), (json!(5), json!(0)), "{done}");
+    let vkid = b.app.secrets.current_kid().to_string();
+    assert_eq!(done["minKeyVersions"][&vkid], json!(1), "{done}");
+    // after a Transit rotate: the rewrap asks Vault first, so v1 shows as stale
+    v.post(&format!("{mount}/keys/vlpds/rotate"), json!({})).await;
+    let checked = |dry: bool| {
+        let x = b.xrpc.clone();
+        async move {
+            x.post("vlpds.admin.rewrapSecrets", &json!({"dryRun": dry, "checkVersions": true}), &Auth::Admin).await.ok()
+        }
+    };
+    let dry = checked(true).await;
+    assert_eq!((dry["stale"].clone(), dry["minKeyVersions"][&vkid].clone()), (json!(5), json!(1)), "{dry}");
+    let done = checked(false).await;
+    assert_eq!((done["stale"].clone(), done["minKeyVersions"][&vkid].clone()), (json!(5), json!(2)), "{done}");
     assert_eq!(rewrap(&b, true).await["stale"], json!(0));
     b.app.log.checkpoint_all().await;
     vlpds::server::shutdown(&b.app).await;
@@ -442,7 +482,7 @@ async fn vault_approle_short_ttl() {
     let cfg = kek(v.cfg(auth), &format!("{mount}/vlpds"), &[]);
     let s = Secrets::from_config(&cfg, false).unwrap();
     s.check_key_service().await.unwrap();
-    let client = vlpds::secrets::VaultClient::new(cfg.vault.as_ref().unwrap()).unwrap();
+    let client = vlpds::secrets::VaultClient::new(cfg.vault.as_ref().unwrap(), false, 8).unwrap();
     let t = vlpds::secrets::VaultTransit::new(client.clone(), &format!("{mount}/vlpds"), true).unwrap();
     use vlpds::secrets::KeyWrapper;
     let start = std::time::Instant::now();
@@ -494,7 +534,7 @@ async fn vault_kubernetes_login() {
     let jwt_file = tmp_file(&sa_jwt(1));
     let auth = VaultAuth::Kubernetes { mount: k8s.clone(), role: "vlpds".into(), jwt_file: jwt_file.clone() };
     let cfg = kek(v.cfg(auth), &format!("{mount}/vlpds"), &[]);
-    let client = vlpds::secrets::VaultClient::new(cfg.vault.as_ref().unwrap()).unwrap();
+    let client = vlpds::secrets::VaultClient::new(cfg.vault.as_ref().unwrap(), false, 8).unwrap();
     let t = vlpds::secrets::VaultTransit::new(client.clone(), &format!("{mount}/vlpds"), true).unwrap();
     use vlpds::secrets::KeyWrapper;
     let c = t.wrap(b"aad", b"k8s").await.unwrap();

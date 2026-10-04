@@ -224,15 +224,21 @@ pub fn conflict() -> XrpcError {
     }
 }
 
-/// `vlpds.admin.rewrapSecrets`. Returns whether a secret was stale.
-pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -> Result<bool, XrpcError> {
+/// `vlpds.admin.rewrapSecrets`. Returns whether a secret was stale, and the
+/// wrapped secrets as they were found.
+pub async fn rewrap(
+    app: &App,
+    did: &str,
+    check_versions: bool,
+    dry_run: bool,
+) -> Result<(bool, Vec<String>), XrpcError> {
     let Some(v) = app.get_private(did, PRIVATE_NAME).await? else {
-        return Ok(false);
+        return Ok((false, Vec::new()));
     };
     let stored: TotpState = serde_json::from_slice(&v).map_err(XrpcError::from_err)?;
-    let blobs: Vec<&String> = [&stored.secret, &stored.pending].into_iter().flatten().collect();
+    let blobs: Vec<String> = [&stored.secret, &stored.pending].into_iter().flatten().cloned().collect();
     if !check_versions && blobs.iter().all(|b| app.secrets.is_current(b)) {
-        return Ok(false);
+        return Ok((false, blobs));
     }
     let _g = lock(did).await;
     for _ in 0..CAS_ROUNDS {
@@ -240,7 +246,7 @@ pub async fn rewrap(app: &App, did: &str, check_versions: bool, dry_run: bool) -
         // unseal memoized only the blobs that are current
         let stale = st.sealed.len() < [&st.secret, &st.pending].into_iter().flatten().count();
         if !stale || dry_run || save_if(app, did, &st, raw).await? {
-            return Ok(stale);
+            return Ok((stale, blobs));
         }
     }
     Err(conflict())

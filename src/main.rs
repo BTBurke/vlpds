@@ -455,6 +455,9 @@ struct Args {
     /// the public roots.
     #[arg(long, env = "VLPDS_VAULT_CA_FILE")]
     vault_ca_file: Option<std::path::PathBuf>,
+    /// Trust only --vault-ca-file for Vault, not the public roots.
+    #[arg(long, env = "VLPDS_VAULT_CA_ONLY", requires = "vault_ca_file")]
+    vault_ca_only: bool,
     /// Vault auth: a file holding a token, re-read every minute and after a
     /// 403 (a Vault Agent sink).
     #[arg(long, env = "VLPDS_VAULT_TOKEN_FILE")]
@@ -1154,7 +1157,24 @@ fn kek_config(args: &Args) -> anyhow::Result<vlpds::secrets::KekConfig> {
     };
     let vault_key = args.vault_transit_key.clone().filter(|k| !k.is_empty());
     let vault_old_keys: Vec<String> = args.vault_transit_old_key.iter().filter(|k| !k.is_empty()).cloned().collect();
-    let vault = if vault_key.is_some() || !vault_old_keys.is_empty() { Some(vault_config(args)?) } else { None };
+    let vault = if vault_key.is_some() || !vault_old_keys.is_empty() {
+        Some(vault_config(args)?)
+    } else {
+        // a typo'd VLPDS_VAULT_TRANSIT_KEY would otherwise fall back to the
+        // local KEK without a word
+        let set = [
+            args.vault_addr.is_some(),
+            args.vault_token_file.is_some(),
+            args.vault_approle_role_id.is_some(),
+            args.vault_k8s_role.is_some(),
+        ];
+        if set.contains(&true) {
+            tracing::warn!(
+                "Vault flags are set but no --vault-transit-key or --vault-transit-old-key: Vault is not used"
+            );
+        }
+        None
+    };
     Ok(vlpds::secrets::KekConfig {
         local,
         local_old,
@@ -1203,7 +1223,13 @@ fn vault_config(args: &Args) -> anyhow::Result<vlpds::secrets::VaultConfig> {
         .as_ref()
         .map(|p| std::fs::read(p).map_err(|e| anyhow::anyhow!("--vault-ca-file {}: {e}", p.display())))
         .transpose()?;
-    Ok(vlpds::secrets::VaultConfig { addr, namespace: args.vault_namespace.clone(), ca_pem, auth })
+    Ok(vlpds::secrets::VaultConfig {
+        addr,
+        namespace: args.vault_namespace.clone(),
+        ca_pem,
+        ca_only: args.vault_ca_only,
+        auth,
+    })
 }
 
 fn peer_tls(

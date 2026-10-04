@@ -59,12 +59,23 @@ pub fn public() -> &'static reqwest::Client {
     &C
 }
 
-/// Like [`public`] with its own small pool, optionally also trusting
-/// `ca_pem` (PEM certificates) for an upstream on a private PKI. A pool
-/// shared across tokio runtimes (tests) hands out connections whose
-/// runtime is gone.
-pub fn public_own(ca_pem: Option<&[u8]>) -> anyhow::Result<reqwest::Client> {
-    let mut b = outbound("public", 16);
+/// An operator-configured upstream holding key material (Vault) with its
+/// own pool, optionally also trusting `ca_pem` (PEM certificates) for a
+/// private PKI, or only it with `ca_only`. It ignores `HTTP(S)_PROXY`: a
+/// proxy set for other egress mustn't see key traffic. A pool shared across
+/// tokio runtimes (tests) hands out connections whose runtime is gone, so
+/// each caller builds its own.
+pub fn dedicated(
+    role: &'static str,
+    max_idle: usize,
+    ca_pem: Option<&[u8]>,
+    ca_only: bool,
+) -> anyhow::Result<reqwest::Client> {
+    let mut b = outbound(role, max_idle).no_proxy();
+    if ca_only {
+        anyhow::ensure!(ca_pem.is_some(), "trusting only the CA bundle needs one");
+        b = b.tls_built_in_root_certs(false);
+    }
     if let Some(pem) = ca_pem {
         let certs = reqwest::Certificate::from_pem_bundle(pem).map_err(|e| anyhow::anyhow!("CA bundle: {e}"))?;
         anyhow::ensure!(!certs.is_empty(), "CA bundle holds no PEM certificate");

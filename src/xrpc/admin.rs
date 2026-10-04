@@ -1483,7 +1483,8 @@ struct RewrapIn {
     #[serde(default)]
     dry_run: bool,
     /// Also unwrap blobs already under the current KEK's id, to find ones
-    /// under an older version of a Cloud KMS key (one KMS decrypt each).
+    /// under an older version of a Cloud KMS or Vault Transit key (one
+    /// decrypt each).
     #[serde(default)]
     check_versions: bool,
     shards: Option<Vec<crate::slots::ShardId>>,
@@ -1496,17 +1497,20 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
     use futures::StreamExt;
     require_admin(&creds)?;
     let inp = body.map(|Json(b)| b).unwrap_or_default();
+    // a version rotation the node hasn't seen yet would count as current
+    app.secrets.refresh_versions().await?;
     let started = std::time::Instant::now();
     let (parts, coverage) = scan_set(&app, &inp.shards);
     let dids: Vec<(String, String)> =
         accounts_of(&parts).await?.into_iter().map(|a| (a.did, a.wrapped_signing_key)).collect();
     let (accounts, check, dry) = (dids.len(), inp.check_versions, inp.dry_run);
     let app2 = app.clone();
-    // (stale signing key, stale TOTP, error)
-    let results: Vec<(bool, bool, Option<String>)> = futures::stream::iter(dids)
+    // (stale signing key, stale TOTP, error, blobs stored afterwards)
+    let results: Vec<(bool, bool, Option<String>, Vec<String>)> = futures::stream::iter(dids)
         .map(|(did, blob)| {
             let app = app2.clone();
             async move {
+                let mut kept = vec![blob.clone()];
                 let r: XResult<(bool, bool)> = async {
                     let key_stale = if !check && app.secrets.is_current(&blob) {
                         false
@@ -1516,6 +1520,7 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
                         match app.secrets.rewrap(Purpose::SigningKey, &did, &blob).await? {
                             None => false,
                             Some(new) => {
+                                kept = vec![new.clone()];
                                 update_account(&app, &did, false, false, move |a| {
                                     // unless rotated meanwhile
                                     if a.wrapped_signing_key == blob {
@@ -1528,13 +1533,17 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
                             }
                         }
                     };
-                    let totp_stale = crate::totp::rewrap(&app, &did, check, dry).await?;
+                    let (totp_stale, totp_blobs) = crate::totp::rewrap(&app, &did, check, dry).await?;
+                    // rewritten ones are under the latest version
+                    if !totp_stale || dry {
+                        kept.extend(totp_blobs);
+                    }
                     Ok((key_stale, totp_stale))
                 }
                 .await;
                 match r {
-                    Ok((k, t)) => (k, t, None),
-                    Err(e) => (false, false, Some(format!("{did}: {}", e.message))),
+                    Ok((k, t)) => (k, t, None, kept),
+                    Err(e) => (false, false, Some(format!("{did}: {}", e.message)), kept),
                 }
             }
         })
@@ -1543,10 +1552,18 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
         .await;
     let mut errors: Vec<String> = Vec::new();
     let (mut keys, mut totp) = (0u64, 0u64);
-    for (k, t, e) in results {
+    // kid -> the lowest key version still stored, for min_decryption_version
+    let mut min_versions: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut note_version = |blob: &str| {
+        if let Some((kid, v)) = app.secrets.blob_version(blob) {
+            min_versions.entry(kid).and_modify(|m| *m = (*m).min(v)).or_insert(v);
+        }
+    };
+    for (k, t, e, kept) in results {
         keys += k as u64;
         totp += t as u64;
         errors.extend(e);
+        kept.iter().for_each(|b| note_version(b));
     }
     // the did:key-indexed rows carry the wrapped key
     let mut reserved = 0u64;
@@ -1566,14 +1583,21 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
             app.secrets.rewrap(Purpose::ReservedKey, did_key, &blob).await
         };
         match r {
-            Ok(None) => {}
-            Ok(Some(_)) if dry => reserved += 1,
+            Ok(None) => note_version(&blob),
+            Ok(Some(_)) if dry => {
+                note_version(&blob);
+                reserved += 1
+            }
             Ok(Some(new)) => {
+                note_version(&new);
                 rec["key"] = json!(new);
                 app.put_private(&routing, vec![pmut(&routing, "k", Some(to_json_bytes(&rec)))]).await?;
                 reserved += 1;
             }
-            Err(e) => errors.push(format!("{did_key}: {e}")),
+            Err(e) => {
+                note_version(&blob);
+                errors.push(format!("{did_key}: {e}"))
+            }
         }
     }
     let stale = keys + totp + reserved;
@@ -1603,6 +1627,8 @@ async fn rewrap_secrets(State(app): AppState, Auth(creds): Auth, body: Option<Js
             "reservedKeys": reserved,
             "failed": failed,
             "errors": errors,
+            // per kid with readable versions (Vault): the lowest still stored
+            "minKeyVersions": min_versions,
         }),
     )))
 }
