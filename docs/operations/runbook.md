@@ -34,20 +34,20 @@ facts:
   - { value: "never", label: edit objects in the bucket by hand, note: "log/, assign/, nodes/, state/, cluster/…", tone: amber }
 ```
 
-`ops/RUNBOOK.md` is the per-alert reference: every rule in `ops/alerts.yml` links its own section
-with what it means, how to confirm it and what to do. This page organizes the common incidents and
-explains the few ideas you need under pressure. Link targets marked RUNBOOK open that file.
+`ops/RUNBOOK.md` is the per-alert reference. Every rule in `ops/alerts.yml` links its own section
+there, with what it means, how to confirm it and what to do. This page groups the common incidents
+and explains the few ideas you need under pressure. Links marked RUNBOOK open that file.
 
-First, from any node that is up:
+First, from any node that's up:
 
 ```bash
 vlpds admin cluster status                         # with VLPDS_ADMIN_TOKEN set
 docker exec vlpds vlpds admin cluster status       # on the host: reads the node's token file
 ```
 
-It shows every node's lease, reachability, owned shards and build, unowned shards, a split or merge
-in progress, fenced logs, the firehose sources and their watermarks, and the feature level. The
-console's [Cluster page](admin-console.md#pages) shows the same, live.
+It shows every node's lease, reachability, owned shards and build. It also shows unowned shards, a
+split or merge in progress, fenced logs, the firehose sources and their watermarks, and the feature
+level. The console's [Cluster page](admin-console.md#pages) shows the same thing live.
 
 ## Exit codes and fail-stops
 
@@ -70,32 +70,32 @@ edges:
 | Code | Reason | Means |
 |---|---|---|
 | 2 | `segment_upload` | the segment upload task failed |
-| 3 | `fenced`, `ordinal_taken` | a successor fenced our log (we were presumed dead), or another process wrote our segment ordinal |
+| 3 | `fenced`, `ordinal_taken` | a successor fenced this node's log (it was presumed dead), or another process wrote its segment ordinal |
 | 4 | `state_apply` | SlateDB failed to apply a durable segment |
-| 5 | `lease_lost`, `lease_lapsed` | the lease was lost or lapsed: slow renewals, a CAS conflict, a reassigned shard, a failed close |
-| 6 | `signature_fault` | three signatures failed self-verification within a minute: suspect the host's memory or CPU |
-| 7 | `incompatible_level` | this build can't run the cluster's feature level; see [Upgrades](upgrades.md#feature-levels) |
-| 8 | `shutdown_fence` | a graceful stop couldn't fence its own log; its shards were already handed out |
-| 9 | `critical_task_panicked` | a repo worker, the log sequencer or finalizer, or the firehose merger panicked: a bug |
+| 5 | `lease_lost`, `lease_lapsed` | the lease was lost or lapsed (slow renewals, a CAS conflict, a reassigned shard, a failed close) |
+| 6 | `signature_fault` | three signatures failed self-verification within a minute. Suspect the host's memory or CPU. |
+| 7 | `incompatible_level` | this build can't run the cluster's feature level (see [Upgrades](upgrades.md#feature-levels)) |
+| 8 | `shutdown_fence` | a graceful stop couldn't fence its own log. Its shards were already handed out. |
+| 9 | `critical_task_panicked` | a repo worker, the log sequencer or finalizer, or the firehose merger panicked. That's a bug. |
 
-Besides these, `vlpds_last_exit_reason_info` reports `clean` (a graceful stop), `error` (exit 1: a
-startup or serve error), `crash` (the file still says running: SIGKILL, OOM kill, host loss) or
-`none` (first start, or no exit-state file). Keep `--cache-dir` (or `--exit-state-file`) on a disk
-that survives restarts, or every exit reads as `none`.
+`vlpds_last_exit_reason_info` also reports `clean` (a graceful stop), `error` (exit 1, a startup or
+serve error), `crash` or `none`. `crash` means the file still says running (SIGKILL, OOM kill, host
+loss). `none` means a first start or no exit-state file. Keep `--cache-dir` (or `--exit-state-file`)
+on a disk that survives restarts, or every exit reads as `none`.
 
 What to do, by code:
 
-- **One restart that rejoined** (it owns its fair share again within a step or two): nothing, once
-  the cause is understood. Read the error line just before the exit.
-- **Exit 2 or 4:** the object store; look before it repeats.
-- **Exit 3 right after another process started with the same `--node-id`:** two processes are
-  fencing each other. Stop one.
-- **Exit 5 with `node lease renew error` warnings before it:** slow store; see
+- One restart that rejoined (it owns its fair share again within a step or two): nothing, once the
+  cause is understood. Read the error line just before the exit.
+- Exit 2 or 4: the object store. Look before it repeats.
+- Exit 3 right after another process started with the same `--node-id`: two processes are fencing
+  each other. Stop one.
+- Exit 5 with `node lease renew error` warnings before it: a slow store. See
   [Lease trouble](#lease-trouble).
-- **Exit 6:** drain the host now and keep vlpds off it until its memory and CPU are checked
+- Exit 6: drain the host now and keep vlpds off it until its memory and CPU are checked
   (RUNBOOK [VlpdsSignatureFault](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssignaturefault)).
   No bad signature was ever sent.
-- **A crash loop (3+ restarts an hour):** SIGTERM the node and leave it down while you diagnose; its
+- A crash loop (3+ restarts an hour): SIGTERM the node and leave it down while you diagnose. Its
   shards move to peers. Roll back the image if the loop began with a deploy.
 
 Alerts: `VlpdsNodeRestarted`, `VlpdsNodeFailStopped`, `VlpdsUncleanNodeExit`,
@@ -117,40 +117,40 @@ edges:
   - "at -> stop: gap"
 ```
 
-- **One node:** its network path to the store, or its CPU. A starved runtime delays the renewal task
-  itself; check `VlpdsRuntimeStalls` and `tokio runtime stall` lines.
-- **Several nodes at once:** the store is browning out, and past the ceiling it stops the whole
+- One node: its network path to the store, or its CPU. A starved runtime delays the renewal task
+  itself. Check `VlpdsRuntimeStalls` and `tokio runtime stall` lines.
+- Several nodes at once: the store is browning out, and past the ceiling it stops the whole
   cluster. Go to [Slow or failing object store](#slow-or-failing-object-store).
-- **Don't lower `--lease-ttl-ms`** to recover faster: it shrinks the ceiling and causes more
+- Don't lower `--lease-ttl-ms` to recover faster. It shrinks the ceiling and causes more
   fail-stops. Never below 10 s in production.
 
 Signals: `vlpds_lease_renew_ttl_ratio`, `vlpds_lease_renew_seconds`, `vlpds_lease_validity_seconds`
 (sampled at scrape time), `vlpds_lease_renew_errors_total{kind}`. Four failed renewals in a row lapse
-a lease. Alerts `VlpdsLeaseRenewalSlow`, `…NearCeiling`, `…AtCeiling`, `VlpdsLeaseRenewErrors`,
-`VlpdsLeaseValidityLow`; RUNBOOK
+a lease. Alerts: `VlpdsLeaseRenewalSlow`, `…NearCeiling`, `…AtCeiling`, `VlpdsLeaseRenewErrors`,
+`VlpdsLeaseValidityLow`. RUNBOOK
 [VlpdsLeaseRenewalNearCeiling](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalnearceiling).
 Background: [Architecture](../architecture.md#leases).
 
 ## Slow or failing object store
 
 ```steps
-- title: Confirm it is the store
-  body: "Provider status; `vlpds_object_store_requests_total{result=~\"error|timeout\"}` and `vlpds_object_store_request_seconds` by component on every node; lease renewal times; control-plane timeouts. Many nodes at once is the store; one node is its network."
+- title: Confirm it's the store
+  body: "Check the provider status page. On every node, check `vlpds_object_store_requests_total{result=~\"error|timeout\"}` and `vlpds_object_store_request_seconds` by component, lease renewal times and control-plane timeouts. Many nodes at once means the store. One node means its network."
 - title: Keep the supervisor restarting nodes
-  body: "With backoff. Segment PUTs retry until they succeed, acks stop, admission control sheds with 503 `Overloaded`; past the renewal ceiling nodes exit 5. **No acked write is lost**: acks require durable segments."
+  body: "With backoff. Segment PUTs retry until they succeed, acks stop, and admission control sheds with 503 `Overloaded`. Past the renewal ceiling, nodes exit 5. No acked write is lost, because acks require durable segments."
 - title: Change nothing in the bucket
-  body: "Don't delete anything, don't lower the lease TTL. Raising the TTL during an incident isn't a supported live operation."
+  body: "Don't delete anything. Don't lower the lease TTL. Raising the TTL during an incident isn't a supported live operation."
 - title: After recovery, watch the catch-up
   body: "Restarted nodes fence the dead incarnations' logs (their own previous ones too) and replay. Watch `VlpdsShardsUnowned`, replay time (`vlpds_shard_open_seconds{kind=\"replay\"}`), who fail-stopped, firehose emit delay and retention catching up."
 ```
 
-A store can also be saturated by vlpds' **own reads**: when the SST metadata cache is too small for
-a node's shards, point reads fetch whole filters and indexes, and in the 100 M-account test that
-reached 1–2.4 GB/s of GETs per node and lapsed the leases of 3 of 4 nodes. The signs come in order:
+vlpds' own reads can saturate the store too. When the SST metadata cache is too small for a node's
+shards, point reads fetch whole filters and indexes. In the 100 M-account test that reached
+1–2.4 GB/s of GETs per node and lapsed the leases of 3 of 4 nodes. The signs come in this order:
 `VlpdsSstMetaRefetching` / `VlpdsSstMetaCacheTooSmall`, then `VlpdsObjectStorePermitsSaturated`,
 `VlpdsControlPlaneLatencyHigh`, then the lease alerts. Pause bulk imports and backfills, then give
-the node more memory or add nodes. A store shared with other tenants can do the same to the leases:
-keep the cluster's store to itself.
+the node more memory or add nodes. A store shared with other tenants can do the same to the leases,
+so keep the cluster's store to itself.
 
 RUNBOOK: [Object-store outage](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#object-store-outage),
 [Store saturated by the node's own reads](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#store-saturated-by-the-nodes-own-reads),
@@ -173,23 +173,23 @@ edges:
   - "merge -> subs: in seq order"
 ```
 
-Find the laggard: `firehose.sources[]` in `vlpds admin cluster status` lists each log's watermark
-(seqs are `unix_micros × 256 + writer`; divide by 256 for microseconds), and `nodes[].log` names the
-node that owns each log.
+Find the laggard. `firehose.sources[]` in `vlpds admin cluster status` lists each log's watermark,
+and `nodes[].log` names the node that owns each log. Seqs are `unix_micros × 256 + writer`, so divide
+by 256 for microseconds.
 
-- **A slow node** (its commit latency, its watermark lag): fix it, or SIGTERM it; a graceful stop
-  fences its own log so every follower drains it and drops it as a source.
-- **A dead log nobody fenced** (its node died owning no shards, so no takeover fenced it):
-  `VlpdsDeadLogUnfenced`. Restart that node id; startup fences its previous incarnation's log.
-  Never write a fence by hand.
-- **Clocks.** An idle log advertises its node's clock, so a node whose clock is behind holds the
-  merge back, and the merged stream lags by the largest offset between nodes. Keep NTP or chrony
-  running everywhere.
-- **Slow subscribers** past `--firehose-max-lag-mb` (128 MiB) are cut off with `ConsumerTooSlow` and
-  resume from their cursor; isolated cases are the consumer's problem.
+- A slow node (check its commit latency and watermark lag): fix it, or SIGTERM it. A graceful stop
+  fences its own log, so every follower drains it and drops it as a source.
+- A dead log nobody fenced (`VlpdsDeadLogUnfenced`): its node died owning no shards, so no takeover
+  fenced it. Restart that node id, and startup fences its previous incarnation's log. Never write a
+  fence by hand.
+- Clocks. An idle log advertises its node's clock, so a node whose clock is behind holds the merge
+  back. The merged stream lags by the largest offset between nodes. Keep NTP or chrony running
+  everywhere.
+- Slow subscribers past `--firehose-max-lag-mb` (128 MiB) are cut off with `ConsumerTooSlow` and
+  resume from their cursor. Isolated cases are the consumer's problem.
 
-Alerts `VlpdsFirehoseEmitDelayHigh` / `…Critical`, `VlpdsFirehoseStalled`, `VlpdsDeadLogUnfenced`,
-`VlpdsFirehoseMergeSpilling`; RUNBOOK
+Alerts: `VlpdsFirehoseEmitDelayHigh` / `…Critical`, `VlpdsFirehoseStalled`, `VlpdsDeadLogUnfenced`,
+`VlpdsFirehoseMergeSpilling`. RUNBOOK
 [VlpdsFirehoseStalled](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfirehosestalled).
 How the merge works: [Firehose](../firehose.md#the-merger).
 
@@ -201,23 +201,24 @@ How the merge works: [Firehose](../firehose.md#the-merger).
 - { value: "> 4", unit: opens/h, label: per shard is flapping, note: "every move costs a checkpoint, an open, replay and cold repos", tone: amber }
 ```
 
-**Unowned for minutes** means survivors can't take the shards. Usual causes:
+Shards unowned for minutes means the survivors can't take them. Usual causes:
 
-- A **frozen** node (its socket still accepts, so the fast path doesn't fire): takeover waits
-  1.2 × TTL, then fence and replay. Kill the frozen process so the refused connection speeds it up.
-- **Control-plane calls timing out** or the store failing: see the store section above.
-- **Shard opens failing** (`VlpdsShardOpenErrors`): SlateDB open or replay errors. A hole in a
-  log span means someone deleted segments by hand.
-- **Commit-wait:** a new owner waits up to 30 s for its clock to pass the previous owner's last seq
+- A frozen node. Its socket still accepts, so the fast path doesn't fire, and takeover waits
+  1.2 × TTL before the fence and replay. Kill the frozen process so the refused connection speeds
+  it up.
+- Control-plane calls timing out, or the store failing. See the store section above.
+- Shard opens failing (`VlpdsShardOpenErrors`), from SlateDB open or replay errors. A hole in a log
+  span means someone deleted segments by hand.
+- Commit-wait. A new owner waits up to 30 s for its clock to pass the previous owner's last seq
   (`waited for our clock to pass`). Fix clock sync.
 
-**Flapping** (`VlpdsOwnershipFlapping`) is nearly always a node restarting repeatedly or a node whose
-renewals keep lapsing. Stabilize or stop that node. **Over-owned** (`VlpdsShardsOverOwned`: the same
-shard on two nodes) is a zombie that hasn't hit its fence yet; SIGKILL it, it can ack nothing.
-**Imbalanced** (`VlpdsOwnershipImbalanced`) usually settles; a graceful restart of the full node
-spreads its shards.
+Flapping (`VlpdsOwnershipFlapping`) is nearly always a node restarting over and over, or a node
+whose renewals keep lapsing. Stabilize or stop that node. Over-owned (`VlpdsShardsOverOwned`, the
+same shard on two nodes) is a zombie that hasn't hit its fence yet. SIGKILL it. It can't ack
+anything. Imbalanced (`VlpdsOwnershipImbalanced`) usually settles, and a graceful restart of the
+full node spreads its shards.
 
-Do **not** edit `assign/` objects to unstick anything. RUNBOOK
+Don't edit `assign/` objects to unstick anything. RUNBOOK
 [VlpdsShardsUnowned](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardsunowned).
 
 ## Memory pressure
@@ -228,39 +229,39 @@ Do **not** edit `assign/` objects to unstick anything. RUNBOOK
 - { value: "SIGTERM", label: before the OOM killer, note: "a handoff without replay beats a crash and a replay", tone: blue }
 ```
 
-The limit is the cgroup limit or physical RAM, whichever is lower (`vlpds_memory_limit_bytes`); the
+The limit is the cgroup limit or physical RAM, whichever is lower (`vlpds_memory_limit_bytes`). The
 node sizes its caches to a budget below it. Caches stay within the plan, so RSS past it is usually
 allocator retention, memtables or bodies in flight. Compare `vlpds_process_resident_bytes` with
 `vlpds_memory_budget_bytes{part}` and `vlpds_jemalloc_bytes{stat}`, and print the plan with
 `vlpds --memory-plan`. Then lower `--memory-budget-mb` or move to a bigger box. An OOM kill is a
-crash: peers take over and replay; nothing acked is lost.
+crash, so peers take over and replay. Nothing acked is lost.
 
-`VlpdsCacheAtCapacity` (a bounded cache full for 6 hours) matters only with a symptom: proxy
-latency, PLC lookups or KMS unwraps on cold writes. Raise `--cache-budget-mb` or one cache's
-`--cache-entries` then. Budget details: [Configuration](configuration.md#memory-budget-and-autosizing).
+`VlpdsCacheAtCapacity` (a bounded cache full for 6 hours) only matters with a symptom, like proxy
+latency, PLC lookups or KMS unwraps on cold writes. If you see one, raise `--cache-budget-mb` or
+one cache's `--cache-entries`. Budget details: [Configuration](configuration.md#memory-budget-and-autosizing).
 
 ## What not to do
 
-- **Never run two processes with the same `--node-id`.** Each start fences the other's log; with a
+- Never run two processes with the same `--node-id`. Each start fences the other's log, so with a
   supervisor restarting both, they fence each other forever.
-- **Never delete or edit objects by hand** under `log/`, `assign/`, `nodes/`, `writers/`, `retain/`,
-  `state/` or `cluster/`. A missing segment is a hole replay stops at; fences are what make a zombie
-  fail-stop; `assign/` holds what successors replay; `cluster/version` changes only through
-  `cluster finalize` / `cluster lower`. Retention and GC delete safely: let them.
-- **Never run `--lease-ttl-ms` below 10 s in production.** The renewal ceiling is 0.4 × TTL.
-- **Don't SIGKILL for routine restarts.** SIGTERM and wait (60 s or more).
-- **Don't suspend or snapshot-pause a running node's VM.** On wake it believes its lease is still
-  valid and serves stale reads until its next PUT hits the fence. A pause longer than
-  `--fence-retention` (7 days) wakes after the fence is gone.
-- **Don't let host clocks drift.** Offsets don't affect safety, but they delay the merged firehose and
+- Never delete or edit objects by hand under `log/`, `assign/`, `nodes/`, `writers/`, `retain/`,
+  `state/` or `cluster/`. A missing segment is a hole that replay stops at. Fences are what make a
+  zombie fail-stop. `assign/` holds what successors replay. `cluster/version` only changes through
+  `cluster finalize` / `cluster lower`. Retention and GC delete safely, so let them.
+- Never run `--lease-ttl-ms` below 10 s in production. The renewal ceiling is 0.4 × TTL.
+- Don't SIGKILL for routine restarts. SIGTERM and wait (60 s or more).
+- Don't suspend or snapshot-pause a running node's VM. When it wakes, it believes its lease is
+  still valid and serves stale reads until its next PUT hits the fence. A pause longer than
+  `--fence-retention` (7 days) wakes up after the fence is gone.
+- Don't let host clocks drift. Offsets don't affect safety, but they delay the merged firehose and
   make new owners wait up to 30 s.
-- **Don't point two clusters at the same bucket and prefix**, and don't change `--shards` expecting a
-  reshard: it applies only to a new prefix.
-- **Don't retire an old KEK** before `rewrap-secrets --dry-run` reports nothing stale on every node,
-  and never destroy KEK material backups still need.
-- **Don't shrink `--log-retention`** below what firehose consumers need to resume; older cursors get
+- Don't point two clusters at the same bucket and prefix. Don't change `--shards` expecting a
+  reshard either, since it only applies to a new prefix.
+- Don't retire an old KEK before `rewrap-secrets --dry-run` reports nothing stale on every node.
+  Never destroy KEK material that backups still need.
+- Don't shrink `--log-retention` below what firehose consumers need to resume. Older cursors get
   `OutdatedCursor`.
-- **Don't restart nodes or move shards during a KMS outage.** A restart empties the signing-key cache
+- Don't restart nodes or move shards during a KMS outage. A restart empties the signing-key cache
   and makes every account the node owns unwritable until KMS is back.
 
 ## The full runbook
@@ -271,7 +272,7 @@ latency, PLC lookups or KMS unwraps on cold writes. Raise `--cache-budget-mb` or
 - { value: "1", label: "list of metric gaps", note: "signals the alerts would want that no metric exports", tone: muted }
 ```
 
-`ops/RUNBOOK.md` stays the reference the alerts' `runbook_url`s point at. Its procedures:
+`ops/RUNBOOK.md` stays the reference that the alerts' `runbook_url`s point at. Its procedures:
 
 | Area | Procedures |
 |---|---|

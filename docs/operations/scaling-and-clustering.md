@@ -28,124 +28,125 @@ facts:
 ```
 
 One node and a cluster run the same binary against the same bucket layout. A single node owns every
-shard; more nodes spread them, and shards move by themselves as nodes join and leave. This page covers
-how big to make a cluster, how to change it, and how to change the shard layout. The mechanisms
-(leases, takeover, handback) are in [Architecture](../architecture.md#shards-and-ownership).
+shard. More nodes spread the shards out, and shards move by themselves as nodes join and leave. The
+mechanisms (leases, takeover, handback) are in [Architecture](../architecture.md#shards-and-ownership).
 
 > [!NOTE]
-> The Ansible role runs a lone node until `vlpds_cluster_enabled` is set; then it sets the peer
-> flags below on every node. See [With the Ansible role](#with-the-ansible-role).
+> The Ansible role runs a lone node until `vlpds_cluster_enabled` is set. After that it sets the
+> peer flags below on every node. See [With the Ansible role](#with-the-ansible-role).
 
 ## Sizing rules
 
 ```facts
 - { value: "~100 µs", label: CPU per commit, note: "whole node: HTTP, MST, signing, log, apply" }
 - { value: "~50 µs", label: CPU per proxied request, note: AppView reads dominate CPU, tone: blue }
-- { value: "~20 ms", label: CPU per password login, note: "Argon2; at most one per core (16 max) at once", tone: amber }
+- { value: "~20 ms", label: CPU per password login, note: "Argon2 · at most one per core (16 max) at once", tone: amber }
 - { value: "10–20 KB", label: memory per active repo, note: only the MST paths recent writes touched, tone: violet }
 ```
 
-Logins and proxying set the CPU, not commits. Size a cluster so that **after losing one node the
-survivors stay under ~60% CPU**: (nodes − 1) × cores × 0.6 ≥ busy cores, fleet-wide.
+Most of the CPU goes to logins and proxying. Size a cluster so that the survivors stay under ~60% CPU
+after losing one node. That works out to (nodes − 1) × cores × 0.6 ≥ busy cores, fleet-wide.
 
 | | Personal | Bluesky today | 10× Bluesky |
 |---|---|---|---|
-| Load | a few commits a day | ~350 commits/s avg, ~900 bursts; 20k proxied req/s (assumed) | ~3.5k avg, ~9k bursts; 200k req/s |
+| Load | a few commits a day | ~350 commits/s avg, ~900 bursts · 20k proxied req/s (assumed) | ~3.5k avg, ~9k bursts · 200k req/s |
 | Busy cores, fleet-wide | ~0 | ~3 | ~25 |
 | Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, ~1 TB NVMe | 3 × 24 cores / 128 GB, or ~8 small nodes |
 | Shards | 1 | 64 | 64, split the hot ones |
 
-- **Add a fourth node at ~2.4× today's load** (~7 busy cores: 2 survivors × 6 cores × 60%).
-- **Memory follows active repos.** A day's writers' MST paths are ~5 GB per node at Bluesky's load
-  on 3 nodes, ~50–75 GB at 10×. The node sizes its caches from its memory limit; see
-  [Configuration](configuration.md#memory-budget-and-autosizing).
-- **Shard count drives the object-store bill**, not traffic: polling, checkpoints and GC are per
-  shard. Start at 64 (~875k repos each at Bluesky scale) and split hot or large shards; 64 instead of
-  256 saves ~$800/mo on S3.
-- **Writer ids are one byte** (the low byte of every seq), so a cluster can't exceed 256 live node
+- Add a fourth node at ~2.4× today's load. That's ~7 busy cores (2 survivors × 6 cores × 60%).
+- Memory follows active repos. A day's writers' MST paths come to ~5 GB per node at Bluesky's load
+  on 3 nodes, and ~50–75 GB at 10×. The node sizes its caches from its memory limit (see
+  [Configuration](configuration.md#memory-budget-and-autosizing)).
+- The shard count drives the object-store bill, since polling, checkpoints and GC are per shard.
+  Start at 64 (~875k repos each at Bluesky scale) and split hot or large shards. Running 64 instead
+  of 256 saves ~$800/mo on S3.
+- Writer ids are one byte (the low byte of every seq), so a cluster can't go past 256 live node
   incarnations.
 
-Numbers are from DESIGN.md "Initial deployment sizing" and the benchmark campaigns
-(`bench/results/`), and are estimates, not promises. The largest runs so far are 100 M bulk-created
-accounts on 4 nodes and ~60k commits/s on one 16-core node.
+These numbers come from DESIGN.md "Initial deployment sizing" and the benchmark campaigns
+(`bench/results/`), and they're estimates. The largest runs so far are 100 M bulk-created accounts
+on 4 nodes and ~60k commits/s on one 16-core node.
 
-Full nodes serve AppView proxying and the firehose; there is no separate read or fan-out tier. To
-serve more, add full nodes. Consumers that can't take the whole stream use `?shard=k/n`; see
-[Firehose](../firehose.md#sharded-subscriptions).
+Full nodes serve AppView proxying and the firehose, and there's no separate read or fan-out tier.
+To serve more, add full nodes. Consumers that can't take the whole stream use `?shard=k/n` (see
+[Firehose](../firehose.md#sharded-subscriptions)).
 
 ## Adding a node
 
 ```steps
 - title: Give it the cluster's identity
-  body: "A **unique** `--node-id`. The same bucket, prefix, KEK, `--jwt-secret`, `--admin-token`, `--internal-token` and PLC rotation key as every other node."
+  body: "Its own unique `--node-id`, plus the same bucket, prefix, KEK, `--jwt-secret`, `--admin-token`, `--internal-token` and PLC rotation key as every other node."
 - title: Give it a peer certificate
-  body: "Issue a node certificate from the cluster CA for its id and peer host (below), and set `--peer-listen`, `--peer-tls-dir` and `--advertise-url https://<host>:<peer port>` to an address every peer can reach."
+  body: "Issue a node certificate from the cluster CA for its id and peer host (see below). Set `--peer-listen`, `--peer-tls-dir` and `--advertise-url https://<host>:<peer port>`, using an address every peer can reach."
 - title: Start it
   body: "It writes its lease and greets every peer. It doesn't count as joined until every live peer follows its log, so the merged firehose never misses its entries."
 - title: Peers hand back shards
-  body: "Each peer above the new fair share, `ceil(shards / live nodes)`, closes its extras with a barrier and checkpoint and hands them straight to the joiner. The joiner opens them with little or nothing to replay."
+  body: "Each peer above the new fair share (`ceil(shards / live nodes)`) closes its extras with a barrier and checkpoint and hands them straight to the joiner. The joiner opens them with little or nothing to replay."
 - title: Scrape it and check the balance
-  body: "Add the target to Prometheus (job `vlpds`). `owned` per node in `vlpds admin cluster status` converges; `VlpdsOwnershipImbalanced` stays quiet."
+  body: "Add the target to Prometheus (job `vlpds`). The `owned` count per node in `vlpds admin cluster status` should converge, and `VlpdsOwnershipImbalanced` should stay quiet."
 ```
 
-Don't list nodes in `--trusted-proxies`: a forwarding node passes the client's address over the
-internal token. List only real load balancers there. Going from one node to two needs no migration:
-the lone node's prefix already is a cluster of one. The procedure is RUNBOOK
+Don't list nodes in `--trusted-proxies`. A forwarding node already passes the client's address
+over the internal token, so only real load balancers go there. Going from one node to two needs no
+migration, because the lone node's prefix is already a cluster of one. The procedure is RUNBOOK
 [Adding a node](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#adding-a-node).
 
 ## Removing a node
 
 ```steps
 - title: Send SIGTERM
-  body: "Never SIGKILL. The node marks its lease `draining`, so peers stop counting it toward fair shares."
+  body: "Don't use SIGKILL. The node marks its lease `draining`, so peers stop counting it toward fair shares."
 - title: It hands its shards out
   body: "Each shard closes with one barrier segment and a checkpoint and goes straight to a settled peer, which opens it without replaying anything (~0.2 s a shard)."
 - title: It fences its own log and deletes its lease
-  body: "Followers drain the log to the fence and drop it as a firehose source. Then it keeps answering for 500 ms and exits 0."
+  body: "Followers drain the log up to the fence and drop it as a firehose source. The node keeps answering for 500 ms and then exits 0."
 - title: Peers rebalance
   body: The fair share is recomputed over the remaining nodes. Don't restart the process if the node is leaving for good.
 ```
 
-Give the supervisor a stop timeout of **at least 60 s**: the close barrier may wait 30 s and the
-quiesce 10 s. A stop that times out into SIGKILL becomes a crash, which peers handle with a fence and a
-replay. If the node can't fence its own log (store errors for min(TTL, 30 s)), it exits 8 and keeps its
-lease, so peers presume it dead and fence it themselves. A crashed node, by contrast, is noticed
-after its lease goes quiet (~12 s at the default 10 s TTL, 3–5 s if its port refuses connections);
-see [Architecture](../architecture.md#failure-and-takeover).
+Give the supervisor a stop timeout of at least 60 s, since the close barrier may wait 30 s and the
+quiesce 10 s. A stop that times out into SIGKILL turns into a crash, which peers handle with a fence
+and a replay. If the node can't fence its own log (store errors for min(TTL, 30 s)), it exits 8 and
+keeps its lease. Peers then presume it's dead and fence it themselves. A crashed node is noticed once
+its lease goes quiet. That takes ~12 s at the default 10 s TTL, or 3–5 s if its port refuses
+connections (see [Architecture](../architecture.md#failure-and-takeover)).
 
 ## With the Ansible role
 
-Every node of the inventory group shares the bucket, prefix, identity and secrets (group vars) and has
-its own node id, sizing and peer address (host vars). Peers talk over the private network: each node
-publishes its peer port on loopback and `tailscale serve` forwards it from the node's private address,
-so the peer port is never on a public interface. TLS passes straight through to vlpds.
+Every node in the inventory group shares the bucket, prefix, identity and secrets (group vars). Each
+one has its own node id, sizing and peer address (host vars). Peers talk over the private network.
+Each node publishes its peer port on loopback and `tailscale serve` forwards it from the node's
+private address, so the peer port is never on a public interface. TLS passes straight through to
+vlpds.
 
-**Adding a node**, starting from one running node:
+To add a node, starting from one running node:
 
 ```steps
 - title: Make the cluster CA, once
-  body: "`vlpds admin tls ca --out ./pki`. `ca.crt` goes in the group vars (`vlpds_peer_tls_ca_cert`). Keep `ca.key` offline, never on a node."
+  body: "Run `vlpds admin tls ca --out ./pki`. `ca.crt` goes in the group vars (`vlpds_peer_tls_ca_cert`). Keep `ca.key` offline and off every node."
 - title: Issue a certificate per node
-  body: "`vlpds admin tls issue --ca ./pki/ca.crt --ca-key ./pki/ca.key --out ./pki --node-id <node id> --host <its private address>`, for the running node too. Per node: the certificate in its host vars (`vlpds_peer_tls_cert`), the key in its encrypted host vars (`vlpds_peer_tls_key`), the address in `vlpds_peer_host`."
+  body: "Run `vlpds admin tls issue --ca ./pki/ca.crt --ca-key ./pki/ca.key --out ./pki --node-id <node id> --host <its private address>` for every node, including the running one. Each node's certificate goes in its host vars (`vlpds_peer_tls_cert`), its key in its encrypted host vars (`vlpds_peer_tls_key`) and its address in `vlpds_peer_host`."
 - title: Let the nodes reach each other
   body: "Allow node-to-node TCP on `vlpds_peer_port` (2584) in the private network's access policy. Nothing public changes."
 - title: Make the running node a cluster of one
-  body: "Set `vlpds_cluster_enabled: true` and run the playbook. The node restarts once, gracefully, with `--peer-listen`, `--advertise-url` and `--peer-tls-dir`; `vlpds admin cluster status` still shows it owning every shard."
+  body: "Set `vlpds_cluster_enabled: true` and run the playbook. The node restarts once, gracefully, with `--peer-listen`, `--advertise-url` and `--peer-tls-dir`. `vlpds admin cluster status` still shows it owning every shard."
 - title: Provision the new node
-  body: "A fresh host: `playbooks/bootstrap.yml` for it, then enable it in the inventory and run the playbook (one node at a time). It starts on the same bucket and prefix and the running node hands it its fair share."
+  body: "Run `playbooks/bootstrap.yml` for the fresh host, then enable it in the inventory and run the playbook (one node at a time). It starts on the same bucket and prefix, and the running node hands it its fair share."
 - title: Send it traffic
   body: "Point DNS at it too, or instead. With wildcard handle certificates, set `vlpds_caddy_hostname_dns01: true` first so the new node's Caddy holds the hostname's certificate before DNS sends it requests. Add its metrics target (Alloy does, through the same role)."
 ```
 
-A prefix made with the `tiny` profile has one shard: one node owns it and the others forward to it,
-which is enough for failover. Split it (below) to spread writes. Takeover after a crash waits about one
-lease TTL, 60 s on `tiny`; a lower `vlpds_lease_ttl_ms` shortens it for more object-store requests.
+A prefix made with the `tiny` profile has one shard. One node owns it and the others forward to it,
+which is enough for failover. Split it (below) to spread writes out. Takeover after a crash waits
+about one lease TTL (60 s on `tiny`). A lower `vlpds_lease_ttl_ms` shortens that in exchange for more
+object-store requests.
 
-**Removing a node**: move DNS away from it first, then stop it with `docker compose down` in
-`/opt/vlpds` (SIGTERM with the 90 s grace period: it hands its shards out, see
-[Removing a node](#removing-a-node)), and take it out of the inventory. The playbook refuses to run two
-enabled nodes while `vlpds_cluster_enabled` is off, because two lone nodes on one prefix never talk
-to each other.
+To remove a node, move DNS away from it first. Then stop it with `docker compose down` in
+`/opt/vlpds` and take it out of the inventory. The stop sends SIGTERM with the 90 s grace period, so
+the node hands its shards out (see [Removing a node](#removing-a-node)). The playbook refuses to run
+two enabled nodes while `vlpds_cluster_enabled` is off, because two lone nodes on one prefix never
+talk to each other.
 
 ## Shard split and merge
 
@@ -165,28 +166,28 @@ edges:
 
 ```steps
 - title: Plan
-  body: "`vlpds admin shard-split <shard> [--at <slot>]` or `shard-merge <left> <right>` (adjacent shards only) on any node. The op is recorded in `assign/layout` with its new shard ids. One op at a time, cluster-wide."
+  body: "Run `vlpds admin shard-split <shard> [--at <slot>]` or `shard-merge <left> <right>` (adjacent shards only) on any node. The op is recorded in `assign/layout` with its new shard ids. The cluster runs one op at a time."
 - title: Freeze
-  body: "Each parent's owner closes it like a release (barrier, checkpoint) and marks it frozen. Its slots answer 503 `PartitionUnavailable` from here, which clients retry."
+  body: "Each parent's owner closes it like a release (barrier, checkpoint) and marks it frozen. From here its slots answer 503 `PartitionUnavailable`, which clients retry."
 - title: Clone
-  body: "The driver clones the children from the frozen parents, an operation proportional to the manifest, not the data."
+  body: "The driver clones the children from the frozen parents. The work grows with the size of the manifest and doesn't depend on how much data the shard holds."
 - title: Flip
-  body: "A compare-and-swap of the layout to the next version. The children become ordinary shards; the driver opens them and nudges every peer; fair shares rebalance them later. `reshard-abort` works only before this point."
+  body: "A compare-and-swap moves the layout to the next version. The children become ordinary shards. The driver opens them and nudges every peer, and fair shares rebalance them later. `reshard-abort` only works before this point."
 ```
 
 `vlpds admin layout` shows the layout and any op in progress. Every node exports
 `vlpds_shard_layout_shards` and `vlpds_shard_layout_version`, and the ownership alerts read the
-count from there. Shard ids are u32 and never reused, so after a few ops ids no longer match
-positions; `state/{id}/` and `assign/{id}` are ten-digit ids.
+count from there. Shard ids are u32 and never reused, so after a few ops the ids no longer match
+positions. `state/{id}/` and `assign/{id}` use ten-digit ids.
 
-- **Automatic splits** are off by default. `--reshard-split-mb` (SST bytes) or
-  `--reshard-split-writes` (state mutations per second) let the owner of slot 0's shard plan splits
-  of shards past either threshold, one at a time.
-- **Retired parents** stay while a child still reads their SSTs. A child that hasn't rewritten them
-  `--forced-detach-after` (5 min) after it opened gets one compaction to do it; the parent's state
-  directory and assignment are deleted `--reshard-gc-grace` (1 h) after nothing references them.
-  `VlpdsRetiredStateGrowing` and `VlpdsReshardGcFailing` watch this.
-- **`--shards` applies only to a new prefix.** Changing it later does nothing; use split and merge.
+- Automatic splits are off by default. Set `--reshard-split-mb` (SST bytes) or
+  `--reshard-split-writes` (state mutations per second), and the owner of slot 0's shard plans
+  splits of shards past either threshold, one at a time.
+- Retired parents stay around while a child still reads their SSTs. If a child hasn't rewritten
+  them `--forced-detach-after` (5 min) after it opened, it gets one compaction to do it. The
+  parent's state directory and assignment are deleted `--reshard-gc-grace` (1 h) after nothing
+  references them. `VlpdsRetiredStateGrowing` and `VlpdsReshardGcFailing` watch this.
+- `--shards` only applies to a new prefix. Changing it later does nothing, so use split and merge.
 - The firehose, `?shard=k/n` subscriptions and `listRepos` cursors are by slot, so a reshard doesn't
   disturb consumers.
 
@@ -209,8 +210,9 @@ edges:
   - { from: nb.r, to: check.l70, dash: true }
 ```
 
-A lone node needs none of this: without `--peer-listen`, `--peer-tls-dir` and `--advertise-url`
-(always set together) it opens no peer listener and makes no peer calls. A cluster needs:
+A lone node doesn't need any of this. Without `--peer-listen`, `--peer-tls-dir` and
+`--advertise-url` (always set together), it opens no peer listener and makes no peer calls. A
+cluster needs this:
 
 ```bash
 vlpds admin tls ca --out ./pki                                  # once: ca.crt, ca.key (0600)
@@ -226,12 +228,12 @@ vlpds --node-id node-a --peer-listen 0.0.0.0:2584 \
   that address. The internal token is still required on top.
 - Startup refuses a certificate that doesn't chain to the CA, is expired, names another node or
   doesn't match its key.
-- Renew before `VlpdsPeerTlsCertExpiring` (14 days): re-issue with `--force`, replace the files and
-  send SIGHUP (or wait for the 60 s file poll). No restart. CA rotation goes through a bundle of old
-  and new CA.
-- `--dev-mode` nodes sharing a `--peer-tls-dir` make their own CA and certificates. Never in
-  production: the CA key sits next to the nodes.
+- Renew before `VlpdsPeerTlsCertExpiring` fires (14 days). Re-issue with `--force`, replace the
+  files and send SIGHUP (or wait for the 60 s file poll). It doesn't need a restart. CA rotation goes
+  through a bundle of the old and new CA.
+- `--dev-mode` nodes sharing a `--peer-tls-dir` make their own CA and certificates. Don't use this
+  in production, because the CA key sits next to the nodes.
 
 Renewal and CA rotation, step by step: RUNBOOK
 [Peer TLS](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#peer-tls-mtls-between-nodes).
-Why it is built this way: [Keys and security](../keys-security.md#peer-tls).
+Why it's built this way: [Keys and security](../keys-security.md#peer-tls).
