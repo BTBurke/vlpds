@@ -2,52 +2,155 @@
 title: Upgrades
 section: Operations
 order: 108
-status: stub
+status: ready
 summary: "Rolling deploys, feature levels and format versioning: how to upgrade a cluster without downtime, finalize, and roll back."
 ---
 
 ```hero
 diagram:
-  caption: "Placeholder: replace with this page's at-a-glance diagram (see docs/_style.md)."
+  caption: "A build that can write new formats keeps writing the cluster's active level until you finalize. Until then rollback is a plain redeploy of the old image; after it, only a fixed build moves forward."
   nodes:
-    - { id: old, label: "build N", at: [0, 0], size: [7, 3] }
-    - { id: mixed, label: "mixed cluster", at: [10, 0], size: [8, 3], tone: amber }
-    - { id: new, label: "build N+1 finalized", at: [21, 0], size: [10, 3], tone: accent }
+    - { id: old, label: build A, sub: levels 1..=L, at: [0, 2], size: [8, 3] }
+    - { id: mixed, label: Mixed or new fleet, sub: "writes level L · soak", at: [12, 2], size: [10, 3], tone: amber }
+    - { id: final, label: Finalized, sub: active = L+1, at: [27, 2], size: [9, 3], tone: accent }
+    - { id: fix, label: build B′, sub: forward-fix only, at: [27, 8], size: [9, 2.6], tone: danger }
   edges:
-    - "old -> mixed: roll"
-    - "mixed -> new: finalize"
+    - { from: old.r, to: mixed.l, label: roll B }
+    - { from: mixed.r, to: final.l, label: finalize }
+    - { from: mixed.t, to: old.t, label: redeploy A, dash: true, via: [[17, 0], [4, 0]] }
+    - { from: final.b, to: fix.t, label: a bug now, dash: true }
 facts:
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
+  - { value: "≥ 60 s", label: stop grace for SIGTERM, note: "the close barrier may wait 30 s and the quiesce 10 s" }
+  - { value: "~0", unit: errors, label: per clean rolling restart, note: "a handful when a forward is in flight; writes resent for up to 20 s", tone: blue }
+  - { value: "24 h", label: default soak before finalize, note: "VlpdsFeatureLevelUnfinalized after 14 days", tone: amber }
+  - { value: "exit 7", label: an old build after finalize, note: "refuses before reading or writing anything", tone: rust }
 ```
+
+Upgrading vlpds is restarting each node on a new image, one at a time. Because every format a node
+persists or sends belongs to a **feature level**, and every node writes the cluster's active level
+whatever its build can do, mixed versions are safe and rolling back is a redeploy until you finalize.
+This page covers the restart, the levels, and how to test an upgrade before shipping it.
+
+> [!NOTE]
+> Today every release runs level 1 only (`baseline`): there has been no level to finalize yet. The
+> machinery (the `cluster/version` object, the startup check, finalize and lower) is built and tested
+> with a test-only level 2.
 
 ## Rolling deploy
 
-<!-- Sources: RUNBOOK "Rolling deploy"; stop grace ≥ 60 s -->
+```steps
+- title: SIGTERM one node
+  body: "Never SIGKILL. It marks its lease `draining`, closes each shard with one barrier segment and a checkpoint, hands it straight to a settled peer, waits up to 10 s for its log to quiesce, fences its own log, deletes its lease and exits 0."
+- title: Wait for the stop
+  body: "Give the supervisor a stop timeout of **at least 60 s**. A timeout that ends in SIGKILL turns a handoff into a crash: peers fence and replay instead. Exit 8 means it couldn't fence its own log; peers or the restart do it."
+- title: Start the new image with the same `--node-id`
+  body: "Same bucket, prefix, tokens and `--advertise-url`. It greets its peers, and they hand back its fair share at their next step."
+- title: Check before the next node
+  body: "`sum(vlpds_owned_partitions)` equals `vlpds_shard_layout_shards`; the node owns about shards ÷ nodes; `vlpds_last_exit_reason_info{reason=\"clean\"}`; every lease valid; `vlpds_build_info{rev}` is the new rev; commit p99 and `vlpds_write_retries_total` back to baseline."
+```
 
-TODO.
+Clients see almost nothing: a forward in flight at the moment of exit can fail (a handful of errors
+per restart), and writes that hit a shard in motion get a retryable 503 that the entry node resends
+for up to 20 s. Expect a burst of resends and some cold repo loads on the moved shards.
+
+**A single node is different**: every restart is a short outage. A graceful restart is ~1 s to the
+first write in an idle test, and roughly 5–30 s of Caddy 502s and dropped firehose connections in
+practice (relays reconnect with their cursor). Pick a quiet time. The Ansible role does this with
+`--tags vlpds-deploy,vlpds-verify` after you set the new image tag; see [Deploy](deploy.md).
 
 ## Feature levels
 
-<!-- Sources: DESIGN "Rolling upgrades and format versioning" (active level, finalize) -->
+```diagram
+caption: "A build declares the levels it can run; the cluster's active level is one object in the bucket. A node starts only if the active level is inside its window, and every writer emits the active level's formats."
+nodes:
+  - { id: cv, label: "cluster/version", sub: "active · target · history", at: [0, 3], size: [10, 3], shape: store, tone: amber }
+  - { id: n1, label: node on build A, sub: "window 1..=1", at: [15, 0], size: [10, 3], tone: accent }
+  - { id: n2, label: node on build B, sub: "window 1..=2", at: [15, 6], size: [10, 3], tone: accent }
+  - { id: out, label: segments · leases · rows, sub: "level 1 bytes from both", at: [30, 3], size: [11, 3], tone: solid }
+edges:
+  - { from: cv.r, to: n1.l, label: read at start }
+  - { from: cv.r, to: n2.l }
+  - { from: n1.r, to: out.l30 }
+  - { from: n2.r, to: out.l70, label: write active, labelAt: [28.5, 9.4] }
+```
 
-TODO.
+- **A level is an integer** in `src/version.rs`. Each persisted or wire format change gets the next
+  one; a level is either **persistent** (it puts new bytes in the bucket) or wire-only.
+- **A build runs `MIN_LEVEL..=MAX_LEVEL`.** It reads everything in that window and writes the active
+  level. A new build at level L therefore writes exactly what the old one writes.
+- **`cluster/version`** holds the active level, a `target` while a raise is running, and the history.
+  A fresh prefix starts at its first node's highest level. Only `vlpds admin cluster finalize` and
+  `cluster lower` change it; never edit it by hand.
+- **The startup gate.** A node reads `cluster/version` before it touches anything, again right after
+  writing its lease, and once per lease TTL while running. A build whose window doesn't contain the
+  active level (or a running raise's target) exits **7 `incompatible_level`**.
+- **Leases advertise** each node's `rev`, `min_level`, `max_level` and the level it last saw, so every
+  node knows the whole cluster's window. `vlpds admin cluster status` and the console's Cluster page
+  show it, with a "finalize available" banner when every node can run the next level.
 
 ## Rolling upgrade, finalize, rollback
 
-<!-- Sources: RUNBOOK same-named procedure; VlpdsMixedVersions, VlpdsFeatureLevelUnfinalized -->
+```steps
+- title: Pre-flight
+  body: "`vlpds admin cluster status`: every node healthy, `Feature level: L active`. The new build's `MIN_LEVEL` must be ≤ L (its release notes list its levels and which are persistent)."
+- title: Roll the new build
+  body: "Exactly as a rolling deploy. Also check each restarted node's row shows the new rev and a window reaching L+1, and that `vlpds_format_errors_total` stays flat."
+- title: Soak at level L
+  body: "Default 24 h with the whole fleet on the new build. **Rollback is a plain redeploy** of the previous image, node by node, in any order: no byte of level L+1 exists yet."
+- title: Finalize
+  body: "`vlpds admin cluster finalize --level L+1` (asks first; `--yes` off a terminal). It writes a raise target, checks every live lease's window, then sets active = L+1, or refuses with 409 `IncompatibleNodes` and changes nothing. Watch format errors, commit p99 and firehose lag for one TTL."
+- title: After finalize, forward-fix only
+  body: "An old build exits 7 at startup. Ship a fixed build. A **wire-only** level can be lowered when its new behaviour is the bug (`vlpds admin cluster lower --level L`); a persistent level never is."
+```
 
-TODO.
+| Alert | Means |
+|---|---|
+| `VlpdsMixedVersions` | more than one `rev` for over an hour: finish or roll back the deploy |
+| `VlpdsIncompatibleNode` | a node exited 7: deploy a build whose window contains the active level |
+| `VlpdsFeatureLevelUnfinalized` | every node could run a higher level for 14 days: finalize or roll back |
+| `VlpdsFormatErrors` | a node met a format marker it doesn't know (pages: should never happen) |
+
+A raise that a dying node left half-done shows as "raising to N" in `cluster status`; clear it with
+`vlpds admin cluster finalize --level <active> --yes`. The full procedure: RUNBOOK
+[Rolling upgrade, finalize, rollback](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#rolling-upgrade-finalize-rollback).
 
 ## Compatibility contract
 
-<!-- Sources: DESIGN "Compatibility contract" -->
+```facts
+- { value: "readers", label: accept every level in their window, note: "unknown segment magics, stream messages or markers are errors, never guessed" }
+- { value: "writers", label: emit the active level only, note: "a segment is one level; a change takes effect at the next one", tone: accent }
+- { value: "objects", label: tolerant both ways, note: "shared control objects keep fields an older node doesn't know", tone: blue }
+```
 
-TODO.
+What every release promises, so that a rolling upgrade and a rollback are always safe:
+
+- **Upgrade one window at a time.** A build starts only if the active level is inside its window.
+  Skipping releases is fine whenever that holds. A build drops support for level L (raises
+  `MIN_LEVEL`) only once data at L can no longer exist.
+- **Control objects survive older nodes.** Assignments, the layout and `cluster/version` are
+  read-modify-CAS'd by whichever node acts, so they keep unknown fields (`serde(flatten)`) and default
+  missing ones. A field an old node must *honour* is still level-gated.
+- **Peer protocols are additive.** Paths stay `/v1`; a new endpoint or message is used only once the
+  peer's lease advertises a level that has it. A 404 from a peer reads as "unsupported", and the log
+  stream skips message types it doesn't know.
+- **SlateDB is a format.** A SlateDB version bump, or a flag that changes stored bytes (log or SST
+  compression codec), is a level: what the new version writes must open under the old one until the
+  level is raised.
+- **Client tokens are a format too.** A session JWT or OAuth token that the old build can't verify
+  turns a rollback into a forced logout, so a change to them belongs to a level.
+
+The format inventory (every persisted and wire format, and how it is versioned) is DESIGN.md
+"Rolling upgrades and format versioning".
 
 ## Testing an upgrade
 
-<!-- Sources: just upgrade-ha / upgrade-ci -->
+```steps
+- title: "`just upgrade-ci`"
+  body: "Before any release with a new level: format fixtures and the MANIFEST freeze (`testdata/formats/L1/`), the level-gating test, and the two-build `upgrade-rolling` HA scenario against the previous release, on a throwaway MinIO."
+- title: "`just upgrade-ha`"
+  body: "Every `upgrade-*` scenario (`bench/ha/upgrade.sh`): rolling upgrade, rollback before finalize, old-node refusal after it, and a node starting during a raise."
+- title: Never deploy a test build
+  body: "The scenarios use the cargo feature `test-level`, which adds a fake level 2 with a different segment format. Such a build logs `TEST BUILD` at startup."
+```
 
-TODO.
+Results of the last two-build run are in `bench/ha/RESULTS.md` ("Two-build upgrade scenarios").

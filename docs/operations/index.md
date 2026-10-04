@@ -2,25 +2,46 @@
 title: Operations
 section: Operations
 order: 100
-status: stub
+status: ready
 summary: "Running vlpds: deploying a node, configuring it, watching it, and what to do when something goes wrong."
 ---
 
 ```hero
 diagram:
-  caption: "Placeholder: replace with this page's at-a-glance diagram (see docs/_style.md)."
+  caption: An operator's loop. Deploy points a node at a bucket; monitoring scrapes it; an alert names its runbook section. Upgrades and scaling are restarts and joins of the same binary on the same bucket.
   nodes:
-    - { id: deploy, label: "deploy", at: [0, 0], size: [7, 3], tone: accent }
-    - { id: watch, label: "monitor", at: [10, 0], size: [7, 3], tone: blue }
-    - { id: act, label: "runbook", at: [20, 0], size: [7, 3], tone: amber }
+    - { id: bucket, label: Object store, sub: bucket + prefix, at: [0, 0.2], size: [8, 2.6], shape: store, tone: amber }
+    - { id: keys, label: Secrets, sub: "KEK · PLC key · tokens", at: [0, 5.2], size: [8, 2.6], tone: muted }
+    - { id: deploy, label: Deploy, sub: Ansible · compose, at: [12, 2.6], size: [8, 3], tone: accent }
+    - { id: watch, label: Monitoring, sub: "metrics · 79 alerts", at: [24, 2.6], size: [8, 3], tone: blue }
+    - { id: runbook, label: Runbook, sub: one section per alert, at: [36, 2.6], size: [8, 3], tone: danger }
+    - { id: upgrade, label: Upgrades, sub: SIGTERM · roll · finalize, at: [12, 9], size: [8, 3], tone: accent }
+    - { id: scale, label: Scaling, sub: "add nodes · split shards", at: [24, 9], size: [8, 3], tone: accent }
+    - { id: backup, label: Backups, sub: design · not built, at: [36, 9], size: [8, 3], shape: note, tone: muted }
   edges:
-    - "deploy -> watch"
-    - "watch -> act: alert"
+    - "bucket.r -> deploy.l30"
+    - "keys.r -> deploy.l70"
+    - "deploy -> watch: scrape"
+    - "watch -> runbook: alert"
+    - { from: deploy.b, to: upgrade.t, label: new image }
+    - { from: watch.b, to: scale.t, label: busy cores }
+    - { from: runbook.b, to: backup.t, label: last resort, dash: true }
 facts:
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
+  - { value: "1", unit: binary, label: and one bucket per PDS, note: "the web UI and the admin CLI are in the same binary" }
+  - { value: "79", unit: alerts, label: each with a runbook section, note: "17 page, 62 ticket (ops/alerts.yml)", tone: blue }
+  - { value: "≥ 60 s", label: stop grace for SIGTERM, note: "a graceful stop hands shards over in ~0.2 s each; never SIGKILL", tone: amber }
+  - { value: "0", label: backups built, note: "durability is the bucket's own; copy the KEK offline", tone: rust }
 ```
+
+These pages are for whoever runs a vlpds server, from a personal PDS on a small VM to a cluster.
+Read [Deploy](deploy.md) first, then [Monitoring](monitoring.md) and the
+[Runbook](runbook.md) before you need them. The [Overview](../overview.md) explains the design in
+one screen.
+
+Two things set vlpds apart from the reference PDS operationally. **The bucket is the database**: a
+node's disk is a cache, so losing a host costs nothing but warm caches. And **a node that can't be
+sure it may write exits**: restarts with exit codes 2 to 9 are the safety mechanism, and the
+supervisor must restart the process on any of them.
 
 ```pages
 {}

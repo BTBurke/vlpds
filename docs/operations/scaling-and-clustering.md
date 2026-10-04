@@ -2,58 +2,216 @@
 title: Scaling and clustering
 section: Operations
 order: 107
-status: stub
+status: ready
 summary: "Growing from one node to many: adding and removing nodes, how shards rebalance, splitting and merging shards, peer TLS, and sizing rules."
 ---
 
 ```hero
 diagram:
-  caption: "Placeholder: replace with this page's at-a-glance diagram (see docs/_style.md)."
+  caption: "Adding capacity is starting another node on the same bucket and prefix. Once every peer follows the new node's log, nodes above the fair share (shards ÷ live nodes) hand their extras straight to it. Three nodes and 64 shards shown; the counts are examples."
   nodes:
-    - { id: a, label: "node A", at: [0, 0], size: [6, 3], tone: accent }
-    - { id: b, label: "node B", at: [0, 4], size: [6, 3], tone: accent }
-    - { id: c, label: "new node C", at: [12, 2], size: [8, 3], tone: blue }
+    - { id: a, label: node A, sub: "32 → 22 shards", at: [0, 0], size: [8, 3], tone: accent }
+    - { id: b, label: node B, sub: "32 → 21 shards", at: [0, 6], size: [8, 3], tone: accent }
+    - { id: c, label: new node C, sub: "0 → 21 shards", at: [14, 3], size: [9, 3], tone: blue }
+    - { id: bucket, label: same bucket + prefix, sub: "assign/ · nodes/ · log/", at: [29, 3], size: [11, 3], shape: store, tone: amber }
   edges:
-    - "a ~> c: handback"
-    - "b ~> c: handback"
+    - { from: a.r, to: c.l30, label: handback, dash: true, labelAt: [9.6, 4.5] }
+    - { from: b.r, to: c.l70, dash: true }
+    - "c -> bucket: lease · CAS"
+    - { from: a.r, to: bucket.t, via: [[34.5, 1.5]] }
+    - { from: b.r, to: bucket.b, via: [[34.5, 7.5]] }
 facts:
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
+  - { value: "2", unit: nodes, label: are enough for high availability, note: "leases and ownership are CAS on bucket objects; no quorum" }
+  - { value: "60%", label: CPU after losing a node, note: "(nodes − 1) × cores × 0.6 ≥ busy cores", tone: amber }
+  - { value: "~0.2 s", label: per shard handed over, note: "planned moves: barrier, checkpoint, open on the new owner", tone: blue }
+  - { value: "64", unit: shards, label: default layout, note: "65,536 hash slots; split and merge online", tone: violet }
 ```
+
+One node and a cluster run the same binary against the same bucket layout. A single node owns every
+shard; more nodes spread them, and shards move by themselves as nodes join and leave. This page covers
+how big to make a cluster, how to change it, and how to change the shard layout. The mechanisms
+(leases, takeover, handback) are in [Architecture](../architecture.md#shards-and-ownership).
+
+> [!NOTE]
+> The Ansible role deploys **one node** today. A multi-node cluster runs from the same image with the
+> peer flags below; the role does not template them yet.
 
 ## Sizing rules
 
-<!-- Sources: DESIGN "Initial deployment sizing" (60% rule: (nodes − 1) × cores × 0.6 ≥ busy cores) -->
+```facts
+- { value: "~100 µs", label: CPU per commit, note: "whole node: HTTP, MST, signing, log, apply" }
+- { value: "~50 µs", label: CPU per proxied request, note: AppView reads dominate CPU, tone: blue }
+- { value: "~20 ms", label: CPU per password login, note: "Argon2; at most one per core (16 max) at once", tone: amber }
+- { value: "10–20 KB", label: memory per active repo, note: only the MST paths recent writes touched, tone: violet }
+```
 
-TODO.
+Logins and proxying set the CPU, not commits. Size a cluster so that **after losing one node the
+survivors stay under ~60% CPU**: (nodes − 1) × cores × 0.6 ≥ busy cores, fleet-wide.
+
+| | Personal | Bluesky today | 10× Bluesky |
+|---|---|---|---|
+| Load | a few commits a day | ~350 commits/s avg, ~900 bursts; 20k proxied req/s (assumed) | ~3.5k avg, ~9k bursts; 200k req/s |
+| Busy cores, fleet-wide | ~0 | ~3 | ~25 |
+| Nodes | 1 small VM (`tiny` profile) | 3 × 6–8 cores, 32 GB, ~1 TB NVMe | 3 × 24 cores / 128 GB, or ~8 small nodes |
+| Shards | 1 | 64 | 64, split the hot ones |
+
+- **Add a fourth node at ~2.4× today's load** (~7 busy cores: 2 survivors × 6 cores × 60%).
+- **Memory follows active repos.** A day's writers' MST paths are ~5 GB per node at Bluesky's load
+  on 3 nodes, ~50–75 GB at 10×. The node sizes its caches from its memory limit; see
+  [Configuration](configuration.md#memory-budget-and-autosizing).
+- **Shard count drives the object-store bill**, not traffic: polling, checkpoints and GC are per
+  shard. Start at 64 (~875k repos each at Bluesky scale) and split hot or large shards; 64 instead of
+  256 saves ~$800/mo on S3.
+- **Writer ids are one byte** (the low byte of every seq), so a cluster can't exceed 256 live node
+  incarnations.
+
+Numbers are from DESIGN.md "Initial deployment sizing" and the benchmark campaigns
+(`bench/results/`), and are estimates, not promises.
 
 ## Adding a node
 
-<!-- Sources: RUNBOOK "Adding a node"; joining waits for every peer to follow its log -->
+```steps
+- title: Give it the cluster's identity
+  body: "A **unique** `--node-id`. The same bucket, prefix, KEK, `--jwt-secret`, `--admin-token`, `--internal-token` and PLC rotation key as every other node."
+- title: Give it a peer certificate
+  body: "Issue a node certificate from the cluster CA for its id and peer host (below), and set `--peer-listen`, `--peer-tls-dir` and `--advertise-url https://<host>:<peer port>` to an address every peer can reach."
+- title: Start it
+  body: "It writes its lease and greets every peer. It doesn't count as joined until every live peer follows its log, so the merged firehose never misses its entries."
+- title: Peers hand back shards
+  body: "Each peer above the new fair share, `ceil(shards / live nodes)`, closes its extras with a barrier and checkpoint and hands them straight to the joiner. The joiner opens them with little or nothing to replay."
+- title: Scrape it and check the balance
+  body: "Add the target to Prometheus (job `vlpds`). `owned` per node in `vlpds admin cluster status` converges; `VlpdsOwnershipImbalanced` stays quiet."
+```
 
-TODO.
+Don't list nodes in `--trusted-proxies`: a forwarding node passes the client's address over the
+internal token. List only real load balancers there. Going from one node to two needs no migration:
+the lone node's prefix already is a cluster of one. The procedure is RUNBOOK
+[Adding a node](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#adding-a-node).
 
 ## Removing a node
 
-<!-- Sources: graceful shutdown: draining lease, handoff with prewarm -->
+```steps
+- title: Send SIGTERM
+  body: "Never SIGKILL. The node marks its lease `draining`, so peers stop counting it toward fair shares."
+- title: It hands its shards out
+  body: "Each shard closes with one barrier segment and a checkpoint and goes straight to a settled peer, which opens it without replaying anything (~0.2 s a shard)."
+- title: It fences its own log and deletes its lease
+  body: "Followers drain the log to the fence and drop it as a firehose source. Then it keeps answering for 500 ms and exits 0."
+- title: Peers rebalance
+  body: The fair share is recomputed over the remaining nodes. Don't restart the process if the node is leaving for good.
+```
 
-TODO.
+Give the supervisor a stop timeout of **at least 60 s**: the close barrier may wait 30 s and the
+quiesce 10 s. A stop that times out into SIGKILL becomes a crash, which peers handle with a fence and a
+replay. If the node can't fence its own log (store errors for min(TTL, 30 s)), it exits 8 and keeps its
+lease, so peers presume it dead and fence it themselves. A crashed node, by contrast, is noticed
+after its lease goes quiet (~12 s at the default 10 s TTL, 3–5 s if its port refuses connections);
+see [Architecture](../architecture.md#failure-and-takeover).
 
 ## Shard split and merge
 
-<!-- Sources: RUNBOOK "Shard split / merge"; DESIGN "Online shard split/merge" -->
+```diagram
+caption: "A split is a metadata-only SlateDB clone: each child's manifest references the frozen parent's SSTs and its own slot range, whatever the parent's size. Ids are never reused; a split takes two new ones. The children compact the inherited SSTs into their own over time, and the parent's directory is deleted after that."
+nodes:
+  - { id: p, label: shard 7, sub: "slots 7168–8191 · frozen", at: [0, 2.5], size: [10, 3], tone: muted }
+  - { id: c1, label: shard 64, sub: "slots 7168–7679", at: [17, 0], size: [9, 3], tone: accent }
+  - { id: c2, label: shard 65, sub: "slots 7680–8191", at: [17, 5], size: [9, 3], tone: accent }
+  - { id: sst, label: "state/0000000007/", sub: SSTs read in place, at: [32, 2.5], size: [11, 3], shape: store, tone: amber }
+edges:
+  - { from: p.r, to: c1.l, label: clone }
+  - { from: p.r, to: c2.l }
+  - { from: c1.r, to: sst.l30, dash: true }
+  - { from: c2.r, to: sst.l70, label: external SSTs, dash: true, labelAt: [30.5, 7.4] }
+```
 
-TODO.
+```steps
+- title: Plan
+  body: "`vlpds admin shard-split <shard> [--at <slot>]` or `shard-merge <left> <right>` (adjacent shards only) on any node. The op is recorded in `assign/layout` with its new shard ids. One op at a time, cluster-wide."
+- title: Freeze
+  body: "Each parent's owner closes it like a release (barrier, checkpoint) and marks it frozen. Its slots answer 503 `PartitionUnavailable` from here, which clients retry."
+- title: Clone
+  body: "The driver clones the children from the frozen parents, an operation proportional to the manifest, not the data."
+- title: Flip
+  body: "A compare-and-swap of the layout to the next version. The children become ordinary shards; the driver opens them and nudges every peer; fair shares rebalance them later. `reshard-abort` works only before this point."
+```
+
+`vlpds admin layout` shows the layout and any op in progress. Every node exports
+`vlpds_shard_layout_shards` and `vlpds_shard_layout_version`, and the ownership alerts read the
+count from there. Shard ids are u32 and never reused, so after a few ops ids no longer match
+positions; `state/{id}/` and `assign/{id}` are ten-digit ids.
+
+- **Automatic splits** are off by default. `--reshard-split-mb` (SST bytes) or
+  `--reshard-split-writes` (state mutations per second) let the owner of slot 0's shard plan splits
+  of shards past either threshold, one at a time.
+- **Retired parents** stay while a child still reads their SSTs. A child that hasn't rewritten them
+  `--forced-detach-after` (5 min) after it opened gets one compaction to do it; the parent's state
+  directory and assignment are deleted `--reshard-gc-grace` (1 h) after nothing references them.
+  `VlpdsRetiredStateGrowing` and `VlpdsReshardGcFailing` watch this.
+- **`--shards` applies only to a new prefix.** Changing it later does nothing; use split and merge.
+- The firehose, `?shard=k/n` subscriptions and `listRepos` cursors are by slot, so a reshard doesn't
+  disturb consumers.
+
+How the layout and clones work: [State storage](../state-storage.md#shard-split-and-merge).
 
 ## Peer TLS
 
-<!-- Sources: RUNBOOK "Peer TLS" -->
+```diagram
+caption: "Node-to-node traffic (forwarded requests carrying users' tokens, `/internal/*`, log streams) runs over HTTP/2 with TLS 1.3 and client certificates on `--peer-listen`. There is no cleartext mode. The CA key stays offline."
+nodes:
+  - { id: ca, label: cluster CA, sub: "ca.key offline", at: [0, 3], size: [8, 3], tone: violet }
+  - { id: na, label: node A, sub: "node-a.crt · ca.crt", at: [14, 0], size: [9, 3], tone: accent }
+  - { id: nb, label: node B, sub: "node-b.crt · ca.crt", at: [14, 6], size: [9, 3], tone: accent }
+  - { id: check, label: Peers check, sub: "chain · host · node id", at: [29, 3], size: [10, 3], shape: note, tone: muted }
+edges:
+  - { from: ca.r, to: na.l, label: issue }
+  - { from: ca.r, to: nb.l }
+  - "na <-> nb: mTLS"
+  - { from: na.r, to: check.l30, dash: true }
+  - { from: nb.r, to: check.l70, dash: true }
+```
 
-TODO.
+A lone node needs none of this: without `--peer-listen`, `--peer-tls-dir` and `--advertise-url`
+(always set together) it opens no peer listener and makes no peer calls. A cluster needs:
+
+```bash
+vlpds admin tls ca --out ./pki                                  # once: ca.crt, ca.key (0600)
+vlpds admin tls issue --ca ./pki/ca.crt --ca-key ./pki/ca.key --out ./pki \
+  --node-id node-a --host 10.0.0.5                              # per node; 365 days (--days)
+# on node-a: ca.crt, node-a.crt, node-a.key in one directory, then
+vlpds --node-id node-a --peer-listen 0.0.0.0:2584 \
+  --advertise-url https://10.0.0.5:2584 --peer-tls-dir /run/vlpds/peer-tls ...
+```
+
+- A node certificate names its node in a `vlpds://node/<node-id>` URI and carries its advertise host.
+  Peers check the chain, the host, and that the certificate names the node whose lease advertises
+  that address. The internal token is still required on top.
+- Startup refuses a certificate that doesn't chain to the CA, is expired, names another node or
+  doesn't match its key.
+- Renew before `VlpdsPeerTlsCertExpiring` (14 days): re-issue with `--force`, replace the files and
+  send SIGHUP (or wait for the 60 s file poll). No restart. CA rotation goes through a bundle of old
+  and new CA.
+- `--dev-mode` nodes sharing a `--peer-tls-dir` make their own CA and certificates. Never in
+  production: the CA key sits next to the nodes.
+
+Renewal and CA rotation, step by step: RUNBOOK
+[Peer TLS](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#peer-tls-mtls-between-nodes).
+Why it is built this way: [Keys and security](../keys-security.md#peer-tls).
 
 ## Planet scale
 
-<!-- Sources: DESIGN "Planet scale" (analysis), "Read replicas and fan-out nodes: not planned" -->
+```facts
+- { value: "1–5 B", unit: accounts, label: the design target, note: "analysis only; nothing at this size has been run", tone: muted }
+- { value: "200–500k", unit: commits/s, label: at peak, note: "~35 cores of commit CPU fleet-wide", tone: amber }
+- { value: "~50–150", unit: nodes, label: "16–32 cores each", note: "sized by write throughput and hot-repo memory", tone: blue }
+```
 
-TODO.
+The storage model doesn't change at this size: fixed hash slots, shards that split online, one log
+and one lease per node, and a firehose that merges N node logs rather than thousands of shard
+streams. Start with ~2–4k shards and split hot or large ones. The largest real runs so far are 100 M
+bulk-created accounts on 4 nodes and ~60k commits/s on one 16-core node (`bench/results/`).
+
+**No separate read or fan-out tier is planned.** Full nodes serve AppView proxying and the firehose;
+a dedicated tier would start to pay only above ~300k proxied req/s (a reader is NIC-bound at ~210k
+per 10 Gbit) or with dozens of full-firehose subscribers at 20–100× today's write load. Before that,
+prefer a DID-aware load balancer (it removes the forwarding hop) and more full nodes. Consumers that
+can't take the whole stream use `?shard=k/n`; see [Firehose](../firehose.md#sharded-subscriptions).

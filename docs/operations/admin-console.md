@@ -2,49 +2,157 @@
 title: Admin console and CLI
 section: Operations
 order: 111
-status: stub
+status: ready
 summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, cluster status and metrics."
 ---
 
 ```hero
 diagram:
-  caption: "Placeholder: replace with this page's at-a-glance diagram (see docs/_style.md)."
+  caption: "Both are clients of admin XRPC with the admin token, on any node; calls about one account are routed to its owner. Neither is ever exposed through the public proxy: the console is reached over the tailnet or an SSH tunnel."
   nodes:
-    - { id: op, label: "operator", at: [0, 0], size: [7, 3] }
-    - { id: ui, label: "/admin console", at: [10, 0], size: [8, 3], tone: accent }
-    - { id: cli, label: "vlpds admin", at: [10, 4], size: [8, 3], tone: accent }
-    - { id: api, label: "admin XRPC", at: [22, 2], size: [8, 3], tone: blue }
+    - { id: op, label: Operator, sub: admin token, at: [0, 3.2], size: [7, 3] }
+    - { id: ui, label: "/admin console", sub: "tailnet · SSH tunnel", at: [11, 0], size: [9, 3], tone: accent }
+    - { id: cli, label: vlpds admin, sub: "CLI · same binary", at: [11, 6.4], size: [9, 3], tone: accent }
+    - { id: api, label: admin XRPC, sub: "com.atproto.admin.* · vlpds.admin.*", at: [24, 3.2], size: [12, 3], tone: blue }
+    - { id: owner, label: owning node, sub: forwarded by DID, at: [40, 3.2], size: [8, 3], tone: accent }
+    - { id: caddy, label: Caddy, sub: "blocks /admin, vlpds.admin.*", at: [24, 9.4], size: [12, 2.6], tone: muted }
   edges:
-    - "op -> ui"
-    - "op.b -> cli.l"
-    - "ui -> api"
-    - "cli -> api"
+    - { from: op.r, to: ui.l }
+    - { from: op.r, to: cli.l }
+    - "ui.r -> api.l30: Basic auth"
+    - cli.r -> api.l70
+    - "api -> owner: per DID"
+    - { from: caddy.t, to: api.b, label: never public, dash: true, arrow: none }
 facts:
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
-  - { value: "?", label: "TODO: key fact or round number", tone: muted }
+  - { value: "6", unit: pages, label: in the console, note: "cluster, live metrics, accounts, invites, rate limits, relays" }
+  - { value: "2 s", label: cluster view refresh, note: "getClusterStatus polled from the node you opened", tone: blue }
+  - { value: "pdsadmin", label: every command covered, note: "plus the reference's maintenance scripts and cluster ops", tone: violet }
+  - { value: "0", label: direct bucket access, note: "the CLI needs only a node URL and the admin token", tone: amber }
 ```
+
+vlpds has two operator tools and both talk admin XRPC to a node: the web **console** at `/admin`,
+served by every node from the same binary, and the **`vlpds admin`** CLI. The console is for looking
+and for one-off account work; the CLI covers everything the reference's `pdsadmin` and maintenance
+scripts do, plus cluster and key operations, and is what you script.
 
 ## Reaching the console
 
-<!-- Sources: tailnet console port (vlpds_tailnet_console_port), admin token -->
+```diagram
+caption: "Two ways in. Caddy refuses `/admin`, `/admin/*`, `/xrpc/vlpds.admin.*`, `/metrics` and `/internal/*` from the internet, so both paths reach the node's port on the host directly."
+nodes:
+  - { id: lap, label: Your laptop, sub: browser, at: [0, 3.9], size: [8, 3] }
+  - { id: ts, label: tailscale serve, sub: "https · tailnet only", at: [13, 0], size: [10, 2.6], tone: muted }
+  - { id: ssh, label: SSH tunnel, sub: "-L 2583:127.0.0.1:2583", at: [13, 7.8], size: [10, 2.6], tone: muted }
+  - { id: app, label: "vlpds :2583", sub: "/admin · admin XRPC", at: [28, 4.2], size: [9, 2.6], tone: accent }
+  - { id: met, label: "vlpds :9583", sub: "/metrics", at: [28, 0], size: [9, 2.6], tone: accent }
+edges:
+  - { from: lap.r, to: ts.l }
+  - { from: lap.r, to: ssh.l }
+  - { from: ts.b, to: app.l30, via: [[18, 4.98]] }
+  - { from: ts.r, to: met.l, label: "/metrics", dash: true }
+  - { from: ssh.r, to: app.l70 }
+```
 
-TODO.
+- **On the tailnet.** With `vlpds_tailnet_console_port` set, the Ansible role runs
+  `tailscale serve` on that port: TLS terminated by tailscaled, listening on the tailnet only, with
+  `/` going to the node and `/metrics` to its metrics listener (so the Live metrics page works).
+  Open `https://<tailnet name>:<port>/admin`. Not port 443: Docker's DNAT for Caddy takes it.
+- **Over SSH.** `ssh -L 2583:127.0.0.1:2583 <host>` and open `http://localhost:2583/admin`.
+  Everything works except Live metrics, which needs `/metrics` on the same origin.
+- **Unlock** with the node's `--admin-token`. The console checks it with a `getClusterStatus` call
+  and keeps it in that browser tab only; **Lock console** forgets it.
+
+Every node serves the console, and any node will do: the Cluster page is that node's view of the
+cluster, and account pages are routed to each account's owner.
 
 ## Pages
 
-<!-- Sources: ui/src/pages/admin: Accounts, Invites, Cluster, Metrics, RateLimits, Relays -->
+```facts
+- { value: Cluster, label: "/admin", note: "ownership map, nodes, firehose sources, feature level; every 2 s", tone: accent }
+- { value: Metrics, label: "/admin/metrics", note: "charts scraped from /metrics every 2 s, last 6 min", tone: blue }
+- { value: Accounts, label: "/admin/accounts", note: "search, details, takedown, handle, email, password, delete", tone: violet }
+- { value: Limits, label: "/admin/ratelimits", note: "live 429s, top keys, buckets and overrides, cluster-wide", tone: amber }
+```
 
-TODO.
+| Page | What it shows | What you can do |
+|---|---|---|
+| **Cluster** | Nodes with a lease, shards owned by this node, its lease, durable log ordinal, feature level (with a finalize or mixed-builds banner); a shard ownership map coloured by node; a node table (reachable, lease, owned, durable ordinal, firehose lag with the slowest log marked, build and level window); the firehose's sources | Read only. Click a node to highlight its shards. |
+| **Live metrics** | Commits and record ops, HTTP requests by method, commit to durable, segment PUT latency, firehose, cold repo loads, forwarded requests, rejected requests, memory | Read only; needs `/metrics` on the console's origin. |
+| **Accounts** | Search by email prefix (every node's shards, paged), or jump by handle or DID; an account's details and moderation status; the dev mailbox in `--dev-mode` | Take down (with a reference) and reverse it; change handle, email or password; enable or disable its invites; delete (type the handle to confirm). |
+| **Invite codes** | Every code, newest first: uses remaining, who used it, whom it is for, when it was made | Create codes (count, uses, for an account); disable selected codes. |
+| **Rate limits** | Each bucket's busiest key, 429s in the last minute and 15 minutes, a 429/s chart, top keys, recent 429s by route, and each node's applied config version | Change a bucket's points, window or on/off; add routes; add IP, CIDR or DID overrides (exempt or a custom limit); a global off switch. Changes apply to every node within seconds and are kept, with your name, in the last 50 changes. |
+| **Relays** | The relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, the minimum interval | Add or remove relays, reset to the flag's list, change the interval, request a crawl now. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
+
+The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
+every node reads the same one; `{}` means the built-in defaults. The relay list lives next to it in
+`config/crawlers.json`.
 
 ## Admin CLI
 
-<!-- Sources: RUNBOOK "Admin CLI"; DESIGN "Admin CLI" (src/cli/admin.rs, src/xrpc/admin_tools.rs) -->
+```diagram
+caption: "`vlpds admin` is the same binary in client mode. Per-account calls go to any node and are routed to the owner. Per-node maintenance runs on every node `getClusterStatus` lists, and shards that moved mid-run are rerun on their new owner."
+nodes:
+  - { id: cli, label: vlpds admin, sub: "--url · token", at: [0, 3], size: [8, 3], tone: accent }
+  - { id: any, label: any node, sub: "account · invites · layout", at: [13, 0], size: [10, 3], tone: accent }
+  - { id: every, label: every node, sub: "rewrap · rotate-plc-keys", at: [13, 6], size: [10, 3], tone: accent }
+  - { id: own, label: owner of the DID, sub: forwarded, at: [28, 0], size: [9, 3], tone: blue }
+  - { id: cover, label: shards covered, sub: "missing → rerun", at: [28, 6], size: [9, 3], shape: note, tone: muted }
+edges:
+  - cli.r -> any.l
+  - cli.r -> every.l
+  - "any -> own: per DID"
+  - every -> cover
+```
 
-TODO.
+```bash
+export VLPDS_ADMIN_TOKEN=...                # or --admin-token-file, as the node reads it
+vlpds admin --url http://127.0.0.1:2583 cluster status
+docker exec vlpds vlpds admin account list  # inside the container: no token argument needed
+```
+
+`--url` (default `http://127.0.0.1:2583`, env `VLPDS_URL`), the token and `--json` go before or after
+the command. Output is a table or a short message; `--json` prints the raw results. It exits 1 on an
+XRPC error or any failed item of a batch. `account delete` and `rebuild-repo` ask first and refuse
+off a terminal without `--yes`.
+
+| Group | Commands |
+|---|---|
+| Accounts (`pdsadmin account …`) | `account list [--email PREFIX]`, `create EMAIL HANDLE`, `delete DID`, `takedown DID [--ref R]`, `untakedown DID`, `reset-password DID`, `info DID` |
+| Invites and relays | `create-invite-code [--uses N] [--count N] [--for-account DID]`, `request-crawl [RELAY,…]` |
+| Identity | `publish-identity [DID…] [--file F]`, `rotate-keys [DID…] [--generate]`, `rotate-plc-keys`, `ensure-recovery-key` |
+| Repos | `check-repo DID`, `rebuild-repo DID [--dry-run]` |
+| Secrets | `rewrap-secrets [--dry-run] [--check-versions]` |
+| Cluster | `cluster status`, `cluster finalize [--level N]`, `cluster lower --level N`, `layout`, `shard-split`, `shard-merge`, `reshard-abort` |
+| Peer TLS | `tls ca`, `tls issue`, `tls show` (local files; no node involved) |
+
+- **`check-repo`** reads one shard snapshot (it works on a repo that won't load) and checks the head
+  commit and its signature, every record's hash, the MST rebuilt from the records against the head,
+  the persisted interior nodes and the indexes. Node or index problems heal on the next cold load,
+  so they aren't an emergency.
+- **`rebuild-repo`** re-derives the repo from its records under a new signed commit and a `#sync`.
+  It refuses when the records no longer rebuild to the head (records were lost): that needs a
+  restore, not a re-sign. A write landing in between makes it fail with `InvalidSwap`; run it again.
+- **Batches** (`publish-identity`, `rotate-keys`) take one DID per line from a file and run one at a
+  time. The PLC directory rate-limits, so keep `rotate-keys` to a few in flight per IP.
+- `pdsadmin update` has no counterpart (roll the image: [Upgrades](upgrades.md#rolling-deploy)), and
+  neither do the sequencer-recovery scripts: there is no single sequencer database to replay.
+
+The full mapping from each reference command: RUNBOOK
+[Admin CLI](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#admin-cli).
 
 ## Common tasks
 
-<!-- Sources: takedown, reset a second factor, invite codes, change rate limits -->
-
-TODO.
+```steps
+- title: Create an account for someone
+  body: "`vlpds admin account create alice@example.com alice.pds.example` prints a generated 24-character password once. With invites required it makes a single-use code for it."
+- title: Hand out invite codes
+  body: "`vlpds admin create-invite-code --count 5` (one per line), or the console's Invite codes page. To let accounts earn their own, see [Email and moderation](email-and-moderation.md#invites)."
+- title: Take an account down
+  body: "`vlpds admin account takedown <did> --ref <ticket>`, or the account's Takedown panel. The repo is hidden and its sessions are revoked; `untakedown` reverses it. A moderation service can do the same with a service token ([Moderation service](email-and-moderation.md#moderation-service))."
+- title: A user is locked out
+  body: "Too many wrong codes or passwords clear by themselves (the factor lock doubles from 5 min, the per-account sign-in bucket within the hour); a DID override on the Rate limits page lifts it early. A lost email inbox: change the address with `updateAccountEmail`, which drops the email factor. A lost authenticator: the user's recovery code; there is no admin reset of TOTP. See [OAuth and 2FA](../oauth-2fa.md#second-factors)."
+- title: An OAuth client app gets 429s
+  body: "Its backend shares one address for all its users (`oauth-ip`: 3,000 per 5 min per IP). Add an IP override for that address on the Rate limits page."
+- title: Check the cluster after a change
+  body: "`vlpds admin cluster status`: every lease valid, no unowned shards, no split or merge stuck, one build rev (or the one you are rolling to)."
+```
