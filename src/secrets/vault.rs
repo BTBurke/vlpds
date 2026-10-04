@@ -182,7 +182,7 @@ impl VaultClient {
         }))
     }
 
-    /// Logins so far (tests, and the startup line).
+    /// Logins so far (tests).
     pub fn logins(&self) -> u64 {
         self.logins.load(Ordering::Relaxed)
     }
@@ -458,10 +458,6 @@ impl VaultTransit {
     /// `vault:{host}/[{namespace}/]{mount}/{key}`, what the kid hashes.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    pub fn client(&self) -> &Arc<VaultClient> {
-        &self.client
     }
 
     /// The newest key version this node has seen (0: none yet).
