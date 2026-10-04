@@ -134,13 +134,48 @@ edges:
   limits, leases and failover, forwarding and resharding, object-store clients, SlateDB, process and
   runtime, KMS / PLC / mail, MinIO (bench only), CPU profiles. Pick the cluster and node in the variables at the top.
 - `bench/obs/grafana/gen_dashboard.py` generates both into `bench/obs/grafana/dashboards/`
-  (`just dashboards`). `--check` fails if one is stale, and `VLPDS_PROM_UID` renders a copy for your
-  Grafana's datasource. Edit the generator and leave the JSON alone.
+  (`just dashboards`), and the vlpds binary embeds that copy. `--check` fails if one is stale.
+  Edit the generator and leave the JSON alone.
 - The [operator console](admin-console.md#pages) has a Cluster page (ownership map, nodes, firehose
   sources, feature level), which polls `getClusterStatus` every 2 s. Its Live metrics page scrapes
   `/metrics` every 2 s and keeps 6 minutes. Live metrics needs `/metrics` on the console's own
   origin. The tailnet console mounts it, but through a plain SSH tunnel to port 2583 the page says
   "Not updating".
+
+### Import into your own Grafana
+
+The binary prints both dashboards, so you don't need the repo:
+
+```bash
+vlpds dashboards --name vlpds > vlpds.json
+vlpds dashboards --name internals > vlpds-internals.json
+# from the image
+docker run --rm ghcr.io/jazware/vlpds dashboards --name vlpds > vlpds.json
+```
+
+In Grafana, go to Dashboards → New → Import, upload a file and pick your Prometheus when it asks.
+The same files are in the repo at `bench/obs/grafana/dashboards/`
+([vlpds.json](https://raw.githubusercontent.com/jazware/vlpds/main/bench/obs/grafana/dashboards/vlpds.json),
+[vlpds-internals.json](https://raw.githubusercontent.com/jazware/vlpds/main/bench/obs/grafana/dashboards/vlpds-internals.json)).
+
+What they need:
+
+- **Grafana 10 or newer.** The internals dashboard uses the state timeline and flame graph panels.
+- **Prometheus scraping `/metrics` on every node.** That's `127.0.0.1:9583` by default, so either
+  run the scraper on the same host or set `--metrics-listen` to a private address
+  ([Metrics endpoint](#metrics-endpoint)). Any job name works: the dashboards find the jobs that
+  export `vlpds_build_info`.
+- **`ops/alerts.yml` loaded** into whatever evaluates rules for that Prometheus, for the alert
+  panels. Without it they stay empty. The rules expect job `vlpds` ([Alerts](#alerts)).
+- **A `cluster` label is optional.** Without one, the cluster picker shows All and every query
+  still matches.
+- **Pyroscope is optional.** Only the internals dashboard's collapsed CPU profile row uses it.
+
+The Prometheus picker at the top of each dashboard (and the internals dashboard's Pyroscope
+picker) switches datasources later.
+Grafana file provisioning doesn't answer the import prompt, so for provisioning print a copy
+bound to your datasource: `vlpds dashboards --out DIR --datasource-uid <uid>` (or
+`--datasource-uid default` for the default datasource).
 
 ## Alerts
 
