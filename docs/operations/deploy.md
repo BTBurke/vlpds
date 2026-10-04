@@ -3,44 +3,44 @@ title: Deploy
 section: Operations
 order: 101
 status: ready
-summary: "A single node with Ansible (vlpds-node1 as the worked example): bucket, DNS, secrets, Caddy, the tiny profile and the first-run checks."
+summary: "A single node with Ansible, as a worked example: bucket, DNS, secrets, Caddy, the tiny profile and the first-run checks."
 ---
 
 ```hero
 diagram:
-  caption: "vlpds-node1, the worked example: one small VPS runs vlpds, Caddy and Alloy under Docker Compose. The bucket holds all the data; the operator console and metrics only go over the tailnet."
+  caption: "The single-node example: one small VPS runs vlpds, Caddy and Alloy under Docker Compose. The bucket holds all the data; the operator console and metrics only go over a private network."
   nodes:
     - { id: apps, label: Apps · relays, sub: HTTPS, at: [0, 1], size: [8, 3] }
-    - { id: op, label: Operator, sub: on the tailnet, at: [0, 6], size: [8, 3] }
+    - { id: op, label: Operator, sub: on the private network, at: [0, 6], size: [8, 3] }
     - { id: cf, label: Cloudflare DNS, sub: "_acme-challenge TXT", at: [12, -6.5], size: [8, 2.6], tone: muted }
     - { id: caddy, label: Caddy, sub: ":443 · *.handle cert", at: [12, 1], size: [8, 3] }
     - { id: ts, label: tailscale serve, sub: ":8443 → /admin", at: [12, 6], size: [8, 3] }
     - { id: vlpds, label: vlpds, sub: "tiny · 1 shard\n3 GiB limit", at: [24, 1], size: [9, 8], tone: accent }
     - { id: alloy, label: Alloy, sub: unprivileged, at: [24, 12], size: [9, 3] }
-    - { id: r2, label: R2 bucket, sub: vlpds-example-dev, at: [38, 3.5], size: [9, 3], shape: store, tone: amber }
-    - { id: mon, label: Lab, sub: metrics · logs, at: [38, 12], size: [9, 3], tone: muted }
+    - { id: r2, label: R2 bucket, sub: one prefix, at: [38, 3.5], size: [9, 3], shape: store, tone: amber }
+    - { id: mon, label: Monitoring, sub: metrics · logs, at: [38, 12], size: [9, 3], tone: muted }
   groups:
-    - { label: "OVH VPS · 2 vCPU / 4 GB", around: [caddy, ts, vlpds, alloy], tone: accent }
+    - { label: "small VPS · 2 vCPU / 4 GB", around: [caddy, ts, vlpds, alloy], tone: accent }
   edges:
     - "apps -> caddy: HTTPS"
-    - "op -> ts: tailnet"
+    - "op -> ts: private network"
     - { from: caddy.t95, to: cf.b95, label: DNS-01, labelAt: [19.6, -2.4] }
     - caddy -> vlpds
     - ts -> vlpds
     - "vlpds -> alloy: /metrics"
     - "vlpds -> r2: S3 API"
-    - "alloy -> mon: tailnet"
+    - "alloy -> mon: private network"
 facts:
-  - { value: "2 vCPU", unit: "/ 4 GB", label: runs a personal PDS, note: "vlpds-node1: OVH VPS, 3 GiB container limit" }
+  - { value: "2 vCPU", unit: "/ 4 GB", label: runs a personal PDS, note: "a small VPS with a 3 GiB container limit" }
   - { value: "$0", unit: /mo, label: object store on R2, note: "tiny profile idles at ~0.3 M Class A/mo (measured)", tone: amber }
   - { value: "60 s", label: lease TTL on tiny, note: "a crash waits ~53 s to write again; SIGTERM ~1 s", tone: violet }
   - { value: "5–30 s", label: of 502s per upgrade, note: one node means every restart is a short outage, tone: rust }
 ```
 
-This page deploys one vlpds node with the Ansible role in `deploy/ansible/roles/vlpds`, using
-`vlpds-node1` (pds.example.com) as the worked example. One node owns every shard, so the setup is simple
-and cheap. The node keeps nothing on its disk that it can't rebuild, so moving to more nodes later is
-a matter of starting another one on the same bucket and prefix. For that, see
+This page deploys one vlpds node with the Ansible role in `deploy/ansible/roles/vlpds`, using a
+single small VPS serving `pds.example.com` as the worked example. One node owns every shard, so the
+setup is simple and cheap. The node keeps nothing on its disk that it can't rebuild, so moving to
+more nodes later is a matter of starting another one on the same bucket and prefix. For that, see
 [Scaling and clustering](scaling-and-clustering.md).
 
 ## What you need
@@ -57,33 +57,37 @@ The node only listens on `127.0.0.1`: `:2583` for the app and `:9583` for metric
 TLS in front of it and blocks the operator paths (`/admin`, `/xrpc/vlpds.admin.*`, `/metrics`,
 `/internal/*`).
 
-## Worked example: vlpds-node1
+## Worked example: one small VPS
+
+The example host is a 2 vCPU / 4 GB VPS with a 40 GB disk, serving `pds.example.com` and handles
+under `*.pds.example.com`. Its DNS is on Cloudflare, its bucket is on R2, and it sits on a private
+network (Tailscale here) that also reaches your monitoring stack. Four roles set it up:
 
 ```steps
-- title: "roles/common: harden and join the tailnet"
-  body: "Docker from download.docker.com, keys-only sshd, ufw (22, 80, 443 and everything on `tailscale0`), fail2ban, security updates without automatic reboots. Tailscale joins as `tag:vlpds`, which can reach only the monitoring host. A fresh VPS runs `playbooks/bootstrap.yml` once first, to move from OVH's password login to keys."
+- title: "roles/common: harden and join the private network"
+  body: "Docker from download.docker.com, keys-only sshd, ufw (22, 80, 443 and everything on `tailscale0`), fail2ban, security updates without automatic reboots. Give the node a Tailscale tag whose ACL lets it reach only your monitoring host. If the provider hands you a password login, run `playbooks/bootstrap.yml` once first to move to keys."
 - title: "roles/vlpds: the node"
-  body: "chrony, sysctls, the 4 GiB disk cache on the root disk, secret files (0400, uid 10001, mounted read-only at `/run/vlpds`), `/opt/vlpds/docker-compose.yml`, the bucket probe, start, verify. The console is served on the tailnet with `tailscale serve` on `:8443`."
+  body: "chrony, sysctls, the 4 GiB disk cache on the root disk, secret files (0400, uid 10001, mounted read-only at `/run/vlpds`), `/opt/vlpds/docker-compose.yml`, the bucket probe, start, verify. With `vlpds_tailnet_console_port: 8443` the console is served on the private network by `tailscale serve`."
 - title: "roles/caddy: TLS"
   body: "Caddy with the caddy-dns/cloudflare module, built on the box. It holds a certificate for `pds.example.com` and one wildcard for `*.pds.example.com`, issued by ACME DNS-01 through a Cloudflare token scoped to the zone. Before proxying a handle request, `forward_auth` asks vlpds' `/tls-check`, so unknown names get an empty 404."
 - title: "roles/alloy: metrics and logs"
-  body: "Alloy scrapes `127.0.0.1:9583` every 10 s as `job=\"vlpds\"`, `instance=\"vlpds-node1\"`, and ships journal and container logs to the lab over the tailnet. It runs as the plain `alloy` user and reaches Docker only through a filtered read-only proxy, so it can read neither the secrets nor the containers' environment."
+  body: "Alloy scrapes `127.0.0.1:9583` every 10 s as `job=\"vlpds\"` with the node's name as `instance`, and ships journal and container logs to your Prometheus-compatible / Loki stack (`alloy_monitoring_url`) over the private network. It runs as the plain `alloy` user and reaches Docker only through a filtered read-only proxy, so it can read neither the secrets nor the containers' environment."
 ```
 
-The inventory is `inventories/<name>`. Its README has the exact commands, and these
-are the choices it makes:
+Put the host in its own inventory, e.g. `inventories/<name>/` with a `hosts.yml` and
+`group_vars/all/`. The role README has the exact commands. These are the choices the example makes:
 
-| Setting | vlpds-node1 | Why |
+| Setting | Example | Why |
 |---|---|---|
-| Host | OVH VPS in Us-west, 2 vCPU / 4 GB / 40 GB NVMe, Ubuntu 26.04 | A personal PDS doesn't need more. |
+| Host | a small VPS, 2 vCPU / 4 GB / 40 GB NVMe, a current Ubuntu LTS | A personal PDS doesn't need more. |
 | Profile | `tiny`, `vlpds_mem_limit_mb: 3072`, 2 I/O threads, 1 worker | Caches size themselves from the 3 GiB limit. ~0.8 GiB stays for the OS, Caddy (~60 MiB) and Alloy (~250 MiB). |
-| Object store | R2 bucket `vlpds-example-dev`, prefix `vlpds-example-dev` | The bucket and its lifecycle rule are in OpenTofu (`deploy/cloudflare/r2.tf`). The API token is scoped to this bucket and to the box's IP. |
-| DNS | `pds.example.com` and `*.pds.example.com`, DNS-only (grey cloud) | In OpenTofu (`deploy/cloudflare/vlpds.tf`). Cloudflare's proxy would cap uploads at 100 MB and close the firehose's idle websockets. |
-| Secrets | sops (`group_vars/all/secrets.yml`), read with the `community.sops.sops` lookup | The role writes each one to a file and passes only `VLPDS_*_FILE`, so `docker inspect` shows no secret. |
-| KEK | Cloud KMS (`vlpds_gcp_kms_key`) with a service-account key | Nothing on the box can unwrap a signing key without KMS. The first local KEK was retired after a rewrap. |
+| Object store | R2 bucket `<your-bucket>`, `vlpds_s3_prefix` set to a name for this PDS | Add the lifecycle rule that aborts incomplete multipart uploads. Scope the API token to this bucket and, where the provider allows it, to the host's IP. |
+| DNS | `pds.example.com` and `*.pds.example.com`, DNS-only (grey cloud) | Cloudflare's proxy would cap uploads at 100 MB and close the firehose's idle websockets. |
+| Secrets | sops (`group_vars/all/secrets.yml`), read with the `community.sops.sops` lookup, or Ansible Vault | The role writes each one to a file and passes only `VLPDS_*_FILE`, so `docker inspect` shows no secret. |
+| KEK | Cloud KMS (`vlpds_gcp_kms_key`) with a service-account key | Nothing on the box can unwrap a signing key without KMS. A local KEK works too and can be rewrapped onto KMS later. |
 | Identity | live plc.directory, operator recovery key in every DID | `vlpds_plc_recovery_did_key`; the private half is offline. See [KEK and key rotation](kek-and-key-rotation.md#operator-recovery-key). |
-| Console | `https://vlpds-node1.<tailnet>.ts.net:8443/admin` | `tailscale serve` terminates TLS on the tailnet only. Caddy can't do this: traffic it gets from Docker comes from the bridge gateway, not a tailnet address. |
-| Relays | `vlpds_crawlers: ["bsky.network"]` | Set once the first account was verified, so restarts re-announce. |
+| Console | `https://<node>.<your-tailnet>.ts.net:8443/admin` | `tailscale serve` terminates TLS on the private network only. Caddy can't do this: traffic it gets from Docker comes from the bridge gateway, not a private-network address. |
+| Relays | `vlpds_crawlers: ["bsky.network"]` | Set once the first account is verified, so restarts re-announce. |
 | Email | off (`vlpds_email_required: false`) | Mail is logged until SMTP credentials exist. |
 
 ## Profiles
@@ -98,7 +102,7 @@ size themselves from the memory budget in both (see
 | `--shards` | 1 | 64 |
 | `--lease-ttl-ms` | 60,000 (renew every 12 s) | 10,000 (renew every 2 s) |
 | `--slatedb-manifest-poll` | 60 s | 10 s |
-| Container memory limit | 2.5 GiB (vlpds-node1: 3 GiB) | 85% of RAM |
+| Container memory limit | 2.5 GiB (the example: 3 GiB) | 85% of RAM |
 | Firehose ring / merge queue / backfill cache | 64 / 32 / 32 MiB | 512 / 256 / 256 MiB |
 | getRepo exports, cursor backfills at once | 4, 4 | 32, 16 |
 | Disk cache | 4 GiB on the root disk, plus 10 GiB kept free | 80% of a dedicated NVMe (`auto`) |

@@ -104,8 +104,8 @@ purpose, fails to unwrap. The `kid` names the KEK: `G…` for a Cloud KMS key, `
   CRC32C checks; the KEK never leaves KMS, and every unwrap is in the KMS audit log. A copy of the bucket is
   useless without decrypt permission on the key. Credentials come from the GCE metadata server, or off GCE
   from a service-account JSON key (`--gcp-credentials-file`) holding only `cloudkms.cryptoKeyEncrypterDecrypter`
-  on that one key. vlpds-node1 runs this way, with the key in a `us` multi-region key ring managed by
-  OpenTofu in `deploy/gcp`.
+  on that one key. `deploy/gcp` has an OpenTofu module that creates such a key in a multi-region key
+  ring.
 - **Local KEK** (`--kek-file`): XChaCha20-Poly1305 with a random nonce per wrap. Fine for a personal server.
   Back the file up offline: it is the only way to read the stored keys. `--dev-mode` falls back to a
   well-known dev KEK, which is refused outside dev mode.

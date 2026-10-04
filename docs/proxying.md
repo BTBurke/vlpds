@@ -231,9 +231,9 @@ tests run against vlpds in `tests/all/ref_ssrf.rs`.
 - { value: "~0.8", unit: Gbit/s, label: each direction at that load, note: "~5 KB per response", tone: violet }
 ```
 
-On a Ryzen 395 (16 cores) against a stub AppView, one node proxied 334k req/s with 50k active
+On a 16-core / 32-thread desktop-class box against a stub AppView, one node proxied 334k req/s with 50k active
 accounts and ~300k with 1M, at about 50 µs of server CPU each and a p99 of 3–7 ms at 512–1,024 in
-flight (`bench/results/benchbox-2026-10-02-head`). Cold accounts cost more until the account and
+flight. Cold accounts cost more until the account and
 token caches warm (~100 µs per request while a million accounts load). The numbers are bounded by
 the box running the load generator and the stub too, so they are a floor for the server.
 

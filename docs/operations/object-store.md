@@ -53,10 +53,9 @@ The probe checks every row. These providers have passed it:
 | AWS S3 | `https://s3.<region>.amazonaws.com` | `<region>` | Fastest in-region. Versioning available. Egress costs if nodes run outside AWS. |
 | Google Cloud Storage | `https://storage.googleapis.com` with HMAC keys | `auto` | **Turn soft delete off**: otherwise deleted segments and replaced SSTs stay billable for 7 days. |
 | MinIO | your server | any | For development and benchmarks (`just minio` starts one on `:9000`). |
-| OVHcloud Object Storage | `https://s3.<region>.io.cloud.ovh.net` | `<region>` | Listed in the design notes; run the probe before relying on it. |
 
 Give the node a key pair for its bucket only. On R2, an API token with "Object Read & Write" on the
-bucket (vlpds-node1's is also limited to the host's IP). On S3, a role with object get, put, delete and
+bucket, limited to the host's IP where you can. On S3, a role with object get, put, delete and
 list on the bucket, and no `s3:DeleteObjectVersion`, bucket-policy or lifecycle permissions.
 
 ## Running the probe
@@ -178,8 +177,8 @@ edges:
 ```
 
 **Per-request latency.** Measured with the probe, R2 answers a PUT in ~255 ms p50 / ~500 ms p99 and a
-GET in ~80 ms p50, and the numbers were the same from the Us-west VPS and from the lab, so they
-are R2's own and not the distance. On vlpds-node1, segment PUTs ran ~300 ms p50 / ~650 ms p99 over a day
+GET in ~80 ms p50, and the numbers were the same from a VPS and from a home connection in different
+places, so they are R2's own and not the distance. On a small single-node deployment, segment PUTs ran ~300 ms p50 / ~650 ms p99 over a day
 (`vlpds_segment_put_seconds`). A write on R2 therefore takes about a third of a second to ack, which is
 fine for a personal PDS. In-region S3 is designed for ~40–50 ms p50 / ~150 ms p99 commit acks. A
 repo's next commit doesn't wait for the previous one to be durable, so slow PUTs cost latency, not
@@ -187,7 +186,7 @@ throughput.
 
 **Hedged PUTs.** A segment PUT still pending after `--hedge-after-ms` (100 ms) gets one duplicate
 PUT, and the first to land wins. On R2, whose median is above that threshold, nearly every segment PUT
-is hedged: on vlpds-node1 all 195 segments in one day were (`vlpds_segment_put_hedges_total` against
+is hedged: on that single-node deployment all 195 segments in one day were (`vlpds_segment_put_hedges_total` against
 `vlpds_segment_put_seconds_count`). Each hedge is one more Class A request. That is noise at a personal
 PDS's rate; on a busy node on a slow store, compare the two counters and set the threshold near the
 store's PUT p90–p99, so hedges still cut the tail without doubling every PUT.

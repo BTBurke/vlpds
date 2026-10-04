@@ -168,9 +168,8 @@ edges:
   dedicated runtime (`--firehose-threads`, 4), so fan-out never competes with writes and API
   requests. Subscribers wake on a shared watch of the stream head; there is no per-subscriber
   queue.
-- **Cost.** Measured on a 16-core box: 1,000 subscribers each kept up with 10k events/s (~10M
-  events/s, ~18 GB/s over loopback) while write p99 stayed under 70 ms
-  (`bench/results/2026-10-03-benchbox`). Egress is a memory-copy problem, not a CPU one.
+- **Cost.** Measured on a 16-core / 32-thread desktop-class box: 1,000 subscribers each kept up with
+  10k events/s (~10M events/s, ~18 GB/s over loopback) while write p99 stayed under 70 ms. Egress is a memory-copy problem, not a CPU one.
 - **Slow consumers.** A subscriber may fall at most `--firehose-max-lag-mb` (128 MiB) behind the
   head. Past that it gets `ConsumerTooSlow` and is closed; it resumes from its cursor. Writes outside
   the live path (backfill chunks, info frames, pongs) that make no progress for 30 s drop the
@@ -217,8 +216,8 @@ the ring.
 - **Concurrency.** At most `--firehose-max-backfills` (16) backfills run at once, so read-ahead
   memory is bounded at 16 × 64 MiB. More wait for a slot (`vlpds_firehose_backfills{state}`),
   still answering pings.
-- **Speed.** Over 860k events/s (~1.7 GB/s) for one subscriber against a local store
-  (`bench/results/2026-10-03-benchbox`); a remote bucket is slower but the read-ahead hides most of
+- **Speed.** Over 860k events/s (~1.7 GB/s) for one subscriber against a local store on the
+  same box; a remote bucket is slower but the read-ahead hides most of
   the round trips.
 - **Errors.** A bucket error is retried a few times, then the subscriber is disconnected and
   resumes from its cursor. vlpds never skips stored events to keep a connection alive.

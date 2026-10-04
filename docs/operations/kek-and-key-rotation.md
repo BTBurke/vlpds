@@ -48,13 +48,13 @@ edges:
 
 A node refuses to start outside `--dev-mode` without a KEK, and every node of a cluster needs the same KEK set.
 
-**Cloud KMS** (recommended for anything beyond a personal server; vlpds-node1 runs this way):
+**Cloud KMS** (recommended for anything beyond a personal server):
 
 ```steps
 - title: Create the key
   body: "A symmetric `ENCRYPT_DECRYPT` key in a multi-region location. `deploy/gcp` does this in OpenTofu: key ring `vlpds` and key `secrets` in `us`, a 120-day destroy-scheduled duration and `prevent_destroy` (`just plan`, `just apply`)."
 - title: Grant one identity
-  body: "The nodes' service account gets `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key only. Nobody routinely holds `cloudkms.cryptoKeyVersions.destroy`. Off GCE, create a JSON key for that account and store it with the other secrets (vlpds-node1: straight into sops)."
+  body: "The nodes' service account gets `roles/cloudkms.cryptoKeyEncrypterDecrypter` on that key only. Nobody routinely holds `cloudkms.cryptoKeyVersions.destroy`. Off GCE, create a JSON key for that account and store it with the other secrets (e.g. in sops or Ansible Vault)."
 - title: Point the nodes at it
   body: "`--gcp-kms-key projects/P/locations/us/keyRings/vlpds/cryptoKeys/secrets`, plus `--gcp-credentials-file` off GCE. The Ansible role writes the JSON key to `/run/vlpds/gcp-sa.json` (0400) from `vlpds_gcp_credentials_json`."
 - title: Check
@@ -179,8 +179,8 @@ server key (a leaked key, a bad deploy), an op signed by the recovery key replac
 ```
 
 Changing the recovery key: roll out the new did:key and rerun `ensure-recovery-key`. The old one stays listed until a
-DID's keys are rewritten; remove it only if it leaked. On vlpds-node1 the recovery key is set and has been backfilled onto
-every account. Users add their own keys, ahead of the operator's, on the account page or in `/migrate`'s advanced
+DID's keys are rewritten; remove it only if it leaked. Set it before the first account where you can; `ensure-recovery-key`
+backfills it onto accounts created earlier. Users add their own keys, ahead of the operator's, on the account page or in `/migrate`'s advanced
 mode ([Keys and security](../keys-security.md#plc-rotation-key-and-recovery-keys)).
 
 Runbook: "Operator recovery key".

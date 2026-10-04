@@ -26,7 +26,7 @@ diagram:
     - pool.r -> repo.l
 facts:
   - { value: "1", unit: number, label: to set for memory, note: "the container's memory limit; every cache sizes itself from it" }
-  - { value: "~1.4 GiB", label: of caches in 3 GiB, note: "vlpds-node1 (tiny profile); ~16 GiB in a 32 GB standard node", tone: blue }
+  - { value: "~1.4 GiB", label: of caches in 3 GiB, note: "a small VPS (tiny profile); ~16 GiB in a 32 GB standard node", tone: blue }
   - { value: "64 / 1", unit: shards, label: standard / tiny, note: "set once per prefix; split and merge online after", tone: amber }
   - { value: "10 s / 60 s", label: lease TTL, note: "takeover after a crash ~12 s; a lone node's crash restart ~53 s", tone: violet }
 ```
@@ -106,7 +106,7 @@ refuses to start if explicit sizes don't fit the budget.
 
 | Node | Budget | Fixed | Pool | Initial split (meta / block / repo) |
 |---|---|---|---|---|
-| vlpds-node1, tiny profile | 3 GiB | ~1.6 GiB | ~1.4 GiB | ~160 / ~630 / ~630 MiB |
+| tiny profile, 3 GiB limit (small VPS) | 3 GiB | ~1.6 GiB | ~1.4 GiB | ~160 / ~630 / ~630 MiB |
 | standard, 32 GB host | ~27 GiB (85%) | ~11 GiB | ~16 GiB | the metadata cache grows with the owned SSTs |
 
 When the pool can't hold the metadata target, the node logs an error and `VlpdsSstMetaCacheTooSmall`
