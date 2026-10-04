@@ -91,6 +91,10 @@ pub struct MergedBatch {
     slots: OnceLock<Vec<u16>>,
     /// Each event's log key when renumbered (empty: the seqs are the keys).
     keys: Vec<i64>,
+    /// The [`FrameFilter`]'s verdicts and the generation they're for, from
+    /// the first subscriber to read the batch under it. None inside: it
+    /// skips none of these events.
+    skips: parking_lot::Mutex<Option<(u64, Option<Arc<[bool]>>)>>,
 }
 
 impl MergedBatch {
@@ -141,6 +145,7 @@ impl MergedBatch {
             offs,
             slots: OnceLock::new(),
             keys,
+            skips: parking_lot::Mutex::new(None),
         }
     }
 
@@ -165,20 +170,44 @@ impl MergedBatch {
         self.slots.get_or_init(|| self.events.iter().map(|(_, f)| event_slot(f)).collect())
     }
 
+    /// Which events `filter` skips, computed once per filter generation
+    /// (None: it skips none of them).
+    fn skipped(&self, filter: &dyn FrameFilter) -> Option<Arc<[bool]>> {
+        let g = filter.generation()?;
+        let mut c = self.skips.lock();
+        match &*c {
+            Some((cg, v)) if *cg == g => v.clone(),
+            _ => {
+                let v: Vec<bool> = self.events.iter().map(|(_, f)| filter.skip(&frame_meta(f))).collect();
+                let v: Option<Arc<[bool]>> = v.contains(&true).then(|| v.into());
+                *c = Some((g, v.clone()));
+                v
+            }
+        }
+    }
+
     /// The messages of the events from index `i` on whose repo is in
-    /// `range`: one slice of `wire` per run of consecutive matching events.
-    /// Returns the slices and the number of events.
-    fn wire_runs(&self, i: usize, range: &SlotRange) -> (Vec<std::io::IoSlice<'_>>, usize) {
-        let slots = self.slots();
+    /// `range` (None: any) and that `skip` doesn't mark: one slice of `wire`
+    /// per run of consecutive kept events. Returns the slices and the number
+    /// of events.
+    fn wire_runs(
+        &self,
+        i: usize,
+        range: Option<&SlotRange>,
+        skip: Option<&[bool]>,
+    ) -> (Vec<std::io::IoSlice<'_>>, usize) {
+        let slots = range.map(|r| (r, self.slots()));
+        let keep = |j: usize| slots.map_or(true, |(r, s)| r.contains(s[j])) && skip.map_or(true, |s| !s[j]);
         let end = |j: usize| self.offs.get(j).copied().unwrap_or(self.wire.len());
+        let len = self.events.len();
         let (mut runs, mut n, mut j) = (Vec::new(), 0, i);
-        while j < slots.len() {
-            if !range.contains(slots[j]) {
+        while j < len {
+            if !keep(j) {
                 j += 1;
                 continue;
             }
             let a = j;
-            while j < slots.len() && range.contains(slots[j]) {
+            while j < len && keep(j) {
                 j += 1;
             }
             n += j - a;
@@ -211,6 +240,80 @@ fn frame_did(f: &[u8]) -> Option<&[u8]> {
         cbor_skip(f, &mut i, 0)?;
     }
     None
+}
+
+/// A frame's event type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameKind {
+    Commit,
+    Sync,
+    Identity,
+    Account,
+    /// `#info`, errors, anything else.
+    Other,
+}
+
+/// What a [`FrameFilter`] sees of a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameMeta<'a> {
+    pub kind: FrameKind,
+    /// `repo` of a #commit, `did` of a #sync, #identity or #account: the
+    /// key each kind is checked and applied by, so a frame carrying both
+    /// can't pass as the other DID. None for other kinds or a frame
+    /// without it.
+    pub did: Option<&'a [u8]>,
+}
+
+/// The type and DID of a frame, read straight from its DAG-CBOR without
+/// decoding it.
+pub fn frame_meta(f: &[u8]) -> FrameMeta<'_> {
+    let mut meta = FrameMeta { kind: FrameKind::Other, did: None };
+    let mut i = 0;
+    let Some((5, n)) = cbor_head(f, &mut i) else { return meta };
+    for _ in 0..n {
+        let Some(key) = cbor_text(f, &mut i) else { return meta };
+        if key == b"t" {
+            meta.kind = match cbor_text(f, &mut i) {
+                Some(b"#commit") => FrameKind::Commit,
+                Some(b"#sync") => FrameKind::Sync,
+                Some(b"#identity") => FrameKind::Identity,
+                Some(b"#account") => FrameKind::Account,
+                Some(_) => FrameKind::Other,
+                None => return meta,
+            };
+        } else if cbor_skip(f, &mut i, 0).is_none() {
+            return meta;
+        }
+    }
+    let want: &[u8] = match meta.kind {
+        FrameKind::Commit => b"repo",
+        FrameKind::Sync | FrameKind::Identity | FrameKind::Account => b"did",
+        FrameKind::Other => return meta,
+    };
+    let Some((5, n)) = cbor_head(f, &mut i) else { return meta };
+    for _ in 0..n {
+        let Some(key) = cbor_text(f, &mut i) else { return meta };
+        if key == want {
+            meta.did = cbor_text(f, &mut i);
+            return meta;
+        }
+        if cbor_skip(f, &mut i, 0).is_none() {
+            return meta;
+        }
+    }
+    meta
+}
+
+/// Frames subscribeRepos leaves out, live and in cursor backfill (opt-in
+/// through [`Firehose::set_filter`]; vlRelay's takedowns). A skipped frame
+/// keeps its seq, so consumers see a gap rather than renumbered events.
+pub trait FrameFilter: Send + Sync + 'static {
+    /// None while it skips nothing: frames aren't even parsed. Otherwise a
+    /// number that changes whenever `skip` may answer differently, since a
+    /// ring batch's verdicts are computed once per generation and shared by
+    /// all of its subscribers. Change it after the change `skip` sees.
+    fn generation(&self) -> Option<u64>;
+    fn skip(&self, frame: &FrameMeta<'_>) -> bool;
 }
 
 /// (major type, argument) of the item at `i`; definite lengths only (DAG-CBOR).
@@ -345,6 +448,7 @@ pub struct Firehose {
     /// under the ring's write lock.
     ring_floor_key: AtomicI64,
     renumber: OnceLock<Arc<dyn Renumber>>,
+    filter: OnceLock<Arc<dyn FrameFilter>>,
     /// False while renumbered and not anchored yet: nothing is served.
     ready: watch::Sender<bool>,
     /// The merged stream's start floor F: events <= F are only served by the
@@ -385,6 +489,7 @@ impl Firehose {
             ring_floor: AtomicI64::new(floor),
             ring_floor_key: AtomicI64::new(floor),
             renumber: OnceLock::new(),
+            filter: OnceLock::new(),
             ready: watch::channel(true).0,
             start_floor: floor,
             settled: AtomicI64::new(i64::MIN),
@@ -471,6 +576,12 @@ impl Firehose {
 
     pub fn renumbered(&self) -> bool {
         self.renumber.get().is_some()
+    }
+
+    /// Leaves the frames `f` skips out of every subscriber's stream (see
+    /// [`FrameFilter`]). Set once, before serving.
+    pub fn set_filter(&self, f: Arc<dyn FrameFilter>) {
+        let _ = self.filter.set(f);
     }
 
     /// (ring floor, its key), read together.
@@ -959,16 +1070,17 @@ impl Firehose {
                 if i == b.events.len() {
                     continue;
                 }
-                let (sent, bytes) = match &shard {
-                    None => {
+                let skip = self.filter.get().and_then(|f| b.skipped(f.as_ref()));
+                let (sent, bytes) = match (&shard, &skip) {
+                    (None, None) => {
                         let wire = b.wire_from(i);
                         out.send_live(&mut [std::io::IoSlice::new(&wire)], &mut head, b.start(), allowance).await?;
                         (b.events.len() - i, wire.len())
                     }
-                    // only the matching events: each run of them is one
-                    // slice of the shared bytes, all written in one go
-                    Some(range) => {
-                        let (mut runs, n) = b.wire_runs(i, range);
+                    // only the kept events: each run of them is one slice
+                    // of the shared bytes, all written in one go
+                    _ => {
+                        let (mut runs, n) = b.wire_runs(i, shard.as_ref(), skip.as_deref());
                         let len = runs.iter().map(|r| r.len()).sum();
                         if n > 0 {
                             out.send_live(&mut runs, &mut head, b.start(), allowance).await?;
@@ -1114,16 +1226,21 @@ impl Firehose {
             while rx.recv_many(&mut chunk, 1024).await > 0 {
                 buf.clear();
                 let mut n = 0;
+                let filter = self.filter.get().filter(|f| f.generation().is_some());
+                let skip = |f: &[u8]| filter.is_some_and(|x| x.skip(&frame_meta(f)));
                 for (key, f) in &chunk {
                     match &renumber {
                         None => {
-                            push_message(&mut buf, OP_BINARY, f);
                             seq = *key;
+                            if skip(f) {
+                                continue;
+                            }
+                            push_message(&mut buf, OP_BINARY, f);
                         }
                         Some(r) => {
                             seq += 1;
                             // the read started at a checkpoint before the cursor
-                            if seq <= *last {
+                            if seq <= *last || skip(f) {
                                 continue;
                             }
                             frame.clear();
@@ -1749,45 +1866,42 @@ mod tests {
     use crate::segment::SegmentBuilder;
     use object_store::{ObjectStoreExt, PutPayload};
 
+    /// A #commit, #sync, #identity or #account (by `kind % 4`) for `did`.
+    fn kind_frame(kind: usize, did: &str, seq: i64) -> Bytes {
+        let cid = crate::cid::Cid::dag_cbor(b"x");
+        let f = match kind % 4 {
+            0 => {
+                let ops = [
+                    events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
+                    events::RepoOp { action: "update", path: "app.bsky.feed.like/3j", cid: Some(cid), prev: Some(cid) },
+                ];
+                events::commit_frame(&events::CommitFrame {
+                    repo: did,
+                    rev: "3kabc",
+                    since: Some("3kabb"),
+                    commit: cid,
+                    prev_data: Some(cid),
+                    blocks: &[7u8; 300],
+                    ops: &ops,
+                    time: "2026-01-01T00:00:00Z",
+                })
+            }
+            1 => events::sync_frame(did, "3kabc", &[1, 2, 3], "t"),
+            2 => events::identity_frame(did, "a.test", "t"),
+            _ => events::account_frame(did, false, Some("takendown"), "t"),
+        };
+        let mut out = Vec::new();
+        f.finish(seq, &mut out);
+        Bytes::from(out)
+    }
+
     /// event_slot finds the repo of every event kind (a #commit's `repo`
     /// sits after its ops), and wire_runs writes exactly the matching
     /// events' messages, one slice per run.
     #[test]
     fn event_slots_and_runs() {
-        let cid = crate::cid::Cid::dag_cbor(b"x");
         let dids: Vec<String> = (0..64).map(crate::state::bulk_did).collect();
-        let frame = |i: usize| -> Bytes {
-            let did = dids[i].as_str();
-            let f = match i % 4 {
-                0 => {
-                    let ops = [
-                        events::RepoOp { action: "create", path: "app.bsky.feed.post/3k", cid: Some(cid), prev: None },
-                        events::RepoOp {
-                            action: "update",
-                            path: "app.bsky.feed.like/3j",
-                            cid: Some(cid),
-                            prev: Some(cid),
-                        },
-                    ];
-                    events::commit_frame(&events::CommitFrame {
-                        repo: did,
-                        rev: "3kabc",
-                        since: Some("3kabb"),
-                        commit: cid,
-                        prev_data: Some(cid),
-                        blocks: &[7u8; 300],
-                        ops: &ops,
-                        time: "2026-01-01T00:00:00Z",
-                    })
-                }
-                1 => events::sync_frame(did, "3kabc", &[1, 2, 3], "t"),
-                2 => events::identity_frame(did, "a.test", "t"),
-                _ => events::account_frame(did, false, Some("takendown"), "t"),
-            };
-            let mut out = Vec::new();
-            f.finish(1000 + i as i64, &mut out);
-            Bytes::from(out)
-        };
+        let frame = |i: usize| kind_frame(i, &dids[i], 1000 + i as i64);
         let evs: Vec<(i64, Bytes)> = (0..dids.len()).map(|i| (1000 + i as i64, frame(i))).collect();
         for (i, (_, f)) in evs.iter().enumerate() {
             assert_eq!(event_slot(f), crate::slots::slot_of(&dids[i]), "event {i}");
@@ -1799,7 +1913,7 @@ mod tests {
             for k in 0..n {
                 let range = SlotRange::new(k, n).unwrap();
                 for from in [0, 17] {
-                    let (runs, count) = batch.wire_runs(from, &range);
+                    let (runs, count) = batch.wire_runs(from, Some(&range), None);
                     let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
                     let want: Vec<(i64, Bytes)> =
                         evs[from..].iter().filter(|(_, f)| range.contains(event_slot(f))).cloned().collect();
@@ -1812,6 +1926,153 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Skips #commit and #sync frames of one DID while it's set.
+    #[derive(Default)]
+    struct SkipDid {
+        did: parking_lot::Mutex<Option<String>>,
+        generation: AtomicU64,
+        calls: AtomicUsize,
+    }
+
+    impl SkipDid {
+        fn set(&self, did: Option<&str>) {
+            *self.did.lock() = did.map(String::from);
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    impl FrameFilter for SkipDid {
+        fn generation(&self) -> Option<u64> {
+            self.did.lock().is_some().then(|| self.generation.load(Ordering::Acquire))
+        }
+        fn skip(&self, f: &FrameMeta<'_>) -> bool {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            matches!(f.kind, FrameKind::Commit | FrameKind::Sync)
+                && f.did == self.did.lock().as_deref().map(str::as_bytes)
+        }
+    }
+
+    /// frame_meta reads each kind's own DID key, even with the other one
+    /// in the frame, and never panics on garbage.
+    #[test]
+    fn frame_meta_reads_the_kind_and_its_did() {
+        use crate::cbor::*;
+        let did = crate::state::bulk_did(1);
+        for (k, kind) in
+            [FrameKind::Commit, FrameKind::Sync, FrameKind::Identity, FrameKind::Account].into_iter().enumerate()
+        {
+            let f = kind_frame(k, &did, 7);
+            assert_eq!(frame_meta(&f), FrameMeta { kind, did: Some(did.as_bytes()) });
+        }
+        // a #commit carrying a `did` (sorted first) is still its `repo`'s
+        let mut f = Vec::new();
+        write_map_head(&mut f, 2);
+        write_text(&mut f, "t");
+        write_text(&mut f, "#commit");
+        write_text(&mut f, "op");
+        write_uint(&mut f, 1);
+        write_map_head(&mut f, 2);
+        write_text(&mut f, "did");
+        write_text(&mut f, "did:plc:other");
+        write_text(&mut f, "repo");
+        write_text(&mut f, "did:plc:real");
+        assert_eq!(frame_meta(&f), FrameMeta { kind: FrameKind::Commit, did: Some(b"did:plc:real".as_slice()) });
+        let info = info_frame("OutdatedCursor", "x");
+        assert_eq!(frame_meta(&info), FrameMeta { kind: FrameKind::Other, did: None });
+        let full = kind_frame(0, &did, 7);
+        for n in 0..full.len() {
+            let m = frame_meta(&full[..n]);
+            assert!(m.did.is_none_or(|d| d == did.as_bytes()), "truncated at {n}");
+        }
+        assert_eq!(frame_meta(b"").kind, FrameKind::Other);
+    }
+
+    /// A batch asks the filter once per generation (every subscriber shares
+    /// the verdicts), reports none skipped when nothing matches, and its
+    /// runs leave out exactly the skipped events, with or without a shard.
+    #[test]
+    fn filtered_runs_skip_exactly_the_marked_events() {
+        let dids: Vec<String> = (0..4).map(crate::state::bulk_did).collect();
+        let evs: Vec<(i64, Bytes)> =
+            (0..64).map(|i| (1000 + i as i64, kind_frame(i % 4, &dids[(i / 4) % 4], 1000 + i as i64))).collect();
+        let batch = MergedBatch::new(evs.clone(), 0);
+        let filter = SkipDid::default();
+        assert!(batch.skipped(&filter).is_none());
+        assert_eq!(filter.calls.load(Ordering::Relaxed), 0, "no generation: frames aren't parsed");
+        filter.set(Some("did:plc:nobody"));
+        assert!(batch.skipped(&filter).is_none());
+        filter.set(Some(&dids[1]));
+        let calls = filter.calls.load(Ordering::Relaxed);
+        let skip = batch.skipped(&filter).expect("did 1's commits and syncs");
+        assert!(Arc::ptr_eq(&skip, &batch.skipped(&filter).unwrap()));
+        assert_eq!(filter.calls.load(Ordering::Relaxed), calls + evs.len(), "once per generation");
+        let want_skip = |i: usize| (i / 4) % 4 == 1 && i % 4 < 2;
+        assert_eq!(skip.iter().filter(|s| **s).count(), 8);
+        assert!(skip.iter().enumerate().all(|(i, s)| *s == want_skip(i)));
+        let range = SlotRange::new(1, 2).unwrap();
+        for shard in [None, Some(&range)] {
+            for from in [0, 5, 63] {
+                let (runs, count) = batch.wire_runs(from, shard, Some(&skip));
+                let got: Vec<u8> = runs.iter().flat_map(|r| r.to_vec()).collect();
+                let mut want = Vec::new();
+                let mut n = 0;
+                for (i, (_, f)) in evs.iter().enumerate().skip(from) {
+                    if !want_skip(i) && shard.is_none_or(|r| r.contains(event_slot(f))) {
+                        push_message(&mut want, OP_BINARY, f);
+                        n += 1;
+                    }
+                }
+                assert_eq!((got, count), (want, n), "shard {shard:?} from {from}");
+            }
+        }
+        filter.set(None);
+        assert!(batch.skipped(&filter).is_none(), "lifted: everything again");
+    }
+
+    /// The filter's cost (ignored; --ignored --nocapture): the verdicts for
+    /// a 2,000-event batch against a 10,000-DID set, once per batch, and
+    /// the runs each of 16 subscribers then writes.
+    #[test]
+    #[ignore]
+    fn frame_filter_cost() {
+        struct Set(std::collections::HashSet<Vec<u8>>);
+        impl FrameFilter for Set {
+            fn generation(&self) -> Option<u64> {
+                Some(1)
+            }
+            fn skip(&self, f: &FrameMeta<'_>) -> bool {
+                matches!(f.kind, FrameKind::Commit | FrameKind::Sync) && f.did.is_some_and(|d| self.0.contains(d))
+            }
+        }
+        // one taken-down DID in the batch: every subscriber writes runs
+        let set = Set((10_000..20_000u64).chain([7]).map(|i| crate::state::bulk_did(i).into_bytes()).collect());
+        let evs: Vec<(i64, Bytes)> =
+            (0..2000u64).map(|i| (i as i64, kind_frame(0, &crate::state::bulk_did(i), i as i64))).collect();
+        let rounds = 50;
+        let (mut skip_t, mut runs_t) = (Duration::ZERO, Duration::ZERO);
+        for _ in 0..rounds {
+            let b = MergedBatch::new(evs.clone(), 0);
+            let t = std::time::Instant::now();
+            std::hint::black_box(b.skipped(&set));
+            skip_t += t.elapsed();
+            let t = std::time::Instant::now();
+            for _ in 0..16 {
+                let skip = b.skipped(&set);
+                match skip {
+                    None => std::hint::black_box(b.wire_from(0).len()),
+                    Some(s) => std::hint::black_box(b.wire_runs(0, None, Some(&s)).1),
+                };
+            }
+            runs_t += t.elapsed();
+        }
+        let per = |d: Duration| d.as_nanos() as f64 / (rounds * evs.len()) as f64;
+        eprintln!(
+            "filter verdicts: {:.0} ns/event once per batch; 16 subscribers' cached lookups: {:.1} ns/event total",
+            per(skip_t),
+            per(runs_t)
+        );
     }
 
     /// Sharded fan-out cost per event (ignored; --ignored --nocapture):
@@ -1850,7 +2111,7 @@ mod tests {
             slots_t += t.elapsed();
             let t = std::time::Instant::now();
             for k in 0..16 {
-                std::hint::black_box(b.wire_runs(0, &SlotRange::new(k, 16).unwrap()));
+                std::hint::black_box(b.wire_runs(0, Some(&SlotRange::new(k, 16).unwrap()), None));
             }
             runs_t += t.elapsed();
         }
@@ -1876,7 +2137,10 @@ mod tests {
     }
 
     async fn put_seg(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame_len: usize) -> LogBatch {
-        let frame = Bytes::from(vec![ord as u8; frame_len]);
+        put_frame(store, log, ord, seq, Bytes::from(vec![ord as u8; frame_len])).await
+    }
+
+    async fn put_frame(store: &crate::store::Store, log: &str, ord: u64, seq: i64, frame: Bytes) -> LogBatch {
         let mut b = SegmentBuilder::new();
         b.push(seq, crate::slots::ShardId(0), 1, |o| o.extend_from_slice(&frame), &[]);
         let mut obj = b.header(log, ord);
@@ -1992,6 +2256,93 @@ mod tests {
         assert_eq!(conn.last_seq.load(Ordering::Relaxed), seq(2));
         assert!(!conn.backfilling.load(Ordering::Relaxed));
         assert!(!streaming.0.is_finished());
+    }
+
+    /// The websocket messages' payloads, as a subscriber reads them, until
+    /// `n` have come.
+    async fn read_messages(r: &mut tokio::io::DuplexStream, n: usize) -> Vec<Bytes> {
+        let (mut buf, mut out) = (Vec::new(), Vec::new());
+        while out.len() < n {
+            let mut tmp = [0u8; 8192];
+            let k = tokio::time::timeout(Duration::from_secs(5), r.read(&mut tmp))
+                .await
+                .unwrap_or_else(|_| panic!("got {} of {n} messages", out.len()))
+                .unwrap();
+            assert!(k > 0, "closed after {} of {n} messages", out.len());
+            buf.extend_from_slice(&tmp[..k]);
+            loop {
+                if buf.len() < 2 {
+                    break;
+                }
+                let (len, at) = match buf[1] & 0x7f {
+                    126 if buf.len() >= 4 => (u16::from_be_bytes([buf[2], buf[3]]) as usize, 4),
+                    127 if buf.len() >= 10 => (u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize, 10),
+                    126 | 127 => break,
+                    n => (n as usize, 2),
+                };
+                if buf.len() < at + len {
+                    break;
+                }
+                out.push(Bytes::copy_from_slice(&buf[at..at + len]));
+                buf.drain(..at + len);
+            }
+        }
+        out
+    }
+
+    /// A filtered subscriber from an old cursor gets every frame but the
+    /// skipped ones, from the bucket and from the ring, with their seqs
+    /// unchanged; once the filter lets a DID go, its frames come back.
+    #[tokio::test]
+    async fn filter_skips_frames_in_backfill_and_live() {
+        let store = crate::store::Store::memory(None);
+        // the ring keeps only the newest batch: the rest is backfilled
+        let fh = Firehose::new(Options { ring_bytes: 1, ..Options::default() });
+        *fh.store.write() = Some(store.clone());
+        let filter = Arc::new(SkipDid::default());
+        fh.set_filter(filter.clone());
+        let (_, wa) = fh.add_remote("A");
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sub = fh.subscribe();
+        let mut last = i64::MIN;
+        fh.spawn_merger(rx);
+        let base = fh.position();
+        let seq = |k: i64| base + k * 256 + 1;
+        let dids: Vec<String> = (0..3).map(crate::state::bulk_did).collect();
+        // commits and syncs from 3 DIDs, then DID 0's #account
+        let mut frames: Vec<Bytes> = (0..12).map(|k| kind_frame(k % 2, &dids[k % 3], seq(k as i64))).collect();
+        frames.push(kind_frame(3, &dids[0], seq(12)));
+        for (k, f) in frames.iter().enumerate() {
+            tx.send(put_frame(&store, "A", k as u64, seq(k as i64), f.clone()).await).unwrap();
+            wa.store(seq(k as i64), Ordering::Release);
+            next_batches(&fh, &mut sub, &mut last).await;
+        }
+        assert!(fh.ring_floor.load(Ordering::Acquire) >= seq(11), "older events are only in the bucket");
+        let subscribe = |cursor: i64| {
+            let (w, r) = tokio::io::duplex(1 << 20);
+            let (ctl_tx, ctl) = mpsc::channel(1);
+            let mut out = Out { w, ctl, idle: Duration::from_secs(5), conn: None };
+            let fh = fh.clone();
+            (AbortOnDrop(tokio::spawn(async move { fh.stream(&mut out, Some(cursor), None).await })), r, ctl_tx)
+        };
+        filter.set(Some(&dids[0]));
+        let kept: Vec<Bytes> =
+            frames.iter().enumerate().filter(|(k, _)| k % 3 != 0 || *k == 12).map(|(_, f)| f.clone()).collect();
+        let (_s, mut r, _c) = subscribe(base);
+        assert_eq!(read_messages(&mut r, kept.len()).await, kept);
+        // live: a later commit of DID 0 is skipped, DID 1's isn't
+        let later = [kind_frame(0, &dids[0], seq(13)), kind_frame(0, &dids[1], seq(14))];
+        for (k, f) in later.iter().enumerate() {
+            let k = 13 + k as i64;
+            tx.send(put_frame(&store, "A", k as u64, seq(k), f.clone()).await).unwrap();
+        }
+        wa.store(seq(14), Ordering::Release);
+        assert_eq!(read_messages(&mut r, 1).await, vec![later[1].clone()]);
+        // lifted: the same cursor gets everything again
+        filter.set(None);
+        let all: Vec<Bytes> = frames.iter().chain(later.iter()).cloned().collect();
+        let (_s, mut r, _c) = subscribe(base);
+        assert_eq!(read_messages(&mut r, all.len()).await, all);
     }
 
     /// Backfills beyond `max_backfills` wait for a slot (answering their
