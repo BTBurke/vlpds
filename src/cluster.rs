@@ -970,20 +970,33 @@ impl Cluster {
     /// The lease counts as valid again only once the check passed. False
     /// means fail-stop.
     async fn try_revalidate(&self, host: &Arc<dyn ShardHost>) -> bool {
-        let lapsed = *self.valid_until.read();
         let etag = self.lease_etag.read().clone();
-        if let Err(e) = self.write_lease(if_match(etag)).await {
-            let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
-            if moved {
-                tracing::error!("lapsed node lease was rewritten under us: fail-stop ({e:#})");
-                return false;
+        let renewed = match self.write_lease_ungranted(if_match(etag)).await {
+            Ok(v) => v,
+            Err(e) => {
+                let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
+                if !moved {
+                    // still lapsed (no validity from a failed write): the
+                    // next renewal retries, the watchdog bounds it
+                    tracing::warn!("revalidating our lapsed node lease failed (will retry): {e:#}");
+                    return true;
+                }
+                // our previous attempt may have landed with its answer lost
+                return match self.recreate_vanished_lease().await {
+                    Recreate::Lost => {
+                        tracing::error!("lapsed node lease was rewritten under us: fail-stop ({e:#})");
+                        false
+                    }
+                    Recreate::Landed => {
+                        crate::metrics::LEASE_EVENTS.with_label_values(&["renewal_landed"]).inc();
+                        tracing::warn!("a revalidation of our lapsed lease landed with its answer lost: adopted it, still lapsed ({e:#})");
+                        true
+                    }
+                    // recreated only after its own fence check
+                    Recreate::Done | Recreate::Retry => true,
+                };
             }
-            // still lapsed (no validity from a failed write): the next
-            // renewal retries, the watchdog bounds it
-            tracing::warn!("revalidating our lapsed node lease failed (will retry): {e:#}");
-            return true;
-        }
-        let renewed = std::mem::replace(&mut *self.valid_until.write(), lapsed);
+        };
         match self.bounded_any("fence-scan", self.own_log_fenced(host)).await {
             Ok(false) => {
                 *self.valid_until.write() = renewed;
@@ -1193,6 +1206,15 @@ impl Cluster {
     }
 
     async fn write_lease(&self, mode: PutMode) -> anyhow::Result<()> {
+        let valid_until = self.write_lease_ungranted(mode).await?;
+        *self.valid_until.write() = valid_until;
+        Ok(())
+    }
+
+    /// [`Cluster::write_lease`] without granting the validity it earns,
+    /// which it returns: a revalidation grants it only once our log is
+    /// known unfenced, or the log could PUT and ack in between.
+    async fn write_lease_ungranted(&self, mode: PutMode) -> anyhow::Result<Instant> {
         let sent = Instant::now();
         let mut l = self.lease.read().clone();
         l.expires_ms = self.wall_ms() + self.cfg.ttl.as_millis() as u64;
@@ -1216,8 +1238,7 @@ impl Cluster {
             cur.wm_cap = l.wm_cap;
         }
         self.expires_local_ms.store(expires_local_ms, Ordering::Release);
-        *self.valid_until.write() = sent + self.cfg.ttl - self.cfg.skew;
-        Ok(())
+        Ok(sent + self.cfg.ttl - self.cfg.skew)
     }
 
     /// True while we may acknowledge writes and PUT segments.
@@ -3378,6 +3399,35 @@ mod tests {
         lapse(&d);
         d.renew(&hd_dyn).await;
         assert_eq!(hd.lost.load(Ordering::SeqCst), 1, "no opt-in");
+    }
+
+    /// A revalidation's CAS grants no validity before the fence check, and
+    /// one that landed with its answer lost is adopted on the next try
+    /// instead of read as our lease rewritten under us.
+    #[tokio::test]
+    async fn revalidation_grants_nothing_early_and_survives_a_lost_answer() {
+        let store = Store::memory(None);
+        let a = join(cfg("a"), store.clone()).await.unwrap();
+        let (ha, ha_dyn) = host();
+        a.step(&ha_dyn).await.unwrap();
+        a.set_revalidate(true);
+        let lapse = |c: &Cluster| *c.valid_until.write() = Instant::now() - c.cfg.skew;
+        lapse(&a);
+        let etag = a.lease_etag.read().clone();
+        a.write_lease_ungranted(if_match(etag)).await.unwrap();
+        assert!(!a.lease_valid(), "the CAS alone grants nothing");
+
+        // our CAS landed, its answer didn't: the bucket is a renewal ahead
+        let mut landed = a.own_lease();
+        landed.renewals += 1;
+        let path = a.path("nodes/a");
+        Cluster::put_json_on(&store, &path, &landed, PutMode::Overwrite).await.unwrap();
+        a.renew(&ha_dyn).await;
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a lost answer is no rewrite");
+        assert!(!a.lease_valid(), "still lapsed until a revalidation passes");
+        a.renew(&ha_dyn).await;
+        assert!(a.lease_valid(), "revalidated");
+        assert_eq!(ha.lost.load(Ordering::SeqCst), 0);
     }
 
     /// With `set_trim_spans(1)` one checkpointed takeover is enough: the
