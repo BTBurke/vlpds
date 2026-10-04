@@ -10,7 +10,8 @@
 import { chromium } from 'playwright'
 import { createECDH, createHash, randomBytes } from 'node:crypto'
 import { deflateSync } from 'node:zlib'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 
 const REF = process.env.REF_PDS ?? 'http://localhost:2783'
 const VLPDS = process.env.VLPDS ?? 'http://127.0.0.1:2784'
@@ -535,19 +536,39 @@ async function driveOne(ctx, a, state, opts) {
     let imports = 0
     page.on('request', (r) => r.url().includes('com.atproto.repo.importRepo') && imports++)
     await page.reload()
-    await waitHeading(page, /Copying your data|Move your identity|Confirm the move/)
+    await waitHeading(page, /Copying your data|Save a copy of your account|Back up before the switch/)
     check(true, `reloaded mid-copy (${before.match(/\d+ of \d+ (photos & videos )?copied/)?.[0]}) and landed back on the copy step`)
     if (!opts.advanced) {
-      const after = await waitCardText(page, new RegExp(`${esc(repoLine)}|Confirm the move`))
+      const after = await waitCardText(page, new RegExp(`${esc(repoLine)}|Save a copy of your account`))
       check(after.includes(repoLine), 'after the reload, the repo counts are still shown (kept with the progress)', after)
     }
-    await waitHeading(page, /Move your identity|Confirm the move/, 300_000)
+    await waitHeading(page, BACKUP_HEADING, 300_000)
     check(imports === 0, 'the resumed copy did not import the repository again', `imports=${imports}`)
   } else {
-    await waitHeading(page, /Move your identity|Confirm the move/, 300_000)
+    await waitHeading(page, BACKUP_HEADING, 300_000)
   }
 
-  // 7. identity
+  // 7. the optional backup, from the old server
+  await shot(page, `${a.name}-backup`)
+  if (opts.backupAtStep) {
+    const zip = await downloadBackup(page, opts.backupAtStep, () => page.click('button[name=backup]'))
+    await page.locator('.mig-card .notice', { hasText: 'Saved' }).waitFor()
+    await shot(page, `${a.name}-backup-saved`)
+    await verifyBackup(zip, a, { base: REF, label: 'step', password: [a.password, a.newPassword] })
+    await page.click('.mig-card button:has-text("Continue")')
+  } else {
+    await page.click('button[name=skip-backup]')
+  }
+  await waitHeading(page, /Move your identity|Confirm the move/)
+  if (!opts.backupAtStep) {
+    await page.reload()
+    await waitHeading(page, /Move your identity|Confirm the move|Continue moving/)
+    if (/Continue moving/.test(await heading(page).innerText())) await page.click('button:has-text("Continue")')
+    await waitHeading(page, /Move your identity|Confirm the move/)
+    check(true, 'a skipped backup is not offered again')
+  }
+
+  // 8. identity
   if (opts.advanced) await page.locator('.mig-diff').waitFor()
   else {
     await page.getByText('Your account will be hosted at').first().waitFor()
@@ -594,7 +615,7 @@ async function driveOne(ctx, a, state, opts) {
   await shot(page, `${a.name}-identity-code`)
   await moveBtn.click()
 
-  // 8. finish
+  // 9. finish
   await waitHeading(page, /Welcome to your new home/, 120_000)
   await page.locator('.tiles').waitFor()
   if (!opts.advanced) {
@@ -603,6 +624,20 @@ async function driveOne(ctx, a, state, opts) {
     check(tiles.startsWith(exp), `welcome screen: ${exp}`, `got "${tiles}"`)
   } else check((await page.locator('.tiles.mig-counts').count()) === 0, 'advanced welcome screen keeps the records tile')
   await shot(page, `${a.name}-done`)
+  if (opts.backupAtWelcome) {
+    // the secondary entry point, from vlpds, with the key made in this tab
+    await page.click('summary:has-text("Download a backup from here")')
+    const box = page.locator('.mig-backup')
+    if (a.ownPrivate) {
+      await box.locator('input[name=backup-recovery-key]').check()
+      await box.getByText('Anyone with this file can take over your identity').waitFor()
+    }
+    await shot(page, `${a.name}-done-backup`)
+    const zip = await downloadBackup(page, opts.backupAtWelcome, () => box.locator('button[name=backup]').click())
+    await box.locator('.notice', { hasText: 'Saved' }).waitFor()
+    await shot(page, `${a.name}-done-backup-saved`)
+    await verifyBackup(zip, a, { base: VLPDS, label: 'welcome', password: [a.password, a.newPassword], key: a.ownPrivate })
+  }
   await page.click('button:has-text("Open your account")')
   await page.waitForURL(/\/account/)
   await page.getByText(a.newHandle).first().waitFor({ timeout: 20_000 })
@@ -614,6 +649,15 @@ async function driveOne(ctx, a, state, opts) {
     delete a.ownPrivate
   }
   if (opts.accountKey) await accountRecoveryKey(page, a)
+  if (opts.backupOnAccount) {
+    await page.click('aside.sidenav a:has-text("Export")')
+    await page.getByText('Download my data').first().waitFor()
+    await shot(page, `${a.name}-account-export`)
+    const zip = await downloadBackup(page, opts.backupOnAccount, () => page.click('button[name=backup]'))
+    await page.locator('.notice', { hasText: 'Saved' }).first().waitFor()
+    await shot(page, `${a.name}-account-export-saved`)
+    await verifyBackup(zip, a, { base: VLPDS, label: 'account', password: [a.password, a.newPassword], extras: true })
+  }
   await page.close()
 }
 
@@ -682,13 +726,17 @@ async function drive(state) {
   try {
     // alice and dave in advanced mode with their own recovery keys; bob and carol in simple mode
     const plans = {
-      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate' },
-      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true, fakeProfile: true, holdBlobs: true },
+      // backups: bob saves one at the step (streamed to a picked file), the
+      // others skip it; alice also takes one from the welcome screen (with
+      // her new recovery key) and dave from the account page (in memory)
+      alice: { byHandle: true, inviteInUrl: true, appPasswordFirst: true, advanced: true, ownKey: 'generate', backupAtWelcome: 'memory' },
+      bob: { loseCreateAnswer: true, wrongPlcToken: true, fromLanding: true, accountKey: true, fakeProfile: true, holdBlobs: true, backupAtStep: 'stream' },
       carol: { reloadMidBlobs: true, newTabBeforePlc: true },
-      dave: { keepHandle: true, advanced: true, ownKey: 'paste' },
+      dave: { keepHandle: true, advanced: true, ownKey: 'paste', backupOnAccount: 'memory' },
     }
     for (const [name, opts] of Object.entries(plans)) {
-      const ctx = await browser.newContext({ viewport: { width: 1180, height: 900 } })
+      const ctx = await browser.newContext({ viewport: { width: 1180, height: 900 }, acceptDownloads: true })
+      await ctx.addInitScript(SAVE_PICKER)
       try {
         await driveOne(ctx, state.accounts[name], state, opts)
       } catch (e) {
@@ -721,6 +769,206 @@ async function drive(state) {
     await browser.close()
   }
   save(state)
+}
+
+// ---------------------------------------------------------------- backups
+
+const BACKUP_HEADING = /Save a copy of your account|Back up before the switch/
+
+/** Installed in every page before its scripts. Which save path the page
+ * takes is set per download through window.__backupMode: 'stream' stands in
+ * for showSaveFilePicker (headless Chromium has no file dialog) with a
+ * writable that keeps the bytes; 'memory' hides it, so the page builds the
+ * ZIP in memory and downloads a blob: URL. */
+const SAVE_PICKER = () => {
+  const real = window.showSaveFilePicker
+  Object.defineProperty(window, 'showSaveFilePicker', {
+    configurable: true,
+    get() {
+      if (window.__backupMode === 'memory') return undefined
+      if (window.__backupMode !== 'stream') return real
+      return async (opts) => {
+        window.__backupName = opts?.suggestedName
+        return {
+          createWritable: async () => {
+            const chunks = []
+            window.__backupBytes = undefined
+            return new WritableStream({
+              write: (c) => void chunks.push(c),
+              close: () => {
+                window.__backupBytes = new Blob(chunks)
+              },
+            })
+          },
+        }
+      }
+    },
+  })
+}
+
+/** Clicks the backup button and returns the ZIP's bytes. */
+async function downloadBackup(page, mode, click) {
+  await page.evaluate((m) => (window.__backupMode = m), mode)
+  if (mode === 'memory') {
+    const [dl] = await Promise.all([page.waitForEvent('download', { timeout: 120_000 }), click()])
+    check(/-backup-\d{4}-\d\d-\d\d\.zip$/.test(dl.suggestedFilename()), `in-memory backup downloaded as ${dl.suggestedFilename()}`)
+    return readFileSync(await dl.path())
+  }
+  await click()
+  for (let i = 0; ; i++) {
+    const b64 = await page.evaluate(async () => {
+      const b = window.__backupBytes
+      if (!b) return null
+      const bytes = new Uint8Array(await b.arrayBuffer())
+      let s = ''
+      for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+      return btoa(s)
+    })
+    if (b64) {
+      check(true, `backup streamed through the save picker (${await page.evaluate(() => window.__backupName)})`)
+      return Buffer.from(b64, 'base64')
+    }
+    if (i > 600) throw new Error('the streamed backup never finished')
+    await sleep(200)
+  }
+}
+
+const canon = (v) => (Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v)
+const norm = (p) => JSON.stringify(canon(p.filter((x) => !x.$type.endsWith('#declaredAgePref')).sort((x, y) => x.$type.localeCompare(y.$type))))
+
+const B32 = 'abcdefghijklmnopqrstuvwxyz234567'
+function b32(bytes) {
+  let out = 'b'
+  let acc = 0
+  let bits = 0
+  for (const x of bytes) {
+    acc = ((acc << 8) | x) & 0xffff
+    bits += 8
+    while (bits >= 5) {
+      bits -= 5
+      out += B32[(acc >> bits) & 31]
+    }
+  }
+  if (bits) out += B32[(acc << (5 - bits)) & 31]
+  return out
+}
+
+function uvarint(b, at) {
+  let n = 0
+  for (let shift = 1; ; shift *= 128) {
+    const x = b[at++]
+    n += (x & 0x7f) * shift
+    if (x < 0x80) return [n, at]
+  }
+}
+
+/** Just enough DAG-CBOR for a CAR header: maps, arrays, strings, bytes, ints, tag 42. */
+function cbor(b, at = 0) {
+  const ib = b[at++]
+  const major = ib >> 5
+  let n = ib & 31
+  if (n === 24) n = b[at++]
+  else if (n === 25) (n = b.readUInt16BE(at)), (at += 2)
+  else if (n === 26) (n = b.readUInt32BE(at)), (at += 4)
+  else if (n === 27) (n = Number(b.readBigUInt64BE(at))), (at += 8)
+  if (major === 0) return [n, at]
+  if (major === 2) return [b.subarray(at, at + n), at + n]
+  if (major === 3) return [b.subarray(at, at + n).toString(), at + n]
+  if (major === 4 || major === 5) {
+    const out = major === 4 ? [] : {}
+    for (let i = 0; i < n; i++) {
+      let k, v
+      if (major === 5) [k, at] = cbor(b, at)
+      ;[v, at] = cbor(b, at)
+      if (major === 4) out.push(v)
+      else out[k] = v
+    }
+    return [out, at]
+  }
+  if (major === 6 && n === 42) {
+    const [v, end] = cbor(b, at)
+    return [b32(v.subarray(1)), end]
+  }
+  throw new Error(`unexpected CBOR major type ${major} at ${at - 1}`)
+}
+
+/** The CAR's header, and how many blocks don't hash to their CID. */
+function parseCar(car) {
+  const [hlen, h0] = uvarint(car, 0)
+  const [header] = cbor(car.subarray(h0, h0 + hlen))
+  let blocks = 0
+  let bad = 0
+  for (let at = h0 + hlen; at < car.length; ) {
+    const [len, start] = uvarint(car, at)
+    let p = start
+    ;[, p] = uvarint(car, p)
+    ;[, p] = uvarint(car, p)
+    const [code, p2] = uvarint(car, p)
+    const [dlen, d0] = uvarint(car, p2)
+    const digest = car.subarray(d0, d0 + dlen)
+    const data = car.subarray(d0 + dlen, start + len)
+    if (code !== 0x12 || createHash('sha256').update(data).digest().compare(digest) !== 0) bad++
+    blocks++
+    at = start + len
+  }
+  return { root: header.roots?.[0], version: header.version, blocks, bad }
+}
+
+/** Unzips a backup and checks it against the seeded account and the server it came from. */
+async function verifyBackup(zip, a, { base, label, password = [], key, extras }) {
+  const name = `${OUT}backup-${a.name}-${label}`
+  const dir = `${name}/`
+  rmSync(dir, { recursive: true, force: true })
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(`${name}.zip`, zip)
+  execFileSync('unzip', ['-tq', `${name}.zip`])
+  execFileSync('unzip', ['-q', `${name}.zip`, '-d', dir])
+  label = `backup (${label})`
+  check(true, `${label}: the ZIP (${zip.length} bytes) passes unzip -t`)
+  const read = (f) => readFileSync(`${dir}${f}`)
+  const json = (f) => JSON.parse(read(f).toString())
+
+  const car = parseCar(read('repo.car'))
+  const head = await xrpc(base, 'com.atproto.sync.getLatestCommit', { params: { did: a.did } })
+  check(car.version === 1 && car.bad === 0 && car.blocks > 10, `${label}: repo.car parses, all ${car.blocks} blocks hash to their CIDs`, JSON.stringify(car))
+  check(car.root === head.cid, `${label}: repo.car's root is getLatestCommit's ${head.cid}`, car.root)
+
+  const files = existsSync(`${dir}blobs`) ? readdirSync(`${dir}blobs`).sort() : []
+  const want = Object.keys(a.blobs).sort()
+  const badHash = files.filter((c) => sha(read(`blobs/${c}`)) !== a.blobs[c])
+  check(JSON.stringify(files) === JSON.stringify(want), `${label}: blobs/ holds all ${want.length} blobs`, `${files.length} files`)
+  check(badHash.length === 0, `${label}: every blob's sha-256 matches the seeded bytes`, badHash.join(' '))
+  check(!existsSync(`${dir}missing-blobs.txt`), `${label}: no missing-blobs.txt`)
+
+  check(norm(json('preferences.json').preferences) === norm(a.prefs), `${label}: preferences.json equals the seeded preferences`)
+  const doc = await fetch(`${PLC}/${a.did}`).then((r) => r.json())
+  const pick = (d) => JSON.stringify(canon({ id: d.id, alsoKnownAs: d.alsoKnownAs, verificationMethod: d.verificationMethod, service: d.service }))
+  check(pick(json('identity/did.json')) === pick(doc), `${label}: identity/did.json matches the PLC directory's document`, `${pick(json('identity/did.json'))} vs ${pick(doc)}`)
+  const audit = await fetch(`${PLC}/${a.did}/log/audit`).then((r) => r.json())
+  const ops = json('identity/plc-audit-log.json')
+  check(JSON.stringify(ops.map((e) => e.cid)) === JSON.stringify(audit.map((e) => e.cid)), `${label}: identity/plc-audit-log.json has the directory's ${audit.length} ops`)
+
+  const acct = json('account.json')
+  check(
+    acct.did === a.did && acct.latestCommit?.cid === car.root && acct.counts.blobsIncluded === want.length && acct.counts.blobsMissing === 0,
+    `${label}: account.json (did, commit, counts)`,
+    JSON.stringify(acct),
+  )
+  const readme = read('README.txt').toString()
+  check(readme.includes('importRepo') && /not\s+exportable/.test(readme), `${label}: README.txt explains restoring, and that the signing key stays on the server`)
+
+  const all = execFileSync('find', [dir, '-type', 'f']).toString().trim().split('\n')
+  const text = all.filter((f) => !f.includes('/blobs/')).map((f) => readFileSync(f, 'latin1')).join('\n')
+  const leaked = password.filter((p) => p && text.includes(p))
+  check(leaked.length === 0 && !/accessJwt|refreshJwt|eyJ[A-Za-z0-9_-]{20,}\./.test(text), `${label}: no password, JWT or session token in the backup`)
+  if (key) check(read('keys/recovery-key.txt').toString().includes(key), `${label}: keys/recovery-key.txt holds the recovery key ticked in`)
+  else check(!existsSync(`${dir}keys`), `${label}: no keys/ without the opt-in`)
+  if (extras) {
+    const rk = json('vlpds/rotation-keys.json')
+    const data = await plcData(a.did)
+    check(JSON.stringify(rk.rotationKeys) === JSON.stringify(data.rotationKeys), `${label}: vlpds/rotation-keys.json lists the PLC rotation keys`)
+    check(Array.isArray(json('vlpds/app-passwords.json')) && Array.isArray(json('vlpds/connected-apps.json')), `${label}: app password names and connected apps`)
+  }
 }
 
 // ---------------------------------------------------------------- verify
@@ -765,9 +1013,6 @@ async function verify(state) {
 
     // preferences (vlpds adds the derived declared-age pref, as the reference does)
     const prefs = await xrpc(VLPDS, 'app.bsky.actor.getPreferences', { auth: jwt })
-    const canon = (v) =>
-      Array.isArray(v) ? v.map(canon) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])])) : v
-    const norm = (p) => JSON.stringify(canon(p.filter((x) => !x.$type.endsWith('#declaredAgePref')).sort((x, y) => x.$type.localeCompare(y.$type))))
     check(norm(prefs.preferences) === norm(a.prefs), 'preferences equal', `${norm(prefs.preferences)} vs ${norm(a.prefs)}`)
 
     // the PLC directory points here
