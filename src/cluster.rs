@@ -731,6 +731,17 @@ impl Cluster {
         self.lease.read().clone()
     }
 
+    /// `node_id`'s lease as the bucket has it now.
+    pub async fn read_lease(&self, node_id: &str) -> anyhow::Result<Option<NodeLease>> {
+        Ok(self.get_json::<NodeLease>(&self.path(&format!("nodes/{node_id}"))).await?.map(|(l, _)| l))
+    }
+
+    /// Whether `lease` expired by its own clock, read against ours with
+    /// the configured skew as margin.
+    pub fn lease_expired(&self, lease: &NodeLease) -> bool {
+        lease.expires_ms + (self.cfg.skew.as_millis() as u64) < self.wall_ms()
+    }
+
     /// Once per TTL. An active level outside our window (an operator forced
     /// it) is a fail-stop; a `target` past it is not (a raise lists our lease
     /// and aborts).
