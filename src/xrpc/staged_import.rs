@@ -347,9 +347,22 @@ fn rows(
     records: Vec<ImportedRecord>,
     nodes: Vec<(Cid, Arc<[u8]>)>,
 ) -> (Vec<crate::segment::Mutation>, Vec<(Vec<u8>, Box<str>)>, Vec<String>) {
+    import_rows(did, t.gen, t.rev, records, nodes)
+}
+
+/// [`rows`] for a generation and rev of the caller's (the relay's archival
+/// bootstrap stages a fetched repo with it).
+#[allow(clippy::type_complexity)]
+pub fn import_rows(
+    did: &str,
+    gen: u64,
+    rev: crate::tid::Tid,
+    records: Vec<ImportedRecord>,
+    nodes: Vec<(Cid, Arc<[u8]>)>,
+) -> (Vec<crate::segment::Mutation>, Vec<(Vec<u8>, Box<str>)>, Vec<String>) {
     use crate::segment::Mutation;
-    let gen = t.gen;
-    let rev = t.rev.0.to_be_bytes();
+    let rev_t = rev;
+    let rev = rev_t.0.to_be_bytes();
     let mut muts = Vec::with_capacity(records.len() * 3 + nodes.len());
     let mut links = Vec::new();
     let mut colls: Vec<String> = Vec::new();
@@ -365,7 +378,7 @@ fn rows(
         }
         muts.push(Mutation {
             key: state::record_key(did, gen, &path).into(),
-            val: Some(state::record_value(&cid, t.rev.0, &bytes)),
+            val: Some(state::record_value(&cid, rev_t.0, &bytes)),
         });
         muts.push(Mutation { key: state::record_cid_key(did, gen, &cid, &path).into(), val: Some(Bytes::new()) });
         blobs.sort();

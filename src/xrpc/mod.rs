@@ -34,6 +34,7 @@ pub use account_stats::{export_account_totals, scan_totals, totals, totals_loadi
 pub use blobs::spawn_blob_gc;
 pub use import_budget::ImportBudget;
 pub use repo::DEFAULT_MAX_IMPORT_BYTES;
+pub use repo::{parse_import, ImportedRecord};
 pub(crate) use server::SEC;
 pub use server::{auth_epoch, auth_epoch_cond, epoch_for_login, new_auth_epoch_op, AUTH_EPOCH};
 pub use server::{
@@ -41,9 +42,10 @@ pub use server::{
     spawn_reserved_key_gc, sweep_reserved_keys,
 };
 pub use server::{LogMailer, Mail, Mailer};
+pub use staged_import::import_rows;
 pub use sync::{
-    export_memory_bytes, set_export_prefetch_max_bytes, size_export_prefetch_pool, DEFAULT_EXPORT_STALL,
-    DEFAULT_MAX_EXPORTS,
+    export_memory_bytes, find_record, set_export_prefetch_max_bytes, size_export_prefetch_pool, stream_export,
+    ExportChunkTx, DEFAULT_EXPORT_STALL, DEFAULT_MAX_EXPORTS,
 };
 pub use webui::WebUi;
 
