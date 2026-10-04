@@ -194,11 +194,14 @@ opt-level = 3
 opt-level = 1
 debug = 0
 lto = false
-codegen-units = 16
+# incremental reuse is per codegen unit: with 16, a one-line edit re-optimizes
+# a sixteenth of the crate (lib rebuild 3-16 s vs ~3 s; suite runtime equal)
+codegen-units = 256
 incremental = true
 
 [profile.test.package."*"]
 opt-level = 2
+codegen-units = 16
 
 [dev-dependencies]
 # brotli-encoded stub AppView bodies (read-after-write tests)
