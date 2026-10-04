@@ -40,7 +40,22 @@ impl Store {
     /// [`limited`](Self::limited)) so connections are reused: each close
     /// leaves a TIME_WAIT socket on an ephemeral port.
     pub fn s3(cfg: &S3Config, prefix: &str, latency: Option<(f64, f64)>, connections: usize) -> anyhow::Result<Store> {
+        Self::s3_with(cfg, prefix, latency, connections, false)
+    }
+
+    /// [`Self::s3`], optionally sending bodies as `UNSIGNED-PAYLOAD`: SigV4
+    /// otherwise hashes every PUT body in full on the calling task, which
+    /// over TLS (where the connection already protects the body) is a pass
+    /// over every byte for nothing.
+    pub fn s3_with(
+        cfg: &S3Config,
+        prefix: &str,
+        latency: Option<(f64, f64)>,
+        connections: usize,
+        unsigned_payload: bool,
+    ) -> anyhow::Result<Store> {
         let s3 = AmazonS3Builder::new()
+            .with_unsigned_payload(unsigned_payload)
             .with_endpoint(&cfg.endpoint)
             .with_bucket_name(&cfg.bucket)
             .with_access_key_id(&cfg.access_key)
