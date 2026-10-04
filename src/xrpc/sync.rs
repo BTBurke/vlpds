@@ -549,11 +549,13 @@ async fn get_blocks(
         .map(|(_, v)| v.clone())
         .ok_or_else(|| XrpcError::bad("InvalidRequest", "Error: Params must have the property \"did\""))?;
     let mut want = Vec::new();
+    // a query string holds thousands of CIDs: no quadratic dedup
+    let mut wanted = std::collections::HashSet::new();
     for (k, v) in &pairs {
         if k == "cids" || k == "cids[]" {
             let c = Cid::parse(v)
                 .map_err(|_| XrpcError::bad("InvalidRequest", format!("invalid cid: {v}")))?;
-            if !want.contains(&c) {
+            if wanted.insert(c) {
                 want.push(c);
             }
         }

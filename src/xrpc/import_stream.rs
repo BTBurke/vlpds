@@ -213,7 +213,7 @@ fn stream(input: &mut Input, sink: &mut Sink) -> Result<(Bytes, u64, u64), Stop>
     let roots = car::read_header(&header).map_err(|_| Stop::Depart)?;
     let [root] = roots[..] else { return Err(Stop::Depart) };
     let (c, commit) = input.block().ok_or(Stop::Depart)?;
-    if c != root {
+    if c != root || root.codec != crate::cid::CODEC_DAG_CBOR {
         return Err(Stop::Depart);
     }
     let commit = Value::decode(&commit).map_err(|_| Stop::Depart)?;
@@ -239,7 +239,7 @@ fn stream(input: &mut Input, sink: &mut Sink) -> Result<(Bytes, u64, u64), Stop>
                     return Err(Stop::Depart);
                 }
                 let path = std::str::from_utf8(&key).map_err(|_| Stop::Depart)?;
-                if !super::syntax::valid_record_path(path) {
+                if !super::syntax::valid_record_path(path) || cid.codec != crate::cid::CODEC_DAG_CBOR {
                     return Err(Stop::Depart);
                 }
                 let (c, b) = input.block().ok_or(Stop::Depart)?;
@@ -878,5 +878,140 @@ mod tests {
         assert_eq!(path, "buffered");
         assert_eq!(summary(&got).map(|_| ()), buffered(&car).map(|_| ()));
         assert!(got.is_err());
+    }
+
+    /// A node block from raw parts, canonical or not: `l`, then entries of
+    /// (prefix length, key suffix, right subtree, value).
+    fn raw_node(l: Option<Cid>, es: &[(usize, &[u8], Option<Cid>, Cid)]) -> (Cid, Vec<u8>) {
+        let link = |c: Option<Cid>| c.map_or(Value::Null, Value::Link);
+        let e = es
+            .iter()
+            .map(|(p, k, t, v)| {
+                Value::Map(vec![
+                    ("k".into(), Value::Bytes(k.to_vec())),
+                    ("p".into(), Value::Int(*p as i64)),
+                    ("t".into(), link(*t)),
+                    ("v".into(), Value::Link(*v)),
+                ])
+            })
+            .collect();
+        let b = Value::Map(vec![("e".into(), Value::Array(e)), ("l".into(), link(l))]).to_cbor();
+        (Cid::dag_cbor(&b), b)
+    }
+
+    /// A CAR of a commit over `data`, then `blocks` in the given order.
+    fn car_over(root: Option<(Cid, Vec<u8>)>, data: Cid, blocks: &[(Cid, &[u8])]) -> Vec<u8> {
+        let cm = root.unwrap_or_else(|| commit(data));
+        let mut car = Vec::new();
+        car::write_header(&mut car, &cm.0);
+        car::write_block(&mut car, &cm.0, &cm.1);
+        for (c, b) in blocks {
+            car::write_block(&mut car, c, b);
+        }
+        car
+    }
+
+    fn key_at(h: i32, n: usize) -> Vec<String> {
+        let mut ks: Vec<String> = (0..).map(|i| format!("com.example.a/k{i}")).filter(|k| mst::height_for_key(k.as_bytes()) == h).take(n).collect();
+        ks.sort();
+        ks
+    }
+
+    /// Non-canonical trees and non-dag-cbor links are refused by both
+    /// parses with the same error: duplicate or unordered keys in a node, a
+    /// key at the wrong layer, a node reached through a raw-codec link, a
+    /// record or commit under a raw-codec CID.
+    #[test]
+    fn non_canonical_trees_and_codecs_refused() {
+        let rec = record("com.example.a/x");
+        let rc = Cid::dag_cbor(&rec);
+        let [k0, k1] = <[String; 2]>::try_from(key_at(0, 2)).unwrap();
+        let (k0, k1) = (k0.as_bytes(), k1.as_bytes());
+        let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+
+        // control: the canonical one-node tree imports
+        let (good, gb) = raw_node(None, &[(0, k0, None, rc), (count_prefix(k0, k1), &k1[count_prefix(k0, k1)..], None, rc)]);
+        let ok = car_over(None, good, &[(good, &gb), (rc, &rec), (rc, &rec)]);
+        assert_eq!(buffered(&ok).unwrap().0.len(), 2);
+        assert_eq!(run(&ok, 64).1, "stream");
+
+        let (dup, b) = raw_node(None, &[(0, k0, None, rc), (k0.len(), b"", None, rc)]);
+        cases.push(("duplicate key", car_over(None, dup, &[(dup, &b), (rc, &rec), (rc, &rec)])));
+        let (unordered, b) = raw_node(None, &[(0, k1, None, rc), (0, k0, None, rc)]);
+        cases.push(("keys out of order", car_over(None, unordered, &[(unordered, &b), (rc, &rec), (rc, &rec)])));
+
+        // a height-1 key over a leaf holding another height-1 key
+        let [h1a, h1b] = <[String; 2]>::try_from(key_at(1, 2)).unwrap();
+        let (leaf, lb) = raw_node(None, &[(0, h1a.as_bytes(), None, rc)]);
+        let (top, tb) = raw_node(Some(leaf), &[(0, h1b.as_bytes(), None, rc)]);
+        cases.push(("key at the wrong layer", car_over(None, top, &[(top, &tb), (leaf, &lb), (rc, &rec), (rc, &rec)])));
+
+        // the canonical tree of k0 and h1a, its leaf linked as raw
+        let (leaf, lb) = raw_node(None, &[(0, k0, None, rc)]);
+        let raw_leaf = Cid::raw(&lb);
+        let over = |child: Cid| match k0 < h1a.as_bytes() {
+            true => raw_node(Some(child), &[(0, h1a.as_bytes(), None, rc)]),
+            false => raw_node(None, &[(0, h1a.as_bytes(), Some(child), rc)]),
+        };
+        let (top, tb) = over(raw_leaf);
+        let (canon, cb) = over(leaf);
+        assert!(buffered(&car_over(None, canon, &[(canon, &cb), (leaf, &lb), (rc, &rec), (rc, &rec)])).is_ok());
+        cases.push(("raw-codec node link", car_over(None, top, &[(top, &tb), (raw_leaf, &lb), (rc, &rec), (rc, &rec)])));
+
+        // a record under a raw-codec CID (the tree itself is canonical)
+        let raw_rec = Cid::raw(&rec);
+        let (one, ob) = raw_node(None, &[(0, k0, None, raw_rec)]);
+        cases.push(("raw-codec record", car_over(None, one, &[(one, &ob), (raw_rec, &rec)])));
+
+        // the commit under a raw-codec CID
+        let (one, ob) = raw_node(None, &[(0, k0, None, rc)]);
+        let cm = commit(one);
+        let raw_commit = (Cid::raw(&cm.1), cm.1.clone());
+        cases.push(("raw-codec commit", car_over(Some(raw_commit), one, &[(one, &ob), (rc, &rec)])));
+
+        for (name, car) in cases {
+            let want = buffered(&car);
+            let why = match name {
+                "duplicate key" | "keys out of order" => "keys not in ascending order",
+                "key at the wrong layer" => "child height is not parent height - 1",
+                "raw-codec node link" => "CAR does not contain the complete MST",
+                "raw-codec record" => "record CID at com.example.a/",
+                _ => "commit CID is not dag-cbor",
+            };
+            assert!(want.as_ref().is_err_and(|e| e.contains(why)), "{name}: {want:?}");
+            for chunk in [1, 64, car.len()] {
+                let (got, path) = run(&car, chunk);
+                assert_eq!(path, "buffered", "{name}");
+                assert_eq!(summary(&got).map(|_| ()), want.clone().map(|_| ()), "{name}");
+            }
+        }
+    }
+
+    fn count_prefix(a: &[u8], b: &[u8]) -> usize {
+        a.iter().zip(b).take_while(|(x, y)| x == y).count()
+    }
+
+    /// Duplicate blocks (same CID, same bytes) anywhere in the body are
+    /// tolerated by both parses: content addressing makes them identical.
+    #[test]
+    fn duplicate_blocks_tolerated() {
+        let r = repo(60);
+        let ordered = r.cid_ordered();
+        let (_, blocks) = car::read_car(&ordered).unwrap();
+        let mut car = Vec::new();
+        car::write_header(&mut car, &r.commit.0);
+        for (c, b) in blocks.iter().chain(blocks.iter()) {
+            car::write_block(&mut car, c, b);
+        }
+        assert_eq!(buffered(&car), buffered(&r.streamed()));
+        let once = r.streamed();
+        let mut streamed = once.clone();
+        let (_, sblocks) = car::read_car(&once).unwrap();
+        for (c, b) in &sblocks {
+            car::write_block(&mut streamed, c, b);
+        }
+        let (got, path) = run(&streamed, 100);
+        assert_eq!(path, "stream");
+        assert_eq!(summary(&got), buffered(&r.streamed()));
     }
 }

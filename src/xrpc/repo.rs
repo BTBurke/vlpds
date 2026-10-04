@@ -823,6 +823,9 @@ pub(super) fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate:
     if roots.len() != 1 {
         return Err(bad("expected one root".into()));
     }
+    if roots[0].codec != crate::cid::CODEC_DAG_CBOR {
+        return Err(bad("commit CID is not dag-cbor".into()));
+    }
     let mut map: std::collections::HashMap<Cid, &[u8]> = std::collections::HashMap::with_capacity(blocks.len());
     for (c, b) in blocks {
         if !car::block_matches(&c, b) {
@@ -864,6 +867,10 @@ pub(super) fn parse_import(body: &Bytes) -> XResult<(Vec<ImportedRecord>, crate:
     for (path, cid) in entries {
         if !super::syntax::valid_record_path(&path) {
             return Err(bad(format!("invalid record path {path}")));
+        }
+        // the root check holds for any leaf CID; records are dag-cbor only
+        if cid.codec != crate::cid::CODEC_DAG_CBOR {
+            return Err(bad(format!("record CID at {path} is not dag-cbor: {cid}")));
         }
         let bytes = *map.get(&cid).ok_or_else(|| bad(format!("missing record block {cid} at {path}")))?;
         let blobs = imported_record_blobs(&path, bytes)?;

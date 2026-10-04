@@ -90,6 +90,42 @@ async fn streamed_and_buffered_imports_agree() {
     }
 }
 
+/// Identical records share one CID under several keys: an import takes
+/// each, and deleting one leaves the others (and their block) in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn imported_records_sharing_a_cid_delete_independently() {
+    let old = TestServer::spawn().await;
+    let new = TestServer::spawn().await;
+    let a = old.create_account("shared").await;
+    let rec = json!({"$type": "com.example.same", "same": true});
+    let mut refs = Vec::new();
+    for _ in 0..3 {
+        refs.push(old.create_record(&a, "com.example.same", rec.clone()).await);
+    }
+    assert!(refs.iter().all(|r| r.cid == refs[0].cid));
+    old.post(&a, "other").await;
+    let exported = old.xrpc.get("com.atproto.sync.getRepo", &[("did", &a.did)], &Auth::None).await.body.to_vec();
+    for car in [exported.clone(), shuffled(&exported)] {
+        let b = new.create_account("sharedst").await;
+        import(&new, &b, car).await.ok();
+        for r in &refs {
+            assert_eq!(new.get_record(&b.did, "com.example.same", r.rkey()).await.ok()["cid"], r.cid.as_str());
+        }
+        new.delete_record(&b, "com.example.same", refs[0].rkey()).await.ok();
+        new.get_record(&b.did, "com.example.same", refs[0].rkey()).await.err(400, "RecordNotFound");
+        let repo = new.get_repo(&b.did).await;
+        for r in &refs[1..] {
+            assert_eq!(new.get_record(&b.did, "com.example.same", r.rkey()).await.ok()["value"], rec);
+            assert_eq!(repo.record(&format!("com.example.same/{}", r.rkey())), Some(rec.clone()));
+        }
+        for r in &refs[1..] {
+            new.delete_record(&b, "com.example.same", r.rkey()).await.ok();
+        }
+        let repo = new.get_repo(&b.did).await;
+        assert!(!repo.blocks.contains_key(&Cid::parse(&refs[0].cid).unwrap()), "the last reference's block is gone");
+    }
+}
+
 /// A body that breaks off mid-stream imports nothing; a complete body
 /// holding a truncated CAR gets the buffered parse's error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

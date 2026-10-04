@@ -22,6 +22,7 @@ mod bulk_create;
 mod cache_caps;
 mod cbor_transcode;
 mod checkpoint_stall;
+mod cid_limits;
 mod cold_start;
 mod commit_cpu;
 mod common;
