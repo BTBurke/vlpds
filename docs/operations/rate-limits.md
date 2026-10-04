@@ -52,11 +52,11 @@ the start of the next. The names are what the console, the config and the metric
 
 | Bucket | Key | Window | Points | Applies to | Over it |
 |---|---|---|---|---|---|
-| `global-ip` | IP | 5 min | 3,000 | every `/xrpc/` call, proxied ones too, except `sync.getRepo`, `subscribeRepos` and `_health` · OAuth sign-in form posts | 429 |
+| `global-ip` | IP | 5 min | 3,000 | every `/xrpc/` call, proxied ones too, except `sync.getRepo`, `subscribeRepos` and `_health` · OAuth sign-in and sign-up form posts | 429 |
 | `com.atproto.sync.getRepo-0` | IP | 5 min | 6,000 | `sync.getRepo` (in place of `global-ip`) | 429 |
 | `com.atproto.server.createSession-0` | identifier + IP | 1 day | 300 | `server.createSession` · OAuth sign-in | 429 · the sign-in page shows an error |
 | `com.atproto.server.createSession-1` | identifier + IP | 5 min | 30 | `server.createSession` · OAuth sign-in | 429 · the sign-in page shows an error |
-| `com.atproto.server.createAccount-0` | IP | 5 min | 100 | `server.createAccount` | 429 |
+| `com.atproto.server.createAccount-0` | IP | 5 min | 100 | `server.createAccount` · OAuth sign-up form posts (`/oauth/authorize/sign-up`) | 429, or the sign-up page shows an error |
 | `com.atproto.server.deleteAccount-0` | IP | 5 min | 50 | `server.deleteAccount` | 429 |
 | `com.atproto.server.requestPasswordReset-0` | IP | 1 day | 50 | `server.requestPasswordReset` | 429 |
 | `com.atproto.server.requestPasswordReset-1` | IP | 1 h | 15 | `server.requestPasswordReset` | 429 |
