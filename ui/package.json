@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "check-docs": "node docs-build/check.mjs"
   },
   "dependencies": {
     "@noble/curves": "^2.4.0",
@@ -20,6 +21,9 @@
     "@types/react": "^18.3.31",
     "@types/react-dom": "^18.3.7",
     "@vitejs/plugin-react": "^4.7.0",
+    "highlight.js": "^11.12.0",
+    "js-yaml": "^5.4.2",
+    "markdown-it": "^15.0.2",
     "typescript": "^5.9.3",
     "vite": "^5.4.21"
   }

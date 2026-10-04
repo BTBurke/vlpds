@@ -123,6 +123,7 @@ export function Landing() {
       </main>
       <footer className="footer">
         <span>vlpds</span>
+        <Link to="/docs">Docs</Link>
         <a href="/xrpc/_health">Health</a>
         <a href="/.well-known/oauth-authorization-server">OAuth metadata</a>
         {info?.links?.privacyPolicy && <a href={info.links.privacyPolicy}>Privacy</a>}

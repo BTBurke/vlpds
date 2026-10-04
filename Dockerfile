@@ -20,6 +20,8 @@ WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
 COPY ui/ ./
+# the docs site (/docs) is rendered from ../docs at build time
+COPY docs/ /src/docs/
 RUN npm run build
 
 # --- rust release build -----------------------------------------------------

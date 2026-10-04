@@ -7,6 +7,10 @@ target_dir := env_var_or_default("CARGO_TARGET_DIR", "target")
 ui:
     cd ui && npm install --no-audit --no-fund && npm run build
 
+# Validate the docs site (docs/*.md: front matter, heroes, diagrams, links) and print its nav
+docs-check:
+    cd ui && npm install --no-audit --no-fund && npm run check-docs
+
 # Vite dev server on :5620, proxying /xrpc, /oauth, /metrics to a local vlpds (VLPDS_URL, default http://127.0.0.1:2620)
 dev-ui url="http://127.0.0.1:2620":
     cd ui && npm install --no-audit --no-fund && VLPDS_URL={{url}} npm run dev

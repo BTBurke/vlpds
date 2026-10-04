@@ -34,6 +34,7 @@ mod ctl_shard_move;
 mod ctl_takeover;
 mod delete_account_retry;
 mod differential_shrike;
+mod docs_site;
 mod dpop_resend;
 mod e2e_regressions;
 mod email_2fa;
