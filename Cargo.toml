@@ -166,6 +166,14 @@ codegen-units = 1
 # keep symbols for profiling (sample/perf/pprof)
 debug = 1
 
+# Small helper binaries in the image (vlpds-bucket-probe): fat LTO buys them
+# nothing and costs a full single-threaded optimization pass per binary.
+[profile.tool]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug = 0
+
 # fast iteration builds: `cargo build --profile dev-release`. No LTO and
 # incremental, so an edit recompiles only the crate; dependencies are built
 # once at full opt-level and cached. Benches/deploys use --release.
