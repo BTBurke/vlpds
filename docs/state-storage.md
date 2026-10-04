@@ -3,7 +3,7 @@ title: State storage
 section: vlPDS
 order: 3
 status: ready
-summary: "SlateDB with its WAL turned off: the key layout, how durable segments are applied, checkpoints, compaction and the caches in front of the bucket."
+summary: "SlateDB with its WAL turned off. The key layout, how durable segments get applied, checkpoints, compaction and the caches in front of the bucket."
 ---
 
 ```hero
@@ -37,10 +37,9 @@ facts:
 
 Everything vlpds serves from storage (repo heads, records, accounts, sessions, indexes) lives in
 one [SlateDB](https://slatedb.io) database per shard, under `state/{shard}/` in the bucket. SlateDB
-is an LSM tree that writes its SSTs and manifest straight to object storage. vlpds runs it with its
-own write-ahead log turned off, because the commit log already is one: a write is made durable once,
-in a log segment, and applied to the shard's memtable before it is acknowledged. This page covers
-what is stored where, how state catches up with the log, and the knobs that set its cost and memory.
+is an LSM tree that writes its SSTs and manifest straight to object storage. vlpds turns off
+SlateDB's own write-ahead log, since the commit log already is one. A write is made durable once, in
+a log segment, and applied to the shard's memtable before it's acknowledged.
 
 ## Why an LSM, and why SlateDB
 
@@ -49,12 +48,12 @@ what is stored where, how state catches up with the log, and the knobs that set 
 | Point reads: a repo head, `getRecord`, an account | memtable, then a bloom filter per SST, then one block |
 | Ordered scans: `listRecords`, `listRepos`, a cold MST load | keys sorted by repo and path |
 | Far more records than RAM, ~3 KB written per commit | immutable SSTs in the bucket, merged in the background |
-| A new owner opening a shard in a fraction of a second | open = read a manifest; nothing is copied to the node |
+| A new owner opening a shard in a fraction of a second | opening reads a manifest and copies nothing to the node |
 | Cheap split and merge | a clone references the parent's SSTs instead of copying them |
 
 vlpds uses SlateDB as a sorted key-value store. It builds SlateDB 0.17 from a fork
-(`jazware/slatedb`) carrying four patches: a fix for merging shards that share inherited SSTs, a
-fix for forced compactions, a faster scan path and metadata-cache seeding for compaction output.
+(`jazware/slatedb`) that carries four patches: a fix for merging shards that share inherited SSTs,
+a fix for forced compactions, a faster scan path and metadata-cache seeding for compaction output.
 
 ## Key layout
 
@@ -74,51 +73,51 @@ notes:
 | Key | Value | Used for |
 |---|---|---|
 | **Repo** | | |
-| `h/{did}` | commit CID, data CID, rev, signed commit | the repo head; every write and sync read starts here |
+| `h/{did}` | commit CID, data CID, rev, signed commit | the repo head, where every write and sync read starts |
 | `R/{did}\0{gen}{collection}/{rkey}` | record CID, rev, record bytes | `getRecord`, `listRecords`, exports |
-| `M/{did}\0{gen}{cid digest}` | MST node block | interior nodes of the current tree; leaves are derived from `R/` ([Record storage](record-storage.md#what-is-stored-and-what-is-derived)) |
+| `M/{did}\0{gen}{cid digest}` | MST node block | interior nodes of the current tree. Leaves are derived from `R/` ([Record storage](record-storage.md#what-is-stored-and-what-is-derived)) |
 | `c/{did}\0{gen}{cid8}{path}` | empty | record CID → path index for `getBlocks` |
 | `b/{did}\0{gen}{blob cid}\0{path}` | rev | which records reference a blob ([Blobs](blobs.md#references)) |
 | `bl/{did}\0{gen}{code}{subject}` | rkeys | likes, reposts, follows and blocks of a subject (duplicate pruning) |
 | `S/{did}` | 3 counters | records, MST nodes and blobs for `checkAccountStatus` |
 | `G/{did}` | import state | a staged `importRepo` and generations left to sweep |
 | **Account** | | |
-| `a/{did}` | account row | handle, email, password hash, status; the signing key only wrapped under the KEK ([Keys and security](keys-security.md#secrets-at-rest)) |
+| `a/{did}` | account row | handle, email, password hash, status. The signing key is stored only wrapped under the KEK ([Keys and security](keys-security.md#secrets-at-rest)) |
 | `n/{handle}` | DID | handle lookup (in the DID's slot) |
 | `C/{collection}\0{did}` | empty | `listReposByCollection` |
 | `p/{routing}\0{name}` | varies | private state: sessions, app passwords, email tokens, 2FA, OAuth, `sec/` security controls |
 | `T/` | totals | the slot's account counts (`vlpds_accounts`) |
 | **Shard** | | |
-| `meta/applied2` | log id, ordinal | the applied marker: where replay starts |
+| `meta/applied2` | log id, ordinal | the applied marker, which is where replay starts |
 | `meta/recent` | DIDs | recently written repos the next owner preloads |
 
-`{gen}` is the repo's generation: an import writes the new repo under a fresh generation and
-switches the account to it in one entry, and old generations are swept in the background.
-Cross-account scans (`listRepos`, `searchAccounts`) walk slot by slot, seeking past empty slots, so
-their order is `(slot, DID)` whatever the layout.
+`{gen}` is the repo's generation. An import writes the new repo under a fresh generation and
+switches the account to it in one entry, and old generations get swept in the background.
+Cross-account scans (`listRepos`, `searchAccounts`) walk slot by slot and seek past empty slots, so
+they return results in `(slot, DID)` order whatever the layout.
 
 ## Applying the log
 
 ```steps
 - title: A segment becomes durable
-  body: "Its PUT and every earlier ordinal's have completed. The finalizer takes segments strictly in ordinal order."
+  body: "Its PUT and the PUTs for every earlier ordinal have completed. The finalizer takes segments strictly in ordinal order."
 - title: One write batch per touched shard
-  body: "The segment's mutations for that shard (puts and deletes, in log order) plus the applied marker `meta/applied2 = (log id, ordinal)`. Shards are written concurrently, under each shard's apply lock."
+  body: "The batch holds the segment's mutations for that shard (puts and deletes, in log order) plus the applied marker `meta/applied2 = (log id, ordinal)`. Shards are written concurrently, each under its own apply lock."
 - title: Into the memtable, not the bucket
   body: "With the WAL off, the write returns once the batch is in the memtable. A read right after the ack sees it."
 - title: Ack, firehose, watermark
-  body: "Then the node re-checks its lease and acks the writes, hands the events to the firehose and advances the log's durable watermark."
+  body: "Then the node re-checks its lease and acks the writes. It hands the events to the firehose and advances the log's durable watermark."
 ```
 
-Nothing in a shard's state is durable in the bucket until a flush writes it as an SST, and that's
-fine: the log segment is the durable copy. After a crash, the shard's next owner opens the DB,
-reads `meta/applied2` and replays every span of the shard's history after it, fetching each log
-segment once for all the shards it is opening. Replay refuses to run if the marker names no span
-of the history (a span it needs was dropped), rather than serve without acked writes.
+Nothing in a shard's state is durable in the bucket until a flush writes it as an SST. That's fine,
+since the log segment is the durable copy. After a crash, the shard's next owner opens the DB, reads
+`meta/applied2` and replays every span of the shard's history after it. It fetches each log segment
+once for all the shards it's opening. If the marker names no span of the history (meaning a span it
+needs was dropped), replay refuses to run instead of serving without acked writes.
 
-A failed apply means the node's state and its log disagree, so it fail-stops (exit 4,
+A failed apply means the node's state and its log disagree, so the node fail-stops (exit 4,
 `state_apply`). If a shard's L0 is full, its writes wait for compaction and the finalizer waits with
-them, which holds back acks on the whole node: that is what `VlpdsSlateDbL0Stalls` catches.
+them. That holds back acks on the whole node, and it's what `VlpdsSlateDbL0Stalls` catches.
 
 ## Checkpoints
 
@@ -136,16 +135,17 @@ edges:
   - { from: c63.b, to: st.t85 }
 ```
 
-Every `--checkpoint-every` (10 s), each owned shard gets a write of its applied marker (and its
-recent-repos list) followed by a memtable flush: one L0 SST PUT and one manifest update. That
-bounds a successor's replay to roughly the last 10 s of the log, and lets
-[log retention](firehose.md#retention) advance. A shard already checkpointed at the log's current
-durable ordinal is skipped, so an idle node makes no checkpoint requests. `--checkpoint-stagger`
-(on) spreads the shards over the interval instead of flushing them back to back.
+Every `--checkpoint-every` (10 s), each owned shard writes its applied marker (and its recent-repos
+list) and then flushes its memtable. That's one L0 SST PUT and one manifest update. It bounds a
+successor's replay to roughly the last 10 s of the log, and it lets
+[log retention](firehose.md#retention) advance. A shard that's already checkpointed at the log's
+current durable ordinal gets skipped, so an idle node makes no checkpoint requests.
+`--checkpoint-stagger` (on) spreads the shards over the interval instead of flushing them back to
+back.
 
-Between checkpoints SlateDB also flushes a memtable once it reaches 16 MiB. Graceful closes
-(handoff, split, shutdown) checkpoint the shard as part of the close. Metric
-`vlpds_checkpoint_shard_seconds`; alert `VlpdsCheckpointsStalled`.
+Between checkpoints, SlateDB also flushes a memtable once it reaches 16 MiB. Graceful closes
+(handoff, split, shutdown) checkpoint the shard as part of the close. The metric is
+`vlpds_checkpoint_shard_seconds` and the alert is `VlpdsCheckpointsStalled`.
 
 ## Compaction and garbage collection
 
@@ -160,27 +160,26 @@ edges:
 ```
 
 ```facts
-- { value: "32", unit: L0 SSTs, label: before writes stall, note: "16 MiB each: room for a bulk import between compactions" }
-- { value: "1 h", label: replaced SSTs stay readable, note: "`--slatedb-checkpoint-lifetime`: a scan or export must finish within it", tone: violet }
-- { value: "10 s", label: manifest poll, note: "`--slatedb-manifest-poll`; 60 s on tiny. Writes are visible regardless", tone: blue }
+- { value: "32", unit: L0 SSTs, label: before writes stall, note: "16 MiB each, which leaves room for a bulk import between compactions" }
+- { value: "1 h", label: replaced SSTs stay readable, note: "`--slatedb-checkpoint-lifetime` · a scan or export has to finish within it", tone: violet }
+- { value: "10 s", label: manifest poll, note: "`--slatedb-manifest-poll` · 60 s on tiny · writes are visible regardless", tone: blue }
 - { value: "4×", label: transient space during imports, note: "size-tiered compaction rewrites rows ~3 times", tone: amber }
 ```
 
-- **Compaction** is size-tiered and runs per shard (`--compaction-polling adaptive`,
+- Compaction is size-tiered and runs per shard (`--compaction-polling adaptive`,
   `--compaction-poll 30s`). Compacted SSTs roll at 64 MiB, so a cache miss on one fetches less.
-- **Polling costs requests, not latency.** The node is its shards' only writer, so its reads see
-  its own writes whatever the manifest poll; a poll only picks up compaction results. A writer whose
-  L0 is 8 or more deep refreshes every 500 ms anyway. At these defaults per-shard polling is ~0.4
-  GETs/s, down from 3.2 at SlateDB's defaults.
-- **Garbage collection.** SlateDB deletes an SST once no manifest or live checkpoint references it
-  and it is older than `--slatedb-gc-min-age` (10 min). Before each compaction replaces SSTs, it
-  pins the old manifest for `--slatedb-checkpoint-lifetime` (1 h), which is what lets a long
-  `getRepo` keep reading. After a bulk import, peak transient space is about the last hour's
-  compaction output.
-- **Tombstones** are dropped when they reach the bottom run. `--full-compaction-every` (off) forces
-  that periodically; the soak tests found no read cost from leaving it off.
-- **Bucket settings.** Replaced SSTs are deleted for good, so disable GCS soft delete and add the
-  abort-incomplete-multipart rule on S3 and R2: see [Lifecycle rules](operations/object-store.md#lifecycle-rules).
+- Polling. The node is its shards' only writer, so its reads see its own writes whatever the
+  manifest poll is set to. A poll only picks up compaction results, so the interval changes the
+  request count and not read latency. A writer whose L0 is 8 or more deep refreshes every 500 ms
+  anyway. At these defaults, per-shard polling is ~0.4 GETs/s, down from 3.2 at SlateDB's defaults.
+- Garbage collection. SlateDB deletes an SST once no manifest or live checkpoint references it and
+  it's older than `--slatedb-gc-min-age` (10 min). Before each compaction replaces SSTs, it pins the
+  old manifest for `--slatedb-checkpoint-lifetime` (1 h), which lets a long `getRepo` keep reading.
+  After a bulk import, peak transient space is about the last hour's compaction output.
+- Tombstones get dropped when they reach the bottom run. `--full-compaction-every` (off) forces that
+  periodically. The soak tests found no read cost from leaving it off.
+- Bucket settings. Replaced SSTs are deleted for good, so disable GCS soft delete and add the
+  abort-incomplete-multipart rule on S3 and R2. See [Lifecycle rules](operations/object-store.md#lifecycle-rules).
 
 ## Caches
 
@@ -206,27 +205,28 @@ edges:
 | SST metadata (filters, indexes) | what every owned SST needs × N/(N−1) for a failover × 1.25 for compactions | `--meta-cache-mb` |
 | SST block cache | half of the cache pool left after metadata | `--block-cache-mb` |
 | Repo cache (MST paths in the workers) | the other half | `--repo-cache-mb`, `--cache-per-worker` |
-| Local disk cache | the node's budget ÷ the layout's shard count, floor 64 MiB; unset, 16 GiB per shard | `--cache-dir`, `--disk-cache-mb`, `--disk-cache-shard-mb` |
+| Local disk cache | the node's budget ÷ the layout's shard count, floor 64 MiB · 16 GiB per shard if no budget is set | `--cache-dir`, `--disk-cache-mb`, `--disk-cache-shard-mb` |
 
-The three memory caches are shared by every shard on the node and sized from its **memory budget**:
-the cgroup limit or physical RAM (`--memory-budget-mb` overrides). Fixed costs come off the top (a
-256 MiB baseline, 10% for small in-memory caches, firehose rings, export and import working sets,
-and max(15%, 512 MiB) of headroom for memtables and request bodies); the rest is the cache pool. A
-thread re-plans every 5 s as shards come and go: growth applies at once, shrinking only after the
-lower target has held 5 minutes, so a takeover and its handback don't thrash. `vlpds --memory-plan`
-prints the plan, and a node whose explicit sizes don't fit refuses to start. A 2.5 GiB tiny
-container gets a ~0.9 GiB pool; a 32 GB host ~17 GiB.
+The three memory caches are shared by every shard on the node. They're sized from its **memory
+budget**, which is the cgroup limit or physical RAM (`--memory-budget-mb` overrides it). Fixed costs
+come off the top: a 256 MiB baseline, 10% for small in-memory caches, firehose rings, export and
+import working sets, and max(15%, 512 MiB) of headroom for memtables and request bodies. The rest is
+the cache pool. A thread re-plans every 5 s as shards come and go. Growth applies at once, but
+shrinking waits until the lower target has held for 5 minutes, so a takeover and its handback don't
+thrash. `vlpds --memory-plan` prints the plan, and a node whose explicit sizes don't fit refuses to
+start. A 2.5 GiB tiny container gets a ~0.9 GiB pool, and a 32 GB host gets ~17 GiB.
 
-**The metadata cache must hold every owned SST's filter and index.** A point read checks a filter
-per sorted run and every L0, and SlateDB's filters cover a whole SST, so a miss fetches megabytes to
-answer one key. When the 100M-account capacity test outgrew it, bulk creation fell from 78k to 3k
-accounts/s. Budget ~29 MB per million accounts; `vlpds_sst_meta_bytes` is the encoded need and
-`vlpds_meta_cache_shortfall_bytes` the gap. Alerts: `VlpdsSstMetaCacheTooSmall`,
+The metadata cache has to hold every owned SST's filter and index. A point read checks a filter per
+sorted run and every L0, and SlateDB's filters cover a whole SST, so a miss fetches megabytes to
+answer one key. When the 100M-account capacity test outgrew the cache, bulk creation fell from 78k
+to 3k accounts/s. Budget ~29 MB per million accounts. `vlpds_sst_meta_bytes` is the encoded need and
+`vlpds_meta_cache_shortfall_bytes` is the gap. The alerts are `VlpdsSstMetaCacheTooSmall` and
 `VlpdsSstMetaRefetching`.
 
-The disk cache is divided over every shard of the layout, not just the owned ones, so it fits even
-when this node takes them all after a failover; in steady state an N-node cluster uses about 1/N of
-it. Put it on local NVMe. Flags in detail: [Memory budget and autosizing](operations/configuration.md#memory-budget-and-autosizing),
+The disk cache is divided over every shard of the layout, including the ones this node doesn't own,
+so it still fits when the node takes them all after a failover. In steady state, an N-node cluster
+uses about 1/N of it. Put it on local NVMe. For the flags in detail, see
+[Memory budget and autosizing](operations/configuration.md#memory-budget-and-autosizing) and
 [Disk cache](operations/configuration.md#disk-cache).
 
 ## Shard split and merge
@@ -245,35 +245,35 @@ edges:
   - { from: c2.r, to: gc.l70, dash: true }
 ```
 
-Because keys are slot-major, a shard's state is one key range, and SlateDB can clone a database
-restricted to a range by writing a new manifest that points at the parent's SSTs. A split or merge
-costs one manifest, whatever the shard's size.
+Since keys are slot-major, a shard's state is one key range. SlateDB can clone a database
+restricted to a range by writing a new manifest that points at the parent's SSTs. So a split or
+merge costs one manifest, whatever the shard's size.
 
 ```steps
 - title: Plan
-  body: "An admin call (or the split policy) CASes the layout to record the op and allocate the children's ids. One op at a time, cluster-wide."
+  body: "An admin call (or the split policy) CASes the layout to record the op and allocate the children's ids. Only one op runs at a time, cluster-wide."
 - title: Freeze
-  body: "Each parent's owner closes it like a handoff (barrier, checkpoint, close) and marks its assignment frozen. Its slots answer 503 and are retried until the flip."
+  body: "Each parent's owner closes it like a handoff (barrier, checkpoint, close) and marks its assignment frozen. Its slots answer 503 and get retried until the flip."
 - title: Clone
-  body: "The driver clones the children from the frozen parents and writes their fresh assignments. Idempotent: a crashed driver's successor re-runs it."
+  body: "The driver clones the children from the frozen parents and writes their fresh assignments. The step is idempotent, so a crashed driver's successor just re-runs it."
 - title: Flip
-  body: "A CAS of the layout to the new version, the commit point. The driver opens the children and nudges every peer; fair shares spread them later."
+  body: "The driver CASes the layout to the new version, and that's the commit point. Then it opens the children and nudges every peer. Fair shares spread them out later."
 ```
 
-No acked write is lost because a slot is applied by exactly one open shard at a time, and the
-clone is taken of a parent whose DB already holds every acked entry. Every step resumes from bucket
-state after a crash, and `vlpds admin reshard-abort` works until the flip.
+No acked write is lost, because a slot is applied by exactly one open shard at a time and the clone
+is taken of a parent whose DB already holds every acked entry. Every step resumes from bucket state
+after a crash, and `vlpds admin reshard-abort` works until the flip.
 
-Afterwards, three background parts reclaim the parent:
+Afterwards, the parent is reclaimed in the background:
 
-- **Forced detach.** A child still reading inherited SSTs `--forced-detach-after` (5 min) after it
-  opened gets one compaction that rewrites them, since size-tiered compaction might never touch a
-  quiet child's bottom run. SlateDB then drops the parent from the child's manifest
+- Forced detach. If a child is still reading inherited SSTs `--forced-detach-after` (5 min) after
+  it opened, it gets one compaction that rewrites them. Otherwise size-tiered compaction might never
+  touch a quiet child's bottom run. SlateDB then drops the parent from the child's manifest
   (`--slatedb-detach-interval`, 10 min).
-- **Dir GC.** The owner of slot 0 deletes retired `state/{id}/` directories once no live
-  checkpoint pins them and their manifest is older than `--reshard-gc-grace` (1 h), then their
-  `assign/` record. Idle passes cost one GET.
-- **Alerts.** `VlpdsRetiredStateGrowing`, `VlpdsRetiredStateReferenced`, `VlpdsForcedDetachFailing`,
+- Dir GC. The owner of slot 0 deletes retired `state/{id}/` directories once no live checkpoint
+  pins them and their manifest is older than `--reshard-gc-grace` (1 h). Then it deletes their
+  `assign/` record. An idle pass costs one GET.
+- Alerts. `VlpdsRetiredStateGrowing`, `VlpdsRetiredStateReferenced`, `VlpdsForcedDetachFailing`,
   `VlpdsReshardGcFailing`.
 
-When and how to split: [Shard split and merge](operations/scaling-and-clustering.md#shard-split-and-merge).
+For when and how to split, see [Shard split and merge](operations/scaling-and-clustering.md#shard-split-and-merge).
