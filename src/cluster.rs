@@ -907,8 +907,10 @@ impl Cluster {
     }
 
     /// Our lapsed lease: renew it by CAS and check our log isn't fenced.
-    /// False means fail-stop.
-    async fn try_revalidate(&self) -> bool {
+    /// The lease counts as valid again only once the check passed. False
+    /// means fail-stop.
+    async fn try_revalidate(&self, host: &Arc<dyn ShardHost>) -> bool {
+        let lapsed = *self.valid_until.read();
         let etag = self.lease_etag.read().clone();
         if let Err(e) = self.write_lease(if_match(etag)).await {
             let moved = e.downcast_ref::<object_store::Error>().is_some_and(lease_moved);
@@ -921,24 +923,40 @@ impl Cluster {
             tracing::warn!("revalidating our lapsed node lease failed (will retry): {e:#}");
             return true;
         }
-        self.count("list");
-        match self.bounded_any("fence-scan", crate::nodelog::first_free(&self.store, &self.log_id)).await {
-            Ok((_, false)) => {
+        let renewed = std::mem::replace(&mut *self.valid_until.write(), lapsed);
+        match self.bounded_any("fence-scan", self.own_log_fenced(host)).await {
+            Ok(false) => {
+                *self.valid_until.write() = renewed;
                 crate::metrics::LEASE_EVENTS.with_label_values(&["revalidated"]).inc();
                 tracing::warn!("node lease had lapsed (a pause?) but our log is unfenced: renewed it and carry on");
                 true
             }
-            Ok((_, true)) => {
+            Ok(true) => {
                 tracing::error!("node lease lapsed and our log is fenced: fail-stop");
                 false
             }
             Err(e) => {
-                // can't tell: give up the validity we just took
-                *self.valid_until.write() = Instant::now();
-                tracing::warn!("checking our log for a fence after revalidating: {e:#}");
+                tracing::warn!("checking our log for a fence after revalidating (will retry): {e:#}");
                 true
             }
         }
+    }
+
+    /// A peer's fence goes at our log's first hole, which is at or past
+    /// `durable_end` and at most `next_ordinal`: a few GETs, where the scan
+    /// LISTs the whole log (3 s and more on a slow bucket path).
+    async fn own_log_fenced(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<bool> {
+        let (from, to) = (host.durable_end(), host.next_ordinal());
+        if to < from || to - from > 64 {
+            self.count("list");
+            return Ok(crate::nodelog::first_free(&self.store, &self.log_id).await?.1);
+        }
+        let heads = futures::future::try_join_all((from..=to).map(|o| {
+            self.count("get");
+            crate::nodelog::read_head(&self.store, &self.log_id, o)
+        }))
+        .await?;
+        Ok(heads.iter().any(|h| matches!(h, crate::nodelog::Head::Fence)))
     }
 
     pub fn layout(&self) -> Arc<Layout> {
@@ -1555,7 +1573,7 @@ impl Cluster {
         if !self.lease_valid() {
             let lapsed_for = Instant::now().saturating_duration_since(*self.valid_until.read());
             if self.revalidate.load(Ordering::Acquire) && lapsed_for <= self.revalidate_window() {
-                if !self.try_revalidate().await {
+                if !self.try_revalidate(host).await {
                     crate::metrics::LEASE_RENEW_ERRORS.with_label_values(&["lapsed"]).inc();
                     host.lost();
                 }
