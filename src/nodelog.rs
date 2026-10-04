@@ -219,7 +219,7 @@ impl Watermark {
 
     /// Time-based, strictly increasing; the low byte is this node's writer id
     /// (unique among live nodes), so seqs are unique across logs.
-    fn assign(&self) -> i64 {
+    pub fn assign(&self) -> i64 {
         let mut w = self.inner.lock();
         let now = seq_floor(crate::tid::now_micros()) | self.writer as i64;
         let seq = now.max(w.0 + 256);
@@ -227,7 +227,7 @@ impl Watermark {
         seq
     }
 
-    fn set_durable(&self, seq: i64) {
+    pub fn set_durable(&self, seq: i64) {
         self.inner.lock().1 = seq;
     }
 
