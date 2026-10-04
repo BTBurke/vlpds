@@ -1,6 +1,7 @@
 import { StrictMode, Suspense, lazy, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
+import { SiteFooter } from './components/ui'
 import { usePath } from './lib/router'
 import { Landing } from './pages/Landing'
 import { AccountApp } from './pages/account/AccountApp'
@@ -25,16 +26,23 @@ function App() {
     if (area === 'docs') return // DocsApp titles each page
     document.title = area === 'account' ? 'Account · vlpds' : area === 'admin' ? 'Console · vlpds' : area === 'migrate' ? 'Move here · vlpds' : `${location.hostname} · vlpds`
   }, [area])
-  if (area === 'account') return <AccountApp path={path} />
-  if (area === 'admin') return <AdminApp path={path} />
-  if (area === 'migrate') return <Migrate />
-  if (area === 'docs')
-    return (
-      <Suspense fallback={null}>
-        <DocsApp path={path} />
-      </Suspense>
-    )
-  return <Landing />
+  if (area === 'landing') return <Landing />
+  return (
+    <>
+      {area === 'account' ? (
+        <AccountApp path={path} />
+      ) : area === 'admin' ? (
+        <AdminApp path={path} />
+      ) : area === 'migrate' ? (
+        <Migrate />
+      ) : (
+        <Suspense fallback={null}>
+          <DocsApp path={path} />
+        </Suspense>
+      )}
+      <SiteFooter />
+    </>
+  )
 }
 
 createRoot(document.getElementById('root')!).render(

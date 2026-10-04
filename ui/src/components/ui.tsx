@@ -264,6 +264,18 @@ export function Topbar({ where, children }: { where?: string; children?: ReactNo
   )
 }
 
+export const SOURCE_URL = 'https://github.com/jazware/vlpds'
+
+// The landing page has its own, fuller footer
+export function SiteFooter() {
+  return (
+    <footer className="footer">
+      <span>vlpds</span>
+      <a href={SOURCE_URL}>Source on GitHub</a>
+    </footer>
+  )
+}
+
 // ---------------------------------------------------------------- JSON
 
 type LinkFn = (s: string) => string | undefined

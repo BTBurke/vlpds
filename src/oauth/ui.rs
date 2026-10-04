@@ -120,7 +120,8 @@ fn page_with_script(title: &str, body: &str, script: &str) -> String {
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>{STYLE}</style></head><body><main>\
 <div class=\"brand\">{MARK}vlpds<span>account security</span></div>\
-<div class=\"card\"><div class=\"strata\"></div>{body}</div></main>{script}</body></html>",
+<div class=\"card\"><div class=\"strata\"></div>{body}</div>\
+<footer class=\"muted\"><a href=\"https://github.com/jazware/vlpds\">Source on GitHub</a></footer></main>{script}</body></html>",
         e(title)
     )
 }
