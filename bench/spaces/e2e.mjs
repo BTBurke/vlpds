@@ -7,7 +7,6 @@
 //
 //   node e2e.mjs [config ...]     configs: ref-ref vlpds-authority ref-authority vlpds-only
 //   (VLPDS_BIN=... starts vlpds; CLUSTER=1 for 3 nodes; see run.sh)
-import { createHash } from 'node:crypto'
 import { P256Keypair } from '@atproto/crypto'
 import { LtHash, createSpaceSigHeaders, verifyCommit, verifyRepoCarFull } from '@atproto/space'
 import { APP_SCOPE, Actor, RUN } from './lib/actor.mjs'
@@ -81,6 +80,26 @@ async function listAll(client, space, repo) {
 function adminAuth(hostKey) {
   const pw = HOSTS[hostKey].kind === 'vlpds' ? VLPDS_ADMIN_TOKEN : REF_ADMIN_PASSWORD
   return `Basic ${Buffer.from(`admin:${pw}`).toString('base64')}`
+}
+
+/** The LtHash digest of a repo's path -> cid map. */
+function ltOf(paths) {
+  const h = new LtHash()
+  for (const [p, cid] of paths) h.add(`${p}/${cid}`)
+  return h.digest()
+}
+
+/** rawXrpc as a vlpds OAuth account (DPoP), for methods the typed client has no lexicon for. */
+async function dpopXrpc(actor, nsid, opts = {}) {
+  const signer = actor.oauth.signer()
+  let r
+  for (let i = 0; i < 2; i++) {
+    const headers = new Headers()
+    await signer({ method: opts.method ?? 'GET', url: `${actor.base}/xrpc/${nsid}`, headers })
+    r = await rawXrpc(actor.base, nsid, { ...opts, headers: Object.fromEntries(headers) })
+    if (!(await signer.retry(r))) break
+  }
+  return r
 }
 
 /** A compact r||s P-256 signature as DER, and as its high-S twin. */
@@ -630,6 +649,174 @@ export async function runConfig(rep, cfg, env) {
     { needs: ['credential.read'] },
   )
 
+  // vlpds's record takedown of a space record ("option e"): the record leaves
+  // the signed view (getRepo verifies without it, the digest is the remaining
+  // records'), so a syncer converges on that view and back after reversal.
+  // A vlpds that hides the record but keeps it in the digest (the public-repo
+  // semantics) hasn't got option e yet: not impl., unless the hiding it does
+  // already have regressed.
+  await step(
+    'takedown.record',
+    async (check0) => {
+      let clean = true
+      const check = (ok, ...rest) => {
+        if (!ok) clean = false
+        return check0(ok, ...rest)
+      }
+      const w = S.W1
+      const bytes = Buffer.from(`taken-down blob ${SENTINEL} ${Date.now()}`)
+      const up = await w.client.com.atproto.repo.uploadBlob(bytes, { encoding: 'text/plain' })
+      const blobCid = up.data.blob.ref.toString()
+      S.spaceBlobs = [...(S.spaceBlobs ?? []), blobCid]
+      const rkey = `td-${SENTINEL}`
+      const made = await w.client.com.atproto.space.createRecord({ space: S.space, repo: w.did, collection: COLL, rkey, record: record(`taken down ${SENTINEL}`, { file: up.data.blob }) })
+      const path = `${COLL}/${rkey}`
+      truth.set(S.space, w.did, path, made.data.cid)
+      const full = new Map(truth.repo(S.space, w.did))
+      const without = new Map(full)
+      without.delete(path)
+
+      const syncer = new Syncer(`${cfg}-takedown`, S.space, S.R)
+      await syncer.sync()
+      if (syncer.lastError) throw syncer.lastError
+      check(!mapDiff(full, syncer.view(w.did)).length, 'a fresh syncer starts from the full view', mapDiff(full, syncer.view(w.did)).join(', '))
+
+      const set = (applied) =>
+        rawXrpc(w.base, 'com.atproto.admin.updateSubjectStatus', {
+          method: 'POST',
+          headers: { authorization: adminAuth(w.host) },
+          body: {
+            subject: { $type: 'com.atproto.repo.strongRef', uri: made.data.uri, cid: String(made.data.cid) },
+            takedown: { applied, ref: applied ? 'spaces-e2e-record' : undefined },
+          },
+        })
+      const on = await set(true)
+      if (!on.ok && /not supported|unsupported|not a space record/i.test(on.message ?? '')) {
+        throw new NotImplemented('space record takedown', `(${on.status} ${on.error}: ${on.message})`)
+      }
+      check(on.ok, 'admin takedown of a space record (strongRef with the 7-segment URI)', `${on.status} ${on.error} ${on.message}`)
+      if (!on.ok) return
+
+      const takenDownView = async (check, cl, head, blob) => {
+        check(hashEq(head.hash, ltOf(without)), "while taken down, getLatestCommit's hash is the LtHash of the remaining records")
+        check(await verifyCommit(head, { space: S.space, author: w.did, rev: head.rev }, await signingKey(w.did)), 'and that commit verifies')
+        check(!blob.ok && blob.error === 'BlobNotFound', "space.getBlob of the taken-down record's blob answers BlobNotFound", errName(blob))
+        const lb = await cl.com.atproto.space.listBlobs({ space: S.space, repo: w.did })
+        check(!lb.data.cids.includes(blobCid), 'space.listBlobs does not list it')
+        const car = await cl.com.atproto.space.getRepo({ space: S.space, repo: w.did })
+        const v = await verifyRepoCarFull([car.data], { space: S.space, author: w.did, didKey: await signingKey(w.did) })
+        const got = new Map(v.records.map((r) => [`${r.collection}/${r.rkey}`, r.cid.toString()]))
+        const d = mapDiff(without, got)
+        check(!d.length, 'getRepo verifies and holds every record but the taken-down one', d.join(', '))
+        check(!Object.keys(v.index).includes(path), "the getRepo index doesn't name it")
+        check(hashEq(v.commit.hash, ltOf(without)), "getRepo's commit hash is the remaining records' LtHash")
+        let opsHead
+        let cursor
+        do {
+          const page = await cl.com.atproto.space.listRepoOps({ space: S.space, repo: w.did, cursor, limit: 100 })
+          opsHead = page.data.commit ?? opsHead
+          cursor = page.data.cursor
+        } while (cursor && !opsHead)
+        check(opsHead && hashEq(opsHead.hash, head.hash), "listRepoOps's commit agrees with getLatestCommit")
+        const before = syncer.stats.fullPulls
+        await syncer.pull(w.did)
+        const sd = mapDiff(without, syncer.view(w.did))
+        check(!sd.length, 'the syncer converges on the view without the record', sd.join(', '))
+        check(hashEq(syncer.repos.get(w.did).hash.digest(), ltOf(without)), "and its running LtHash is that view's")
+        if (syncer.stats.fullPulls === before) rep.note(`${cfg}: the syncer reached the takedown view without a getRepo fallback`)
+      }
+
+      let optionE = false
+      try {
+        const cred = await credentialFor(S.R, S.space)
+        const cl = await cred.repoClient(w.did)
+        const g = await attempt(() => cl.com.atproto.space.getRecord({ space: S.space, repo: w.did, collection: COLL, rkey }))
+        check(!g.ok && g.error === 'RecordNotFound', 'getRecord of the taken-down record answers RecordNotFound', errName(g))
+        const listed = await listAll(cl, S.space, w.did)
+        check(!listed.has(path), 'listRecords omits it')
+        const ops = await cl.com.atproto.space.listRepoOps({ space: S.space, repo: w.did })
+        check(
+          !ops.data.ops.some((o) => `${o.collection}/${o.rkey}` === path && o.value !== undefined),
+          'listRepoOps carries no value for it',
+        )
+        const head = (await cl.com.atproto.space.getLatestCommit({ space: S.space, repo: w.did })).data.commit
+        const blob = await attempt(() => cl.com.atproto.space.getBlob({ space: S.space, repo: w.did, cid: blobCid }))
+        optionE = !hashEq(head.hash, ltOf(full))
+        if (optionE) await takenDownView(check, cl, head, blob)
+        else
+          rep.note(
+            `${cfg}: space record takedown keeps the record in the digest (public-repo semantics, option e not landed); space.getBlob of its blob ${blob.ok ? 'is still served' : `answers ${errName(blob)}`}`,
+          )
+      } finally {
+        const off = await set(false)
+        check(off.ok, 'reversal', `${off.status} ${off.error} ${off.message}`)
+      }
+      const cred = await credentialFor(S.R, S.space)
+      const cl = await cred.repoClient(w.did)
+      const g = await attempt(() => cl.com.atproto.space.getRecord({ space: S.space, repo: w.did, collection: COLL, rkey }))
+      check(g.ok && String(g.data.cid) === String(made.data.cid), 'after reversal getRecord returns it again', errName(g))
+      const listed = await listAll(cl, S.space, w.did)
+      check(!mapDiff(full, listed).length, 'and listRecords is the full view', mapDiff(full, listed).join(', '))
+      const head = (await cl.com.atproto.space.getLatestCommit({ space: S.space, repo: w.did })).data.commit
+      check(hashEq(head.hash, ltOf(full)), "getLatestCommit's hash is the full view's again")
+      if (!optionE) {
+        // what vlpds hides today passed; the record-free signed view isn't there yet
+        if (clean) throw new NotImplemented('space record takedown (option e)', '(the record stays in the signed digest)')
+        return
+      }
+      await syncer.pull(w.did)
+      const sd = mapDiff(full, syncer.view(w.did))
+      check(!sd.length, 'the syncer converges on the full view again', sd.join(', '))
+      check(!syncer.violations.length, 'no protocol violations', syncer.violations.join('; '))
+      const blob = await attempt(() => cl.com.atproto.space.getBlob({ space: S.space, repo: w.did, cid: blobCid }))
+      check(blob.ok && Buffer.from(blob.data).equals(bytes), 'space.getBlob serves its blob again')
+    },
+    { needs: ['credential.read'], skip: vl('W1') ? undefined : 'vlpds extension; W1 is not on vlpds' },
+  )
+
+  // Operators may read space records for ToS moderation: admin auth only,
+  // and audited. Not impl. until vlpds has an admin read of space records.
+  await step(
+    'operator.read',
+    async (check) => {
+      const w = S.W1
+      const rkey = `${SENTINEL}-rk`
+      const params = { space: S.space, repo: w.did, collection: COLL, rkey }
+      const auditOf = async () => {
+        const r = await rawXrpc(w.base, 'vlpds.admin.getAuditLog', { params: { did: w.did, limit: 100 }, headers: { authorization: adminAuth(w.host) } }).catch((e) => ({ ok: false, error: e.message }))
+        return r.ok ? r.json.entries : null
+      }
+      const before = await auditOf()
+      const r = await rawXrpc(w.base, 'vlpds.admin.getSpaceRecord', { params, headers: { authorization: adminAuth(w.host) } })
+      check(r.ok, 'admin auth reads a space record with vlpds.admin.getSpaceRecord', `${r.status} ${r.error} ${r.message}`)
+      if (r.ok) {
+        const want = truth.repo(S.space, w.did).get(`${COLL}/${rkey}`)
+        check(String(r.json.cid) === want && r.json.value?.text === 'sentinel rkey', 'it returns the current record', JSON.stringify(r.json).slice(0, 300))
+      }
+      const member = await dpopXrpc(w, 'vlpds.admin.getSpaceRecord', { params })
+      check(!member.ok, "a member's OAuth token cannot use it (its own record, even)", `${member.status} ${member.error}`)
+      const outsider = S.X.oauth
+        ? await dpopXrpc(S.X, 'vlpds.admin.getSpaceRecord', { params })
+        : await rawXrpc(w.base, 'vlpds.admin.getSpaceRecord', { params, headers: { authorization: `Bearer ${S.X.session.accessJwt}` } })
+      check(!outsider.ok, 'an unrelated account cannot use it', `${outsider.status} ${outsider.error}`)
+      const wrong = await rawXrpc(w.base, 'vlpds.admin.getSpaceRecord', { params, headers: { authorization: `Basic ${Buffer.from('admin:not-the-token').toString('base64')}` } })
+      check(!wrong.ok, 'a wrong admin password cannot use it', `${wrong.status} ${wrong.error}`)
+      const after = await auditOf()
+      if (!before || !after) {
+        rep.note(`${cfg}: vlpds.admin.getAuditLog unreadable; the operator read's audit entry is unchecked`)
+        return
+      }
+      const seen = new Set(before.map((e) => e.id))
+      const fresh = after.filter((e) => !seen.has(e.id))
+      check(
+        fresh.some((e) => JSON.stringify(e).includes(S.space) || JSON.stringify(e).includes(rkey)),
+        'the read left an audit entry naming the space record',
+        JSON.stringify(fresh).slice(0, 400),
+      )
+    },
+    { needs: ['records.write'], skip: vl('A') && vl('W1') ? undefined : 'vlpds extension; the space or W1 is not on vlpds' },
+  )
+
   await step(
     'app-password',
     async (check) => {
@@ -700,20 +887,12 @@ export async function runConfig(rep, cfg, env) {
     async (check) => {
       const w = S.W1
       const car = await w.client.com.atproto.space.getRepo({ space: S.space, repo: w.did })
-      const url = `${w.base}/xrpc/vlpds.space.importRepo`
-      let r
-      for (let i = 0; i < 2; i++) {
-        r = await rawXrpc(w.base, 'vlpds.space.importRepo', {
-          method: 'POST',
-          params: { space: S.space },
-          body: Buffer.from(car.data),
-          contentType: 'application/vnd.ipld.car',
-          headers: { authorization: `DPoP ${w.oauth.access}`, dpop: w.oauth.key.proof('POST', url, b64sha(w.oauth.access)) },
-        })
-        const nonce = r.headers.get('dpop-nonce')
-        if (nonce) w.oauth.key.nonce = nonce
-        if (!(r.status === 401 && /use_dpop_nonce/.test(r.headers.get('www-authenticate') ?? ''))) break
-      }
+      const r = await dpopXrpc(w, 'vlpds.space.importRepo', {
+        method: 'POST',
+        params: { space: S.space },
+        body: Buffer.from(car.data),
+        contentType: 'application/vnd.ipld.car',
+      })
       if (r.status === 404 || r.status === 501) throw new NotImplemented('vlpds.space.importRepo', `(${r.status})`)
       check(r.ok, 'vlpds.space.importRepo accepts the exported space repo', `${r.status} ${r.error} ${r.message}`)
       const after = await listAll(w.client, S.space, w.did)
@@ -779,8 +958,6 @@ export async function runConfig(rep, cfg, env) {
   for (const t of S.taps ?? []) t.close()
   return S
 }
-
-const b64sha = (s) => createHash('sha256').update(s).digest('base64url')
 
 /** A TID for a given wall time (microseconds since the epoch, base32-sortable). */
 export function tidAt(ms) {

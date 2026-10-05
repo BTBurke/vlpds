@@ -82,6 +82,18 @@ rule for `sync.getBlob`), revocation, `FutureRev` and stale notifies sent straig
 host, admin takedowns, app passwords, member removal, `vlpds.space.importRepo`, space deletion and
 the leak check.
 
+Two steps cover vlpds extensions and run only when the writer (and, for the second, the space) is on
+vlpds:
+
+- `takedown.record`: an admin takedown of one space record (`updateSubjectStatus` with a strongRef
+  to its 7-segment URI). While it's down, credential reads don't see it, `getRepo` verifies without
+  it, the commit hash is the LtHash of the remaining records, `listRepoOps` agrees, its blob answers
+  `BlobNotFound`, and a syncer converges on that view, then back to the full one after reversal.
+  A vlpds that hides the record but keeps it in the digest reports not impl.
+- `operator.read`: `vlpds.admin.getSpaceRecord` with admin auth reads a space record, a member's
+  OAuth token, an unrelated account and a wrong admin password can't, and the read shows up in
+  `vlpds.admin.getAuditLog`. Not impl. while the method is missing.
+
 Every step ends in one of these states:
 
 - pass
