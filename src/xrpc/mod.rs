@@ -13,6 +13,7 @@ mod ctl_load;
 mod email2fa;
 pub mod extract;
 mod feature_level;
+pub mod firehose_subs;
 mod identity;
 pub mod import_budget;
 mod import_stream;
@@ -324,6 +325,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(internal::routes())
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
+        .merge(firehose_subs::routes())
         .merge(moderation::routes())
         .merge(feature_level::routes())
         .merge(webui::routes())

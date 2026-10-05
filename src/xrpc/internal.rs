@@ -29,6 +29,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
         .route("/internal/v1/sync/listReposByCollection", get(sync_list_repos_by_collection))
         .merge(super::ratelimits::internal_routes())
+        .merge(super::firehose_subs::internal_routes())
 }
 
 /// For HA tests and ops.

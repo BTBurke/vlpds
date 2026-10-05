@@ -53,6 +53,7 @@ mod firehose_backfill;
 mod firehose_fanout;
 mod firehose_shards;
 mod firehose_startup;
+mod firehose_subscribers;
 mod formats;
 mod get_blocks_index;
 mod go_checker;

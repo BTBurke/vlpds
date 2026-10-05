@@ -821,6 +821,14 @@ impl Sub {
         Sub { ws, closed: false }
     }
 
+    pub async fn connect_as(url: &str, user_agent: &str) -> Sub {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.into_client_request().expect("ws request");
+        req.headers_mut().insert("user-agent", user_agent.parse().expect("user agent"));
+        let (ws, _) = tokio_tungstenite::connect_async(req).await.expect("ws connect");
+        Sub { ws, closed: false }
+    }
+
     /// Next decoded frame, or None on timeout / close.
     pub async fn next(&mut self, timeout: Duration) -> Option<Frame> {
         use futures::StreamExt;
