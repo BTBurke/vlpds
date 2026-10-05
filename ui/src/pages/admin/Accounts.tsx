@@ -14,6 +14,7 @@ export type AccountView = {
   indexedAt: string
   emailConfirmedAt?: string
   deactivatedAt?: string
+  deletionScheduledAt?: string
   invitesDisabled?: boolean
   invites?: InviteCode[]
   invitedBy?: InviteCode
@@ -167,7 +168,10 @@ export function AccountDetail({ did }: { did: string }) {
                   {subj.data?.takedown?.applied ? (
                     <Status kind="bad">Taken down</Status>
                   ) : a.deactivatedAt ? (
-                    <Status kind="warn">Deactivated {fmtTime(a.deactivatedAt)}</Status>
+                    <>
+                      <Status kind="warn">Deactivated {fmtTime(a.deactivatedAt)}</Status>{' '}
+                      {a.deletionScheduledAt && <Status kind="bad">Scheduled for deletion on {fmtTime(a.deletionScheduledAt)}</Status>}
+                    </>
                   ) : (
                     <Status kind="ok">Active</Status>
                   )}

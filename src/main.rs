@@ -566,6 +566,16 @@ struct Args {
     /// they are deleted.
     #[arg(long, env = "VLPDS_BLOB_QUARANTINE_DAYS", default_value_t = vlpds::server::DEFAULT_BLOB_QUARANTINE_DAYS)]
     blob_quarantine_days: u64,
+    /// Delete deactivated accounts whose `deleteAfter` (set by
+    /// deactivateAccount) has passed. false: keep them until deleted by
+    /// hand.
+    #[arg(long, env = "VLPDS_DELETE_AFTER", default_value_t = true, action = clap::ArgAction::Set)]
+    delete_after: bool,
+    /// Days an account stays deactivated before --delete-after deletes it,
+    /// whatever its `deleteAfter` says (OAuth clients may deactivate an
+    /// account, but deleting one takes an emailed token).
+    #[arg(long, env = "VLPDS_DELETE_AFTER_MIN_HOLD_DAYS", default_value_t = vlpds::server::DEFAULT_DELETE_AFTER_MIN_HOLD_DAYS)]
+    delete_after_min_hold_days: u64,
     /// PLC directory: did:plc resolution and, with PLC registration on,
     /// where new accounts' genesis ops and their updates are submitted (a
     /// local did-method-plc server works for e2e runs).
@@ -1387,6 +1397,9 @@ async fn run(args: Args) -> anyhow::Result<()> {
         blob_quota_bytes: args.blob_quota_gb.saturating_mul(1_000_000_000),
         blob_uploads_per_day: args.blob_uploads_per_day,
         blob_quarantine: Duration::from_secs(args.blob_quarantine_days.saturating_mul(86_400)),
+        delete_after_min_hold: args
+            .delete_after
+            .then(|| Duration::from_secs(args.delete_after_min_hold_days.saturating_mul(86_400))),
         plc_url: args.plc_url.clone(),
         plc: plc_config(&args)?,
         invite_required: args.invite_required,
@@ -1480,6 +1493,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     vlpds::xrpc::spawn_reserved_key_gc(app.clone());
     vlpds::oauth::gc::spawn_gc(app.clone());
     vlpds::xrpc::staged_import::spawn_import_gc(app.clone());
+    vlpds::xrpc::scheduled_deletion::spawn(app.clone());
     // Keep serving through a graceful shutdown: peers forward to us until
     // our handoff nudges reach them, and a forward we drop mid-request is
     // ambiguous to them (a client 503), while one we answer "not owned"

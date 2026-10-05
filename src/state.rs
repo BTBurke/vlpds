@@ -20,6 +20,7 @@
 //! T/                      -> the slot's account totals (crate::totals; keyed by slot alone)
 //! S/{did}                 -> repo counts (`RepoStats`: checkAccountStatus)
 //! G/{did}                 -> `ImportState`: a staged import, generations left to sweep
+//! D/{did}                 -> the account's `deleteAfter` (crate::xrpc::scheduled_deletion)
 //!
 //! `{gen}` is the repo's generation (`Account::repo_gen`, LEB128): importRepo
 //! stages the new repo under a fresh one and moves the account to it in one
@@ -108,6 +109,15 @@ pub fn handle_key(did: &str, handle: &str) -> Vec<u8> {
 pub fn repo_stats_key(did: &str) -> Vec<u8> {
     keyed(did, b"S/", &[did.as_bytes()])
 }
+
+/// Present while the account has a `deleteAfter`, written in the same
+/// batch as the account row, so the deletion sweep finds the scheduled
+/// accounts with one family scan instead of reading every account.
+pub fn delete_after_key(did: &str) -> Vec<u8> {
+    keyed(did, DELETE_AFTER_FAMILY, &[did.as_bytes()])
+}
+
+pub const DELETE_AFTER_FAMILY: &[u8] = b"D/";
 
 pub const HEAD_FAMILY: &[u8] = b"h/";
 pub const ACCOUNT_FAMILY: &[u8] = b"a/";

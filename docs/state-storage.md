@@ -85,6 +85,7 @@ notes:
 | `a/{did}` | account row | handle, email, password hash, status. The signing key is stored only wrapped under the KEK ([Keys and security](keys-security.md#secrets-at-rest)) |
 | `n/{handle}` | DID | handle lookup (in the DID's slot) |
 | `C/{collection}\0{did}` | empty | `listReposByCollection` |
+| `D/{did}` | `deleteAfter` | deactivated accounts scheduled for deletion ([Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion)) |
 | `p/{routing}\0{name}` | varies | private state: sessions, app passwords, email tokens, 2FA, OAuth, `sec/` security controls |
 | `T/` | totals | the slot's account counts (`vlpds_accounts`) |
 | **Shard** | | |

@@ -1184,6 +1184,9 @@ async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
     if let Some(s) = &a.status {
         out["status"] = json!(s);
     }
+    if let Some(t) = super::scheduled_deletion::scheduled_at(app, a) {
+        out["deletionScheduledAt"] = json!(t);
+    }
     if include_email {
         if let Some(e) = &a.email {
             out["email"] = json!(e);
@@ -2079,7 +2082,7 @@ pub fn set_delete_crash_hook(did: &str, h: Option<crate::lifecycle::CrashHook>) 
 
 /// What deleting `did` has to do. Err(AccountNotFound): no account and no
 /// deletion of one left unfinished.
-enum DeleteFrom {
+pub(super) enum DeleteFrom {
     /// The account row: the whole deletion.
     Account(Deleting),
     /// A deletion that got past the repo delete: the rest.
@@ -2089,7 +2092,7 @@ enum DeleteFrom {
     Unreadable,
 }
 
-async fn delete_from(app: &App, did: &str) -> XResult<DeleteFrom> {
+pub(super) async fn delete_from(app: &App, did: &str) -> XResult<DeleteFrom> {
     match super::internal::account_anywhere(app, did).await {
         Ok(a) => Ok(DeleteFrom::Account(Deleting { handle: a.handle, email: a.email, password_hash: a.password_hash })),
         Err(e) if e.error == "AccountNotFound" => match get_json::<Deleting>(app, did, DELETING).await? {
@@ -2104,25 +2107,56 @@ async fn delete_from(app: &App, did: &str) -> XResult<DeleteFrom> {
 /// claims, private state. Retry-safe: a failure anywhere leaves either the
 /// account or its `DELETING` row, and a retry finishes from it.
 pub(super) async fn delete_account_fully(app: &App, did: &str) -> XResult<()> {
-    finish_delete(app, did, delete_from(app, did).await?).await
+    finish_delete(app, did, delete_from(app, did).await?, "admin", None).await
 }
 
-async fn finish_delete(app: &App, did: &str, from: DeleteFrom) -> XResult<()> {
+fn count_deleted(reason: &str) {
+    crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
+    crate::metrics::ACCOUNT_DELETIONS.with_label_values(&[reason]).inc();
+}
+
+/// `reason` labels `vlpds_account_deletions_total`. `only_if` refuses the
+/// repo delete unless the account still passes it; a refused deletion
+/// leaves the account as it was.
+pub(super) async fn finish_delete(
+    app: &App,
+    did: &str,
+    from: DeleteFrom,
+    reason: &str,
+    only_if: Option<crate::worker::AccountCheck>,
+) -> XResult<()> {
     let intent = match from {
         DeleteFrom::Account(d) => {
             app.put_private(did, vec![pmut(did, DELETING, Some(to_json_bytes(&d)))]).await?;
-            revoke_all_sessions(app, did).await?;
-            app.account_op(did, AccountOp::Delete).await?;
-            crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
+            if only_if.is_some() {
+                // revoking first would sign out an account whose reactivation
+                // then wins the race and refuses the delete
+                if let Err(e) = app.account_op(did, AccountOp::Delete { only_if }).await {
+                    // a refusal applied nothing; other failures may have
+                    if e.error == "InvalidRequest" {
+                        app.put_private(did, vec![pmut(did, DELETING, None)]).await?;
+                    }
+                    return Err(e);
+                }
+                revoke_all_sessions(app, did).await?;
+            } else {
+                revoke_all_sessions(app, did).await?;
+                app.account_op(did, AccountOp::Delete { only_if: None }).await?;
+            }
+            count_deleted(reason);
             Some(d)
         }
         DeleteFrom::Unreadable => {
             revoke_all_sessions(app, did).await?;
-            app.account_op(did, AccountOp::Delete).await?;
-            crate::metrics::ACCOUNT_EVENTS.with_label_values(&["deleted"]).inc();
+            app.account_op(did, AccountOp::Delete { only_if: None }).await?;
+            count_deleted(reason);
             None
         }
-        DeleteFrom::Leftovers(d) => Some(d),
+        DeleteFrom::Leftovers(d) => {
+            // a guarded deletion revokes only after its repo delete
+            revoke_all_sessions(app, did).await?;
+            Some(d)
+        }
     };
     if DELETE_HOOKS.fires(did, "deleted") {
         return Err(XrpcError::internal(format!("deletion of {did} stopped after the repo delete (crash hook)")));
@@ -2178,7 +2212,7 @@ async fn delete_account(State(app): AppState, Json(inp): Json<DeleteAccountIn>) 
     if matches!(from, DeleteFrom::Account(_)) {
         assert_email_token(&app, &inp.did, "delete_account", &inp.token).await?;
     }
-    finish_delete(&app, &inp.did, from).await?;
+    finish_delete(&app, &inp.did, from, "user", None).await?;
     Ok(StatusCode::OK)
 }
 

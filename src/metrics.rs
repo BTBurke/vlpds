@@ -239,6 +239,7 @@ lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retentio
 
 lazy!(SIGNUPS: IntCounterVec = register_int_counter_vec!("vlpds_signups_total", "Sign-up attempts (createAccount, the OAuth sign-up form) by result: created, or refused for invite (missing or unusable invite code), email_policy (unsupported or disposable address), handle_policy (reserved or inappropriate handle), taken (handle or email already in use), invalid (other bad input), error (server-side failure)", &["result"]));
 lazy!(ACCOUNT_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_account_events_total", "Account lifecycle events: created (sign-ups and migrations in; not vlpds.admin.bulkCreate), deleted, deactivated, reactivated", &["event"]));
+lazy!(ACCOUNT_DELETIONS: IntCounterVec = register_int_counter_vec!("vlpds_account_deletions_total", "Accounts deleted, by reason: user (deleteAccount with an emailed token), admin (com.atproto.admin.deleteAccount), delete_after (the sweep, once a deactivated account's deleteAfter passed)", &["reason"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
 lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), blocked (taken-down or inactive account), rate_limited, error (server-side failure)", &["method", "result"]));
 lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), unknown_email (asked for an address with no account; answered the same), completed (a new password set with its token)", &["step"]));
@@ -502,6 +503,7 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&IMPORT_GROWTHS, &["granted", "waited", "rejected"]),
     (&SIGNUPS, &["created", "invite", "email_policy", "handle_policy", "taken", "invalid", "error"]),
     (&ACCOUNT_EVENTS, &["created", "deleted", "deactivated", "reactivated"]),
+    (&ACCOUNT_DELETIONS, &["user", "admin", "delete_after"]),
     (&PASSWORD_RESETS, &["requested", "unknown_email", "completed"]),
     (&INVITE_CODES, &["created", "used"]),
     (&BLOB_UPLOADS, &["image", "video", "other"]),

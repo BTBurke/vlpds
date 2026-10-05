@@ -3,7 +3,7 @@ title: Email and moderation
 section: Operations
 order: 112
 status: ready
-summary: "Outgoing mail (SMTP, branding, disposable-address policy), the moderation service, operator takedowns and cases, blob quarantine and upload quotas, earned invites and external handles."
+summary: "Outgoing mail (SMTP, branding, disposable-address policy), the moderation service, operator takedowns and cases, blob quarantine and upload quotas, scheduled deletion, earned invites and external handles."
 ---
 
 ```hero
@@ -275,6 +275,40 @@ An account migrating in uploads the blobs its imported repo references without c
 daily limit, and without being refused for size. Those blobs still count toward its bytes. An
 account that arrives over its quota is listed on the console's Quotas view until it's under (raise
 its quota, or ask the user to delete media). Its other uploads are held to both limits.
+
+## Scheduled deletion
+
+`deactivateAccount` takes an optional `deleteAfter`, a date the client suggests the server delete
+the deactivated account after. The reference PDS stores it and never acts on it. vlpds deletes the
+account once that date has passed and the account has been deactivated for at least
+`--delete-after-min-hold-days` (3), whichever is later. `--delete-after false` keeps every account
+until it's deleted by hand.
+
+The hold is there since an OAuth app with the account-status scope can deactivate an account, but
+deleting one takes the password and an emailed token. With a `deleteAfter` in the past, the app
+could otherwise delete the account on the next sweep. Within the hold, the user can sign in with
+their password and reactivate, and that clears `deleteAfter`. So does an admin reactivation, and
+an admin deactivation (`updateSubjectStatus`) replaces it with none.
+
+The deletion is the same as `deleteAccount`: the repo, blobs, a `#account` event with status
+`deleted`, sessions, and the handle and email claims. Like `deleteAccount`, it doesn't touch the
+PLC entry. That's what an account that moved away needs, since the DID now points at its new host.
+
+| Account | Deleted? |
+|---|---|
+| Deactivated, `deleteAfter` and the hold both passed | Yes, on the next sweep |
+| Deactivated, `deleteAfter` in the future | On the first sweep after it |
+| Reactivated | No, `deleteAfter` is cleared |
+| Taken down or suspended | No. Moderation holds it, and the sweep picks it up again only once the takedown is reversed and it's still deactivated |
+
+Each node sweeps the shards it owns every 10 minutes and deletes at most 100 accounts a pass. It
+finds them through a `D/{did}` row the account's worker writes with the account, so a pass reads
+only the scheduled accounts, never every account. A shard move carries the rows along, and the new
+owner's sweep takes over. The worker refuses the delete unless the account is still due, so a
+reactivation that lands mid-sweep wins. A deletion that stops partway (a crash, a shard move) is
+finished by the next pass. `getSession` and the console's account page show
+`deletionScheduledAt`, and `vlpds_account_deletions_total{reason="delete_after"}` counts the
+deletions (`user` and `admin` count the others).
 
 ## Handle policy
 
