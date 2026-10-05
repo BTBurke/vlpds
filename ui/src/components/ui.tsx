@@ -65,17 +65,25 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   )
 }
 
-export function CopyText({ text, display, label, mono = true }: { text: string; display?: ReactNode; label?: string; mono?: boolean }) {
+function useCopy(text: string) {
   const [done, setDone] = useState(false)
+  const timer = useRef<number>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(text)
       setDone(true)
-      setTimeout(() => setDone(false), 1400)
+      clearTimeout(timer.current)
+      timer.current = window.setTimeout(() => setDone(false), 1400)
     } catch {
       /* clipboard blocked */
     }
   }
+  return [done, copy] as const
+}
+
+export function CopyText({ text, display, label, mono = true }: { text: string; display?: ReactNode; label?: string; mono?: boolean }) {
+  const [done, copy] = useCopy(text)
   return (
     <span className="copy">
       <span className={mono ? 'mono' : ''}>{display ?? text}</span>
@@ -83,6 +91,44 @@ export function CopyText({ text, display, label, mono = true }: { text: string; 
         {done ? <I.Check /> : <I.Copy />}
       </button>
     </span>
+  )
+}
+
+/**
+ * CopyText for tight spots (one-line table cells): the value itself is the button, so it keeps the
+ * cell's truncation. `title` is the hover text, usually the full value when it's cut short.
+ * Clicks don't reach the row, which may have its own click handler.
+ */
+export function CopyValue({
+  text,
+  display,
+  label,
+  title,
+  mono = true,
+  className,
+}: {
+  text: string
+  display?: ReactNode
+  label?: string
+  title?: string
+  mono?: boolean
+  className?: string
+}) {
+  const [done, copy] = useCopy(text)
+  return (
+    <button
+      type="button"
+      className={`copyval${mono ? ' mono' : ''}${done ? ' done' : ''}${className ? ` ${className}` : ''}`}
+      onClick={(e) => {
+        e.stopPropagation()
+        copy()
+      }}
+      aria-label={done ? 'Copied' : (label ?? `Copy ${text}`)}
+      title={done ? 'Copied' : (title ?? 'Click to copy')}
+    >
+      <span className="v">{display ?? text}</span>
+      {done ? <I.Check /> : <I.Copy />}
+    </button>
   )
 }
 

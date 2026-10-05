@@ -1,5 +1,5 @@
 import { useEffect, useState, type JSX } from 'react'
-import { Confirm, CopyText, Empty, ErrorNotice, Field, JsonView, Loading, Notice, PageHead, Panel, PartialNotice, partialOf, Spinner, Status, type PartialResult } from '../../components/ui'
+import { Confirm, CopyText, CopyValue, Empty, ErrorNotice, Field, JsonView, Loading, Notice, PageHead, Panel, PartialNotice, partialOf, Spinner, Status, type PartialResult } from '../../components/ui'
 import { fmtTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { Link, navigate } from '../../lib/router'
@@ -97,15 +97,17 @@ export function Accounts() {
                 {rows.map((a) => {
                   const to = `/admin/accounts/${encodeURIComponent(a.did)}`
                   return (
-                    <tr key={a.did} className="link" onClick={() => navigate(to)}>
+                    <tr key={a.did}>
                       <td>
-                        <Link to={to} onClick={(e) => e.stopPropagation()}>
+                        <Link to={to}>
                           <b>@{a.handle}</b>
                         </Link>
                       </td>
-                      <td className="mono small">{a.did}</td>
+                      <td className="small">
+                        <CopyValue text={a.did} label={`Copy DID ${a.did}`} />
+                      </td>
                       <td className="break">
-                        {a.email ?? <span className="muted">—</span>}
+                        {a.email ? <CopyValue text={a.email} label={`Copy email ${a.email}`} mono={false} /> : <span className="muted">—</span>}
                         {a.email && !a.emailConfirmedAt && <span className="muted small"> (unconfirmed)</span>}
                       </td>
                       <td className="nowrap">{fmtTime(a.indexedAt)}</td>
@@ -308,7 +310,7 @@ function Invites({ did, a, onDone }: { did: string; a: AccountView; onDone: () =
               <tr key={c.code}>
                 <td className="mono small">{c.code}</td>
                 <td className="num">
-                  {c.uses.length}/{c.available + c.uses.length} used
+                  {c.uses.length}/{c.available} used
                 </td>
                 <td>{c.disabled && <span className="pill danger">disabled</span>}</td>
               </tr>

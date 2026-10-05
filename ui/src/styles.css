@@ -653,6 +653,8 @@ table.data.compact .pill {
 }
 .table-wrap {
   overflow-x: auto;
+  /* contains .sr-only header text, which would otherwise widen the page from the last column */
+  position: relative;
 }
 
 .copy {
@@ -682,11 +684,80 @@ table.data.compact .pill {
   width: 14px;
   height: 14px;
 }
+.copyval {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  min-width: 0;
+  text-align: left;
+  vertical-align: bottom;
+  cursor: copy;
+  border-radius: 3px;
+}
+.copyval.mono {
+  font-family: var(--mono);
+}
+.copyval.muted {
+  color: var(--ink2);
+}
+.copyval .v {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.copyval:hover .v {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+/* always laid out, so showing it on hover doesn't shift the line */
+.copyval svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  color: var(--ink3);
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.copyval:hover svg,
+.copyval:focus-visible svg {
+  opacity: 1;
+}
+.copyval.done svg {
+  opacity: 1;
+  color: var(--ok);
+}
 .invite-links {
-  display: flex;
+  display: inline-flex;
   flex-wrap: wrap;
   gap: 0 14px;
   color: var(--ink2);
+}
+table.data.invites .invite-links {
+  flex-wrap: nowrap;
+}
+/* DIDs cut to their method and the start of the id; the full DID is the tooltip */
+table.data.invites a.did {
+  display: inline-block;
+  max-width: 17ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+table.data.invites tr.invite-uses td {
+  white-space: normal;
+  border-top: 0;
+  padding-top: 0;
+}
+table.data.invites tr.invite-uses a.did {
+  max-width: none;
+  margin-right: 14px;
 }
 
 .empty {
@@ -1474,8 +1545,9 @@ dialog.modal h2 {
   align-items: start;
 }
 @media (max-width: 1100px) {
+  /* minmax(0, …): the nodes table scrolls in its panel instead of widening the column */
   .cluster-grid {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .cluster-grid .shardmap {
     max-width: 560px;
@@ -2833,6 +2905,11 @@ table.data.firehose-subs td.ua {
   max-width: 260px;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+/* the value inside truncates (.copyval .v), not the button */
+table.data.firehose-subs td.ua .copyval,
+table.data.firehose-subs td.ptr .copyval.trunc {
+  display: inline-flex;
 }
 /* AS number, a gap, then the name; truncated names keep the full text in the cell's tooltip */
 table.data.firehose-subs td.net a {

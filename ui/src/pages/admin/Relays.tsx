@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner, Status } from '../../components/ui'
+import { CopyValue, Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner, Status } from '../../components/ui'
 import { fmtTime, relTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
@@ -125,8 +125,8 @@ export function Relays() {
               <tbody>
                 {d.relays.map((r) => (
                   <tr key={r.relay}>
-                    <td className="mono" title={r.url}>
-                      {r.relay}
+                    <td>
+                      <CopyValue text={r.relay} label={`Copy relay ${r.relay}`} title={r.url === r.relay ? undefined : `${r.url} (click to copy ${r.relay})`} />
                     </td>
                     <td className="nowrap">
                       <Result s={r.status} />
