@@ -60,5 +60,6 @@ pub mod tid;
 pub mod totals;
 pub mod totp;
 pub mod version;
+pub mod webauthn;
 pub mod worker;
 pub mod xrpc;
