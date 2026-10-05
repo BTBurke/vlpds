@@ -334,10 +334,13 @@ mod tests {
     }
 
     /// ring and p256 agree on valid, high-S, tampered and out-of-range
-    /// signatures.
+    /// signatures (r or s zero, n or above), and only the first two verify.
     #[test]
     fn verify_es256_matches_p256() {
         use p256::elliptic_curve::ops::Reduce;
+        // the P-256 group order
+        let n = hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551").unwrap();
+        let n_plus_1 = hex::decode("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632552").unwrap();
         let sk = SigningKey::generate();
         let vk = *sk.verifying_key();
         let jwt = |input: &str, sig: Vec<u8>| DecodedJwt {
@@ -359,19 +362,24 @@ mod tests {
             flipped[i % 64] ^= 1;
             let zero_s = [&b[..32], &[0u8; 32][..]].concat();
             let big_r = [&[0xffu8; 32][..], &b[32..]].concat();
+            let with_s = |s: &[u8]| [&b[..32], s].concat();
+            let with_r = |r: &[u8]| [r, &b[32..]].concat();
             for (what, sig, other) in [
                 ("valid", b.clone(), &input),
                 ("high-S", high, &input),
                 ("flipped", flipped, &input),
                 ("zero s", zero_s, &input),
                 ("r over n", big_r, &input),
+                ("s = n", with_s(&n), &input),
+                ("s = n + 1", with_s(&n_plus_1), &input),
+                ("s = 2^256 - 1", with_s(&[0xff; 32]), &input),
+                ("r = 0", with_r(&[0; 32]), &input),
+                ("r = n", with_r(&n), &input),
                 ("other input", b.clone(), &format!("{input}x")),
             ] {
                 let p256_ok = Signature::from_slice(&sig).is_ok_and(|s| vk.verify(other.as_bytes(), &s).is_ok());
                 assert_eq!(jwt(other, sig).verify_es256(&vk), p256_ok, "{what} #{i}");
-                if what == "valid" || what == "high-S" {
-                    assert!(p256_ok, "{what} #{i}");
-                }
+                assert_eq!(p256_ok, what == "valid" || what == "high-S", "{what} #{i}");
             }
         }
     }
