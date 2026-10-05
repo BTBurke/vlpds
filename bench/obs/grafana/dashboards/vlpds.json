@@ -3295,8 +3295,8 @@
   {
    "type": "stat",
    "id": 30,
-   "title": "Relays connected",
-   "description": "Relays and other services following your PDS's live update stream (the 'firehose'). 0 means the network isn't hearing about new posts: check requestCrawl below.",
+   "title": "Firehose subscribers",
+   "description": "Relays and other services following your PDS's live update stream (the 'firehose'), on every server. 0 means the network isn't hearing about new posts: check requestCrawl below. The operator console's Firehose page lists who they are.",
    "datasource": {
     "type": "prometheus",
     "uid": "${ds_prometheus}"
@@ -3734,13 +3734,399 @@
    }
   },
   {
-   "type": "row",
+   "type": "timeseries",
    "id": 36,
+   "title": "Firehose subscribers over time",
+   "description": "Relays and other services connected to the firehose, and how many of them are reading old updates from storage (they asked to start from a point in the past) before they get new ones live.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prometheus}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 73,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum(vlpds_firehose_subscribers{cluster=~\"$cluster\"})",
+     "legendFormat": "connected",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum(vlpds_firehose_backfills{cluster=~\"$cluster\", state=\"running\"})",
+     "legendFormat": "catching up on old updates",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never",
+      "spanNulls": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisSoftMin": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "noValue": "none"
+    },
+    "overrides": []
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 37,
+   "title": "Firehose connects, disconnects and refusals, per hour",
+   "description": "Firehose connections per hour by how they started and how they ended. A few drops a day are normal (relays restart and reconnect). The same relay dropped for falling behind again and again can't keep up.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prometheus}"
+   },
+   "gridPos": {
+    "x": 12,
+    "y": 73,
+    "w": 12,
+    "h": 7
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum by (mode) (increase(vlpds_firehose_connections_total{cluster=~\"$cluster\"}[1h])) > 0",
+     "legendFormat": "connected {{mode}}",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum by (reason) (increase(vlpds_firehose_disconnects_total{cluster=~\"$cluster\"}[1h])) > 0",
+     "legendFormat": "disconnected {{reason}}",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum by (reason) (increase(vlpds_firehose_rejected_total{cluster=~\"$cluster\"}[1h])) > 0",
+     "legendFormat": "refused {{reason}}",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never",
+      "spanNulls": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisSoftMin": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "noValue": "none"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "connected live"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "connected (new updates only)"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "connected backfill"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "connected (from a point in the past)"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected client_gone"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "disconnected: connection dropped"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected client_closed"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "disconnected: the subscriber closed it"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected too_slow"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "dropped: fell too far behind"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected write_stalled"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "dropped: stopped reading"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected future_cursor"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "refused: asked to start in the future"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected backfill_failed"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "dropped: reading old updates failed"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected kicked"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "disconnected by the server"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "disconnected shutdown"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "disconnected: server shutting down"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "refused per_ip"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "refused: too many connections from one address"
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 38,
+   "title": "Firehose: events/s per connection vs this PDS",
+   "description": "Updates per second each connection gets (5 min average), against the updates your PDS puts on its firehose (the bold line). A connection that's keeping up sits on the bold line. One below it for long is falling behind. Lines are named relay (when it's one you list in --crawlers), address and connection number (#conn, as the console's Firehose page shows it). Past 1,000 connections on a server the rest are one line, other.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prometheus}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 80,
+    "w": 24,
+    "h": 9
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "max(rate(vlpds_firehose_events_total{cluster=~\"$cluster\"}[5m]))",
+     "legendFormat": "this PDS",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum by (instance, relay, ip, conn) (rate(vlpds_firehose_subscriber_events_total{cluster=~\"$cluster\"}[5m]))",
+     "legendFormat": "{{relay}} {{ip}} #{{conn}}",
+     "range": true,
+     "refId": "B"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "ops",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never",
+      "spanNulls": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisSoftMin": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "noValue": "no subscribers"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "this PDS"
+      },
+      "properties": [
+       {
+        "id": "custom.lineWidth",
+        "value": 3
+       },
+       {
+        "id": "custom.fillOpacity",
+        "value": 0
+       },
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "text"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "table",
+     "placement": "right",
+     "showLegend": true,
+     "calcs": [
+      "mean",
+      "max"
+     ],
+     "sortBy": "Max",
+     "sortDesc": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "row",
+   "id": 39,
    "title": "Moderation and safety",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 73,
+    "y": 89,
     "w": 24,
     "h": 1
    },
@@ -3748,7 +4134,7 @@
   },
   {
    "type": "stat",
-   "id": 37,
+   "id": 40,
    "title": "Reports and takedowns (24 h)",
    "description": "Reports your users filed (on posts, accounts...) and passed to the moderation service (failed: the service refused or couldn't be reached), and takedowns applied by you or your moderation service (com.atproto.admin.updateSubjectStatus), and reversals.",
    "datasource": {
@@ -3757,7 +4143,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 74,
+    "y": 90,
     "w": 12,
     "h": 4
    },
@@ -3877,7 +4263,7 @@
   },
   {
    "type": "stat",
-   "id": 38,
+   "id": 41,
    "title": "Abusive traffic blocked (24 h)",
    "description": "Requests refused for coming too fast (rate limits), plus connections refused from one address opening too many, plus one account flooding the Bluesky app proxy.",
    "datasource": {
@@ -3886,7 +4272,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 74,
+    "y": 90,
     "w": 6,
     "h": 4
    },
@@ -3941,7 +4327,7 @@
   },
   {
    "type": "stat",
-   "id": 39,
+   "id": 42,
    "title": "Emails (24 h)",
    "description": "Emails sent (address confirmation, password reset, sign-in codes, account deletion...) and ones that could not be delivered. Failures mean users can't confirm, reset or sign in with 2FA codes.",
    "datasource": {
@@ -3950,7 +4336,7 @@
    },
    "gridPos": {
     "x": 18,
-    "y": 74,
+    "y": 90,
     "w": 6,
     "h": 4
    },
@@ -4040,7 +4426,7 @@
   },
   {
    "type": "timeseries",
-   "id": 40,
+   "id": 43,
    "title": "Blocked and refused, per hour",
    "description": "Abusive or excessive traffic your PDS turned away, each point counting the hour before it. Sign-ups blocked by policy: invite (no or bad invite code), email_policy (disposable email), handle_policy (reserved or offensive handle).",
    "datasource": {
@@ -4049,7 +4435,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 78,
+    "y": 94,
     "w": 12,
     "h": 8
    },
@@ -4141,7 +4527,7 @@
   },
   {
    "type": "timeseries",
-   "id": 41,
+   "id": 44,
    "title": "Emails per hour",
    "description": "Emails sent by kind, and ones that failed or were dropped (red), each point counting the hour before it.",
    "datasource": {
@@ -4150,7 +4536,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 78,
+    "y": 94,
     "w": 12,
     "h": 8
    },
@@ -4312,12 +4698,12 @@
   },
   {
    "type": "row",
-   "id": 42,
+   "id": 45,
    "title": "Resources and cost",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 86,
+    "y": 102,
     "w": 24,
     "h": 1
    },
@@ -4325,7 +4711,7 @@
   },
   {
    "type": "stat",
-   "id": 43,
+   "id": 46,
    "title": "Busiest server: CPU and memory in use",
    "description": "On the busiest server: CPU used out of the cores available to vlpds (5 min; sustained over 70% leaves little headroom for spikes), and memory used out of what the server or its container allows (85% and 95% are the memory alerts; at 100% the server is killed and restarts).",
    "datasource": {
@@ -4334,7 +4720,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 87,
+    "y": 103,
     "w": 8,
     "h": 4
    },
@@ -4437,7 +4823,7 @@
   },
   {
    "type": "stat",
-   "id": 44,
+   "id": 47,
    "title": "Disk cache",
    "description": "Local disk cache (--cache-dir) used out of its size limit (the cache's own count of its files). It saves storage requests; full is normal (oldest entries make room).",
    "datasource": {
@@ -4446,7 +4832,7 @@
    },
    "gridPos": {
     "x": 8,
-    "y": 87,
+    "y": 103,
     "w": 8,
     "h": 4
    },
@@ -4525,7 +4911,7 @@
   },
   {
    "type": "stat",
-   "id": 45,
+   "id": 48,
    "title": "Estimated storage request bill",
    "description": "ESTIMATE: object-storage request charges for a month at the last hour's request rate, at the Class A (writes, lists) and Class B (reads) prices picked at the top (S3 or R2 list prices; R2's free tier and S3's free deletes are not subtracted, so the real bill can be lower). Storage space and data transfer are not included. A one-account PDS is about $2-5/month on S3 and $0 on R2.",
    "datasource": {
@@ -4534,7 +4920,7 @@
    },
    "gridPos": {
     "x": 16,
-    "y": 87,
+    "y": 103,
     "w": 8,
     "h": 4
    },
@@ -4590,7 +4976,7 @@
   },
   {
    "type": "timeseries",
-   "id": 46,
+   "id": 49,
    "title": "CPU and memory by server",
    "description": "Per server: CPU used out of its available cores, and memory used out of its limit.",
    "datasource": {
@@ -4599,7 +4985,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 91,
+    "y": 107,
     "w": 12,
     "h": 8
    },
@@ -4677,7 +5063,7 @@
   },
   {
    "type": "timeseries",
-   "id": 47,
+   "id": 50,
    "title": "Storage requests and estimated monthly cost",
    "description": "Object-store requests per second by price class (left) and what the last hour's rate would cost over a month (right, dashed; an estimate, see the bill stat).",
    "datasource": {
@@ -4686,7 +5072,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 91,
+    "y": 107,
     "w": 12,
     "h": 8
    },
@@ -4810,12 +5196,12 @@
   },
   {
    "type": "row",
-   "id": 48,
+   "id": 51,
    "title": "Alerts",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 99,
+    "y": 115,
     "w": 24,
     "h": 1
    },
@@ -4823,7 +5209,7 @@
   },
   {
    "type": "table",
-   "id": 49,
+   "id": 52,
    "title": "Alerts firing now",
    "description": "Alerts from the PDS's alert rules (ops/alerts.yml), in plain words. 'urgent' (page) means users are or soon will be affected; 'soon' (ticket) means look at it today. Empty = nothing firing, or the alert rules aren't loaded. Each alert's fix is in the runbook. Needs ops/alerts.yml loaded in the rule evaluator that writes ALERTS to this Prometheus; without it this stays empty ([monitoring docs](https://github.com/jazware/vlpds/blob/main/docs/operations/monitoring.md)).",
    "datasource": {
@@ -4832,7 +5218,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 100,
+    "y": 116,
     "w": 16,
     "h": 6
    },
@@ -5194,11 +5580,11 @@
   },
   {
    "type": "text",
-   "id": 50,
+   "id": 53,
    "title": "Digging deeper",
    "gridPos": {
     "x": 16,
-    "y": 100,
+    "y": 116,
     "w": 8,
     "h": 6
    },

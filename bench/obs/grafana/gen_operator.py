@@ -384,10 +384,11 @@ def build(g):
 
     # ================================================================ network
     row("Federation: relays, directory, identity", collapsed=False)
-    stat("Relays connected", f"sum(vlpds_firehose_subscribers{{{C}}}) or (0 * count({UP} == 1))", w=5, h=4,
+    stat("Firehose subscribers", f"sum(vlpds_firehose_subscribers{{{C}}}) or (0 * count({UP} == 1))", w=5, h=4,
          steps=[(1, "green")], spark=True, no_value="no data",
-         desc="Relays and other services following your PDS's live update stream (the 'firehose'). "
-              "0 means the network isn't hearing about new posts: check requestCrawl below.")
+         desc="Relays and other services following your PDS's live update stream (the 'firehose'), on every server. "
+              "0 means the network isn't hearing about new posts: check requestCrawl below. "
+              "The operator console's Firehose page lists who they are.")
     D.panels[-1]["fieldConfig"]["defaults"]["thresholds"] = g.thresholds([(1, "green")], base="orange")
     stat("Relays dropped for falling behind (24 h)", day("vlpds_firehose_disconnects_total", 'reason="too_slow"'),
          w=5, h=4, steps=[(1, "orange")], spark=False,
@@ -415,6 +416,45 @@ def build(g):
             "change), PLC directory calls by result (rejected / unavailable are failures), custom-domain handle lookups, "
             "the account page's checks of a new handle (available / taken for a name here; verified / unverified for "
             "the user's own domain), and requestCrawl calls to relays (rejected / failed are failures).")
+    ts("Firehose subscribers over time",
+       [t(f"sum(vlpds_firehose_subscribers{{{C}}})", "connected"),
+        t(f'sum(vlpds_firehose_backfills{{{C}, state="running"}})', "catching up on old updates")],
+       "short", w=12, h=7, empty="none",
+       desc="Relays and other services connected to the firehose, and how many of them are reading old "
+            "updates from storage (they asked to start from a point in the past) before they get new ones live.")
+    ts("Firehose connects, disconnects and refusals, per hour",
+       [t(inc("vlpds_firehose_connections_total", by="mode") + " > 0", "connected {{mode}}"),
+        t(inc("vlpds_firehose_disconnects_total", by="reason") + " > 0", "disconnected {{reason}}"),
+        t(inc("vlpds_firehose_rejected_total", by="reason") + " > 0", "refused {{reason}}")],
+       "short", w=12, h=7, empty="none",
+       overrides=names({
+           "connected live": "connected (new updates only)",
+           "connected backfill": "connected (from a point in the past)",
+           "disconnected client_gone": "disconnected: connection dropped",
+           "disconnected client_closed": "disconnected: the subscriber closed it",
+           "disconnected too_slow": "dropped: fell too far behind",
+           "disconnected write_stalled": "dropped: stopped reading",
+           "disconnected future_cursor": "refused: asked to start in the future",
+           "disconnected backfill_failed": "dropped: reading old updates failed",
+           "disconnected kicked": "disconnected by the server",
+           "disconnected shutdown": "disconnected: server shutting down",
+           "refused per_ip": "refused: too many connections from one address",
+       }),
+       desc="Firehose connections per hour by how they started and how they ended. A few drops a day are normal "
+            "(relays restart and reconnect). The same relay dropped for falling behind again and again can't keep up.")
+    ts("Firehose: events/s per connection vs this PDS",
+       [t(f"max(rate(vlpds_firehose_events_total{{{C}}}[5m]))", "this PDS"),
+        t(f"sum by (instance, relay, ip, conn) (rate(vlpds_firehose_subscriber_events_total{{{C}}}[5m]))",
+          "{{relay}} {{ip}} #{{conn}}")],
+       "ops", w=24, h=9, legend="table", empty="no subscribers",
+       overrides=[{"matcher": {"id": "byName", "options": "this PDS"},
+                   "properties": [{"id": "custom.lineWidth", "value": 3}, {"id": "custom.fillOpacity", "value": 0},
+                                  {"id": "color", "value": {"mode": "fixed", "fixedColor": "text"}}]}],
+       desc="Updates per second each connection gets (5 min average), against the updates your PDS puts on its "
+            "firehose (the bold line). A connection that's keeping up sits on the bold line. One below it for long is "
+            "falling behind. Lines are named relay (when it's one you list in --crawlers), address and connection "
+            "number (#conn, as the console's Firehose page shows it). Past 1,000 connections on a server the rest "
+            "are one line, other.")
 
     # ================================================================ safety
     row("Moderation and safety", collapsed=False)
