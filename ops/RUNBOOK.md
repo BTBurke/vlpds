@@ -1595,6 +1595,79 @@ certificate` (client) warn logs name the address and reason.
 and `--advertise-url` host, and compare their `ca.crt` files. All nodes must
 trust the CA every node's cert comes from (both CAs, mid CA rotation).
 
+### VlpdsScheduledDeletionFailing
+
+**Means:** at least 3 of a node's scheduled-deletion sweeps (every 10 min) in
+the last hour failed, for an hour. A sweep deletes the deactivated accounts on
+the node's shards whose `deleteAfter` and minimum hold have passed. It fails
+when a shard's `D/` scan fails, or when an account's deletion does
+(`vlpds_scheduled_deletion_accounts_total{result="failed"}`). The account is
+kept and retried every sweep, so a lasting failure is usually one account.
+
+**Confirm:** the node's warnings `scheduled deletion failed (retried next
+sweep)` (with the DID and error) or `scheduled deletions: scan failed` (with
+the shard). The internals dashboard's Accounts row shows the sweeps by result.
+
+**Do:**
+- Store errors or timeouts in the error: fix the store path as for any store
+  trouble. The sweep catches up by itself.
+- `account row unreadable`: the account row doesn't decode. Look at it with
+  `vlpds admin account info DID`. Deleting it by hand
+  (`com.atproto.admin.deleteAccount`) deletes it fully, and the next sweep
+  drops its `D/` row.
+- An error that names the account's private rows or handle: a deletion that
+  stopped partway. `com.atproto.admin.deleteAccount` for the DID finishes it.
+- To stop the sweep while you look, set `--delete-after false` (rolling
+  restart). Scheduled accounts then stay deactivated.
+
+### VlpdsScheduledDeletionsSurge
+
+**Means:** over 50 more accounts (and over 0.1% of all accounts) have a
+`deleteAfter` than a day ago
+(`vlpds_scheduled_deletion_accounts{state="scheduled"}`, summed over nodes as of
+their last sweep). `deactivateAccount` takes `deleteAfter` from the account's
+own session, including an OAuth app holding `account:status?action=manage`, so
+a wave like this is either many users leaving at once or one app deactivating
+the accounts it holds. They're deleted only once
+`--delete-after-min-hold-days` (3) have passed since deactivation, so there is
+time.
+
+**Confirm:** `vlpds_account_events_total{event="deactivated"}` jumps at the same
+time. Sample a few accounts in the console (`deletionScheduledAt`) and their
+recent OAuth sessions and sign-ins. One client in common points at that app.
+
+**Do:**
+- Users leaving (a migration away, a protest): nothing to do.
+- An app doing it: set `--delete-after false` on every node (rolling restart)
+  before the hold ends. That keeps every account deactivated. Revoke the app's
+  sessions, reactivate the affected accounts ("Cancelling a scheduled deletion"),
+  then turn the sweep back on.
+
+### VlpdsSignInAlertsSuppressed
+
+**Means:** a sign-in from a new device wasn't mailed to the account's owner
+because that recipient's mail budget (`mail-recipient-hour` 10,
+`mail-recipient-day` 30) was spent
+(`vlpds_mail_suppressed_total{purpose="sign_in_alert",reason="recipient_limit"}`).
+Sign-in alerts are capped at 3 a day, a tenth of the day's budget, so other mail
+to that inbox used it up first: password resets, sign-in codes, email changes.
+Flooding an inbox and then signing in from a new device is how an account
+takeover would stay unnoticed. (A spent node or cluster budget has its own
+alerts, VlpdsMailNodeBudgetExhausted and VlpdsMailClusterBudgetExhausted.)
+
+**Confirm:** the console's Rate limits tab: the top consumers of
+`mail-recipient-*` name the account, and the rejections by route
+(`mail:<purpose>`) show what filled its budget.
+`vlpds_password_resets_total` and `vlpds_logins_total` by result at the same time
+show resets or failed sign-ins.
+
+**Do:** contact the owner out of band, or ask them to check Recent sign-ins on
+the Security tab. If a sign-in isn't theirs: reset the password (revokes every
+session) and have them turn on a second factor. If the mail came from someone
+requesting resets or codes for the account, the per-account buckets are already
+holding it. Lift the budget early only for a real user (a DID override in the
+Rate limits tab).
+
 ---
 
 ## Procedures

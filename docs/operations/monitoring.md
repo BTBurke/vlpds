@@ -14,7 +14,7 @@ diagram:
     - { id: console, label: Live metrics, sub: "/admin/metrics · 2 s", at: [0, 9.5], size: [10, 2.6], tone: accent }
     - { id: alloy, label: Alloy, sub: "scrape 10 s · logs", at: [16, 3.5], size: [8, 3], tone: muted }
     - { id: prom, label: Prometheus, sub: VictoriaMetrics, at: [28, 0], size: [9, 2.6], tone: muted }
-    - { id: vmalert, label: vmalert, sub: "83 alerts · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
+    - { id: vmalert, label: vmalert, sub: "86 alerts · ops/alerts.yml", at: [28, 3.7], size: [9, 2.6], tone: muted }
     - { id: loki, label: Loki, sub: JSON log lines, at: [28, 7.4], size: [9, 2.6], tone: muted }
     - { id: grafana, label: Grafana, sub: operator · internals, at: [41, 3.5], size: [8, 3], tone: blue }
   edges:
@@ -28,7 +28,7 @@ diagram:
     - { from: console.t, to: node.b, label: polls }
 facts:
   - { value: "~200", unit: metrics, label: "vlpds_* names per node", note: "Prometheus text; histograms for every latency that matters" }
-  - { value: "83", unit: alerts, label: in nine groups, note: "17 page, 66 ticket; each links its RUNBOOK section", tone: blue }
+  - { value: "86", unit: alerts, label: in ten groups, note: "17 page, 69 ticket; each links its RUNBOOK section", tone: blue }
   - { value: "0.4", unit: × TTL, label: lease renewal ceiling, note: "vlpds_lease_renew_ttl_ratio; past it the node fail-stops", tone: violet }
   - { value: "~150 ms", label: commit p99 on S3, note: "design target; alerts at 500 ms (ticket) and 2 s (page)", tone: amber }
 ```
@@ -118,20 +118,21 @@ edges:
 ## Dashboards
 
 ```facts
-- { value: "vlpds", label: operator dashboard, note: "Is my PDS up · users · content · federation · moderation · cost · alerts, in plain words with every row open" }
-- { value: "internals", label: engineer's dashboard, note: "a Health row for incidents, then 14 collapsed rows per subsystem", tone: blue }
+- { value: "vlpds", label: operator dashboard, note: "Is my PDS up · users · sign-in security · content · federation · moderation · cost · alerts, in plain words with every row open" }
+- { value: "internals", label: engineer's dashboard, note: "a Health row for incidents, then 15 collapsed rows per subsystem", tone: blue }
 - { value: "2 s", label: console Live metrics, note: "charts from /metrics in the browser, no Prometheus needed", tone: violet }
 ```
 
 - `vlpds` (uid `vlpds`) is for someone running a PDS for a community. It shows request outcomes,
-  how long common actions take, accounts and sign-ups, posts and likes written, relay and PLC
-  health, moderation actions, resources and cost, and firing alerts. It reads the same for one
+  how long common actions take, accounts and sign-ups, sign-in security (second factors, trusted
+  browsers, new-device alerts, OAuth-only refusals, app permissions) and scheduled deletions, posts
+  and likes written, relay and PLC health, moderation actions, resources and cost, and firing alerts. It reads the same for one
   server and for a cluster.
 - `vlpds internals` (uid `vlpds-internals`) opens on a Health row (requests, 5xx, 429s, read and
   write p99, commit p99, firehose lag, nodes up, shards owned, lease renewal ÷ TTL, store errors and
   permit waits, restarts, fail-stops, firing alerts). Below that it has one collapsed row per
   subsystem: commit pipeline, log and retention, firehose, repo workers, HTTP and proxy, rate
-  limits, leases and failover, forwarding and resharding, object-store clients, SlateDB, process and
+  limits, accounts (scheduled deletion, sign-in security, OAuth scopes), leases and failover, forwarding and resharding, object-store clients, SlateDB, process and
   runtime, KMS / PLC / mail, MinIO (bench only), CPU profiles. Pick the cluster and node in the variables at the top.
 - `bench/obs/grafana/gen_dashboard.py` generates both into `bench/obs/grafana/dashboards/`
   (`just dashboards`), and the vlpds binary embeds that copy. `--check` fails if one is stale.
@@ -182,10 +183,10 @@ bound to your datasource: `vlpds dashboards --out DIR --datasource-uid <uid>` (o
 ```diagram
 caption: "Every rule carries a severity and a `runbook_url` whose anchor is the alert's own section in `ops/RUNBOOK.md`."
 nodes:
-  - { id: rules, label: "ops/alerts.yml", sub: 83 alerts · 9 groups, at: [0, 2], size: [9, 3], tone: accent }
+  - { id: rules, label: "ops/alerts.yml", sub: 86 alerts · 10 groups, at: [0, 2], size: [9, 3], tone: accent }
   - { id: eval, label: vmalert, sub: or Prometheus, at: [13, 2], size: [8, 3], tone: muted }
   - { id: page, label: page, sub: "17: act now", at: [25, 0], size: [8, 2.6], tone: danger }
-  - { id: ticket, label: ticket, sub: "63: act today", at: [25, 4], size: [8, 2.6], tone: amber }
+  - { id: ticket, label: ticket, sub: "69: act today", at: [25, 4], size: [8, 2.6], tone: amber }
   - { id: rb, label: RUNBOOK section, sub: "Means · Confirm · Do", at: [40, 2], size: [9, 3], tone: solid }
 edges:
   - rules -> eval
@@ -206,6 +207,7 @@ edges:
 | `vlpds-object-store` | 10 | a brownout on two or more nodes |
 | `vlpds-durability` | 9 | (tickets only: checkpoints, retention, dead logs, reshard GC) |
 | `vlpds-resources` | 18 | memory over 95%, KMS or PLC directory down, a signature fault |
+| `vlpds-accounts` | 3 | (tickets only: scheduled deletions failing or surging, sign-in alerts not mailed) |
 
 A `vlpds-derived` group holds the recording rules (`vlpds:layout_shards`). Read the header of
 `ops/alerts.yml` before loading it anywhere. The main points:

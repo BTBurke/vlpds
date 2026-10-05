@@ -1125,3 +1125,53 @@ groups:
         annotations:
           summary: "{{ $labels.instance }}: peer TLS handshakes failing ({{ $labels.side }} side, {{ $value | humanize }}/s)"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlshandshakefailures"
+
+  # ---------------------------------------------------------------------------
+  # Accounts: scheduled deletion, sign-in security
+  # ---------------------------------------------------------------------------
+  - name: vlpds-accounts
+    rules:
+      # Each node sweeps its shards' scheduled deletions every 10 min. A pass
+      # errs when a shard scan or an account's deletion fails; the account is
+      # retried next pass, so a lone failure heals. Half the passes of the
+      # last hour, for an hour, means an account that keeps failing (guess).
+      - alert: VlpdsScheduledDeletionFailing
+        expr: sum by (instance) (increase(vlpds_scheduled_deletion_passes_total{job="vlpds",result="error"}[1h])) >= 3
+        for: 1h
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} of its scheduled-deletion sweeps failed in the last hour, for an hour"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsscheduleddeletionfailing"
+
+      # Accounts with a deleteAfter grew by over 50 and 0.1% of all accounts
+      # in a day (guess): a wave of deactivations asking for deletion, e.g.
+      # an OAuth client that deactivates the accounts it holds. The minimum
+      # hold (--delete-after-min-hold-days, 3) is the time left to act.
+      - alert: VlpdsScheduledDeletionsSurge
+        expr: >-
+          (sum(vlpds_scheduled_deletion_accounts{job="vlpds",state="scheduled"})
+            - sum(vlpds_scheduled_deletion_accounts{job="vlpds",state="scheduled"} offset 1d)) > 50
+          and
+          (sum(vlpds_scheduled_deletion_accounts{job="vlpds",state="scheduled"})
+            - sum(vlpds_scheduled_deletion_accounts{job="vlpds",state="scheduled"} offset 1d))
+            > 0.001 * sum(vlpds_accounts{job="vlpds"})
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanize }} more accounts are scheduled for deletion than a day ago (deleted after a 3-day minimum hold)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsscheduleddeletionssurge"
+
+      # A new-device sign-in alert not mailed because the account's own
+      # mail-recipient-* budget was spent. Alerts are capped at a tenth of
+      # that budget, so something else filled the inbox's quota first: an
+      # inbox flood followed by a quiet sign-in is how a takeover would
+      # hide. (Node and cluster budgets: VlpdsMail*BudgetExhausted.)
+      - alert: VlpdsSignInAlertsSuppressed
+        expr: sum(increase(vlpds_mail_suppressed_total{job="vlpds",purpose="sign_in_alert",reason="recipient_limit"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanize }} new-device sign-in alerts were not mailed in the last hour: the recipient's mail budget was spent"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssigninalertssuppressed"
