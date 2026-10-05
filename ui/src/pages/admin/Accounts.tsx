@@ -185,6 +185,7 @@ export function AccountDetail({ did }: { did: string }) {
           </div>
           <div>
             <Updates did={did} a={a} onDone={reload} />
+            <SecondFactors did={did} handle={a.handle} />
             {a.email && <DevMail email={a.email} />}
             <DeleteAccount did={did} handle={a.handle} />
           </div>
@@ -315,6 +316,46 @@ function Invites({ did, a, onDone }: { did: string; a: AccountView; onDone: () =
           </tbody>
         </table>
       )}
+    </Panel>
+  )
+}
+
+/** For a user who lost every factor. Audited, and the user is mailed. */
+function SecondFactors({ did, handle }: { did: string; handle: string }) {
+  const [reason, setReason] = useState('')
+  const [open, setOpen] = useState(false)
+  const [done, setDone] = useState<{ passkeys: number; totp: boolean; trustedBrowsers: number }>()
+  const act = useAction(async () => {
+    const r = await admin('vlpds.admin.resetSecondFactors', { body: { did, reason: reason.trim() } })
+    setDone(r.result)
+    setOpen(false)
+    setReason('')
+  })
+  return (
+    <Panel
+      title="Two-factor sign-in"
+      desc="For someone who lost every passkey, their authenticator app and their recovery codes. Removes all of them and their trusted browsers; their password and email sign-in codes stay. Check who's asking first: it's recorded in the audit log and the user is emailed."
+    >
+      {done && (
+        <Notice kind="ok">
+          Reset: {done.passkeys} passkey{done.passkeys === 1 ? '' : 's'}, {done.totp ? 'the authenticator app, ' : ''}
+          {done.trustedBrowsers} trusted browser{done.trustedBrowsers === 1 ? '' : 's'}.
+        </Notice>
+      )}
+      <ErrorNotice error={act.error} />
+      <form
+        onSubmit={(e) => {
+          e.preventDefault()
+          setOpen(true)
+        }}
+      >
+        <Field label="Reason" hint="Kept in the audit log, e.g. how you checked it was them." action={<button className="btn danger">Reset</button>}>
+          <input type="text" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={2000} required />
+        </Field>
+      </form>
+      <Confirm open={open} title={`Reset two-factor sign-in for @${handle}?`} action="Reset" danger busy={act.busy} onConfirm={() => act.run()} onClose={() => setOpen(false)}>
+        Their passkeys, authenticator app, recovery codes and trusted browsers are removed, and anything their passkeys signed in to is signed out. Until they set up two-factor again, they sign in with the password (and an emailed code, if they turned that on).
+      </Confirm>
     </Panel>
   )
 }

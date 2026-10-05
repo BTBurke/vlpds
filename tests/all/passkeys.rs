@@ -742,3 +742,50 @@ async fn oauth_recovery_code() {
     assert_eq!(st, 200, "{html}");
     assert!(html.contains("Authorize access"), "{html}");
 }
+
+// ---------------------------------------------------------------- the operator's reset
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_reset() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkreset").await;
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "lost").await;
+    s.enable_totp(&a).await;
+    // a session the passkey signed in, which the reset ends
+    let opts = start_sign_in(&s, json!({})).await.ok();
+    let out = passkey_session(&s, &a.did, k.assert(opts["challenge"].as_str().unwrap(), &Lie::default())).await.ok();
+    let pk_session = Auth::Bearer(out["accessJwt"].as_str().unwrap().into());
+    s.login(&a.handle, &a.password, None).await.err(401, "AuthFactorTokenRequired");
+
+    // admin only, and a reason is required
+    let body = json!({"did": a.did, "reason": "verified by a video call", "actor": "jaz"});
+    s.xrpc.post("vlpds.admin.resetSecondFactors", &body, &a.auth()).await.err_status(401);
+    s.xrpc
+        .post("vlpds.admin.resetSecondFactors", &json!({"did": a.did, "reason": " "}), &Auth::Admin)
+        .await
+        .err(400, "InvalidRequest");
+    let r = s.xrpc.post("vlpds.admin.resetSecondFactors", &body, &Auth::Admin).await.ok();
+    assert_eq!(r["result"], json!({"passkeys": 1, "totp": true, "trustedBrowsers": 0}), "{r}");
+
+    // the password alone works again, the passkey doesn't, its session is gone
+    s.login(&a.handle, &a.password, None).await.ok();
+    assert_eq!(list(&s, &a).await["passkeys"], json!([]));
+    assert_eq!(list(&s, &a).await["recoveryCodesRemaining"], json!(0));
+    s.get_session(&pk_session).await.err_status(400);
+    let opts = start_sign_in(&s, json!({})).await.ok();
+    passkey_session(&s, &a.did, k.assert(opts["challenge"].as_str().unwrap(), &Lie::default()))
+        .await
+        .err(400, "PasskeyRefused");
+    let st = s.xrpc.get("vlpds.server.getTotpStatus", &[], &a.auth()).await.ok();
+    assert_eq!(st["enabled"], json!(false));
+
+    // audited, and the user was told
+    let log = s.xrpc.get("vlpds.admin.getAuditLog", &[], &Auth::Admin).await.ok();
+    let e = log["entries"].as_array().unwrap().iter().find(|e| e["action"] == "second_factors.reset").cloned();
+    let e = e.unwrap_or_else(|| panic!("{log}"));
+    assert_eq!((e["actor"].as_str(), e["reason"].as_str()), (Some("jaz"), Some("verified by a video call")));
+    assert_eq!(e["subject"]["did"], json!(a.did));
+    let mail = s.dev_mail(&a.email).await.ok();
+    assert!(mail.to_string().contains("operator reset your two-factor sign-in"), "{mail}");
+}

@@ -48,6 +48,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.admin.updateCase", post(update_case))
         .route("/xrpc/vlpds.admin.setBlobQuota", post(set_blob_quota))
         .route("/xrpc/vlpds.admin.listOverQuota", get(list_over_quota))
+        .route("/xrpc/vlpds.admin.resetSecondFactors", post(reset_second_factors))
 }
 
 /// The client address for audit entries (as the rate-limit config's).
@@ -126,7 +127,8 @@ pub struct AuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
     pub node: String,
-    /// takedown, restore, blob.purge, case.create, case.update, quota.set
+    /// takedown, restore, blob.purge, case.create, case.update, quota.set,
+    /// second_factors.reset
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<SubjectRef>,
@@ -1069,6 +1071,50 @@ async fn update_case(
     )
     .await?;
     Ok(Json(c))
+}
+
+#[derive(Deserialize)]
+struct ResetFactorsIn {
+    did: String,
+    reason: String,
+    actor: Option<String>,
+}
+
+/// For a user who lost every factor: removes their passkeys, TOTP,
+/// recovery codes and trusted browsers (the password and the email factor
+/// stay). A reason is required; it's audited and the user is mailed, since
+/// whoever talks the operator into it still needs the password.
+async fn reset_second_factors(
+    State(app): AppState,
+    Auth(creds): Auth,
+    ClientIp(ip): ClientIp,
+    Json(inp): Json<ResetFactorsIn>,
+) -> XResult<Json<J>> {
+    require_admin(&creds)?;
+    let reason = bounded_text("reason", &inp.reason, MAX_REASON)?;
+    if reason.is_empty() {
+        return Err(XrpcError::bad("InvalidRequest", "a reason is required"));
+    }
+    app.account(&inp.did).await.map_err(|e| {
+        if e.error == "AccountNotFound" {
+            not_here(format!("{} has no account on this PDS", inp.did))
+        } else {
+            e
+        }
+    })?;
+    let result = super::server::reset_second_factors(&app, &inp.did).await?;
+    let who = Who { actor: actor_of(inp.actor), ip: ip.map(|i| i.to_string()) };
+    let e = audit(
+        &app,
+        &who,
+        "second_factors.reset",
+        Some(&SubjectRef::account(&inp.did)),
+        Some(&reason),
+        None,
+        Some(result.clone()),
+    )
+    .await?;
+    Ok(Json(json!({"did": inp.did, "result": result, "auditId": e.id})))
 }
 
 #[derive(Deserialize)]

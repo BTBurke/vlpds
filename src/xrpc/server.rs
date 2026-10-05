@@ -3096,6 +3096,38 @@ async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
     .map(|_| ())
 }
 
+/// The operator's reset (`vlpds.admin.resetSecondFactors`): passkeys, TOTP,
+/// the shared recovery codes and lockout, and trusted browsers, in one
+/// write; what the passkeys signed in is ended as a removal would. What
+/// was removed, for the audit entry.
+pub(super) async fn reset_second_factors(app: &App, did: &str) -> XResult<J> {
+    use super::cas::Op;
+    let passkeys = super::passkeys::load(app, did).await?;
+    let totp = crate::totp::load(app, did).await?.enabled();
+    let trusted = super::internal::scan_private_anywhere(app, did, super::signin::TRUST).await?.len();
+    let ops = vec![
+        Op::put(super::passkeys::ROW, None),
+        Op::put(crate::totp::PRIVATE_NAME, None),
+        Op::put(super::mfa::ROW, None),
+        Op::DeletePrefix { prefix: super::signin::TRUST.into() },
+    ];
+    app.private_cas(did, Vec::new(), ops).await?;
+    set_totp_flag(app, did, false).await?;
+    for c in &passkeys.creds {
+        revoke_signed_in_with(app, did, &c.auth_ref()).await?;
+    }
+    if !passkeys.creds.is_empty() {
+        crate::metrics::PASSKEYS.with_label_values(&["reset"]).inc();
+    }
+    super::passkeys::security_mail(
+        app,
+        did,
+        "This server's operator reset your two-factor sign-in: your passkeys, authenticator app, recovery codes and trusted browsers were removed. Set them up again on the Security page.",
+    )
+    .await;
+    Ok(json!({"passkeys": passkeys.creds.len(), "totp": totp, "trustedBrowsers": trusted}))
+}
+
 async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = full_access(&creds)?;
     let acct = app.account(&did).await?;
