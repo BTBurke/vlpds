@@ -52,6 +52,9 @@ ARG VLPDS_FEATURES=""
 # panics and backtraces still name functions.
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
 ARG TARGETARCH
+# Unset builds with every core; benchbox-image.sh lowers it while the batch
+# pipeline runs.
+ARG CARGO_BUILD_JOBS
 # Both binaries in one invocation: the probe reuses the crate's compiled lib
 # and its LTO link runs beside vlpds's (+3 s; its own profile recompiled
 # the lib after the vlpds build, +40-55 s).
