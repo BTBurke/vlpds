@@ -13,4 +13,5 @@
 __pycache__/
 /bench/migrate/out/
 /bench/passkeys/out/
+/passkey-differential/target/
 .DS_Store

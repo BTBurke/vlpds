@@ -97,7 +97,6 @@ mod oauth;
 mod oauth_replay_durable;
 mod objstore_pressure;
 mod ops_metrics;
-mod passkey_differential;
 mod passkeys;
 mod peer_tls;
 mod plc;

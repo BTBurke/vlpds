@@ -97,6 +97,11 @@ migrate-e2e:
 passkeys-e2e:
     bench/passkeys/run.sh
 
+# The WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs; its own crate, since passkey-types
+# turns on serde_json's preserve_order, which would change every vlpds test build
+passkey-differential:
+    cargo test --manifest-path passkey-differential/Cargo.toml
+
 # Build the Go sync 1.1 firehose checker and run it against a vlpds (extra flags e.g. -cursor 0 -strict)
 checker host="http://127.0.0.1:2620" *args:
     cd checker && go build -o checker . && ./checker -host {{host}} {{args}}

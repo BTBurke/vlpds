@@ -1,0 +1,35 @@
+[package]
+name = "vlpds-passkey-differential"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Differential test of vlpds's WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs"
+
+# standalone, like checker-rs: passkey-types turns on serde_json's
+# preserve_order, which as a dev-dependency of vlpds would change map order
+# (and verdicts) in every vlpds test build
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# what src/webauthn.rs uses, at vlpds's versions
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+hmac = "0.12"
+base64 = "0.22"
+
+[dev-dependencies]
+passkey = { version = "=0.6.0", features = ["rust-crypto"] }
+# its JSON with base64url bytes, as a browser's PublicKeyCredential.toJSON()
+passkey-types = { version = "=0.6.0", features = ["serialize_bytes_as_base64_string"] }
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+url = "2"

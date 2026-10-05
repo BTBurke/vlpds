@@ -561,9 +561,16 @@ fn verify_new(app: &App, did: &str, c: &RegistrationIn) -> Result<(Cred, webauth
     Ok((cred, ch))
 }
 
-/// One message whatever failed: the reason is in the metrics.
+/// A registration the signed-in owner made: the check that failed helps
+/// them, and tells nobody else anything.
 pub(super) fn refused(f: Fail) -> XrpcError {
     XrpcError::bad("PasskeyRefused", format!("The passkey was not accepted ({})", f.reason()))
+}
+
+/// A sign-in: one message whatever failed (the reason is in the metrics),
+/// so nothing says which accounts have passkeys or which check failed.
+fn not_recognized() -> XrpcError {
+    XrpcError::bad("PasskeyRefused", "Passkey not recognized")
 }
 
 #[derive(Deserialize)]
@@ -747,19 +754,19 @@ async fn create_session_inner(
     }
     rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1)?;
     rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1)?;
-    let not_recognized = |f: Fail| {
+    let refuse = |f: Fail| {
         count_failure(f);
-        refused(f)
+        not_recognized()
     };
     let acct = match super::server::account_if_exists(app, &did).await? {
         Some(a) => a,
-        None => return Err(not_recognized(Fail::UnknownCredential)),
+        None => return Err(refuse(Fail::UnknownCredential)),
     };
     // read before the check: a revoke-all racing this sign-in lands first
     // (and voids it) or after
     let epoch = super::server::auth_epoch(app, &did).await?;
-    let cdj = decode_capped(&inp.credential.client_data_json, MAX_CDJ_B64).map_err(not_recognized)?;
-    let challenge = webauthn::client_data_challenge(&cdj).map_err(not_recognized)?;
+    let cdj = decode_capped(&inp.credential.client_data_json, MAX_CDJ_B64).map_err(refuse)?;
+    let challenge = webauthn::client_data_challenge(&cdj).map_err(refuse)?;
     let key = challenge_key(app);
     *second = webauthn::open_challenge(&key, "spa-2fa", &spa_2fa_binding(&did, &epoch), &challenge, now_secs()).is_ok();
     let ex = if *second {
@@ -767,14 +774,14 @@ async fn create_session_inner(
     } else {
         let handle = inp.credential.user_handle.as_deref().and_then(did_from_user_handle);
         if handle.as_deref() != Some(did.as_str()) {
-            return Err(not_recognized(Fail::UnknownCredential));
+            return Err(refuse(Fail::UnknownCredential));
         }
         Expect { purpose: "spa-signin", binding: String::new(), require_uv: true }
     };
     let used = match use_passkey(app, &did, &inp.credential, &ex).await {
         Ok(u) => u,
         Err(UseErr::Server(e)) => return Err(e),
-        Err(UseErr::Refused(f)) => return Err(refused(f)),
+        Err(UseErr::Refused(_)) => return Err(not_recognized()),
     };
     if super::server::is_takendown_account(&acct) {
         return Err(super::takedown_error());
