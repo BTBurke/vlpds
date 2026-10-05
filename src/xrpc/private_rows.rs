@@ -60,6 +60,7 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
         device_id: Some("dev-passkey".into()),
         request_id: Some("req-passkey".into()),
         auth_cred: Some(cred.clone()),
+        space_collections: None,
     };
     let dev = o::Device {
         id: "dev-passkey".into(),
@@ -176,6 +177,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         consumed: Some(("ses-fixture".into(), "tok-1".into())),
         auth_epoch: String::new(),
         auth_cred: None,
+        space_collections: None,
     };
     let ses = o::Session {
         id: "ses-fixture".into(),
@@ -194,6 +196,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         device_id: Some("dev-fixture".into()),
         request_id: Some("req-fixture".into()),
         auth_cred: None,
+        space_collections: None,
     };
     let dev = o::Device {
         id: "dev-fixture".into(),

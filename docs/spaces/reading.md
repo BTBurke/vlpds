@@ -72,6 +72,12 @@ password or password session can't get a service token for a `com.atproto.space.
 declaration, an authority by its handle when the handle resolves back to it (else the DID), and
 warns on `space:*?authority=*`.
 
+A bare grant that writes (`space:<type>` with no `collection`) gets the collections its type
+declares. vlpds looks those up once, while it shows the consent screen, and the token carries
+exactly that list at the code exchange and at every refresh. So if the declaration later adds a
+collection, an existing session doesn't pick it up. If the lookup fails at consent, the screen says
+the writes couldn't be looked up and the token request fails, as it does on the reference.
+
 ## What a member host checks
 
 ```steps

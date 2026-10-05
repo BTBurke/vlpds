@@ -416,6 +416,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
         consumed: None,
         auth_epoch: String::new(),
         auth_cred: None,
+        space_collections: None,
     };
     store::put_request(app, &id, Some(&req)).await?;
     Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
@@ -957,21 +958,35 @@ fn passwordless_ui(app: &App, binding: &str) -> Option<(String, String)> {
 
 /// Approves directly when the user already granted these scopes to this
 /// confidential client.
-async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
+async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
     let acct = match account_any(app, did).await {
         Ok(a) => a,
         Err(_) => return login_page(app, &flow, "", Some("Account not found"), StatusCode::OK),
     };
-    match consent_required(app, &flow, did).await {
-        Ok(false) => return issue_code(app, flow, did).await,
-        Ok(true) => {}
+    let required = match consent_required(app, &flow, did).await {
+        Ok(r) => r,
         Err(e) => return server_error_page(app, "Authorization failed", &e.description),
+    };
+    if !required && !app.config.spaces {
+        return issue_code(app, flow, did).await;
     }
     let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
     let names = match app.config.spaces {
-        true => Some(space_names(app, &flow.req.params.scope, &sets).await),
+        true => Some(space_names(app, &flow.req.params.scope, &sets, required).await),
         false => None,
     };
+    // what the screen shows is exactly what the token will carry
+    let resolved = names.as_ref().filter(|n| !n.decls.is_empty());
+    flow.req.space_collections =
+        resolved.map(|n| n.decls.iter().map(|(t, d)| (t.clone(), d.collections.clone())).collect());
+    if !required {
+        return issue_code(app, flow, did).await;
+    }
+    if resolved.is_some() {
+        if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
+            return server_error_page(app, "Authorization failed", &e.description);
+        }
+    }
     let rows = ui::describe_scopes(&flow.req.params.scope, &sets, names.as_ref());
     let csrf = flow.csrf(app);
     let name = server_name(app);
@@ -982,8 +997,13 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
 /// The consent screen's names for the `space:` grants requested, directly
 /// or through permission sets (reference `getSpacesFromScope` and
 /// `getSpaceHandlesFromScope`), each looked up in bounded time and shown
-/// raw when it doesn't resolve.
-async fn space_names(app: &App, scope: &str, sets: &[(crate::oauth::scopes::IncludeScope, J)]) -> ui::SpaceNames {
+/// raw when it doesn't resolve. `handles`: false when no screen is shown.
+async fn space_names(
+    app: &App,
+    scope: &str,
+    sets: &[(crate::oauth::scopes::IncludeScope, J)],
+    handles: bool,
+) -> ui::SpaceNames {
     use crate::oauth::scopes::Permission;
     const MAX_LOOKUPS: usize = 16;
     let mut perms: Vec<Permission> = scope.split(' ').filter_map(Permission::parse).collect();
@@ -996,7 +1016,7 @@ async fn space_names(app: &App, scope: &str, sets: &[(crate::oauth::scopes::Incl
         if p.space_type != "*" && !types.contains(&p.space_type) {
             types.push(p.space_type.clone());
         }
-        if !["*", "self"].contains(&p.authority.as_str()) && !dids.contains(&p.authority) {
+        if handles && !["*", "self"].contains(&p.authority.as_str()) && !dids.contains(&p.authority) {
             dids.push(p.authority);
         }
     }
@@ -1884,7 +1904,7 @@ async fn code_grant(
     if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
         return Err(fail("The passkey that approved this code was removed"));
     }
-    let token_scope = lexicon::build_token_scope_cached(app, &params.scope, &did)
+    let token_scope = lexicon::build_token_scope_cached(app, &params.scope, &did, req.space_collections.as_ref())
         .await
         .map_err(|e| OAuthError::invalid_request(&e))?;
     let now = now_secs();
@@ -1905,6 +1925,7 @@ async fn code_grant(
         device_id: req.device_id.clone(),
         request_id: Some(rid.clone()),
         auth_cred: req.auth_cred.clone(),
+        space_collections: req.space_collections.clone(),
     };
     req.consumed = Some((did.clone(), s.id.clone()));
     store::put_request(app, &rid, Some(&req)).await?;
@@ -2017,8 +2038,9 @@ async fn refresh_grant(
         return Err(OAuthError::invalid_grant("Refresh token expired"));
     }
     ensure_active_any(app, &s.did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    s.token_scope =
-        lexicon::build_token_scope_cached(app, &s.scope, &s.did).await.map_err(|e| OAuthError::server_error(&e))?;
+    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope, &s.did, s.space_collections.as_ref())
+        .await
+        .map_err(|e| OAuthError::server_error(&e))?;
     s.refresh_gen += 1;
     super::cas::pause_point("oauth_refresh", &s.did).await;
     // only if the row is still the one read: a revocation since is not undone

@@ -1,7 +1,8 @@
 //! `space:` OAuth scopes end to end (`--spaces`; src/oauth/scopes.rs,
 //! src/oauth/lexicon.rs, src/oauth/ui.rs, src/xrpc/authn.rs): grants made
-//! concrete when the token is issued (a bare grant takes its type
-//! declaration's collections, `self` becomes the account, `include:` sets
+//! concrete when the token is issued (a bare grant takes the collections
+//! its type declared at consent and never more, one that didn't resolve
+//! fails the token request, `self` becomes the account, `include:` sets
 //! carry space permissions), collections and actions enforced on writes,
 //! read vs read_self, the consent screen's names and warning, and the
 //! Spaces rate-limit buckets.
@@ -66,8 +67,7 @@ fn scopes(c: &SpaceClient) -> Vec<&str> {
 }
 
 /// A bare grant that writes takes its declaration's collections when the
-/// token is issued; one whose declaration doesn't resolve gets no write
-/// targets, and reads still work.
+/// token is issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bare_grant_takes_declared_collections() {
     let s = spawn().await;
@@ -100,25 +100,138 @@ async fn bare_grant_takes_declared_collections() {
     let t = regrant(&a, &format!("space:{titled}?action=create&manage=create")).await;
     let sp2 = t.create_space(titled, "pics").await;
     t.create_record(&sp2, "com.c6title.photo", None, rec("com.c6title.photo")).await.ok();
+}
 
-    // unresolvable: no write targets (fail closed); the grant still reads
+/// Signs `acct` in on a new flow for `scope` and returns the consent page
+/// with what posting "allow" needs.
+async fn consent_page(
+    srv: &Srv,
+    acct: &oauth::Account,
+    scope: &str,
+    key: &DpopKey,
+) -> (Browser, String, oauth::Pkce, String) {
+    let f = Flow::loopback(scope, key);
+    let p = oauth::pkce();
+    let mut b = Browser::default();
+    let ru = f.request_uri(srv, &p, "c6u").await;
+    let csrf = oauth::csrf_of(&b.authorize(srv, &f, &ru).await.2);
+    let (st, _, html) = b.sign_in(srv, &ru, &csrf, &acct.handle, oauth::PASSWORD).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access"), "{html}");
+    (b, ru, p, html)
+}
+
+/// Posts "allow" on the page [`consent_page`] returned, then exchanges the code.
+async fn approve_and_exchange(
+    srv: &Srv,
+    acct: &oauth::Account,
+    scope: &str,
+    key: &DpopKey,
+    (mut b, ru, p, html): (Browser, String, oauth::Pkce, String),
+) -> oauth::Resp {
+    let csrf = oauth::csrf_of(&html);
+    let (st, h, body) = b
+        .post(
+            srv,
+            "/oauth/authorize/consent",
+            &[("request_uri", &ru), ("csrf", &csrf), ("did", &acct.did), ("action", "allow")],
+        )
+        .await;
+    assert_eq!(st, 303, "{body}");
+    let code = oauth::location_params(&h).1.get("code").expect("code").clone();
+    oauth::exchange(srv, &Flow::loopback(scope, key), &code, &p, &[]).await
+}
+
+/// A bare grant that writes, whose declaration doesn't resolve while the
+/// account approves it: the consent screen says the writes couldn't be
+/// looked up and the token request fails, as the reference's does. That
+/// holds when the declaration resolves by the time the code is exchanged,
+/// so the token never carries writes the screen didn't show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolved_declaration_fails_the_token_request() {
+    let s = spawn().await;
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6unres").await;
+
     let missing = "com.c6nodecl.forum";
-    vlpds::oauth::lexicon::override_authority(&vlpds::oauth::lexicon::nsid_authority(missing), &a.did);
-    let m = SpaceClient::new(&s, "c6miss", &format!("space:{missing}?manage=create")).await;
-    let bare = format!("space:{missing}?authority={}&manage=create", m.did);
-    assert!(scopes(&m).contains(&bare.as_str()), "{}", m.scope);
-    let sp3 = m.create_space(missing, "x").await;
-    m.create_record(&sp3, "com.c6nodecl.thread", None, rec("com.c6nodecl.thread")).await.err(403, "ScopeMissingError");
-    m.get("com.atproto.space.listRecords", &[("space", &sp3), ("repo", &m.did)]).await.ok();
+    vlpds::oauth::lexicon::override_authority(&vlpds::oauth::lexicon::nsid_authority(missing), &acct.did);
+    let scope = format!("atproto space:{missing}?manage=create");
+    let key = DpopKey::new();
+    let page = consent_page(&srv, &acct, &scope, &key).await;
+    consent_html_has(
+        &page.3,
+        &[&format!(
+            "com.c6nodecl.forum spaces on your account: read everything and manage the space and its members. It also asks to create, update and delete records of the kinds {missing} declares, which could not be looked up, so approving this will fail"
+        )],
+    );
+    let r = approve_and_exchange(&srv, &acct, &scope, &key, page).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(r.body["error"], "invalid_request", "{}", r.body);
+    assert!(r.body["error_description"].as_str().unwrap().contains(missing), "{}", r.body);
 
-    // a declaration that isn't a space type fails closed too
+    // the lookup fails at consent and works by the exchange: still refused
+    let late = "com.c6late.forum";
+    vlpds::oauth::lexicon::override_authority(&vlpds::oauth::lexicon::nsid_authority(late), &acct.did);
+    let scope = format!("atproto space:{late}?manage=create");
+    let page = consent_page(&srv, &acct, &scope, &key).await;
+    assert!(page.3.contains("could not be looked up"), "{}", page.3);
+    publish(&s, late, json!({"type": "space", "name": "Late", "collections": ["com.c6late.thread"]})).await;
+    let r = approve_and_exchange(&srv, &acct, &scope, &key, page).await;
+    assert_eq!(r.status, 400, "the exchange widened the grant: {}", r.body);
+    assert_eq!(r.body["error"], "invalid_request", "{}", r.body);
+    // it does resolve now: a new approval gets the collections
+    let t = oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&scope, &key), &acct).await;
+    assert!(t.scope.contains("collection=com.c6late.thread"), "{}", t.scope);
+
+    // a declaration that isn't a space type doesn't resolve either
     let not_space = "com.c6notspace.forum";
     publish(&s, not_space, json!({"type": "permission-set", "permissions": []})).await;
-    let n = regrant(&a, &format!("space:{not_space}?manage=create")).await;
-    let sp4 = n.create_space(not_space, "y").await;
-    n.create_record(&sp4, "com.c6notspace.thread", None, rec("com.c6notspace.thread"))
-        .await
-        .err(403, "ScopeMissingError");
+    let scope = format!("atproto space:{not_space}?manage=create");
+    let page = consent_page(&srv, &acct, &scope, &key).await;
+    let r = approve_and_exchange(&srv, &acct, &scope, &key, page).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+
+    // a bare grant that only reads needs no declaration
+    let scope = format!("atproto space:{missing}?action=read");
+    let t = oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&scope, &key), &acct).await;
+    assert!(t.scope.contains(&format!("space:{missing}?authority={}&action=read", acct.did)), "{}", t.scope);
+}
+
+/// A refresh keeps the collections approved at consent, even after the
+/// type's declaration grows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_never_widens_a_bare_grant() {
+    let s = spawn().await;
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6refr").await;
+    let ty = "com.c6grow.forum";
+    publish(&s, ty, json!({"type": "space", "name": "Forum", "collections": ["com.c6grow.thread"]})).await;
+    let scope = format!("atproto space:{ty}?manage=create");
+    let key = DpopKey::new();
+    let f = Flow::loopback(&scope, &key);
+    let t = oauth::grant(&srv, &mut Browser::default(), &f, &acct).await;
+    let narrow = format!("space:{ty}?authority={}&collection=com.c6grow.thread&manage=create", acct.did);
+    assert!(t.scope.split(' ').any(|x| x == narrow), "{}", t.scope);
+
+    publish(
+        &s,
+        ty,
+        json!({"type": "space", "name": "Forum", "collections": ["com.c6grow.thread", "com.c6grow.reply"]}),
+    )
+    .await;
+    vlpds::oauth::lexicon::forget_cached(ty);
+    let key2 = DpopKey::new();
+    let wide = oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&scope, &key2), &acct).await;
+    assert!(wide.scope.contains("collection=com.c6grow.reply"), "the new declaration resolves: {}", wide.scope);
+
+    let mut rt = t.refresh.expect("refresh token");
+    for _ in 0..2 {
+        let r = oauth::refresh(&srv, &f, &rt, &[]).await;
+        let n = oauth::tokens(&r);
+        assert!(n.scope.split(' ').any(|x| x == narrow), "refresh widened the grant: {}", n.scope);
+        assert!(!n.scope.contains("com.c6grow.reply"), "{}", n.scope);
+        rt = n.refresh.unwrap();
+    }
 }
 
 /// `authority=self` is resolved to the account when the token is issued, so

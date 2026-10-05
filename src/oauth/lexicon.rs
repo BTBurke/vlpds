@@ -17,7 +17,7 @@ use crate::cid::Cid;
 use crate::lexicon::SpaceDecl;
 use crate::xrpc::App;
 use serde_json::Value as J;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,11 @@ static IN_FLIGHT: LazyLock<parking_lot::Mutex<std::collections::HashSet<String>>
 /// bypassing DNS.
 pub fn override_authority(authority: &str, did: &str) {
     OVERRIDES.lock().insert(authority.to_ascii_lowercase(), did.to_string());
+}
+
+/// Tests: drops `nsid`'s in-memory copy, so its next use looks it up again.
+pub fn forget_cached(nsid: &str) {
+    CACHE.lock().remove(nsid);
 }
 
 /// All segments but the name, reversed.
@@ -346,39 +351,20 @@ pub async fn space_declaration(app: &App, nsid: &str) -> Result<SpaceDecl, Strin
         .map_err(|_| format!("Timed out resolving space type {nsid}"))?
 }
 
-/// Recent failures, so a bare grant of a type that doesn't resolve costs
-/// its token requests no more than one inline attempt per [`RETRY_AFTER`].
-static SPACE_MISSES: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
-
-async fn space_declaration_cached(app: &Arc<App>, nsid: &str) -> Result<SpaceDecl, String> {
-    if SPACE_MISSES.lock().get(nsid).is_some_and(|at| at.elapsed() < RETRY_AFTER) {
-        return Err(format!("space type {nsid} did not resolve"));
-    }
-    let r = lexicon_cached(app, nsid, space_decl).await;
-    let mut misses = SPACE_MISSES.lock();
-    match &r {
-        Ok(_) => {
-            misses.remove(nsid);
-        }
-        Err(_) => {
-            if misses.len() >= 1024 {
-                misses.retain(|_, at| at.elapsed() < RETRY_AFTER);
-            }
-            if misses.len() < 1024 {
-                misses.insert(nsid.to_string(), Instant::now());
-            }
-        }
-    }
-    r
-}
-
 /// `include:` scopes replaced by the permissions their sets grant, then
 /// with `--spaces` each `space:` grant made concrete
 /// (`LexiconManager.buildTokenScope`), in bounded time: a bare grant that
-/// writes takes its type declaration's collections, and `self` becomes
-/// `did`. A declaration that doesn't resolve leaves the grant with no write
-/// targets, where the reference fails the token request.
-pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str, did: &str) -> Result<String, String> {
+/// writes takes the collections its type declared when the account
+/// approved it (`consented`, by type), and `self` becomes `did`. Taking
+/// them from the approval rather than a fresh lookup means a code exchange
+/// or refresh never grants writes the consent screen didn't show; a type
+/// that didn't resolve then fails the request, as the reference's does.
+pub async fn build_token_scope_cached(
+    app: &Arc<App>,
+    scope: &str,
+    did: &str,
+    consented: Option<&BTreeMap<String, Vec<String>>>,
+) -> Result<String, String> {
     let spaces = app.config.spaces;
     let has_space = spaces && scope.split(' ').any(super::scopes::is_space_scope);
     if !has_space && !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
@@ -408,11 +394,10 @@ pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str, did: &str) ->
         // collections only name write targets, so a grant that writes
         // nothing needs no declaration
         let p = if p.collection.is_none() && p.space_type != "*" && p.writes() {
-            match space_declaration_cached(app, &p.space_type).await {
-                Ok(d) => p.with_default_collections(&d.collections),
-                Err(e) => {
-                    tracing::debug!(space_type = %p.space_type, "space grant without write targets: {e}");
-                    p
+            match consented.and_then(|c| c.get(&p.space_type)) {
+                Some(c) => p.with_default_collections(c),
+                None => {
+                    return Err(format!("Space type {} could not be resolved when access was approved", p.space_type))
                 }
             }
         } else {

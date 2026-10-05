@@ -98,6 +98,11 @@ pub struct RequestData {
     /// removing it ends what it signed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_cred: Option<String>,
+    /// `--spaces`: the collections each space type declared, by type, as
+    /// resolved for the consent screen. A bare grant that writes gets these
+    /// and nothing wider, at the code exchange and every refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_collections: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 pub fn req_routing(id: &str) -> String {
@@ -206,6 +211,11 @@ pub struct Session {
     /// removing it ends what it signed in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_cred: Option<String>,
+    /// `--spaces`: the collections each space type declared, by type, as
+    /// resolved for the consent screen. A bare grant that writes gets these
+    /// and nothing wider, at the code exchange and every refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_collections: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 pub fn session_key(id: &str) -> String {
@@ -423,6 +433,7 @@ mod tests {
             device_id: None,
             request_id: None,
             auth_cred: None,
+            space_collections: None,
         };
         let key = [7u8; 32];
         let t = refresh_token(&key, &s);

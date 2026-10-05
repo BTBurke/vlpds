@@ -672,25 +672,37 @@ pub fn describe_space(p: &SpacePermission, names: &SpaceNames) -> String {
     } else if p.action.iter().any(|a| a == "read_self") {
         parts.push("read only your own data".into());
     }
-    if let Some(c) = &p.collection {
-        let verbs: Vec<&str> =
-            p.action.iter().map(String::as_str).filter(|a| ["create", "update", "delete"].contains(a)).collect();
-        if !verbs.is_empty() {
+    let verbs: Vec<&str> =
+        p.action.iter().map(String::as_str).filter(|a| ["create", "update", "delete"].contains(a)).collect();
+    match &p.collection {
+        Some(c) if !verbs.is_empty() => {
             let colls = match c.iter().any(|c| c == "*") {
                 true => "of any kind".to_string(),
                 false => format!("({})", c.join(", ")),
             };
             parts.push(format!("{} records {colls}", join_and(&verbs)));
         }
+        _ => {}
     }
+    // the token request fails rather than guess at what was meant
+    let unresolved =
+        (p.collection.is_none() && !verbs.is_empty() && decl.is_none() && p.space_type != "*").then(|| {
+            format!(
+                "{} records of the kinds {} declares, which could not be looked up, so approving this will fail",
+                join_and(&verbs),
+                p.space_type
+            )
+        });
     if p.manage.is_some() {
         parts.push("manage the space and its members".into());
     }
-    if parts.is_empty() {
-        parts.push("no access".into());
-    }
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
-    format!("{what}: {}", join_and(&parts))
+    match (parts.is_empty(), unresolved) {
+        (true, None) => format!("{what}: no access"),
+        (true, Some(u)) => format!("{what}: {u}"),
+        (false, None) => format!("{what}: {}", join_and(&parts)),
+        (false, Some(u)) => format!("{what}: {}. It also asks to {u}", join_and(&parts)),
+    }
 }
 
 fn capitalize(s: &str) -> String {

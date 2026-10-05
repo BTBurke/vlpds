@@ -5399,12 +5399,14 @@ oplog replay from one snapshot and counts a mismatch in
   upstream could adopt. The set taken down is tiny and comes from the
   account's cached takedowns, so an untouched space pays nothing for it.
 - A bare `space:` grant that writes takes its type declaration's
-  collections when the token is issued, as in the reference. If the
-  declaration doesn't resolve, the reference fails the token request.
-  vlpds issues the token with no write targets instead (still fail
-  closed), so one unpublished type doesn't break a whole grant, and it
-  doesn't refuse the authorization request either. A grant that only reads
-  or manages skips the lookup, since collections only name write targets.
+  collections, as in the reference. vlpds looks the declaration up once,
+  for the consent screen, and stores the collections with the
+  authorization request and then the session. The code exchange and every
+  refresh use that copy, so a token never carries writes the screen
+  didn't show, even if the declaration resolves later or grows. If it
+  doesn't resolve at consent, the screen says so and the token request
+  fails, which is what the reference does. A grant that only reads or
+  manages skips the lookup, since collections only name write targets.
 - `space:` scopes also take indigo's `spaceType` parameter for the type
   (`space?spaceType=…`). The reference only knows `type`.
 - The oplog keeps 7 days of ops (`--space-oplog-retention`). The reference

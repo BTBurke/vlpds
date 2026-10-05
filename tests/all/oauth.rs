@@ -488,7 +488,7 @@ pub(crate) fn tokens(r: &Resp) -> Tokens {
     }
 }
 
-async fn refresh(s: &Srv, f: &Flow<'_>, rt: &str, extra: &[(&str, &str)]) -> Resp {
+pub(crate) async fn refresh(s: &Srv, f: &Flow<'_>, rt: &str, extra: &[(&str, &str)]) -> Resp {
     let mut pairs = vec![("grant_type", "refresh_token"), ("client_id", f.client_id.as_str()), ("refresh_token", rt)];
     pairs.extend_from_slice(extra);
     as_post(s, f.key, "/oauth/token", &pairs).await
