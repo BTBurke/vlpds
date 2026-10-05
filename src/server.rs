@@ -134,6 +134,9 @@ pub struct Config {
     pub trusted_device_days: u32,
     /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
+    /// AT Protocol Spaces (`--spaces`; src/space). No methods yet: their
+    /// NSIDs answer 501 instead of being proxied.
+    pub spaces: bool,
     /// Largest importRepo body.
     pub max_import_bytes: usize,
     /// The import budget (`xrpc::import_budget`). None: the memory plan's
@@ -320,6 +323,7 @@ impl Default for Config {
             mail_daily_budget: crate::ratelimit::DEFAULT_MAIL_DAILY_BUDGET,
             trusted_device_days: crate::xrpc::DEFAULT_TRUST_DAYS,
             resolve_lexicons: None,
+            spaces: false,
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             import_memory_bytes: None,
             import_wait: crate::xrpc::import_budget::ADMIT_WAIT,

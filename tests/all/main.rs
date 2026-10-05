@@ -138,6 +138,7 @@ mod shrike_adopt;
 mod sign_in_security;
 mod signature_faults;
 mod smtp_mail;
+mod spaces;
 mod staged_import;
 mod subscribe_repos;
 mod sync;
