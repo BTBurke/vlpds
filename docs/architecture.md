@@ -273,8 +273,9 @@ The same handoff runs in three situations:
   that are short of theirs, like a node that just joined or restarted.
 - Graceful shutdown. SIGTERM marks the lease `draining`, so peers stop counting it toward fair
   shares. The node hands out every shard, fences its own log and deletes the lease. Then it serves
-  500 ms more so in-flight forwards get an answer instead of a dropped connection, stops accepting
-  connections and waits up to 30 s for every request still in flight to be answered. If it can't fence
+  500 ms more so in-flight forwards get an answer instead of a dropped connection (a node without
+  peers skips this). It stops accepting connections, closes its firehose subscribers and exits once
+  every request still in flight is answered, waiting 30 s at most. If it can't fence
   its log within min(TTL, 30 s), it exits 8 and leaves the lease for a peer or its own restart to
   fence.
 - Joining. A new or restarted node takes no shards until every live peer confirms it's following

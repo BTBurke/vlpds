@@ -471,6 +471,9 @@ pub struct Firehose {
     /// Set (for good) when this node leaves the cluster: the merger emits
     /// nothing more (see `freeze`).
     frozen: AtomicBool,
+    /// Set (for good) as the node drains: every subscriber, connected or
+    /// connecting, gets a going-away close.
+    closing: watch::Sender<bool>,
     runtime: tokio::runtime::Handle,
     max_lag_bytes: u64,
     readahead_bytes: usize,
@@ -513,6 +516,7 @@ impl Firehose {
             max_queue_bytes: AtomicUsize::new(DEFAULT_MERGE_QUEUE_BYTES),
             queued_bytes: AtomicUsize::new(0),
             frozen: AtomicBool::new(false),
+            closing: watch::channel(false).0,
             runtime: opts.runtime.unwrap_or_else(tokio::runtime::Handle::current),
             max_lag_bytes: opts.max_lag_bytes as u64,
             readahead_bytes: opts.readahead_bytes,
@@ -585,6 +589,12 @@ impl Firehose {
     /// elsewhere from their cursors when we close.
     pub fn freeze(&self) {
         self.frozen.store(true, Ordering::Release);
+    }
+
+    /// Closes every subscriber with 1001 (going away) at its next frame
+    /// boundary: they reconnect and resume from their cursors.
+    pub fn close_subscribers(&self) {
+        self.closing.send_replace(true);
     }
 
     /// Serves renumbered seqs (see [`Renumber`]). Set before `spawn_merger`.
@@ -995,7 +1005,7 @@ impl Firehose {
     {
         let (ctl_tx, ctl) = mpsc::channel(8);
         // the read half keeps the socket open until it's aborted, kicks included
-        let _reader = AbortOnDrop(tokio::spawn(read_client(r, ctl_tx)));
+        let _reader = AbortOnDrop(tokio::spawn(read_client(r, ctl_tx, self.closing.subscribe())));
         let mut out = Out { w, ctl, idle: self.write_idle, conn };
         match self.stream(&mut out, cursor, shard).await {
             Ok(()) => "shutdown",
@@ -1871,55 +1881,62 @@ fn handshake(h: &HeaderMap) -> Result<String, (StatusCode, &'static str)> {
 enum Ctl {
     Ping(Vec<u8>),
     Close,
+    /// We are shutting down.
+    GoingAway,
 }
 
-/// Ends on a close frame, EOF or a protocol error; dropping `ctl` tells the
-/// writer the client is gone.
-async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>) {
-    let res: std::io::Result<()> = async {
-        loop {
-            let mut h = [0u8; 2];
-            r.read_exact(&mut h).await?;
-            let op = h[0] & 0x0f;
-            let len = match h[1] & 0x7f {
-                126 => r.read_u16().await? as u64,
-                127 => r.read_u64().await?,
-                n => n as u64,
-            };
-            let mut mask = [0u8; 4];
-            if h[1] & 0x80 != 0 {
-                r.read_exact(&mut mask).await?;
-            }
-            if op & 0x8 != 0 {
-                if len > 125 {
-                    return Err(std::io::ErrorKind::InvalidData.into());
-                }
-                let mut p = vec![0u8; len as usize];
-                r.read_exact(&mut p).await?;
-                for (i, b) in p.iter_mut().enumerate() {
-                    *b ^= mask[i % 4];
-                }
-                match op {
-                    OP_CLOSE => {
-                        let _ = ctl.try_send(Ctl::Close);
-                        return Ok(());
-                    }
-                    OP_PING => {
-                        let _ = ctl.try_send(Ctl::Ping(p));
-                    }
-                    _ => {}
-                }
-            } else {
-                if len > MAX_CLIENT_MESSAGE {
-                    return Err(std::io::ErrorKind::InvalidData.into());
-                }
-                tokio::io::copy(&mut (&mut r).take(len), &mut tokio::io::sink()).await?;
-            }
+/// Ends on a close frame, EOF, a protocol error or `closing`; dropping
+/// `ctl` tells the writer the client is gone.
+async fn read_client<R: AsyncRead + Unpin>(mut r: R, ctl: mpsc::Sender<Ctl>, mut closing: watch::Receiver<bool>) {
+    tokio::select! {
+        res = read_frames(&mut r, &ctl) => if let Err(e) = res {
+            tracing::trace!("subscriber read side ended: {e}");
+        },
+        true = async { closing.wait_for(|c| *c).await.is_ok() } => {
+            let _ = ctl.send(Ctl::GoingAway).await;
         }
     }
-    .await;
-    if let Err(e) = res {
-        tracing::trace!("subscriber read side ended: {e}");
+}
+
+async fn read_frames<R: AsyncRead + Unpin>(r: &mut R, ctl: &mpsc::Sender<Ctl>) -> std::io::Result<()> {
+    loop {
+        let mut h = [0u8; 2];
+        r.read_exact(&mut h).await?;
+        let op = h[0] & 0x0f;
+        let len = match h[1] & 0x7f {
+            126 => r.read_u16().await? as u64,
+            127 => r.read_u64().await?,
+            n => n as u64,
+        };
+        let mut mask = [0u8; 4];
+        if h[1] & 0x80 != 0 {
+            r.read_exact(&mut mask).await?;
+        }
+        if op & 0x8 != 0 {
+            if len > 125 {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            let mut p = vec![0u8; len as usize];
+            r.read_exact(&mut p).await?;
+            for (i, b) in p.iter_mut().enumerate() {
+                *b ^= mask[i % 4];
+            }
+            match op {
+                OP_CLOSE => {
+                    let _ = ctl.try_send(Ctl::Close);
+                    return Ok(());
+                }
+                OP_PING => {
+                    let _ = ctl.try_send(Ctl::Ping(p));
+                }
+                _ => {}
+            }
+        } else {
+            if len > MAX_CLIENT_MESSAGE {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+            tokio::io::copy(&mut (&mut *r).take(len), &mut tokio::io::sink()).await?;
+        }
     }
 }
 
@@ -2068,6 +2085,10 @@ impl<W: AsyncWrite + Unpin> Out<W> {
                 push_message(&mut m, OP_CLOSE, &1000u16.to_be_bytes());
                 let _ = tokio::time::timeout(FINAL_GRACE, self.w.write_all(&m)).await;
                 Err("client_closed")
+            }
+            Some(Ctl::GoingAway) => {
+                self.close(1001).await;
+                Err("shutdown")
             }
             None => Err("client_gone"),
         }

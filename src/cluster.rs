@@ -1346,6 +1346,11 @@ impl Cluster {
         self.halted.load(Ordering::Acquire)
     }
 
+    /// Shutting down (or halted): never takes a shard again.
+    pub fn stopping(&self) -> bool {
+        self.stopping.load(Ordering::Acquire)
+    }
+
     /// On our own wall clock (caps our announced watermark).
     pub fn lease_expiry_us(&self) -> u64 {
         self.expires_local_ms.load(Ordering::Acquire) * 1000
@@ -2768,9 +2773,14 @@ impl Cluster {
         self.stopping.store(true, Ordering::Release);
         let _step = self.step_lock.lock().await;
         // Announce the drain first, or a peer stepping meanwhile hands shards
-        // back to us, which we'd never adopt.
+        // back to us, which we'd never adopt. Without peers nobody reads it,
+        // and the write would wait out the lease key's gap (up to ~1 s).
+        // A joiner we haven't listed yet owns nothing, so it hands us
+        // nothing, and its step takes our shards once our lease is gone.
         self.lease.write().draining = true;
-        self.renew(host).await;
+        if !self.peers.read().is_empty() {
+            self.renew(host).await;
+        }
         let settled = self.settled_peers();
         let to = self.short_of(&settled, self.layout().shards.len().div_ceil(settled.len().max(1)));
         // plus any a peer handed us before it saw the drain (never opened:

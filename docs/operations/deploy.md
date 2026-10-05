@@ -34,7 +34,7 @@ facts:
   - { value: "2 vCPU", unit: "/ 4 GB", label: runs a personal PDS, note: "a small VPS with a 3 GiB container limit" }
   - { value: "$0", unit: /mo, label: object store on R2, note: "tiny profile idles at ~0.3 M Class A/mo (measured)", tone: amber }
   - { value: "60 s", label: lease TTL on tiny, note: "a crash waits ~53 s to write again; SIGTERM ~1 s", tone: violet }
-  - { value: "5–30 s", label: of 502s per upgrade, note: one node means every restart is a short outage, tone: rust }
+  - { value: "a few s", label: of 502s per upgrade, note: "one node means every restart is a short outage (vlpds stops in ~0.2 s and writes ~1.3 s after starting, plus the container restart)", tone: rust }
 ```
 
 The worked example here is one vlpds node on a small VPS serving `pds.example.com`, set up with the

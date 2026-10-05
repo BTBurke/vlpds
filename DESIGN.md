@@ -2004,11 +2004,27 @@ most one step of observation delay, plus replay.
   its applied marker once at the end (85 shards x 342 segments were 29k
   SlateDB writes, most of them marker-only).
 - *Graceful stop keeps serving* until its shards are handed out, its lease is
-  gone and 500 ms more: a forward it would drop mid-request is ambiguous to
-  the peer (a client 503), one it answers "not owned" is resent. Then its
+  gone and, with peers, 500 ms more (`server::settle_for`): a forward it
+  would drop mid-request is ambiguous to the peer (a client 503), one it
+  answers "not owned" is resent. A lone node has nobody following its
+  routing, so it skips the 500 ms (and has no handoff to prewarm). Then its
   listeners drain (`server::Drain`): no new connections, idle ones closed,
   and every request in flight answered (HTTP/1 closes after it, HTTP/2 sends
-  GOAWAY) for up to 30 s before the process exits. It used to exit right
+  GOAWAY). The drain ends when the last one is answered. 30 s is only its
+  ceiling. Firehose subscribers get a 1001 (going away) close as the drain
+  starts and resume from their cursors. An upgraded websocket has left
+  hyper's connection, so it never held the drain, but before the close
+  subscribers saw the socket drop (1006) at exit. On a lone node, a write
+  that finds its shard already closed is answered 503 `ShardMoved` at once
+  (`Router::stopping_alone`). Resending it for the 20 s budget had nowhere
+  to go, and it held every single-node stop under load for ~20.6 s (benchbox,
+  64 writers, longest request in flight at SIGTERM 10 ms). Now that stop
+  takes about as long as an idle one. A lone node also skips writing its
+  lease as draining: nobody reads it, and the write waited out the lease
+  key's ~1 s gap. On benchbox (MinIO, 16 shards, 4 subscribers) SIGTERM to
+  exit went from ~0.8-1.1 s to ~0.1 s idle, and from ~20.6 s to ~0.23 s
+  under 64 writers. Stop, start and first write take ~1.5 s (was ~2.0-2.4
+  s idle, ~22 s under load). It used to exit right
   after the 500 ms, dropping answers it owed: the spaces fault run (spaces-2
   47dc3a5c, 3 nodes behind a balancer that resends a request whose
   connection failed) had a space write forwarded by the exiting node and

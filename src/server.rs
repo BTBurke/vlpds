@@ -1062,6 +1062,9 @@ impl crate::forward::Router for ClusterRouter {
     fn alone(&self) -> bool {
         self.app.cluster.as_ref().is_some_and(|c| c.alone())
     }
+    fn stopping_alone(&self) -> bool {
+        self.app.cluster.as_ref().is_some_and(|c| c.stopping() && c.peers().is_empty())
+    }
 }
 
 fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Router {
@@ -1084,13 +1087,25 @@ pub const SHUTDOWN_SETTLE: Duration = Duration::from_millis(500);
 /// deploy's 60 s minimum stop grace.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
-/// SIGTERM: [`shutdown`], [`SHUTDOWN_SETTLE`] more of serving, then the
-/// listeners drain ([`Drain::run`] for `grace`). False: requests still in
-/// flight were cut.
+/// SIGTERM: [`shutdown`], [`settle_for`] more of serving, then the
+/// listeners drain ([`Drain::run`] for `grace`) while firehose subscribers
+/// are told we are going away. False: requests still in flight were cut.
 pub async fn shutdown_gracefully(app: &Arc<xrpc::App>, grace: Duration) -> bool {
     shutdown(app).await;
-    tokio::time::sleep(SHUTDOWN_SETTLE).await;
+    tokio::time::sleep(settle_for(app)).await;
+    // they resume from their cursors elsewhere, or here after the restart,
+    // and see a going-away close instead of their socket dropping at exit
+    app.firehose.close_subscribers();
     app.http_drain.run(grace).await
+}
+
+/// [`SHUTDOWN_SETTLE`] with peers; none for a node without any, whose
+/// routing nobody follows.
+pub fn settle_for(app: &xrpc::App) -> Duration {
+    match &app.cluster {
+        Some(c) if !c.peers().is_empty() => SHUTDOWN_SETTLE,
+        _ => Duration::ZERO,
+    }
 }
 
 /// Hands every shard back and drops the node lease, so successors take over

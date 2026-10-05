@@ -11,6 +11,10 @@
 //!   public and space, through such a balancer while nodes shut down
 //!   gracefully one after another.
 //! - [`drain_answers_requests_in_flight`]: the drain itself.
+//! - [`idle_lone_node_stops_at_once`], [`lone_node_skips_the_handoff_wait`],
+//!   [`writes_during_a_lone_stop_dont_hold_the_drain`],
+//!   [`open_firehose_does_not_hold_the_drain`]: a single node's deploy
+//!   waits on its requests in flight and nothing else.
 //! - [`space_write_failing_after_it_applied_is_unknown`]: a failure after
 //!   the ack (the authority's served-hash push) is a 500, not ShardMoved.
 
@@ -296,6 +300,118 @@ async fn drain_answers_requests_in_flight() {
             assert!(!clean, "the write outlived the grace");
             assert!(r.is_err(), "cut: {:?}", r.map(|r| r.status));
         }
+    }
+}
+
+/// A node without peers stops at once: nobody follows its routing, so it
+/// neither settles nor waits on a handoff, and an idle keep-alive
+/// connection is closed rather than waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_lone_node_stops_at_once() {
+    let s = cluster_node("is", HookedStore::new(&Arc::default()), 4, |_| {}).await;
+    // leaves a pooled keep-alive connection behind
+    s.create_account("is").await;
+    assert!(cluster(&s).peers().is_empty());
+    let t = Instant::now();
+    assert!(vlpds::server::shutdown_gracefully(&s.app, vlpds::server::SHUTDOWN_GRACE).await);
+    eprintln!("idle lone stop: {} ms", t.elapsed().as_millis());
+    assert!(t.elapsed() < Duration::from_secs(1), "an idle lone node took {:?} to stop", t.elapsed());
+}
+
+/// Writes that keep coming while a lone node stops find their shards
+/// closed. Nobody else can take them, so they're answered 503 (nothing
+/// done) at once. Resending them for the 20 s budget held every
+/// single-node deploy's drain open for ~20 s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_during_a_lone_stop_dont_hold_the_drain() {
+    let s = cluster_node("ws", HookedStore::new(&Arc::default()), 4, |_| {}).await;
+    let acct = s.create_account("ws").await;
+    let stop = AtomicBool::new(false);
+    let writer = || async {
+        let mut statuses = std::collections::BTreeMap::<String, usize>::new();
+        while !stop.load(Ordering::Relaxed) {
+            let body = json!({"repo": acct.did, "collection": "app.bsky.feed.post", "record": post_record("w")});
+            let rb = s.xrpc.http.post(format!("{}/xrpc/com.atproto.repo.createRecord", s.url));
+            let k = match s.xrpc.try_send(rb.bearer_auth(&acct.access).json(&body)).await {
+                Ok(r) => format!("{} {}", r.status, r.json["error"].as_str().unwrap_or_default()),
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    "connect".into()
+                }
+            };
+            *statuses.entry(k).or_default() += 1;
+        }
+        statuses
+    };
+    let stopping = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let t = Instant::now();
+        let clean = vlpds::server::shutdown_gracefully(&s.app, vlpds::server::SHUTDOWN_GRACE).await;
+        let took = t.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        (clean, took)
+    };
+    let ((clean, took), seen) = tokio::join!(stopping, futures::future::join_all((0..8).map(|_| writer())));
+    eprintln!("lone stop under writes: {} ms, {seen:?}", took.as_millis());
+    assert!(clean, "nothing was left to cut");
+    assert!(took < Duration::from_secs(3), "writes held the drain for {took:?}");
+    for (k, _) in seen.iter().flatten() {
+        assert!(k.starts_with("200") || k.starts_with("503") || k == "connect", "a write answered {k}");
+    }
+}
+
+/// The settle after the handoff is for peers' routing: a lone node skips
+/// it, and one with a peer keeps it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lone_node_skips_the_handoff_wait() {
+    let bucket = Arc::default();
+    let a = cluster_node("sa", HookedStore::new(&bucket), 4, |_| {}).await;
+    assert_eq!(vlpds::server::settle_for(&a.app), Duration::ZERO);
+    let b = cluster_node("sb", HookedStore::new(&bucket), 4, |_| {}).await;
+    let t = Instant::now();
+    while cluster(&a).peers().is_empty() || cluster(&b).peers().is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(10), "the nodes never saw each other");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(vlpds::server::settle_for(&a.app), vlpds::server::SHUTDOWN_SETTLE);
+    assert_eq!(vlpds::server::settle_for(&b.app), vlpds::server::SHUTDOWN_SETTLE);
+}
+
+/// Firehose subscribers (live and replaying) don't hold the drain open:
+/// each gets a going-away close as it starts, and resumes from its cursor
+/// elsewhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_firehose_does_not_hold_the_drain() {
+    use futures::StreamExt;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+    use tokio_tungstenite::tungstenite::Message;
+    let s = cluster_node("fd", HookedStore::new(&Arc::default()), 4, |_| {}).await;
+    let mut subs = Vec::new();
+    for cursor in [None, Some(0)] {
+        subs.push(tokio_tungstenite::connect_async(s.ws_url(cursor)).await.expect("ws connect").0);
+    }
+    s.create_account("fd").await;
+    for ws in &mut subs {
+        let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await.expect("a frame");
+        assert!(matches!(m, Some(Ok(Message::Binary(_)))), "{m:?}");
+    }
+    let t = Instant::now();
+    assert!(vlpds::server::shutdown_gracefully(&s.app, vlpds::server::SHUTDOWN_GRACE).await);
+    eprintln!("stop with subscribers: {} ms", t.elapsed().as_millis());
+    assert!(t.elapsed() < Duration::from_secs(1), "subscribers held the drain for {:?}", t.elapsed());
+    for mut ws in subs {
+        let close = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(f))) => break f,
+                    Some(Ok(_)) => continue,
+                    other => panic!("no close frame: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("closed at the drain");
+        assert_eq!(close.map(|f| f.code), Some(CloseCode::Away));
     }
 }
 

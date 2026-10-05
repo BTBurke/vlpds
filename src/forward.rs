@@ -143,6 +143,11 @@ pub trait Router: Send + Sync + 'static {
     fn alone(&self) -> bool {
         false
     }
+    /// Shutting down without a peer: a resend has nowhere to go before the
+    /// process exits.
+    fn stopping_alone(&self) -> bool {
+        false
+    }
 }
 
 /// (DID, handle to resolve). `admin` also takes an at:// `uri`'s DID
@@ -712,11 +717,13 @@ async fn with_retries(
             req.headers_mut().insert(RESEND_HEADER, r.header());
             req.extensions_mut().insert(r);
         }
-        let resp = match key.as_deref().and_then(|k| router.remote_owner(k)) {
-            None => next.clone().run(req).await,
-            Some(owner) => forward_counted(client, &owner, req, token, ttfb).await,
+        let (resp, here) = match key.as_deref().and_then(|k| router.remote_owner(k)) {
+            None => (next.clone().run(req).await, true),
+            Some(owner) => (forward_counted(client, &owner, req, token, ttfb).await, false),
         };
-        if resp.status() != StatusCode::SERVICE_UNAVAILABLE {
+        // a lone node's drain would wait out the whole budget on it, and the
+        // client's own retry reaches the restarted node
+        if resp.status() != StatusCode::SERVICE_UNAVAILABLE || (here && router.stopping_alone()) {
             return resp;
         }
         let not_sent = resp.extensions().get::<NotSent>().is_some();

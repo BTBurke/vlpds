@@ -54,9 +54,12 @@ Clients see almost nothing. A forward that's in flight at the moment of exit can
 errors per restart). Writes that hit a shard in motion get a retryable 503, and the entry node
 resends them for up to 20 s. Expect a burst of resends and some cold repo loads on the moved shards.
 
-A single node is different, because every restart is a short outage. A graceful restart takes ~1 s
-to the first write in an idle test. On a real server expect roughly 5–30 s of Caddy 502s and dropped
-firehose connections (relays reconnect with their cursor), so pick a quiet time. The Ansible role
+A single node is different, because every restart is a short outage. A graceful stop takes ~0.1 s
+idle and ~0.2 s under write load, and the restarted node takes its first write ~1.3 s after it
+starts (measured on benchbox against MinIO). The stop waits only for requests already in flight.
+Writes that arrive while it stops get a 503 (nothing done) right away, and firehose subscribers get a
+going-away close, so relays reconnect with their cursor. On a real server add the container's own
+restart, so expect a few seconds of Caddy 502s and pick a quiet time. The Ansible role
 does this with `--tags vlpds-deploy,vlpds-verify` after you set the new image tag (see
 [Deploy](deploy.md)).
 

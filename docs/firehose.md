@@ -136,7 +136,7 @@ procedures, see [Runbook](operations/runbook.md#firehose-stalled-or-lagging).
 - title: The joiner's seqs pass every floor, then it publishes `joined`
   body: Peers hand shards only to joined nodes. So no event the joiner acks can fall below the point where some peer's merge began following it, and no subscriber anywhere misses one.
 - title: A graceful leave freezes the merger first
-  body: "Before deleting its lease, the node stops its merger for good and keeps serving for 500 ms. It fences its own log and closes its log streams (new ones get 410 `LogClosed`). Its subscribers are disconnected and resume from their cursors on another node."
+  body: "Before deleting its lease, the node stops its merger for good and keeps serving for 500 ms. It fences its own log and closes its log streams (new ones get 410 `LogClosed`). Once it stops accepting connections, its subscribers get a 1001 (going away) close and resume from their cursors on another node. They never hold up the stop."
 - title: Peers drain the log to its fence
   body: A follower leaves a live stream within 50 ms of the log's lease no longer being live (deleted, presumed dead or fenced). It reads the rest from the bucket up to the fence and retires the log.
 ```

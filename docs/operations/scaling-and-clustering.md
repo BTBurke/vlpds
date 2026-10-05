@@ -100,7 +100,7 @@ migration, because the lone node's prefix is already a cluster of one. The proce
 - title: It hands its shards out
   body: "Each shard closes with one barrier segment and a checkpoint and goes straight to a settled peer, which opens it without replaying anything (~0.2 s a shard)."
 - title: It fences its own log and deletes its lease
-  body: "Followers drain the log up to the fence and drop it as a firehose source. The node keeps answering for 500 ms and then exits 0."
+  body: "Followers drain the log up to the fence and drop it as a firehose source. The node keeps answering for 500 ms, closes its firehose subscribers (they resume from their cursors) and exits 0 as soon as its last request in flight is answered."
 - title: Peers rebalance
   body: The fair share is recomputed over the remaining nodes. Don't restart the process if the node is leaving for good.
 ```
