@@ -106,6 +106,11 @@ migrate-spaces-e2e:
 passkeys-e2e:
     bench/passkeys/run.sh
 
+# The account page's Spaces tab in headless Chromium (bench/account-spaces/README.md): connect, the lists, the owner
+# grant, members, deleting a space and revocation on a local vlpds; screenshots in bench/account-spaces/out/shots
+account-spaces-e2e:
+    bench/account-spaces/run.sh
+
 # Spaces e2e matrix (bench/spaces/README.md): local PLC, two reference PDSes at the Spaces alpha and MinIO in
 # docker, vlpds from the newest spaces branch; each role on vlpds or a reference PDS, pass / fail / not impl. per step
 # (configs: ref-ref vlpds-authority ref-authority vlpds-only; default all; KEEP=1 leaves it up, CLUSTER=1 for 3 nodes)

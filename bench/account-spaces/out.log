@@ -1,0 +1,61 @@
+23:48:44   ok   the client metadata lists /account/oauth/callback
+23:48:44 seed
+23:48:44   alice runs bookclub (bob writes there) and garden, writes in bob's notes
+23:48:44 screenshots: phone-light
+23:48:46 screenshots: phone-dark
+23:48:49 screenshots: desktop-light
+23:48:51 screenshots: desktop-dark
+23:48:53   36 screenshots and index.html in /home/operator/account-spaces-screens/
+23:48:53   ok   the Spaces link is in the account nav
+23:48:53   ok   before Connect: no OAuth session in the tab
+23:48:53 connect
+23:48:53   ok   the consent asks to read your own space repos
+23:48:53   ok   the first consent asks to manage nothing
+23:48:53   ok   back on /account/spaces, no code in the address bar
+23:48:53 lists
+23:48:53   ok   spaces you write in: bookclub and notes
+23:48:53   ok   bob's space shows his verified handle
+23:48:53   ok   bookclub: 3 of your records
+23:48:53   ok   notes: 2 of your records
+23:48:53   ok   garden isn't listed as written in (nothing of yours there)
+23:48:53   ok   spaces you run: members, writers, policy
+23:48:53 browse
+23:48:53   ok   bookclub: your 3 records, not bob’s
+23:48:53   ok   a record opens to its value
+23:48:53   ok   members: bob, read and write
+23:48:53   ok   no owner controls before Manage
+23:48:53 owner grant
+23:48:53   ok   the second consent asks to manage your spaces (not every space)
+23:48:53   ok   back on the space with the controls open
+23:48:53   ok   the token carries both grants, the owner one for this account only
+23:48:53   ok   the first grant was revoked when the second replaced it
+23:48:53   ok   one DPoP key left (the first grant’s is deleted)
+23:48:53 add and remove a member
+23:48:53   ok   the add confirmation names carol
+23:48:53   ok   the API lists carol as a reader
+23:48:54   ok   the API no longer lists carol (bob stays)
+23:48:54 delete a space
+23:48:54   ok   delete stays disabled until the space key is typed
+23:48:54   ok   typing the key enables it
+23:48:54   ok   the API says garden is gone
+23:48:54   ok   garden is off the list
+23:48:54 disconnect revokes
+23:48:54   ok   the live token works (DPoP-signed in the page)
+23:48:54   ok   after Disconnect the same token is refused
+23:48:54   ok   Disconnect: no OAuth session or pending sign-in left in sessionStorage
+23:48:54   ok   Disconnect: the DPoP key is deleted
+23:48:54   ok   Disconnect: no account-page session left at the server
+23:48:54 leaving the section revokes
+23:48:54   ok   connected again
+23:48:54   ok   leaving the section: no OAuth session or pending sign-in left in sessionStorage
+23:48:54   ok   leaving the section: the DPoP key is deleted
+23:48:54   ok   leaving the section: no account-page session left at the server
+23:48:54 signing out revokes
+23:48:54   ok   after Sign out the token is refused
+23:48:54   ok   Sign out: no OAuth session or pending sign-in left in sessionStorage
+23:48:54   ok   Sign out: the DPoP key is deleted
+23:48:54   ok   Sign out: no account-page session left at the server
+23:48:54 a server without Spaces
+23:48:55   ok   no Spaces link without --spaces
+23:48:55   ok   and no Connect button at /account/spaces
+23:48:55 all ok
