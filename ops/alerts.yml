@@ -693,6 +693,21 @@ groups:
           summary: "{{ $labels.instance }}: {{ $value | humanize }} failed object-store requests/s on {{ $labels.component }}"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorerequesterrors"
 
+      # Throttled answers (429, S3's 503 SlowDown), each one counted at the
+      # HTTP layer (throttle.rs) because object_store retries them out of
+      # sight of vlpds_object_store_requests_total. On lease keys each one
+      # puts a CAS (a renewal too) 1-4 s back, against the 0.4 x TTL renewal
+      # ceiling. A few at a restart are normal (two in a whole R2 cluster
+      # run). 0.05/s for 10 min (guess).
+      - alert: VlpdsObjectStoreThrottled
+        expr: sum by (instance, kind) (rate(vlpds_object_store_throttled_total{job="vlpds"}[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: the object store is throttling {{ $labels.kind }} requests ({{ $value | humanize }}/s)"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorethrottled"
+
       # Object-store requests queued for an in-flight permit of their client
       # (objlimit.rs: log / state / ctl, lane main / reserved). A takeover's
       # burst queues briefly by design; sustained queueing is a pool too

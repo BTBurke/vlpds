@@ -1067,6 +1067,42 @@ and the matching warn/error log lines.
 **Do:** check credentials, permissions, throttling (S3 503 SlowDown) and provider
 status.
 
+### VlpdsObjectStoreThrottled
+
+**Means:** for 10 minutes, over 0.05/s of this node's object-store answers were
+429 Too Many Requests or 503 SlowDown on one key kind
+(`vlpds_object_store_throttled_total{kind}`). object_store retries both inside
+its client, so they're counted at the HTTP layer (`src/throttle.rs`), one per
+answer. A 503 without SlowDown is an outage and isn't counted here. `lease` is
+the control plane (node leases, assignments, writer claims, the cluster
+version), by key for single-object requests and by `prefix=` for LISTs. A bulk
+delete names its keys only in its body, so it counts as `other`. `segment` and
+`other` are account-wide request rates.
+
+R2 takes about one write a second to one key. A node's writes to its own lease
+retry a throttled answer from min(1 s, renew interval), then up to 4 s apart.
+Assignment and writer-claim CASes keep object_store's 100 ms start, since they
+run under the step's 5 s call deadline and the next step retries them. A renewal
+earns validity from its first send, so at the 10 s TTL it survives about 3
+throttled answers (6-7 with the 100 ms start). Past that the node fail-stops
+as for any slow renewal.
+
+A node also keeps its own lease writes at least min(1 s, renew interval) apart.
+A renewal right after a write that landed is skipped, and one carrying a new
+`joined` or `draining` flag waits out the gap (under the renew lock), so peers
+can see either flag up to 1 s late. That costs liveness only. When the validity
+left is short, the renewal goes at once, throttled or not.
+
+**Confirm:** `sum by (kind) (rate(vlpds_object_store_throttled_total{instance="..."}[5m]))`,
+`vlpds_lease_renew_seconds` against the 0.4 x TTL ceiling, and the provider's
+rate-limit docs and dashboard.
+
+**Do:** on `lease`, look for something else writing the same keys (another
+cluster or a tool on the same `--prefix`) or a node restarting in a loop. Don't
+lower `--lease-ttl-ms` (renewals get more frequent). On `segment` or `other`,
+the bucket is past the provider's request rate: spread the load or ask for a
+higher limit.
+
 ### VlpdsObjectStorePermitsSaturated
 
 **Means:** for 10 minutes, over 1/s of this node's object-store requests found

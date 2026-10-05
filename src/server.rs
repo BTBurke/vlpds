@@ -388,7 +388,13 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         Some(s3) => (
             Store::s3(s3, &cfg.prefix, cfg.inject_latency, log_limits.connections())?.counted("log"),
             Store::s3(s3, &cfg.prefix, None, state_limits.connections())?.counted("state"),
-            Store::s3(s3, &cfg.prefix, None, ctl_limits.connections())?.counted("ctl"),
+            Store::s3_ctl(
+                s3,
+                &cfg.prefix,
+                ctl_limits.connections(),
+                cfg.cluster.as_ref().map_or_else(|| ClusterConfig::default().renew_every, |c| c.renew_every),
+            )?
+            .counted("ctl"),
         ),
     };
     let (store, state_store, ctl_store) = (
@@ -532,7 +538,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards
-    cluster.step(&host).await?;
+    cluster.first_step(&host).await?;
     // Only now merge: the step registered a follower for every live peer, so
     // the merger never settles past the start floor on our own log's
     // watermark alone (a peer followed after that would owe only its events

@@ -154,6 +154,7 @@ mod spaces_scopes;
 mod spaces_side;
 mod spaces_sync;
 mod staged_import;
+mod startup_retry;
 mod subscribe_repos;
 mod sync;
 mod sync11_property;

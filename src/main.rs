@@ -1487,6 +1487,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             clock_offset_ms: 0,
             levels: vlpds::version::Window::BUILD,
             lease_plane: None,
+            startup_deadline: vlpds::cluster::STARTUP_DEADLINE,
         }),
         memory_store: None,
         metrics_listen: metrics_addr.clone(),

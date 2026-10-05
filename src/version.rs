@@ -247,8 +247,20 @@ pub fn refuse(node_id: &str, why: &str) -> anyhow::Error {
         None if cfg!(test) => {}
         None => crate::lifecycle::fail_stop(EXIT_CODE, EXIT_REASON),
     }
-    anyhow::anyhow!("{EXIT_REASON}: {why}")
+    anyhow::Error::new(Refused(why.to_string()))
 }
+
+/// What [`refuse`] returns: startup never retries it.
+#[derive(Debug)]
+pub struct Refused(pub String);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{EXIT_REASON}: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 #[cfg(test)]
 mod tests {

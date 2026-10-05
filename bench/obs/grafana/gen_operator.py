@@ -81,6 +81,7 @@ ALERT_NAMES = {
     "VlpdsControlPlaneTimeouts": "Storage is timing out",
     "VlpdsObjectStoreBrownout": "Storage is failing for several servers (outage risk)",
     "VlpdsObjectStoreRequestErrors": "Storage requests are failing",
+    "VlpdsObjectStoreThrottled": "Storage is rate-limiting requests",
     "VlpdsObjectStorePermitsSaturated": "Storage requests are queueing",
     "VlpdsControlPlaneLatencyHigh": "Storage is slow",
     "VlpdsObjectStoreErrors": "Storage requests are failing",

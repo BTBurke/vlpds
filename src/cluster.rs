@@ -132,6 +132,9 @@ pub struct ClusterConfig {
     pub levels: version::Window,
     /// Where the lease is renewed. None: the caller's runtime and `store`.
     pub lease_plane: Option<LeasePlane>,
+    /// How long startup keeps retrying control-plane reads and its first
+    /// step that fail or time out, before the node gives up.
+    pub startup_deadline: Duration,
 }
 
 /// A runtime and an object-store client for lease renewal alone. A node
@@ -181,8 +184,41 @@ impl Default for ClusterConfig {
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
             lease_plane: None,
+            startup_deadline: STARTUP_DEADLINE,
         }
     }
+}
+
+/// The least time from one answered write of our lease to the next one's
+/// send: R2 takes about one write a second to one key. Never more than
+/// `renew_every`, so a short test TTL keeps its cadence.
+const LEASE_KEY_GAP: Duration = Duration::from_secs(1);
+
+fn lease_key_gap(renew_every: Duration) -> Duration {
+    LEASE_KEY_GAP.min(renew_every)
+}
+
+/// [`ClusterConfig::startup_deadline`]'s default. A store that answers late
+/// for a few seconds at boot (one R2 GET took over 3 s) otherwise kills a
+/// node that would have served a moment later.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Startup's first retry waits about this long; later ones double, capped
+/// at `renew_every`.
+const STARTUP_BACKOFF_FLOOR: Duration = Duration::from_millis(200);
+
+/// Exponential backoff with equal jitter: attempt `n` (from 0) waits
+/// between half and all of `min(cap, floor * 2^n)`, `unit` (in [0, 1))
+/// picking where.
+pub(crate) fn jittered_backoff(attempt: u32, floor: Duration, cap: Duration, unit: f64) -> Duration {
+    let full = floor.saturating_mul(1u32 << attempt.min(16)).min(cap);
+    full / 2 + full.mul_f64(unit.clamp(0.0, 1.0) / 2.0)
+}
+
+/// Startup retries a store error that may pass (a 5xx past object_store's
+/// retries, a transport error, a deadline), never a refusal or an answer.
+fn transient(e: &object_store::Error) -> bool {
+    matches!(e, object_store::Error::Generic { .. })
 }
 
 /// What the cluster asks the node to do with shards.
@@ -331,6 +367,9 @@ pub struct Cluster {
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// The last write of our lease: when it was answered, whether it landed,
+    /// and the `joined` / `draining` it carried.
+    last_lease_write: parking_lot::Mutex<Option<(Instant, bool, bool, bool)>>,
     /// With a lease plane every renewal runs there: callers elsewhere ask
     /// its loop (`renew_now`) and wait for a renewal that started after
     /// they asked (`renew_started`, then `renew_done` carrying its number).
@@ -539,6 +578,7 @@ impl Cluster {
             step_lock: tokio::sync::Mutex::new(()),
             gone: AtomicBool::new(false),
             renew_lock: tokio::sync::Mutex::new(()),
+            last_lease_write: parking_lot::Mutex::new(None),
             renew_now: tokio::sync::Notify::new(),
             renew_started: AtomicU64::new(0),
             renew_done: tokio::sync::watch::channel(0).0,
@@ -1110,22 +1150,43 @@ impl Cluster {
         self.with_deadline(op, f, |m| object_store::Error::Generic { store: "cluster", source: m.into() }).await
     }
 
+    /// Before our lease is written, a transient error is retried with
+    /// backoff until `startup_deadline`: there is no lease yet to lapse.
     pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         path: &Path,
     ) -> anyhow::Result<Option<(T, Option<String>)>> {
-        self.count("get");
-        let got = self
-            .bounded("get", async {
-                let r = self.store.raw.get(path).await?;
-                let etag = r.meta.e_tag.clone();
-                Ok((r.bytes().await?, etag))
-            })
-            .await;
-        match got {
-            Ok((b, etag)) => Ok(Some((serde_json::from_slice(&b)?, etag))),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            self.count("get");
+            let got = self
+                .bounded("get", async {
+                    let r = self.store.raw.get(path).await?;
+                    let etag = r.meta.e_tag.clone();
+                    Ok((r.bytes().await?, etag))
+                })
+                .await;
+            match got {
+                Ok((b, etag)) => return Ok(Some((serde_json::from_slice(&b)?, etag))),
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) if transient(&e) && self.expires_local_ms.load(Ordering::Acquire) == 0 => {
+                    let wait = jittered_backoff(attempt, STARTUP_BACKOFF_FLOOR, self.cfg.renew_every, rand::random());
+                    if started.elapsed() + wait >= self.cfg.startup_deadline {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("reading {path} at startup, retried for {:?}", started.elapsed())));
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        %path,
+                        attempt,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "control-plane read failed at startup (retrying): {e:#}"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 
@@ -1235,6 +1296,7 @@ impl Cluster {
         l.wm_cap = crate::nodelog::seq_floor(expires_local_ms * 1000);
         let store = self.cfg.lease_plane.as_ref().map_or(&self.store, |p| &p.store);
         let put = Self::put_json_on(store, &self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        *self.last_lease_write.lock() = Some((Instant::now(), put.is_ok(), l.joined, l.draining));
         self.count("put");
         crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
         let etag = put?;
@@ -1695,6 +1757,33 @@ impl Cluster {
         if self.gone.load(Ordering::Acquire) {
             return;
         }
+        // At most one write to our lease key per gap (R2 throttles a key
+        // past about one a second). A renewal right after a write that
+        // landed and carried the same flags would only push validity a few
+        // hundred ms further: skipped, and the next tick renews. One that
+        // must publish a flag, or follows a failed write, waits out the gap.
+        // Both only while the validity left covers the next tick with room
+        // to spare: a slow write earns validity from its send, so one that
+        // landed late (or failed late) is renewed at once, 429 or not.
+        let gap = lease_key_gap(self.cfg.renew_every);
+        let last = *self.last_lease_write.lock();
+        if let Some((at, landed, joined, draining)) = last {
+            let since = at.elapsed();
+            let left = self.valid_until.read().saturating_duration_since(Instant::now());
+            if since < gap && left > self.cfg.renew_every + gap + self.cfg.skew {
+                let same = {
+                    let l = self.lease.read();
+                    l.joined == joined && l.draining == draining
+                };
+                if landed && same {
+                    return;
+                }
+                tokio::time::sleep(gap - since).await;
+                if self.gone.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        }
         // Never resurrect a lapsed lease: peers may have fenced our log, and
         // a renewal landing now would make them count us live again and
         // release shards they just took.
@@ -1997,6 +2086,35 @@ impl Cluster {
     /// One control-plane round, renewing first.
     pub async fn step(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         self.step_inner(host, true).await
+    }
+
+    /// The node's first step, before it serves, retried with backoff until
+    /// `startup_deadline`. The step loop retries a failed step next tick
+    /// anyway; a store slow at boot must not kill a node that never got
+    /// that far. Each attempt keeps the per-call deadline and renews first,
+    /// and no wait exceeds `renew_every`, so our lease never lapses between
+    /// attempts.
+    pub async fn first_step(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            let e = match self.step(host).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is::<version::Refused>() => return Err(e),
+                Err(e) => e,
+            };
+            let wait = jittered_backoff(attempt, STARTUP_BACKOFF_FLOOR, self.cfg.renew_every, rand::random());
+            if started.elapsed() + wait >= self.cfg.startup_deadline {
+                return Err(e.context(format!("first cluster step, retried for {:?}", started.elapsed())));
+            }
+            attempt += 1;
+            tracing::warn!(
+                attempt,
+                retry_in_ms = wait.as_millis() as u64,
+                "first cluster step failed at startup (retrying): {e:#}"
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn step_inner(&self, host: &Arc<dyn ShardHost>, renew: bool) -> anyhow::Result<()> {
@@ -2912,6 +3030,7 @@ mod tests {
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
             lease_plane: None,
+            startup_deadline: STARTUP_DEADLINE,
         }
     }
 
@@ -2947,6 +3066,7 @@ mod tests {
         let a = join(cfg(&id), store.clone()).await.unwrap();
         let (timed0, conflicts0) =
             (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert!(crate::metrics::LEASE_RENEW_SECONDS.get_sample_count() > timed0);
         let v = a.lease_validity_secs();
@@ -2955,6 +3075,7 @@ mod tests {
         assert!(crate::metrics::LEASE_VALIDITY.with_label_values(&[id.as_str()]).get() > 0.0, "exported at render");
         // someone else rewrites our lease: the next renewal loses its CAS
         store.raw.put(&a.path(&format!("nodes/{id}")), PutPayload::from_static(b"{}")).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 1);
         assert!(m.with_label_values(&["conflict"]).get() > conflicts0);
@@ -3566,12 +3687,29 @@ mod tests {
     /// ret3): the next call of `op` ("get", "put", "list") on a path
     /// containing a substring waits 30 s first. "vanish": the next GET is
     /// answered, then the object deleted. "conflict": the next PUT fails
-    /// its precondition. "fail": the next PUT fails (a store error).
+    /// its precondition. "fail": the next PUT fails (a store error),
+    /// "getfail" the next GET. "slowfail": the next PUT fails after
+    /// SLOW_FAIL (a write the store throttled until object_store gave up).
+    /// "slowland": the next PUT lands after SLOW_LAND (throttled, then let
+    /// through).
+    /// `puts` logs every PUT: (key, sent, answered).
     #[derive(Debug, Default)]
     struct Stalls {
         inner: object_store::memory::InMemory,
         armed: Mutex<Vec<(&'static str, String)>>,
         stalled: AtomicU64,
+        puts: Mutex<Vec<(String, Instant, Instant)>>,
+    }
+
+    const SLOW_FAIL: Duration = Duration::from_millis(1500);
+    const SLOW_LAND: Duration = Duration::from_millis(3300);
+
+    struct PutLog<'a>(&'a Stalls, String, Instant);
+
+    impl Drop for PutLog<'_> {
+        fn drop(&mut self) {
+            self.0.puts.lock().push((std::mem::take(&mut self.1), self.2, Instant::now()));
+        }
     }
 
     impl std::fmt::Display for Stalls {
@@ -3603,6 +3741,14 @@ mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
+            let _log = PutLog(self, location.to_string(), Instant::now());
+            if self.take("slowfail", location.as_ref()) {
+                tokio::time::sleep(SLOW_FAIL).await;
+                return Err(object_store::Error::Generic { store: "Stalls", source: "429 Too Many Requests".into() });
+            }
+            if self.take("slowland", location.as_ref()) {
+                tokio::time::sleep(SLOW_LAND).await;
+            }
             if self.take("put", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
             }
@@ -3640,6 +3786,9 @@ mod tests {
         ) -> object_store::Result<object_store::GetResult> {
             if self.take("get", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
+            }
+            if self.take("getfail", location.as_ref()) {
+                return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
             if self.take("vanish", location.as_ref()) {
                 // answered, then deleted (a peer's delete right after our read)
@@ -3736,9 +3885,11 @@ mod tests {
         let (ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         stalls.arm("landed", "nodes/a");
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the armed renewal ran");
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a landed renewal is no lost lease");
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "the next renewal CASes on the adopted ETag");
         assert!(a.lease_valid());
@@ -3747,6 +3898,7 @@ mod tests {
         let mut l = a.lease.read().clone();
         l.log_id = "someone-else".into();
         a.put_json_unbounded(&a.path("nodes/a"), &l, PutMode::Overwrite).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(ha.lost.load(Ordering::SeqCst), 1);
     }
@@ -3806,16 +3958,19 @@ mod tests {
         let a = join(cfg("rv"), store.clone()).await.unwrap();
         let path = a.path("nodes/rv");
         store.raw.delete(&path).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
         let (l, _) = a.get_json::<NodeLease>(&path).await.unwrap().expect("recreated");
         assert_eq!(l.log_id, a.log_id);
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await; // and renews from there
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
         // presumed dead: a peer fenced our log, then deleted the lease
         let p = join(cfg("rv-peer"), store.clone()).await.unwrap();
         p.fence(&a.log_id).await.unwrap();
         store.raw.delete(&path).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 1);
         assert!(a.get_json::<NodeLease>(&path).await.unwrap().is_none(), "not resurrected");
@@ -4425,5 +4580,275 @@ mod tests {
             (&serde_json::Value::Null, &serde_json::json!({"zone": "b"})),
             "released: {got}"
         );
+    }
+
+    #[test]
+    fn startup_backoff_doubles_with_jitter_under_its_cap() {
+        let (floor, cap) = (Duration::from_millis(200), Duration::from_secs(2));
+        let lo: Vec<u128> = (0..6).map(|n| jittered_backoff(n, floor, cap, 0.0).as_millis()).collect();
+        let hi: Vec<u128> = (0..6).map(|n| jittered_backoff(n, floor, cap, 0.999_999).as_millis()).collect();
+        assert_eq!(lo, [100, 200, 400, 800, 1000, 1000]);
+        assert_eq!(hi, [199, 399, 799, 1599, 1999, 1999]);
+        assert_eq!(jittered_backoff(40, floor, cap, 0.5), Duration::from_millis(1500));
+        // a cap under the floor (a short test TTL) wins
+        assert_eq!(jittered_backoff(0, floor, Duration::from_millis(100), 0.0), Duration::from_millis(50));
+    }
+
+    /// R2 at cluster start: one control-plane GET took over 3 s against a
+    /// 3 s TTL and the node exited instead of retrying. A read that fails
+    /// before our lease exists and a first step whose LIST outlives the
+    /// call deadline are retried, and the node comes up with its shards.
+    #[tokio::test]
+    async fn startup_retries_failing_and_slow_control_plane_reads() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        stalls.arm("getfail", "cluster/version");
+        stalls.arm("getfail", "cluster/version");
+        let c = lone_join(cfg("a"), store).await.unwrap();
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 2, "both failing reads retried");
+        stalls.arm("list", "nodes");
+        stalls.arm("list", "nodes");
+        let (h, d) = host();
+        let t = Instant::now();
+        c.first_step(&d).await.unwrap();
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 4);
+        assert!(t.elapsed() >= c.cfg.ttl * 2, "each stalled LIST waited out the call deadline: {:?}", t.elapsed());
+        assert_eq!(c.owned().len(), 8);
+        assert!(c.lease_valid());
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_gives_up_at_its_deadline() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let short = || ClusterConfig { startup_deadline: Duration::from_millis(1500), ..cfg("a") };
+        for _ in 0..100 {
+            stalls.arm("getfail", "cluster/version");
+        }
+        let t = Instant::now();
+        let e = lone_join(short(), store.clone()).await.err().expect("join gives up");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(format!("{e:#}").contains("at startup"), "{e:#}");
+        stalls.armed.lock().clear();
+
+        let c = lone_join(short(), store).await.unwrap();
+        for _ in 0..100 {
+            stalls.arm("list", "nodes");
+        }
+        let (_h, d) = host();
+        let t = Instant::now();
+        let e = c.first_step(&d).await.unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(format!("{e:#}").contains("timed out after"), "{e:#}");
+    }
+
+    /// Startup's retries end with startup. Afterwards a control-plane call
+    /// fails at its deadline (min(TTL, 5 s)) or on its first error, and a
+    /// renewal stalled past the lease's validity still fail-stops the node.
+    #[tokio::test]
+    async fn after_startup_calls_keep_their_deadline_and_renewals_fail_stop() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = lone_join(cfg("a"), store).await.unwrap();
+        let (_h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert_eq!(c.call_deadline(), Some(c.cfg.ttl));
+
+        stalls.arm("get", "nodes/b");
+        let t = Instant::now();
+        let e = c.read_lease("b").await.unwrap_err();
+        assert!(format!("{e:#}").contains("timed out after 600ms"), "{e:#}");
+        assert!(t.elapsed() < c.cfg.ttl * 2, "{:?}", t.elapsed());
+        stalls.arm("getfail", "nodes/b");
+        let gets = c.store_requests();
+        assert!(c.read_lease("b").await.is_err());
+        assert_eq!(c.store_requests(), gets + 1, "no retry once our lease exists");
+
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = lone_join(cfg("r"), store).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert!(c.lease_valid());
+        stalls.arm("put", "nodes/r");
+        c.spawn(d);
+        tokio::time::sleep(c.cfg.ttl + c.cfg.skew * 3 + Duration::from_millis(300)).await;
+        assert!(h.lost.load(Ordering::SeqCst) >= 1, "a stalled renewal must still fail-stop");
+    }
+
+    /// Sends to our lease key from the renew loop, as (when, urgent): a tick
+    /// every `renew_every` (a missed one fires when polled, the next a
+    /// period later), `rtt` per attempt, and write number `bad` throttled
+    /// `retries` times (object_store's shortest waits, the floor, between)
+    /// before it lands. `renew_here` within the gap of the last answer
+    /// skips (after a landed write) or waits, unless the validity left is
+    /// short: then it sends at once (urgent). The bool: a tick found the
+    /// lease lapsed.
+    fn lease_sends(ttl_s: u64, rtt: Duration, bad: usize, retries: u32) -> (Vec<(Duration, bool)>, bool) {
+        let ttl = Duration::from_secs(ttl_s);
+        let (renew_every, skew) = (ttl / 5, ttl / 5);
+        let gap = lease_key_gap(renew_every);
+        let floor = crate::throttle::CTL_WRITE_FLOOR.min(renew_every);
+        let (mut sends, mut tick, mut now) = (Vec::new(), Duration::ZERO, Duration::ZERO);
+        let (mut valid_until, mut last_end, mut writes) = (ttl - skew, None::<Duration>, 0);
+        for _ in 0..40 {
+            now = now.max(tick);
+            tick = now + renew_every;
+            if now >= valid_until {
+                return (sends, true);
+            }
+            let left = valid_until - now;
+            let mut urgent = false;
+            if last_end.is_some_and(|e| now - e < gap) {
+                if left > renew_every + gap + skew {
+                    continue;
+                }
+                urgent = true;
+            }
+            let sent = now;
+            let tries = if writes == bad { retries + 1 } else { 1 };
+            for t in 0..tries {
+                sends.push((now, urgent && t == 0));
+                now += rtt;
+                if t + 1 < tries {
+                    now += floor;
+                }
+            }
+            writes += 1;
+            if now < sent + ttl - skew {
+                valid_until = sent + ttl - skew;
+            }
+            last_end = Some(now);
+        }
+        (sends, false)
+    }
+
+    /// R2 takes about one write a second to one key. Renewals go every TTL/5
+    /// (0.5/s at the default 10 s TTL, 1/s at 5 s), a throttled one retries
+    /// at least min(1 s, renew_every) apart, and the next renewal keeps
+    /// that gap unless the slow one left too little validity: then it goes
+    /// at once, since a lapse would fail-stop the node.
+    #[test]
+    fn lease_renewals_stay_under_one_write_a_second_per_key() {
+        let rtt = Duration::from_millis(200);
+        for ttl_s in [3u64, 5, 10, 60] {
+            let renew_every = Duration::from_secs(ttl_s) / 5;
+            let gap = lease_key_gap(renew_every);
+            let (calm, lapsed) = lease_sends(ttl_s, rtt, usize::MAX, 0);
+            assert!(!lapsed);
+            let calm_gap = calm.windows(2).map(|w| w[1].0 - w[0].0).min().unwrap();
+            assert_eq!(calm_gap, renew_every, "TTL {ttl_s} s: calm cadence");
+            for retries in 0..=6 {
+                let (sends, lapsed) = lease_sends(ttl_s, rtt, 3, retries);
+                let slow = (rtt + gap) * retries + rtt;
+                let ceiling = Duration::from_secs(ttl_s) * 4 / 5;
+                if slow < ceiling - renew_every {
+                    assert!(!lapsed, "TTL {ttl_s} s, {retries} retries: lapsed");
+                }
+                for w in sends.windows(2).filter(|w| !w[1].1) {
+                    assert!(w[1].0 - w[0].0 >= gap, "TTL {ttl_s} s, {retries} retries: {:?} apart", w[1].0 - w[0].0);
+                }
+                if ttl_s == 10 && retries <= 2 {
+                    assert!(sends.iter().all(|s| !s.1), "TTL 10 s, {retries} retries: an urgent renewal");
+                }
+            }
+        }
+        assert_eq!(lease_key_gap(Duration::from_secs(2)), Duration::from_secs(1));
+        assert_eq!(lease_key_gap(Duration::from_millis(100)), Duration::from_millis(100));
+    }
+
+    /// The renew loop itself: a renewal the store held past its tick and
+    /// then failed is followed by the next one no sooner than the gap.
+    #[tokio::test]
+    async fn a_slow_failed_renewal_is_not_followed_at_once() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = ClusterConfig {
+            ttl: Duration::from_secs(8),
+            renew_every: Duration::from_secs(1),
+            skew: Duration::from_secs(1),
+            ..cfg("r")
+        };
+        let c = lone_join(c, store).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        stalls.arm("slowfail", "nodes/r");
+        c.hold_steps.store(true, Ordering::Release);
+        c.spawn(d);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let puts: Vec<(Instant, Instant)> =
+            stalls.puts.lock().iter().filter(|(k, _, _)| k.ends_with("nodes/r")).map(|&(_, s, e)| (s, e)).collect();
+        let slow = puts.iter().position(|(s, e)| *e - *s >= SLOW_FAIL).expect("the throttled renewal");
+        let next = puts.get(slow + 1).expect("a renewal after it");
+        let after = next.0 - puts[slow].1;
+        assert!(after >= Duration::from_millis(950), "renewed {after:?} after the failed one");
+        assert!(c.lease_valid());
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// The join's lease write, the first step's renewal and the renewal
+    /// that publishes `joined` used to land within a few ms on one key (a
+    /// likely cause of R2's 429 at a restart). Now no two writes to it are
+    /// under the gap apart, a renewal that only refreshes is skipped, and
+    /// `joined` still gets published.
+    #[tokio::test]
+    async fn startup_lease_writes_are_a_gap_apart() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = ClusterConfig {
+            ttl: Duration::from_secs(6),
+            renew_every: Duration::from_secs(1),
+            skew: Duration::from_secs(1),
+            ..cfg("s")
+        };
+        let c = lone_join(c, store.clone()).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert!(c.joined() && c.owned().len() == 8);
+        c.spawn(d);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let puts: Vec<(Instant, Instant)> =
+            stalls.puts.lock().iter().filter(|(k, _, _)| k.ends_with("nodes/s")).map(|&(_, s, e)| (s, e)).collect();
+        assert!(puts.len() >= 3, "{} lease writes", puts.len());
+        for w in puts.windows(2) {
+            let apart = w[1].0 - w[0].1;
+            assert!(apart >= Duration::from_millis(990), "lease writes {apart:?} apart");
+        }
+        assert!(c.read_lease("s").await.unwrap().unwrap().joined, "joined published");
+        assert!(c.lease_valid());
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A renewal the store throttled for most of the validity it earns
+    /// (TTL 10 s scaled by half: sent at S, landed at S + 3.3 s, valid to
+    /// S + 4 s). The missed tick that fires as it lands must renew at once:
+    /// skipping it, or waiting out the gap, left the next tick to find the
+    /// lease lapsed and fail-stop.
+    #[tokio::test]
+    async fn a_renewal_landing_late_in_its_validity_is_renewed_at_once() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = ClusterConfig {
+            ttl: Duration::from_secs(5),
+            renew_every: Duration::from_secs(1),
+            skew: Duration::from_secs(1),
+            ..cfg("late")
+        };
+        let c = lone_join(c, store).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        stalls.arm("slowland", "nodes/late");
+        c.hold_steps.store(true, Ordering::Release);
+        c.spawn(d);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0, "fail-stopped after a slow renewal that landed");
+        assert!(c.lease_valid());
+        let puts: Vec<(Instant, Instant)> =
+            stalls.puts.lock().iter().filter(|(k, _, _)| k.ends_with("nodes/late")).map(|&(_, s, e)| (s, e)).collect();
+        let slow = puts.iter().position(|(s, e)| *e - *s >= SLOW_LAND).expect("the slow renewal");
+        let next = puts.get(slow + 1).expect("a renewal after it");
+        assert!(next.0 - puts[slow].1 < Duration::from_millis(200), "renewed {:?} after it", next.0 - puts[slow].1);
     }
 }

@@ -863,6 +863,12 @@ ts("Requests/s by op", [t(f"sum by (op) (rate(vlpds_object_store_requests_total{
    desc="Billable ops (put, put_cas, get, get_range, head, list pages, delete, ...): cost tracks this mix.")
 ts("Non-ok results/s", [t(f'sum by (result, client) (rate(vlpds_object_store_requests_total{{{I}, result!="ok"}}{RI})) > 0', "{{result}} {{client}}")], "reqps",
    desc="not_found / precondition are normal answers (misses, lost CAS races); timeout / error failed; cancelled = the caller gave up.")
+ts("Throttled answers/s (429, 503 SlowDown)", [rate("vlpds_object_store_throttled_total", by="kind", legend="{{kind}}")], "reqps", nonzero=True,
+   empty="no throttling",
+   desc="Every 429 or 503 SlowDown the store answered, retries included (object_store retries them inside its client, so the request "
+        "counters see only the final result). lease = node leases, assignments, writer claims and the cluster version (LISTs by prefix; "
+        "bulk deletes count as other). R2 takes about one write a second per key, and node lease writes retry 1-4 s apart. "
+        f"{rb('VlpdsObjectStoreThrottled')}.")
 ts("p99 latency by component", [t(hq(0.99, "vlpds_object_store_request_seconds", by="component") + " > 0", "{{component}}")], "s", w=12, legend="table",
    desc=f"To the response head (GET), first page (LIST); deletes are not timed. {rb('VlpdsObjectStoreLatencyHigh')}")
 ts("Bytes/s by client and direction", [t(f"sum by (client, dir) (rate(vlpds_object_store_bytes_total{{{I}}}{RI}))", "{{client}} {{dir}}")], "Bps", w=12)

@@ -54,7 +54,31 @@ impl Store {
         connections: usize,
         unsigned_payload: bool,
     ) -> anyhow::Result<Store> {
-        let s3 = AmazonS3Builder::new()
+        let s3 = Self::s3_builder(cfg, prefix, connections, unsigned_payload).build()?;
+        Ok(Store { raw: Arc::new(s3), prefix: prefix.trim_end_matches('/').to_string(), latency })
+    }
+
+    /// The control plane's client: writes to node leases back off from a
+    /// floor of min(1 s, `renew_every`) on throttling
+    /// ([`crate::throttle::ctl_write_retry`]), everything else keeps the
+    /// default schedule. Each half pools up to `connections`.
+    pub fn s3_ctl(cfg: &S3Config, prefix: &str, connections: usize, renew_every: Duration) -> anyhow::Result<Store> {
+        let plain = Self::s3_builder(cfg, prefix, connections, false).build()?;
+        let lease = Self::s3_builder(cfg, prefix, connections, false)
+            .with_retry(crate::throttle::ctl_write_retry(rand::random(), renew_every))
+            .build()?;
+        let prefix = prefix.trim_end_matches('/').to_string();
+        let raw = Arc::new(crate::throttle::LeaseWrites {
+            plain: Arc::new(plain),
+            lease: Arc::new(lease),
+            prefix: prefix.clone(),
+        });
+        Ok(Store { raw, prefix, latency: None })
+    }
+
+    fn s3_builder(cfg: &S3Config, prefix: &str, connections: usize, unsigned_payload: bool) -> AmazonS3Builder {
+        AmazonS3Builder::new()
+            .with_http_connector(crate::throttle::Counting::new(&cfg.bucket, prefix))
             .with_unsigned_payload(unsigned_payload)
             .with_endpoint(&cfg.endpoint)
             .with_bucket_name(&cfg.bucket)
@@ -75,8 +99,6 @@ impl Store {
                     // must be set after with_client_options would overwrite it
                     .with_allow_http(cfg.endpoint.starts_with("http://")),
             )
-            .build()?;
-        Ok(Store { raw: Arc::new(s3), prefix: prefix.trim_end_matches('/').to_string(), latency })
     }
 
     pub fn memory(latency: Option<(f64, f64)>) -> Store {
