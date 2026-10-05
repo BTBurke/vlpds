@@ -28,8 +28,8 @@ function check(ok, what, detail = '') {
 
 const b64u = (b) => Buffer.from(b).toString('base64url')
 
-async function xrpc(nsid, body, auth) {
-  const r = await fetch(`${VLPDS.replace('//localhost:', '//127.0.0.1:')}/xrpc/${nsid}`, {
+async function xrpc(nsid, body, auth, base = VLPDS) {
+  const r = await fetch(`${base.replace('//localhost:', '//127.0.0.1:')}/xrpc/${nsid}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json', ...(auth ? { authorization: `Bearer ${auth}` } : {}) },
     body: JSON.stringify(body),
@@ -59,7 +59,7 @@ const REDIRECT = 'http://127.0.0.1/cb'
 const CLIENT_ID = `http://localhost?scope=${encodeURIComponent('atproto')}&redirect_uri=${encodeURIComponent(REDIRECT)}`
 
 /** A pushed authorization request; the browser URL that opens it. */
-async function authorizeUrl() {
+async function authorizeUrl(base = VLPDS) {
   const verifier = b64u(randomBytes(32))
   const challenge = b64u(createHash('sha256').update(verifier).digest())
   const form = new URLSearchParams({
@@ -71,7 +71,7 @@ async function authorizeUrl() {
     code_challenge: challenge,
     code_challenge_method: 'S256',
   })
-  const htu = `${VLPDS}/oauth/par`
+  const htu = `${base}/oauth/par`
   let nonce
   for (let i = 0; i < 2; i++) {
     const r = await fetch(htu.replace('//localhost:', '//127.0.0.1:'), {
@@ -85,7 +85,7 @@ async function authorizeUrl() {
       continue
     }
     if (!r.ok) throw new Error(`PAR ${r.status} ${JSON.stringify(j)}`)
-    return `${VLPDS}/oauth/authorize?client_id=${encodeURIComponent(CLIENT_ID)}&request_uri=${encodeURIComponent(j.request_uri)}`
+    return `${base}/oauth/authorize?client_id=${encodeURIComponent(CLIENT_ID)}&request_uri=${encodeURIComponent(j.request_uri)}`
   }
   throw new Error('PAR: no nonce')
 }
@@ -202,6 +202,87 @@ await page.getByRole('button', { name: 'Sign in with a passkey' }).click()
 await page.getByRole('link', { name: 'Security' }).waitFor()
 check((await page.content()).includes(acct.did), 'the account page is signed in')
 await shot('account-passwordless')
+
+// 5. Enter in the password field signs in like the button, with autofill's
+// passkey request pending (presence held, so it stays pending)
+log('Enter in the password field')
+const VLPDS_IP = process.env.VLPDS_IP ?? 'http://127.0.0.1:2791'
+const plain = `pe${Date.now().toString(36)}.vlpds.test`
+const email = (h) => `${h.replace(/\./g, '-')}@example.com`
+await xrpc('com.atproto.server.createAccount', { handle: plain, password, email: email(plain) })
+await xrpc('com.atproto.server.createAccount', { handle: plain, password, email: email(plain) }, undefined, VLPDS_IP)
+await presence(false)
+const errBanner = () => page.locator('.notice.err, p.err:visible').count()
+
+/** Fills the account page's sign-in and presses Enter; createSession's answer ('ok' or the error), if one was sent. */
+async function enterOnAccountPage(base, who, autofill) {
+  await context.clearCookies()
+  await page.evaluate(() => sessionStorage.clear()).catch(() => {})
+  const opts = autofill && page.waitForResponse((r) => r.url().includes('vlpds.server.startPasskeySignIn'))
+  await page.goto(`${base}/account`)
+  await page.getByLabel('Handle, DID or email').waitFor()
+  if (opts) {
+    await opts
+    await page.waitForTimeout(300)
+  }
+  await page.getByLabel('Handle, DID or email').fill(who)
+  const pw = page.getByLabel('Password', { exact: true })
+  await pw.fill(password)
+  const session = page.waitForResponse((r) => r.url().includes('com.atproto.server.createSession'), { timeout: 5000 }).catch(() => undefined)
+  await pw.press('Enter')
+  const r = await session
+  return r && (r.ok() ? 'ok' : (await r.json().catch(() => ({}))).error)
+}
+
+check((await enterOnAccountPage(VLPDS, plain, true)) === 'ok', 'localhost: Enter sends createSession')
+await page.getByRole('link', { name: 'Security' }).waitFor({ timeout: 5000 }).catch(() => {})
+check((await page.getByRole('link', { name: 'Security' }).count()) === 1 && (await errBanner()) === 0, 'localhost: Enter signs in, no error banner')
+
+check((await enterOnAccountPage(VLPDS, handle, true)) === 'PasskeyRequired', 'localhost, passkey account: Enter sends createSession (PasskeyRequired)')
+await page.getByRole('heading', { name: 'Two-factor check' }).waitFor()
+check((await page.getByLabel('Handle, DID or email').count()) === 0 && (await errBanner()) === 0, 'it moves to the second step, no error banner')
+await presence(true)
+await page.getByRole('button', { name: 'Use your passkey' }).click()
+await page.getByRole('link', { name: 'Security' }).waitFor()
+check((await page.content()).includes(acct.did), 'the passkey button passes the second step after Enter')
+await presence(false)
+
+check((await enterOnAccountPage(VLPDS_IP, plain, false)) === 'ok', '127.0.0.1: Enter sends createSession')
+await page.getByRole('link', { name: 'Security' }).waitFor({ timeout: 5000 }).catch(() => {})
+check((await page.getByRole('link', { name: 'Security' }).count()) === 1 && (await errBanner()) === 0, '127.0.0.1: Enter signs in, no error banner')
+await context.clearCookies()
+await page.evaluate(() => sessionStorage.clear())
+await page.goto(`${VLPDS_IP}/account`)
+await page.getByText(/Passkeys are off on 127\.0\.0\.1/).waitFor()
+check((await page.getByRole('button', { name: 'Sign in with a passkey' }).count()) === 0 && (await errBanner()) === 0, '127.0.0.1: no passkey button, a note instead, no error banner')
+await shot('account-sign-in-ip')
+
+/** The OAuth sign-in page: fill it in, Enter, and the consent screen follows (not Cancel's denial). */
+async function enterOnOAuthPage(base, who) {
+  await context.clearCookies()
+  await page.goto(await authorizeUrl(base))
+  await page.getByLabel('Handle or DID').fill(who)
+  await page.waitForTimeout(300)
+  await page.getByLabel('Password', { exact: true }).fill(password)
+  await page.getByLabel('Password', { exact: true }).press('Enter')
+  await page.getByRole('heading', { name: 'Authorize access' }).waitFor({ timeout: 5000 }).catch(() => {})
+  return page.getByRole('heading', { name: 'Authorize access' }).count()
+}
+check((await enterOnOAuthPage(VLPDS, plain)) === 1, 'OAuth, localhost: Enter signs in')
+await context.clearCookies()
+await page.goto(await authorizeUrl(VLPDS_IP))
+await page.getByLabel('Handle or DID').waitFor()
+await page.waitForTimeout(300)
+check(await page.locator('#pk-go').isHidden(), 'OAuth, 127.0.0.1: no passkey button')
+check((await errBanner()) === 0, 'OAuth, 127.0.0.1: no error')
+check((await enterOnOAuthPage(VLPDS_IP, plain)) === 1, 'OAuth, 127.0.0.1: Enter signs in')
+await context.clearCookies()
+await page.goto(`${VLPDS_IP}/oauth/account`)
+await page.getByLabel('Handle or DID').fill(plain)
+await page.getByLabel('Password', { exact: true }).fill(password)
+await page.getByLabel('Password', { exact: true }).press('Enter')
+await page.getByRole('button', { name: 'Sign out' }).waitFor({ timeout: 5000 }).catch(() => {})
+check((await page.getByRole('button', { name: 'Sign out' }).count()) === 1 && (await errBanner()) === 0, '/oauth/account, 127.0.0.1: Enter signs in')
 
 // the log names the passkey sign-ins
 const session = await xrpc('com.atproto.server.createSession', { identifier: handle, password }).catch((e) => e)

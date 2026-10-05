@@ -45,6 +45,7 @@ button.primary:hover{filter:brightness(1.08)}
 button.danger{color:var(--danger)}
 button.danger:hover{border-color:var(--danger)}
 .row{display:flex;gap:10px;justify-content:flex-end;margin-top:22px;flex-wrap:wrap}
+.row .back{order:-1}
 .err{color:var(--danger);margin:12px 0;padding:8px 11px;border:1px solid var(--danger);border-radius:5px;font-size:14px}
 ul.perms{padding-left:0;margin:10px 0;list-style:none}
 ul.perms li{margin:0;padding:8px 0 8px 18px;border-top:1px solid var(--rule);position:relative}
@@ -205,8 +206,10 @@ pub struct PasskeyUi<'a> {
 /// (allowed by hash, like the style), reading everything from the `#pk`
 /// form's data attributes, posting the assertion as hidden fields: no
 /// fetch, so no connect-src. Conditional UI (autofill) on the password step.
+/// On a host that isn't the RP ID (an IP address never is) every request
+/// would fail, so the button stays hidden and autofill never starts.
 pub const PASSKEY_JS: &str = "(function(){var f=document.getElementById('pk');if(!f||!window.PublicKeyCredential)return;\
-var d=f.dataset,E=f.elements,ctl;\
+var d=f.dataset,E=f.elements,ctl,h=location.hostname;if(h!==d.rp||/^[\\d.]+$/.test(h)||h.indexOf(':')>=0)return;\
 function b(s){var r=atob(s.replace(/-/g,'+').replace(/_/g,'/')),u=new Uint8Array(r.length);for(var i=0;i<r.length;i++)u[i]=r.charCodeAt(i);return u}\
 function e(a){var u=new Uint8Array(a),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')}\
 var o={challenge:b(d.challenge),rpId:d.rp,timeout:300000,userVerification:d.uv,\
@@ -351,11 +354,14 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
         )),
     }
     b.push_str("<div class=\"row\">");
-    if ctx.is_some() {
-        b.push_str("<button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>");
-    }
+    // Enter submits with the form's first submit button: Sign in, not Cancel
     if !recovery_only {
         b.push_str("<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button>");
+    }
+    if ctx.is_some() {
+        b.push_str(
+            "<button type=\"submit\" class=\"back\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>",
+        );
     }
     b.push_str("</div></form>");
     if let (None, Some(pk)) = (&f.second, &f.passkey) {
@@ -422,8 +428,8 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
         ));
     }
     b.push_str(
-        "<div class=\"row\"><button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>\
-<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-up\">Create account</button></div></form>",
+        "<div class=\"row\"><button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-up\">Create account</button>\
+<button type=\"submit\" class=\"back\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button></div></form>",
     );
     b.push_str(&format!(
         "<p class=\"alt\">Already have an account? <a href=\"{}\">Sign in</a></p>",
