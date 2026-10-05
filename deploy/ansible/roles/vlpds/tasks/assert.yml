@@ -128,6 +128,11 @@
       - vlpds_shards | int >= 1
       - vlpds_shards | int <= 65536
       - vlpds_stop_grace_period is match('^[0-9]+s$')
+      # A multi-node stop drains in at most ~48.5 s: the shard handoff
+      # (node.rs HANDOFF_WARM_MAX 8 s + HANDOFF_WAIT 10 s), SHUTDOWN_SETTLE
+      # 0.5 s, then SHUTDOWN_GRACE 30 s for requests in flight (server.rs).
+      # 60 s leaves margin before docker's SIGKILL cuts the drain. A lone
+      # node stops in ~0.1-0.25 s.
       - (vlpds_stop_grace_period | regex_replace('s$', '') | int) >= 60
     fail_msg: "--lease-ttl-ms must be >= 10000 in production, 1 <= shards <= 65536, and the stop grace period >= 60s (RUNBOOK Rolling deploy)"
     quiet: true

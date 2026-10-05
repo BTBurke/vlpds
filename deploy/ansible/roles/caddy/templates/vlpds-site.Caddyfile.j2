@@ -26,6 +26,12 @@
 	# (--trusted-proxies {{ vlpds_trusted_proxies | join(',') }}). WebSocket
 	# upgrades (subscribeRepos, subscribeLabels) need nothing extra.
 	reverse_proxy {{ _vlpds_caddy_upstream }} {
+		# While compose recreates the container (~4.5 s of 502s measured on
+		# one node) requests wait and retry instead. Caddy retries only a
+		# failed dial, which the upstream never saw, so a POST can't run
+		# twice, and an unread body is kept for the next try.
+		lb_try_duration 10s
+		lb_try_interval 250ms
 		# firehose frames go out as they arrive
 		flush_interval -1
 		# keep firehose subscribers connected across config reloads
@@ -62,6 +68,8 @@
 	# local handles. Anything else gets an empty response, never the upstream.
 	forward_auth {{ _vlpds_caddy_upstream }} {
 		uri /tls-check?domain={host}
+		lb_try_duration 10s
+		lb_try_interval 250ms
 		@vlpds_unknown_handle status 4xx
 		handle_response @vlpds_unknown_handle {
 			respond 404
