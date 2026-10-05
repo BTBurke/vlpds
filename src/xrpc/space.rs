@@ -1242,9 +1242,9 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
         // notifySpaceDeleted
         return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
     }
-    if space_takendown(app, &space).await? {
-        return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
-    }
+    // told only to those it would otherwise admit: a non-member learns
+    // nothing about the space from it
+    let taken_down = space_takendown(app, &space).await?;
     // vlpds: no credential names a taken-down authority or member (the
     // reference admits both)
     let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
@@ -1271,6 +1271,9 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
     }
     if !super::simplespace::authorize_user(app, &space, &row, &d.user, "read", client_id.as_deref()).await? {
         return Err(XrpcError::bad("UserNotAuthorized", "User not authorized for this space"));
+    }
+    if taken_down {
+        return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
     }
     let mint = token::Mint { iss: &space.authority, sub: &space.uri, key_id: Some(&d.key_id), ..Default::default() };
     let now = crate::tid::now_micros() as i64 / 1_000_000;
