@@ -608,6 +608,14 @@ export async function runConfig(rep, cfg, env) {
       check(off.ok, 'reversal', `${off.status} ${off.error}`)
       const r2 = await attempt(async () => (await cred.repoClient(t.did)).com.atproto.space.listRecords({ space: S.space, repo: t.did }))
       check(r2.ok, 'reads work again after reversal', errName(r2))
+      if (HOSTS[t.host].kind === 'vlpds' && t.oauth) {
+        // vlpds revokes an account's OAuth sessions at takedown and a reversal
+        // doesn't bring them back (the reference keeps them): a recorded divergence
+        const old = await attempt(() => t.client.com.atproto.space.getDelegationToken({ space: S.space }))
+        check(!old.ok, `${t}: its OAuth session stays revoked after the reversal (divergence from the reference)`, errName(old))
+        await t.authorize(APP_SCOPE)
+        rep.note(`${cfg}: ${t} re-authorized after the takedown reversal (vlpds revokes OAuth sessions at takedown)`)
+      }
     },
     { needs: ['credential.read'] },
   )
