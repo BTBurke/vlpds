@@ -227,6 +227,102 @@ fn keys() -> Vec<u8> {
     pretty(&k)
 }
 
+const SPACE: &str = "at://did:plc:fixture0000000000000000/space/com.example.group/main";
+
+/// Spaces (`--spaces`): the `s*` key layout and row values.
+fn space_keys() -> Vec<u8> {
+    use vlpds::state;
+    let sid = state::space_id(SPACE);
+    let k: BTreeMap<&str, String> = [
+        ("space head sH/", state::space_head_key(DID, &sid)),
+        ("space record sR/", state::space_record_key(DID, &sid, "com.example.post/1")),
+        ("space oplog sO/", state::space_oplog_key(DID, &sid, 0x1234_5678_9abc, 3)),
+        ("space outbox sP/", state::space_outbox_key(DID, &sid)),
+        ("space sS/", state::space_key(DID, &sid)),
+        ("space member sM/", state::space_member_key(DID, &sid, "did:plc:member")),
+        ("space writer sW/", state::space_writer_key(DID, &sid, "did:plc:writer")),
+        ("space seq sQ/", state::space_seq_key(DID, &sid, 0x1234_5678_9abc)),
+    ]
+    .into_iter()
+    .map(|(n, k)| (n, hex::encode(k)))
+    .collect();
+    pretty(&k)
+}
+
+fn space_head() -> vlpds::space::rows::HeadRow {
+    let mut hash = vlpds::space::lthash::LtHash::default();
+    hash.add(&vlpds::space::commit::element("com.example.post", "1", &Cid::dag_cbor(b"\xa1aa\x01").to_string()));
+    vlpds::space::rows::HeadRow {
+        uri: SPACE.into(),
+        rev: vlpds::tid::Tid(0x1234_5678_9abc),
+        hash,
+        records: 1,
+        created: 1_790_000_000_000_000,
+    }
+}
+
+fn space_ops() -> Vec<u8> {
+    use vlpds::space::rows::{OpAction, OpRow};
+    let (a, b) = (Cid::dag_cbor(b"\xa1aa\x01"), Cid::dag_cbor(b"\xa1aa\x02"));
+    let ops = [
+        OpRow {
+            action: OpAction::Create,
+            collection: "com.example.post".into(),
+            rkey: "1".into(),
+            cid: Some(a),
+            prev: None,
+        },
+        OpRow {
+            action: OpAction::Update,
+            collection: "com.example.post".into(),
+            rkey: "1".into(),
+            cid: Some(b),
+            prev: Some(a),
+        },
+        OpRow {
+            action: OpAction::Delete,
+            collection: "com.example.post".into(),
+            rkey: "1".into(),
+            cid: None,
+            prev: Some(b),
+        },
+    ];
+    let mut out = Vec::new();
+    for op in ops {
+        let v = op.encode();
+        out.extend_from_slice(&(v.len() as u32).to_be_bytes());
+        out.extend_from_slice(&v);
+    }
+    out
+}
+
+fn space_ops_decode(b: &[u8]) -> Vec<vlpds::space::rows::OpRow> {
+    let mut out = Vec::new();
+    let mut rest = b;
+    while !rest.is_empty() {
+        let n = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        out.push(vlpds::space::rows::OpRow::decode(&rest[4..4 + n]).unwrap());
+        rest = &rest[4 + n..];
+    }
+    out
+}
+
+fn space_outbox() -> vlpds::space::rows::OutboxRow {
+    vlpds::space::rows::OutboxRow { uri: SPACE.into(), repo_rev: vlpds::tid::Tid(0x1234_5678_9abc), hash: [7; 32] }
+}
+
+fn space_writer() -> vlpds::space::rows::WriterRow {
+    vlpds::space::rows::WriterRow {
+        repo_rev: vlpds::tid::Tid(0x1234_5678_9abc),
+        hash: [7; 32],
+        space_rev: vlpds::tid::Tid(0x1234_5678_9abd),
+    }
+}
+
+fn space_space() -> vlpds::space::rows::SpaceRow {
+    vlpds::space::rows::SpaceRow::defaults(SPACE, TIME)
+}
+
 fn pretty<T: serde::Serialize>(v: &T) -> Vec<u8> {
     let mut b = serde_json::to_vec_pretty(v).unwrap();
     b.push(b'\n');
@@ -352,6 +448,12 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/applied2.bin", vlpds::nodelog::encode_marker(LOG, 5)),
         ("state/recent.bin", recent()),
         ("state/keys.json", keys()),
+        ("state/space_keys.json", space_keys()),
+        ("state/space_head.bin", space_head().encode().to_vec()),
+        ("state/space_oplog.bin", space_ops()),
+        ("state/space_outbox.bin", space_outbox().encode().to_vec()),
+        ("state/space_writer.bin", space_writer().encode().to_vec()),
+        ("state/space_space.json", space_space().encode().to_vec()),
         ("control/node_lease.json", compact(&lease())),
         ("control/assignment.json", compact(&assignment())),
         ("control/layout.json", compact(&layout())),
@@ -744,6 +846,43 @@ async fn check(level: u32, name: &str, b: &[u8]) {
                     "{n}: slot-prefixed by the DID's slot"
                 );
             }
+        }
+        "state/space_keys.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            for (n, hexkey) in &k {
+                let key = hex::decode(hexkey).unwrap();
+                assert_eq!(vlpds::state::key_slot(&key), Some(vlpds::slots::slot_of(DID)), "{n}");
+                assert!(vlpds::state::is_space_key(&key), "{n}");
+            }
+        }
+        "state/space_head.bin" => {
+            let h = vlpds::space::rows::HeadRow::decode(b).unwrap();
+            assert_eq!((h.uri.as_str(), h.records), (SPACE, 1));
+            assert!(h.encode() == b);
+        }
+        "state/space_oplog.bin" => {
+            let ops = space_ops_decode(b);
+            assert_eq!(ops.len(), 3);
+            let mut again = Vec::new();
+            for op in ops {
+                let v = op.encode();
+                again.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                again.extend_from_slice(&v);
+            }
+            assert!(again == b);
+        }
+        "state/space_outbox.bin" => {
+            let o = vlpds::space::rows::OutboxRow::decode(b).unwrap();
+            assert!(o.encode() == b);
+        }
+        "state/space_writer.bin" => {
+            let w = vlpds::space::rows::WriterRow::decode(b).unwrap();
+            assert!(w.encode() == b);
+        }
+        "state/space_space.json" => {
+            let r = vlpds::space::rows::SpaceRow::decode(b).unwrap();
+            assert!(r.live() && r.encode() == b);
         }
         "control/node_lease.json" => {
             json_reencode::<vlpds::cluster::NodeLease>(name, b);
