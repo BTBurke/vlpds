@@ -280,7 +280,7 @@ function BlobCard({ did, b, onDone, compact }: { did: string; b: BlobView; onDon
 function SafePreview({ did, b }: { did: string; b: BlobView }) {
   const [url, setUrl] = useState<string>()
   const [reveal, setReveal] = useState(false)
-  const urlRef = useRef<string>()
+  const urlRef = useRef<string | undefined>(undefined)
   useEffect(
     () => () => {
       if (urlRef.current) URL.revokeObjectURL(urlRef.current)

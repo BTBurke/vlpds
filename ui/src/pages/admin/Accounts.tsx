@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type JSX } from 'react'
 import { Confirm, CopyText, Empty, ErrorNotice, Field, JsonView, Loading, Notice, PageHead, Panel, PartialNotice, partialOf, Spinner, Status, type PartialResult } from '../../components/ui'
 import { fmtTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'

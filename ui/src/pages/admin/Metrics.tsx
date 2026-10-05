@@ -85,7 +85,7 @@ export function Metrics() {
   const [points, setPoints] = useState<Point[]>([])
   const [gauges, setGauges] = useState<Scrape>()
   const [error, setError] = useState<unknown>()
-  const last = useRef<Scrape>()
+  const last = useRef<Scrape | undefined>(undefined)
 
   useEffect(() => {
     let live = true

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type JSX } from 'react'
 import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'

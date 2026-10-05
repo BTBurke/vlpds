@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type JSX } from 'react'
 import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
 import { useSession } from '../../lib/hooks'
 import { Link, match, navigate, useSearch } from '../../lib/router'
@@ -88,7 +88,7 @@ function SignIn() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
   const canPasskey = passkeysHere()
-  const autofill = useRef<AbortController>()
+  const autofill = useRef<AbortController | undefined>(undefined)
 
   // autofill: offer this site's passkeys in the identifier field's suggestions
   useEffect(() => {

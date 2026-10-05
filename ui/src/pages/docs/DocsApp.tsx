@@ -164,7 +164,7 @@ function PrevNext({ prev, next }: { prev?: DocMeta; next?: DocMeta }) {
 }
 
 /** "On this page", highlighting the section being read. */
-function Toc({ page, root }: { page: DocMeta; root: RefObject<HTMLDivElement> }) {
+function Toc({ page, root }: { page: DocMeta; root: RefObject<HTMLDivElement | null> }) {
   const [active, setActive] = useState<string | null>(null)
   const items = useMemo(() => page.headings.filter((h) => h.level === 2), [page])
   useEffect(() => {

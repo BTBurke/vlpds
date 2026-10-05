@@ -337,7 +337,7 @@ type History = { series: Series[]; data: (number | null)[][]; spark: Map<string,
 
 function useRejectionHistory(d?: Loaded): History {
   const [samples, setSamples] = useState<Sample[]>([])
-  const last = useRef<number>()
+  const last = useRef<number | undefined>(undefined)
   useEffect(() => {
     if (!d || last.current === d.fetchedAt) return
     last.current = d.fetchedAt

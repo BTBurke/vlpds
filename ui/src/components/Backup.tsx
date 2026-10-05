@@ -50,7 +50,7 @@ export function BackupBox({
   const [st, setSt] = useState<State>({ s: 'idle' })
   const [withKey, setWithKey] = useState(false)
   const [estimate, setEstimate] = useState<number>()
-  const ac = useRef<AbortController>()
+  const ac = useRef<AbortController | undefined>(undefined)
   const streams = canStreamToDisk()
   const host = source.base ? new URL(source.base).host : location.host
 
