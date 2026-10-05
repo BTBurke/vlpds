@@ -61,10 +61,31 @@ pub const SHARD_MOVED: &str = "ShardMoved";
 #[derive(Clone, Copy, Debug)]
 pub struct NotSent;
 
-/// Response extension on a 503 [`REPO_LOADING`] or [`SHARD_MOVED`] answer:
-/// nothing was done.
-#[derive(Clone, Copy, Debug)]
-pub struct NotApplied;
+/// Peer-only: `{id:x}.{attempt}` of a [`Resend`], from a forwarding entry
+/// node.
+pub const RESEND_HEADER: &str = "x-vlpds-resend";
+
+/// Request extension: one client request the entry node may send more than
+/// once ([`with_retries`]), the same `id` on every attempt. The DPoP check
+/// claims the proof for `id`, so a resend isn't refused as its own replay
+/// (DESIGN.md "A resent OAuth request reuses its DPoP proof").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resend {
+    pub id: u64,
+    pub attempt: u32,
+}
+
+impl Resend {
+    fn header(self) -> HeaderValue {
+        HeaderValue::from_str(&format!("{:x}.{}", self.id, self.attempt)).expect("ascii")
+    }
+
+    fn parse(v: &HeaderValue) -> Option<Resend> {
+        let (id, attempt) = v.to_str().ok()?.split_once('.')?;
+        let id = u64::from_str_radix(id, 16).ok().filter(|&id| id != 0)?;
+        Some(Resend { id, attempt: attempt.parse().ok()? })
+    }
+}
 
 tokio::task_local! {
     static FORWARDED: ();
@@ -73,11 +94,6 @@ tokio::task_local! {
 /// Its client waits on the peer's time-to-first-byte deadline.
 pub fn is_forwarded() -> bool {
     FORWARDED.try_with(|_| ()).is_ok()
-}
-
-/// What [`with_retries`] resends.
-pub(crate) fn resendable(req: &Request) -> bool {
-    retryable_write(req) || retryable_read(req)
 }
 
 fn retryable_write(req: &Request) -> bool {
@@ -578,9 +594,13 @@ pub async fn route(
     let app = router.app();
     // a client's copy never counts; a peer's only with its valid token
     let client_ip = req.headers_mut().remove(crate::ratelimit::CLIENT_IP_HEADER);
+    let resent = req.headers_mut().remove(RESEND_HEADER);
     if take_forwarded(&mut req, app) {
         if let Some(ip) = client_ip.and_then(|v| v.to_str().ok()?.trim().parse::<std::net::IpAddr>().ok()) {
             req.extensions_mut().insert(crate::ratelimit::ClientIp(ip.to_canonical()));
+        }
+        if let Some(r) = resent.as_ref().and_then(Resend::parse) {
+            req.extensions_mut().insert(r);
         }
         return FORWARDED.scope((), next.run(req)).await;
     }
@@ -657,6 +677,13 @@ async fn with_retries(
     let retries =
         if req.method() == Method::GET { &crate::metrics::READ_RETRIES } else { &crate::metrics::WRITE_RETRIES };
     let (parts, _) = req.into_parts();
+    let dpop = parts.headers.get(axum::http::header::AUTHORIZATION).is_some_and(|v| v.as_bytes().starts_with(b"DPoP "));
+    let id = loop {
+        let id = rand::random::<u64>();
+        if id != 0 {
+            break id;
+        }
+    };
     let rebuild = || {
         let mut req = Request::new(Body::from(body.clone()));
         *req.method_mut() = parts.method.clone();
@@ -679,7 +706,12 @@ async fn with_retries(
                 Err(r) => return r,
             };
         }
-        let req = rebuild();
+        let mut req = rebuild();
+        if dpop {
+            let r = Resend { id, attempt };
+            req.headers_mut().insert(RESEND_HEADER, r.header());
+            req.extensions_mut().insert(r);
+        }
         let resp = match key.as_deref().and_then(|k| router.remote_owner(k)) {
             None => next.clone().run(req).await,
             Some(owner) => forward_counted(client, &owner, req, token, ttfb).await,

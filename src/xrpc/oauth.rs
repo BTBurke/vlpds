@@ -2099,8 +2099,6 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
 struct DpopCtx {
     /// XrpcError can't carry headers.
     challenge: Option<String>,
-    /// The proof's replay claim, held by this request.
-    claim: Option<ou::Replay>,
 }
 
 tokio::task_local! {
@@ -2117,34 +2115,14 @@ fn dpop_fail(error: &str, desc: &str) -> XrpcError {
 /// Adds a fresh `DPoP-Nonce` (RFC 9449 §8.2/§9) and, when verification
 /// failed, the `WWW-Authenticate` challenge. [`with_dpop_layer`] clones the
 /// app only for DPoP requests, not once per request.
-///
-/// A request the entry node resends (`forward::with_retries`) carries the
-/// same proof, already claimed when the first attempt was answered
-/// ShardMoved / RepoLoading after authenticating. That answer means
-/// nothing was done, so the claim is given back before the answer leaves
-/// and the resend can claim it again. The proof still authorizes at most
-/// one request that does something: until the release a replay is
-/// refused; after it the proof is as if never presented, and only
-/// whichever request claims it next (the resend, or a replay racing it)
-/// is served.
 async fn dpop_layer(app: Option<Arc<App>>, req: axum::extract::Request, next: axum::middleware::Next) -> Response {
     let Some(app) = app else {
         return next.run(req).await;
     };
-    let resendable = crate::forward::resendable(&req);
     DPOP_CTX
         .scope(RefCell::new(DpopCtx::default()), async move {
             let mut r = next.run(req).await;
-            let (challenge, claim) = DPOP_CTX.with(|c| {
-                let mut c = c.borrow_mut();
-                (c.challenge.take(), c.claim.take())
-            });
-            let not_applied = r.extensions().get::<crate::forward::NotApplied>().is_some();
-            if let Some(claim) = claim.filter(|_| resendable && not_applied) {
-                if let Err(e) = super::internal::release_replay_anywhere(&app, &claim.routing, &claim.key).await {
-                    tracing::debug!(error = %e.message, "DPoP claim not released: a resend of its proof is refused");
-                }
-            }
+            let challenge = DPOP_CTX.with(|c| c.borrow_mut().challenge.take());
             let h = r.headers_mut();
             if let Ok(v) = HeaderValue::from_str(&keys(&app).nonces.next()) {
                 h.insert(HeaderName::from_static("dpop-nonce"), v);
@@ -2177,6 +2155,10 @@ pub fn access_token_sub(app: &App, token: &str) -> Option<String> {
     let jwt = super::authn::verify_access_token(&keys(app).server, token).ok()?;
     jwt.claim_str("sub").map(String::from)
 }
+
+/// 503 for a resend whose DPoP proof another request claimed (never
+/// resent: not [`crate::forward::REPO_LOADING`] / `SHARD_MOVED`).
+pub const RESEND_REFUSED: &str = "ResendRefused";
 
 pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Credentials> {
     let k = keys(app);
@@ -2215,11 +2197,20 @@ pub async fn verify_dpop(app: &App, token: &str, parts: &Parts) -> XResult<Crede
         return Err(dpop_fail("invalid_token", "Access token is bound to another DPoP key"));
     }
     // claimed at the token DID's owner (normally this node: the request was
-    // routed by that DID), in memory only (crate::oauth: residual risk)
+    // routed by that DID), in memory only (crate::oauth: residual risk); for
+    // the client request, so the entry node's resends of it pass
     let replay = checked.replay(did.to_string());
-    match super::internal::claim_transient_anywhere(app, &replay.routing, &replay.key, replay.until).await {
-        Ok(true) => {
-            let _ = DPOP_CTX.try_with(|c| c.borrow_mut().claim = Some(replay));
+    let resend = parts.extensions.get::<crate::forward::Resend>().copied();
+    let holder = resend.map_or(0, |r| r.id);
+    match super::internal::claim_proof_anywhere(app, &replay.routing, &replay.key, replay.until, holder).await {
+        Ok(true) => {}
+        // someone else's request took the proof between our attempts: ours
+        // did nothing, but a resend never ends in a definite refusal
+        Ok(false) if resend.is_some_and(|r| r.attempt > 0) => {
+            return Err(XrpcError::unavailable(
+                RESEND_REFUSED,
+                "the DPoP proof was used by another request while this one was being resent; retry with a new proof",
+            ))
         }
         Ok(false) => return Err(dpop_fail("invalid_dpop_proof", "DPoP proof replayed")),
         Err(e) => return Err(e),

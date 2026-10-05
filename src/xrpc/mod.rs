@@ -297,12 +297,7 @@ impl From<crate::secrets::SecretError> for XrpcError {
 impl IntoResponse for XrpcError {
     fn into_response(self) -> Response {
         let unavailable = self.status == StatusCode::SERVICE_UNAVAILABLE;
-        let not_applied =
-            unavailable && (self.error == crate::forward::SHARD_MOVED || self.error == crate::forward::REPO_LOADING);
         let mut r = (self.status, Json(json!({"error": self.error, "message": self.message}))).into_response();
-        if not_applied {
-            r.extensions_mut().insert(crate::forward::NotApplied);
-        }
         // every 503 here is transient (shard moving, shedding, repo loading)
         if unavailable {
             r.headers_mut().insert(header::RETRY_AFTER, axum::http::HeaderValue::from_static("1"));

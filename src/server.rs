@@ -676,8 +676,12 @@ pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListen
 }
 
 /// Stripped on [`public_router`], so a client's copy means nothing.
-const PEER_ONLY_HEADERS: [&str; 3] =
-    [crate::forward::FORWARDED_HEADER, "x-vlpds-internal", crate::ratelimit::CLIENT_IP_HEADER];
+const PEER_ONLY_HEADERS: [&str; 4] = [
+    crate::forward::FORWARDED_HEADER,
+    "x-vlpds-internal",
+    crate::ratelimit::CLIENT_IP_HEADER,
+    crate::forward::RESEND_HEADER,
+];
 
 /// [`router`] without `/internal/*`, and with the peer-only headers dropped
 /// before anything reads them: a forwarded marker is served as the client

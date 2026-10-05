@@ -277,9 +277,10 @@ pub async fn claim_replay_owned(
     key: &str,
     until: i64,
     durable: bool,
+    holder: u64,
 ) -> Result<bool, crate::xrpc::XrpcError> {
     let until = until.min(now_secs() + MAX_CLAIM_TTL);
-    if !node_state(app).replays(ClaimKind::of(key, durable)).insert_unique(routing, key, until) {
+    if !node_state(app).replays(ClaimKind::of(key, durable)).insert_held(routing, key, until, holder) {
         return Ok(false);
     }
     if !durable {
@@ -333,8 +334,8 @@ pub struct ReplayCache {
 
 #[derive(Default)]
 struct ReplayInner {
-    /// key -> (until, seq, group)
-    map: std::collections::HashMap<String, (i64, u64, std::sync::Arc<str>)>,
+    /// key -> (until, seq, group, holder: 0 = none)
+    map: std::collections::HashMap<String, (i64, u64, std::sync::Arc<str>, u64)>,
     /// (until, seq) -> key: expiry order
     order: std::collections::BTreeMap<(i64, u64), String>,
     /// group -> its entries' (until, seq)
@@ -345,7 +346,7 @@ struct ReplayInner {
 impl ReplayInner {
     fn remove_at(&mut self, at: (i64, u64)) {
         if let Some(key) = self.order.remove(&at) {
-            if let Some((_, _, g)) = self.map.remove(&key) {
+            if let Some((_, _, g, _)) = self.map.remove(&key) {
                 if let Some(set) = self.groups.get_mut(&g) {
                     set.remove(&at);
                     if set.is_empty() {
@@ -392,18 +393,24 @@ impl ReplayCache {
 
     fn remove(&self, key: &str) {
         let mut g = self.inner.lock();
-        if let Some(&(until, seq, _)) = g.map.get(key) {
+        if let Some(&(until, seq, _, _)) = g.map.get(key) {
             g.remove_at((until, seq));
         }
     }
 
     /// False: a replay. Never refuses a new key: a full set evicts.
     pub fn insert_unique(&self, group: &str, key: &str, expires_at: i64) -> bool {
+        self.insert_held(group, key, expires_at, 0)
+    }
+
+    /// [`Self::insert_unique`], except that a key claimed by the same
+    /// nonzero `holder` (one request, sent again) is not a replay.
+    pub fn insert_held(&self, group: &str, key: &str, expires_at: i64, holder: u64) -> bool {
         let now = now_secs();
         let mut g = self.inner.lock();
         g.expire(now);
-        if g.map.contains_key(key) {
-            return false;
+        if let Some(&(_, _, _, h)) = g.map.get(key) {
+            return holder != 0 && h == holder;
         }
         if expires_at <= now {
             // nothing to remember: it can't be presented again in time
@@ -415,7 +422,7 @@ impl ReplayCache {
             Some((k, _)) => k.clone(),
             None => group.into(),
         };
-        g.map.insert(key.to_string(), (expires_at, at.1, group.clone()));
+        g.map.insert(key.to_string(), (expires_at, at.1, group.clone(), holder));
         g.order.insert(at, key.to_string());
         let over = {
             let set = g.groups.entry(group).or_default();
@@ -466,6 +473,15 @@ mod tests {
         // already expired: accepted, not kept
         assert!(c.insert_unique("g", "old", now_secs() - 1));
         assert_eq!(c.len(), 2);
+
+        // a holder's own claim again is not a replay; anyone else's is
+        assert!(c.insert_held("g", "h", exp, 7));
+        assert!(c.insert_held("g", "h", exp, 7), "same holder");
+        assert!(!c.insert_held("g", "h", exp, 8), "another holder");
+        assert!(!c.insert_unique("g", "h", exp), "no holder");
+        assert!(c.insert_unique("g", "n", exp));
+        assert!(!c.insert_held("g", "n", exp, 7), "claimed without a holder");
+        assert_eq!(c.len(), 4);
     }
 
     /// A full cache evicts (the entry closest to expiry) instead of refusing
