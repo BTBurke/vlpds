@@ -391,8 +391,22 @@ async fn import_repo_round_trip_and_refusals() {
     let y = pds(&plc, "did:web:y-pds.test").await;
     let a = SpaceClient::new(&x, "simp", OWNER).await;
     let space = a.create_space(TYPE, "main").await;
+    let x_acct = TestAccount {
+        did: a.did.clone(),
+        handle: a.handle.clone(),
+        password: String::new(),
+        email: String::new(),
+        access: a.session_jwt.clone(),
+        refresh: String::new(),
+    };
+    let blob = x.upload_blob(&x_acct, &random_png(7), "image/png").await;
+    let blob_cid = blob["ref"]["$link"].as_str().unwrap().to_string();
     for (k, t) in [("aa", "one"), ("bb", "two"), ("ccc", "three")] {
-        a.create_record(&space, COLL, Some(k), rec(t)).await.ok();
+        let mut r = rec(t);
+        if k == "aa" {
+            r["image"] = blob.clone();
+        }
+        a.create_record(&space, COLL, Some(k), r).await.ok();
     }
     a.delete_record(&space, COLL, "bb").await.ok();
     let doc =
@@ -480,6 +494,9 @@ async fn import_repo_round_trip_and_refusals() {
 
     let r = import(exported.clone()).await.ok();
     assert_eq!((r["rev"].clone(), r["records"].clone()), (at_x["rev"].clone(), json!(2)));
+    // the imported record's blob hasn't come over yet
+    let lm = y.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &session).await.ok();
+    assert_eq!(lm["blobs"], json!([{"cid": blob_cid, "recordUri": format!("{space}/{}/{COLL}/aa", a.did)}]), "{lm}");
     import(exported.clone()).await.err(400, "InvalidRequest");
 
     // the DID moves to y, and the account reads its imported repo there

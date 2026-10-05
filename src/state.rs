@@ -330,6 +330,11 @@ pub fn space_blob_cid_key(did: &str, blob: &Cid, sid: &SpaceId, path: &str) -> V
     [&space_blob_cid_prefix(did, &blob.to_string())[..], sid, path.as_bytes()].concat()
 }
 
+/// `sc/{did}\0`: every space ref of the account's blobs, in CID order.
+pub fn space_blob_cid_did_prefix(did: &str) -> Vec<u8> {
+    keyed(did, SPACE_BLOB_CID_FAMILY, &[did.as_bytes(), b"\0"])
+}
+
 /// `sc/{did}\0{cid}\0`: every space ref of one blob of the account.
 pub fn space_blob_cid_prefix(did: &str, blob: &str) -> Vec<u8> {
     keyed(did, SPACE_BLOB_CID_FAMILY, &[did.as_bytes(), b"\0", blob.as_bytes(), b"\0"])

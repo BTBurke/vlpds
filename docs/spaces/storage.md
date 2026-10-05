@@ -107,6 +107,9 @@ The account's writes to that space are refused while it imports.
   before it lands.
 - An import over a repo with records is refused. One over a repo that's been emptied works if the
   CAR's rev is newer, and the old head goes in the same entry.
+- The blobs the imported records name don't come with the CAR. `repo.listMissingBlobs` lists them
+  next to the public repo's, with a space record URI for each, so the blob step of a move copies
+  them the same way.
 
 It takes an OAuth session that may create records in the space, or the account's own password
 session while the account is still deactivated (an account moving in can't sign in with OAuth

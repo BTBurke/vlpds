@@ -100,7 +100,8 @@ delete, or a create that carries blobs).
 Writes refuse the old `{cid, mimeType}` blob form. `importRepo` still indexes it, so an old
 migrated repo's images are listed and kept. `sync.listBlobs` pages through the references in CID
 order (with `since`, only the ones added after a rev). `repo.listMissingBlobs` HEADs each one to
-find what a migration still has to upload. See [Migration](migration.md).
+find what a migration still has to upload. With `--spaces` it also walks the blobs the account's
+space records name (`sc/`), in the same CID order. See [Migration](migration.md).
 
 ## Garbage collection
 

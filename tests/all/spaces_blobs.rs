@@ -287,3 +287,69 @@ async fn space_only_blob_stays_private_with_the_flag_off() {
     off.create_record(&acct, "app.bsky.feed.post", image_post("now public", &private)).await;
     assert_eq!(off.get_blob(&owner.did, &cid(&private)).await.status, 200);
 }
+
+/// listMissingBlobs counts blobs space records name, merged in CID order
+/// with the public ones, each with one record naming it: a move has to
+/// bring those over too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missing_space_blobs_are_listed() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "sbmiss", OWNER).await;
+    let space = owner.create_space(TYPE, "main").await;
+    let (in_space, _) = upload(&s, &owner, 11).await;
+    let (in_public, _) = upload(&s, &owner, 12).await;
+    let (in_both, _) = upload(&s, &owner, 13).await;
+    let (kept, _) = upload(&s, &owner, 14).await;
+    owner.create_record(&space, COLL, Some("a"), rec("a", &[&in_space, &kept])).await.ok();
+    owner.create_record(&space, COLL, Some("b"), rec("b", &[&in_both])).await.ok();
+    let acct = legacy(&owner);
+    let public = s.create_record(&acct, "app.bsky.feed.post", image_post("p", &in_public)).await;
+    s.create_record(&acct, "app.bsky.feed.post", image_post("q", &in_both)).await;
+    for b in [&in_space, &in_public, &in_both] {
+        let path = object_store::path::Path::from(format!("{}/blob/{}/{}", s.app.store.prefix, owner.did, cid(b)));
+        s.app.store.raw.delete(&path).await.unwrap();
+    }
+
+    let mut want = [
+        (cid(&in_space), format!("{space}/{}/{COLL}/a", owner.did)),
+        (cid(&in_public), public.uri.clone()),
+        (cid(&in_both), String::new()),
+    ];
+    want.sort();
+    let got = s.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &acct.auth()).await.ok();
+    let got: Vec<(String, String)> = got["blobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| (b["cid"].as_str().unwrap().to_string(), b["recordUri"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(got.len(), 3, "{got:?}");
+    for ((wc, wu), (gc, gu)) in want.iter().zip(&got) {
+        assert_eq!(wc, gc, "{got:?}");
+        if *wc == cid(&in_both) {
+            // a public record names it too: that's the one shown
+            assert!(gu.starts_with(&format!("at://{}/app.bsky.feed.post/", owner.did)), "{gu}");
+        } else {
+            assert_eq!(wu, gu);
+        }
+    }
+
+    // paged one at a time, the cursor walks both lists
+    let mut paged = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut q = vec![("limit", "1".to_string())];
+        if let Some(c) = &cursor {
+            q.push(("cursor", c.clone()));
+        }
+        let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let r = s.xrpc.get("com.atproto.repo.listMissingBlobs", &q, &acct.auth()).await.ok();
+        let blobs = r["blobs"].as_array().unwrap();
+        if blobs.is_empty() {
+            break;
+        }
+        paged.push(blobs[0]["cid"].as_str().unwrap().to_string());
+        cursor = r["cursor"].as_str().map(String::from);
+    }
+    assert_eq!(paged, got.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+}

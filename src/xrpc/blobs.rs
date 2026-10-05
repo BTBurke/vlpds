@@ -487,24 +487,47 @@ struct MissingQ {
     cursor: Option<String>,
 }
 
+/// Public refs, and with `--spaces` the account's space records' refs
+/// (`sc/`, imported ones included), merged in CID order: a blob a space
+/// record names has to come over in a move as much as a public one does.
 async fn list_missing_blobs(State(app): AppState, Auth(creds): Auth, Query(q): Query<MissingQ>) -> XResult<Json<J>> {
+    const PAGE: usize = 256;
     let did = creds.user_did()?.to_string();
     let limit = q.limit.unwrap_or(500).clamp(1, 1000);
     let mut cursor = q.cursor.clone();
     let mut missing: Vec<J> = Vec::new();
     // a taken-down blob can't be re-uploaded: not the user's to fix
     let takedowns = super::server::ctl(&app, &did).await?;
+    let mut space_uris = std::collections::HashMap::new();
     'outer: loop {
-        let mut page = referenced_blobs(&app, &did, cursor.as_deref(), 256, None).await?;
+        let public = referenced_blobs(&app, &did, cursor.as_deref(), PAGE, None).await?;
+        let spaced = match app.config.spaces {
+            true => space_referenced_blobs(&app, &did, cursor.as_deref(), PAGE, &mut space_uris).await?,
+            false => Vec::new(),
+        };
+        // past the last CID of a full page, that list hasn't been read yet
+        let bound = [&public, &spaced]
+            .iter()
+            .filter(|l| l.len() == PAGE)
+            .filter_map(|l| l.last())
+            .map(|(c, _)| c)
+            .min()
+            .cloned();
+        let mut page: std::collections::BTreeMap<String, String> = spaced.into_iter().collect();
+        for (cid, path) in public {
+            page.insert(cid, format!("at://{did}/{path}"));
+        }
+        if let Some(b) = &bound {
+            page.retain(|c, _| c <= b);
+        }
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|(c, _)| c.clone());
-        let full = page.len() == 256;
-        page.retain(|(cid, _)| !takedowns.has_takedown(&format!("blob/{cid}")));
+        cursor = page.keys().next_back().cloned();
+        page.retain(|cid, _| !takedowns.has_takedown(&format!("blob/{cid}")));
         let checks: Vec<_> = page
-            .iter()
-            .map(|(cid, _)| {
+            .keys()
+            .map(|cid| {
                 let path = blob_path(&app, &did, cid);
                 let store = app.store.raw.clone();
                 async move {
@@ -517,15 +540,15 @@ async fn list_missing_blobs(State(app): AppState, Auth(creds): Auth, Query(q): Q
             })
             .collect();
         let results: Vec<XResult<bool>> = futures::stream::iter(checks).buffered(32).collect().await;
-        for ((cid, path), r) in page.iter().zip(results) {
+        for ((cid, uri), r) in page.iter().zip(results) {
             if r? {
-                missing.push(json!({"cid": cid, "recordUri": format!("at://{did}/{path}")}));
+                missing.push(json!({"cid": cid, "recordUri": uri}));
                 if missing.len() == limit {
                     break 'outer;
                 }
             }
         }
-        if !full {
+        if bound.is_none() {
             break;
         }
     }
@@ -534,6 +557,52 @@ async fn list_missing_blobs(State(app): AppState, Auth(creds): Auth, Query(q): Q
         out["cursor"] = last["cid"].clone();
     }
     Ok(Json(out))
+}
+
+/// Distinct (cid, the URI of one space record naming it) of `did`'s space
+/// refs after `cursor`, in CID order. `uris` caches each space's URI (its
+/// `sH` row). A ref whose space has no head (an import that stopped) is
+/// skipped, as it's never served.
+async fn space_referenced_blobs(
+    app: &App,
+    did: &str,
+    cursor: Option<&str>,
+    limit: usize,
+    uris: &mut std::collections::HashMap<state::SpaceId, Option<String>>,
+) -> XResult<Vec<(String, String)>> {
+    let p = app.partition(did)?;
+    let prefix = state::space_blob_cid_did_prefix(did);
+    let lo = match cursor {
+        Some(c) => state::prefix_end(&[prefix.as_slice(), c.as_bytes(), b"\0"].concat()),
+        None => prefix.clone(),
+    };
+    let mut iter = p.db.scan(lo..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+    let mut out: Vec<(String, String)> = Vec::new();
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        let rest = &kv.key[prefix.len()..];
+        let Some(nul) = rest.iter().position(|b| *b == 0) else { continue };
+        let (Ok(cid), tail) = (std::str::from_utf8(&rest[..nul]), &rest[nul + 1..]) else { continue };
+        if out.last().is_some_and(|(c, _)| c == cid) || tail.len() < state::SPACE_ID_LEN {
+            continue;
+        }
+        let (sid, path) = tail.split_at(state::SPACE_ID_LEN);
+        let sid: state::SpaceId = sid.try_into().unwrap();
+        let uri = match uris.get(&sid) {
+            Some(u) => u.clone(),
+            None => {
+                let head = p.db.get(state::space_head_key(did, &sid)).await.map_err(XrpcError::from_err)?;
+                let u = head.and_then(|h| crate::space::rows::HeadRow::decode(&h).ok()).map(|h| h.uri);
+                uris.insert(sid, u.clone());
+                u
+            }
+        };
+        let Some(uri) = uri else { continue };
+        if out.len() == limit {
+            break;
+        }
+        out.push((cid.to_string(), format!("{uri}/{did}/{}", String::from_utf8_lossy(path))));
+    }
+    Ok(out)
 }
 
 /// Only DIDs whose partition this node owns are swept.
