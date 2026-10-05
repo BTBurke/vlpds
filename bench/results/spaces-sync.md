@@ -151,11 +151,38 @@ The flag-off comparison against main (the benchbox A/B grid) is in
 
 ### createAccount under the benchbox methods sample
 
-One thing in that A/B isn't explained yet. In the methods sample, `createAccount` (64 in
-flight, right after the `createRecord` phase) has a second mode at ~250-300 ms. It showed up in
-4 of 4 runs of `3ebf852d` (p99 286 / 298 / 247 / 227 ms, 850-1,040 accounts/s) and 1 of 4 runs of
-`36f0be7b` (p99 290 ms, the other three ~70 ms at ~1,125/s). Run first, without the phases before
-it, `createAccount` matched across six alternating runs (p99 72-93 ms, ~1,080/s each). Since main
-shows the same mode, it's not something `--spaces` code adds to account creation directly, but
-it's worth a profile before the PR (`methods-abba/` and `create-account/` in
-`spaces1-ab-2026-10-05`).
+The A/B's methods sample showed `createAccount` (64 in flight, right after the `createRecord`
+phase) with a second mode at ~250-300 ms. It was in 4 of 4 runs of `3ebf852d` (p99 286 / 298 /
+247 / 227 ms) and 1 of 4 runs of `36f0be7b` (p99 290 ms). It comes from the bench's MinIO disk,
+and vlpds and `--spaces` have nothing to do with it.
+
+`bench/benchbox/catail.py` reproduces it. It runs `createAccount` alone and then `createRecord`
+followed by `createAccount`, three times on one node, and samples `/metrics`, the host's dirty
+pages, the NVMe's counters and MinIO's CPU every 0.5 s. Here's createAccount's p99 per phase
+(`spaces2c-ca-tail-2026-10-05`):
+
+| Build | MinIO data | createAccount p99 per phase (ms) |
+|---|---|---|
+| `3ebf852d` (Spaces) | disk | 78 · 289 · 311 · 83 · 160 · 128 |
+| `36f0be7b` (main) | disk | 71 · 242 · 326 · 82 · 605 · 85 |
+| `3ebf852d` (Spaces) | tmpfs | 66 · 68 · 68 · 69 · 68 · 68 |
+
+So main shows the mode as often as the Spaces build does, and it doesn't need to follow a
+`createRecord` phase directly (phases 3 and 5 are `createAccount` alone). With MinIO's data on a
+tmpfs it's gone from all six phases, and the max stays under 100 ms.
+
+The slow stretches last 2-6 s. In each one, every bucket PUT on the node gets 3-10x slower. The
+handle and email claims (`account_index` put_create) go from ~8-16 ms to 50-130 ms, and segment
+PUTs from ~7-13 ms to 40-50 ms. Meanwhile the NVMe sits at ~93% busy while writing only ~27 MB/s
+(~60% and ~75 MB/s otherwise), MinIO's CPU drops from ~3.2 cores to ~0.7 because it's waiting on
+fsync, and the host's dirty pages keep growing. Each stretch ends with a writeback burst of
+~300 MB/s that drops the dirty pages from ~200 MB to ~60 MB. SlateDB compaction isn't the cause.
+The longest stretch had no compaction reads at all, and 40 s of steady compaction later had none.
+
+`createAccount` shows it more than any other method because it waits on the most PUTs: two
+conditional claim PUTs (in parallel with the Argon2 hash) and then the account's segment PUT. Its
+p50 is ~56 ms, mostly Argon2, so 50-100 ms more of PUT latency moves a few hundred requests a
+second into the tail. In production the bucket is R2 or S3, which doesn't fsync on the PDS's own
+disk, so there's nothing here to fix in vlpds. For A/Bs of the account path on benchbox, alternate the builds and
+count a run as an outlier only when both builds show the mode, or run MinIO on a tmpfs
+(`MINIO_TMPFS=4g`).
