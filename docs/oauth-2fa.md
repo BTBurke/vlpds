@@ -65,6 +65,34 @@ reference. Other services get short-lived **service-auth JWTs** signed with the 
 (`getServiceAuth`). The one inbound use is video upload, where the video service calls `uploadBlob` with
 the user's token.
 
+### Scoped app passwords
+
+An app password can also carry OAuth scopes, so a bot can get a password that only posts. This is a
+vlpds extension: `createAppPassword` takes an optional `scopes` field (space-separated, the same syntax
+an OAuth client asks for), and `listAppPasswords` returns it. Other PDSes ignore the field, so clients
+that don't know about it keep working.
+
+| Account page choice | Scopes | What the app can do |
+|---|---|---|
+| Full access | none | the same as any app password |
+| Post only | `repo?collection=…&action=create&action=delete` for posts, likes, reposts and follows, plus `blob:*/*` | post, delete, like, repost, follow and upload |
+| Read only | `rpc:*?aud=<AppView>#bsky_appview` | anything served by the AppView, so feeds and notifications, but no repo writes |
+| Custom | whatever you type | what those scopes allow |
+
+A scoped password gets what both the app password and its scopes allow. Its scopes can't add anything
+an app password couldn't already do, so it still can't change the email, password or handle, and DMs
+need the "privileged" flag as well as a chat scope (`transition:chat.bsky`). Every XRPC route checks the
+scopes the same way it checks an OAuth token's, including proxied calls and `getServiceAuth`. The few
+methods that refuse OAuth outright (`listAppPasswords`, `getTotpStatus`, `checkSignupQueue`) refuse a
+scoped password too.
+
+The scopes go into every access token as an `appPassScope` claim and are kept with the session, so a
+refresh keeps them. A password's scopes never change after it's created. To change them, revoke it and
+make a new one. `include:` permission sets aren't accepted, since they're resolved over the network
+when an OAuth grant is made and an app password has no such step. "Read only" isn't strictly read
+only. The AppView's `rpc:*` also covers its few writes (mutes, saved feeds, marking notifications seen),
+because the scope syntax can't tell a query from a procedure.
+
 ## The OAuth flow
 
 ```steps

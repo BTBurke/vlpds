@@ -183,21 +183,76 @@ function Totp() {
 
 // ---------------------------------------------------------------- app passwords
 
-type AppPassword = { name: string; createdAt: string; privileged: boolean }
+type AppPassword = { name: string; createdAt: string; privileged: boolean; scopes?: string }
+
+type Access = 'full' | 'post' | 'read' | 'custom'
+
+const POST_ONLY_SCOPES =
+  'atproto repo?collection=app.bsky.feed.like&collection=app.bsky.feed.post&collection=app.bsky.feed.repost&collection=app.bsky.graph.follow&action=create&action=delete blob:*/*'
+
+function readOnlyScopes(appviewAud: string) {
+  return `atproto rpc:*?aud=${appviewAud.replace('#', '%23')}`
+}
+
+function accessOf(p: AppPassword, appviewAud?: string): Access {
+  if (!p.scopes) return 'full'
+  if (p.scopes === POST_ONLY_SCOPES) return 'post'
+  if (appviewAud && p.scopes === readOnlyScopes(appviewAud)) return 'read'
+  return 'custom'
+}
+
+function AccessSummary({ p, appviewAud }: { p: AppPassword; appviewAud?: string }) {
+  switch (accessOf(p, appviewAud)) {
+    case 'full':
+      return p.privileged ? <span className="pill amber">Full access, includes DMs</span> : <span className="pill">Full access</span>
+    case 'post':
+      return <span className="pill">Post only</span>
+    case 'read':
+      return <span className="pill">Read only</span>
+    case 'custom':
+      return (
+        <div className="row" style={{ gap: 4 }}>
+          <span className="pill amber">Custom{p.privileged ? ', DMs allowed' : ''}</span>
+          {p.scopes!.split(' ').map((sc) => (
+            <span key={sc} className="pill mono">
+              {sc}
+            </span>
+          ))}
+        </div>
+      )
+  }
+}
 
 function AppPasswords() {
-  const list = useLoad<{ passwords: AppPassword[] }>(() => acall('com.atproto.server.listAppPasswords'), [])
+  const list = useLoad<{ passwords: AppPassword[]; appviewAud?: string }>(() => acall('com.atproto.server.listAppPasswords'), [])
+  const appviewAud = list.data?.appviewAud
   const [name, setName] = useState('')
+  const [access, setAccess] = useState<Access>('full')
+  const [custom, setCustom] = useState('')
   const [privileged, setPrivileged] = useState(false)
   const [created, setCreated] = useState<{ name: string; password: string }>()
   const [revoking, setRevoking] = useState<string>()
   const create = useAction(async () => {
-    const r = await acall('com.atproto.server.createAppPassword', { body: { name: name.trim(), privileged } })
+    const scopes =
+      access === 'post' ? POST_ONLY_SCOPES : access === 'read' && appviewAud ? readOnlyScopes(appviewAud) : access === 'custom' ? custom.trim() : undefined
+    const dms = privileged && (access === 'full' || access === 'custom')
+    const r = await acall('com.atproto.server.createAppPassword', { body: { name: name.trim(), privileged: dms, ...(scopes ? { scopes } : {}) } })
     setCreated(r)
     setName('')
+    setAccess('full')
+    setCustom('')
     setPrivileged(false)
     list.reload()
   })
+  const choice = (value: Access, title: string, desc: string) => (
+    <label className="ap-choice">
+      <input type="radio" name="ap-access" checked={access === value} onChange={() => setAccess(value)} />
+      <div>
+        <strong>{title}</strong>
+        <div className="small muted">{desc}</div>
+      </div>
+    </label>
+  )
   const revoke = useAction(async (n: string) => {
     await acall('com.atproto.server.revokeAppPassword', { body: { name: n } })
     setRevoking(undefined)
@@ -242,7 +297,9 @@ function AppPasswords() {
                     <b>{p.name}</b>
                   </td>
                   <td className="nowrap">{fmtTime(p.createdAt)}</td>
-                  <td>{p.privileged ? <span className="pill amber">Includes DMs</span> : <span className="pill">Standard</span>}</td>
+                  <td>
+                    <AccessSummary p={p} appviewAud={appviewAud} />
+                  </td>
                   <td className="num">
                     <button className="btn danger sm" onClick={() => setRevoking(p.name)}>
                       Revoke
@@ -261,21 +318,52 @@ function AppPasswords() {
           create.run()
         }}
       >
-        <Field
-          label="New app password name"
-          action={
-            <button className="btn primary" disabled={create.busy}>
-              {create.busy && <Spinner />}
-              Create password
-            </button>
-          }
-        >
+        <Field label="New app password name">
           <input type="text" value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Graysky on my phone" maxLength={64} required />
         </Field>
-        <label className="check">
-          <input type="checkbox" checked={privileged} onChange={(e) => setPrivileged(e.target.checked)} />
-          <span>Allow access to direct messages</span>
-        </label>
+        <div role="radiogroup" aria-label="What the app may do">
+          <p className="small muted" style={{ margin: '0 0 8px' }}>
+            What may the app do?
+          </p>
+          {choice('full', 'Full access (like today)', 'Everything a Bluesky app needs: read your feeds, post, follow, edit your profile and settings.')}
+          {choice(
+            'post',
+            'Post only',
+            "Post, delete posts, like, repost, follow and upload images. It can't read your feeds or notifications, change your profile, or see DMs. Good for bots."
+          )}
+          {appviewAud &&
+            choice(
+              'read',
+              'Read only',
+              "Read your timeline, profiles and notifications. It can't post, like, follow, upload or change your profile. It can still change app settings kept with Bluesky, such as mutes, saved feeds and which notifications you've seen."
+            )}
+          {choice('custom', 'Custom', 'Pick exactly what it may do, written as OAuth permissions. For developers.')}
+        </div>
+        {access === 'custom' && (
+          <Field
+            label="Permissions"
+            hint={
+              <>
+                Space-separated OAuth scopes, e.g. <span className="mono">repo:app.bsky.feed.post blob:image/*</span>. DMs need a chat scope too, such as{' '}
+                <span className="mono">transition:chat.bsky</span>.
+              </>
+            }
+          >
+            <textarea className="mono" value={custom} onChange={(e) => setCustom(e.target.value)} rows={3} required maxLength={2048} />
+          </Field>
+        )}
+        {(access === 'full' || access === 'custom') && (
+          <label className="check">
+            <input type="checkbox" checked={privileged} onChange={(e) => setPrivileged(e.target.checked)} />
+            <span>Allow access to direct messages</span>
+          </label>
+        )}
+        <div className="row end">
+          <button className="btn primary" disabled={create.busy}>
+            {create.busy && <Spinner />}
+            Create password
+          </button>
+        </div>
       </form>
       <Confirm
         open={!!revoking}

@@ -363,6 +363,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("stream/watermark.bin", vlpds::remote::encode_watermark(1003 << 8).to_vec()),
         ("private/rows.json", private_rows()),
         ("private/blob_quota.json", blob_quota_rows()),
+        ("private/app_password_scopes.json", app_password_scope_rows()),
     ];
     v.extend(frames());
     v
@@ -385,6 +386,12 @@ fn private_rows() -> Vec<u8> {
 /// level 1's `private/rows.json` was frozen.
 fn blob_quota_rows() -> Vec<u8> {
     rows_json(vlpds::xrpc::private_rows::blob_quota_row_fixtures(DID))
+}
+
+/// Scoped app password rows, added after level 1's `private/rows.json` was
+/// frozen.
+fn app_password_scope_rows() -> Vec<u8> {
+    rows_json(vlpds::xrpc::private_rows::app_password_scope_row_fixtures(DID))
 }
 
 fn rows_json(rows: Vec<vlpds::xrpc::private_rows::PrivateRow>) -> Vec<u8> {
@@ -800,7 +807,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             }
             assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
         }
-        "private/blob_quota.json" => {
+        "private/blob_quota.json" | "private/app_password_scopes.json" => {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
             assert!(pretty(&rows) == b, "{name}: re-encode differs");
             for r in &rows {

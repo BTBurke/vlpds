@@ -601,3 +601,54 @@ async fn get_record_for_unhosted_repo_goes_to_appview() {
     assert_eq!((s, e["error"].as_str()), (400, Some("RecordNotFound")));
     assert_eq!(env.appview.count(), n);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scoped_app_passwords_on_proxied_methods() {
+    let env = spawn_env(true).await;
+    let u = env.s.create_account("scoped").await;
+    let chat_svc = format!("{}#other_svc", env.reports.did.lock().clone());
+    let appview_aud = format!("{APPVIEW_DID}#bsky_appview");
+    let j = env.s.xrpc.get("com.atproto.server.listAppPasswords", &[], &u.auth()).await.ok();
+    assert_eq!(j["appviewAud"], json!(appview_aud));
+
+    let scoped = |name: &'static str, privileged: bool, scopes: String| {
+        let (env, u) = (&env, &u);
+        async move {
+            let body = json!({"name": name, "privileged": privileged, "scopes": scopes});
+            let pw = env.s.xrpc.post("com.atproto.server.createAppPassword", &body, &u.auth()).await.ok();
+            env.session(u, pw["password"].as_str().unwrap(), json!({})).await
+        }
+    };
+    let chat = |who: &TestAccount| env.get(Some(who), "chat.bsky.convo.listConvos").header("atproto-proxy", &chat_svc);
+
+    // post only, though privileged: no DMs, no AppView
+    let post_only = scoped("post", true, "atproto repo:app.bsky.feed.post blob:*/*".into()).await;
+    let (av, rep) = (env.appview.count(), env.reports.count());
+    let (s, b) = err_of(chat(&post_only).send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (403, Some("ScopeMissingError")), "{b}");
+    let (s, b) = err_of(env.get(Some(&post_only), "app.bsky.feed.getTimeline").send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (403, Some("ScopeMissingError")), "{b}");
+    assert_eq!((env.appview.count(), env.reports.count()), (av, rep), "a scoped app password reached an upstream");
+
+    // DMs need both the privileged flag and a chat scope
+    let dms = scoped("dms", true, "atproto transition:chat.bsky".into()).await;
+    assert_eq!(chat(&dms).send().await.unwrap().status(), 200);
+    let (s, _) = err_of(env.get(Some(&dms), "app.bsky.feed.getTimeline").send().await.unwrap()).await;
+    assert_eq!(s, 403);
+    let dms_plain = scoped("dms-plain", false, "atproto transition:chat.bsky".into()).await;
+    let (s, b) = err_of(chat(&dms_plain).send().await.unwrap()).await;
+    assert_eq!((s, b["error"].as_str()), (400, Some("InvalidToken")), "{b}");
+
+    // read only: the AppView, no repo writes
+    let read_only = scoped("read", false, format!("atproto rpc:*?aud={}", appview_aud.replace('#', "%23"))).await;
+    assert_eq!(env.get(Some(&read_only), "app.bsky.feed.getTimeline").send().await.unwrap().status(), 200);
+    assert_eq!(env.get(Some(&read_only), "app.bsky.actor.getPreferences").send().await.unwrap().status(), 200);
+    let post = json!({"repo": u.did, "collection": "app.bsky.feed.post", "record": post_record("nope")});
+    let r = env.post(&read_only, "com.atproto.repo.createRecord").json(&post).send().await.unwrap();
+    assert_eq!(err_of(r).await.0, 403);
+    let r =
+        env.post(&read_only, "com.atproto.repo.uploadBlob").body(PNG_1X1.to_vec()).header("content-type", "image/png");
+    assert_eq!(err_of(r.send().await.unwrap()).await.0, 403);
+    let (s, _) = err_of(chat(&read_only).send().await.unwrap()).await;
+    assert!((400..500).contains(&s));
+}

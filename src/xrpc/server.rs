@@ -290,9 +290,12 @@ fn full_access(creds: &Credentials) -> XResult<String> {
     }
 }
 
-/// The reference's ACCESS_STANDARD (OAuth refused).
+/// The reference's ACCESS_STANDARD (OAuth and scoped app passwords refused).
 fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
     match creds {
+        Credentials::AppPassword { scopes: Some(_), .. } => {
+            Err(err(StatusCode::FORBIDDEN, "InsufficientScope", "Scoped app passwords can't use this method"))
+        }
         Credentials::Session { did } | Credentials::AppPassword { did, .. } | Credentials::Takendown { did } => {
             Ok(did.clone())
         }
@@ -311,10 +314,16 @@ fn full_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResu
     }
 }
 
-/// `standard_no_oauth`, or OAuth holding `account:{attr}?action={action}`.
+/// `standard_no_oauth`, or OAuth or a scoped app password holding
+/// `account:{attr}?action={action}`.
 fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> XResult<String> {
     match creds {
         Credentials::OAuth { did, .. } => creds.need_account(attr, action).map(|_| did.clone()),
+        // an unscoped app password may, so the scopes alone decide
+        Credentials::AppPassword { did, scopes: Some(s), .. } => match s.allows_account(attr, action) {
+            true => Ok(did.clone()),
+            false => Err(super::authn::scope_missing(&super::authn::account_scope(attr, action))),
+        },
         _ => standard_no_oauth(creds),
     }
 }
@@ -948,6 +957,10 @@ pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: boo
 pub(super) struct AppPassRef {
     pub name: String,
     pub privileged: bool,
+    /// A scoped app password's scopes, which its sessions keep across
+    /// refreshes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -970,9 +983,16 @@ fn access_scope(ap: &Option<AppPassRef>) -> &'static str {
     }
 }
 
-fn issue_pair(app: &App, did: &str, scope: &str, family: &str, refresh_id: &str) -> (String, String) {
+fn issue_pair(
+    app: &App,
+    did: &str,
+    scope: &str,
+    app_pass_scope: Option<&str>,
+    family: &str,
+    refresh_id: &str,
+) -> (String, String) {
     (
-        app.jwt.issue_with_jti(did, scope, ACCESS_TTL, "at+jwt", Some(family)),
+        app.jwt.issue_scoped(did, scope, app_pass_scope, ACCESS_TTL, "at+jwt", Some(family)),
         app.jwt.issue_with_jti(did, SCOPE_REFRESH, REFRESH_TTL, "refresh+jwt", Some(refresh_id)),
     )
 }
@@ -1038,7 +1058,8 @@ async fn create_session_tokens(
     if !out.applied {
         return Err(XrpcError::auth("Credentials were revoked during sign-in"));
     }
-    Ok(issue_pair(app, did, scope, &family, &rid))
+    let ap_scope = st.app_password.as_ref().and_then(|a| a.scopes.as_deref()).filter(|_| !takendown);
+    Ok(issue_pair(app, did, scope, ap_scope, &family, &rid))
 }
 
 /// Revokes the families' access tokens.
@@ -1141,10 +1162,16 @@ pub async fn verify_bearer(app: &App, token: &str) -> XResult<Credentials> {
     if c.exp < now_secs() {
         return Err(expired_token("Token has expired"));
     }
+    let app_pass = |privileged| Credentials::AppPassword {
+        did: c.sub.clone(),
+        privileged,
+        scopes: c.app_pass_scope.as_deref().map(super::oauth::ScopeSet::new),
+    };
     let creds = match c.scope.as_str() {
+        SCOPE_APP_PASS => app_pass(false),
+        SCOPE_APP_PASS_PRIVILEGED => app_pass(true),
+        _ if c.app_pass_scope.is_some() => return Err(bad_scope()),
         SCOPE_ACCESS => Credentials::Session { did: c.sub.clone() },
-        SCOPE_APP_PASS => Credentials::AppPassword { did: c.sub.clone(), privileged: false },
-        SCOPE_APP_PASS_PRIVILEGED => Credentials::AppPassword { did: c.sub.clone(), privileged: true },
         SCOPE_TAKENDOWN => Credentials::Takendown { did: c.sub.clone() },
         _ => return Err(bad_scope()),
     };
@@ -1608,7 +1635,11 @@ async fn verify_app_password(app: &App, did: &str, password: &str) -> XResult<Op
     };
     let name = String::from_utf8_lossy(&name).to_string();
     let meta: Option<J> = get_json(app, did, &format!("apppass/{name}")).await?;
-    Ok(meta.map(|m| AppPassRef { name, privileged: m["privileged"].as_bool().unwrap_or(false) }))
+    Ok(meta.map(|m| AppPassRef {
+        name,
+        privileged: m["privileged"].as_bool().unwrap_or(false),
+        scopes: m["scopes"].as_str().map(String::from),
+    }))
 }
 
 /// For `vlpds_logins_total`.
@@ -1668,18 +1699,26 @@ async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginS
     step.second_factor = false;
     let epoch = epoch_for_login(app, &acct).await?.ok_or_else(invalid)?;
     super::cas::pause_point("legacy_login", &acct.did).await;
+    let include_email = shows_email(app_pass.as_ref());
     let (access, refresh) = create_session_tokens(app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
-    let mut out = session_info(app, &acct, true).await;
+    let mut out = session_info(app, &acct, include_email).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
+}
+
+/// Whether a login's or refresh's answer may show the email: getSession's
+/// rule for the tokens it hands out.
+fn shows_email(ap: Option<&AppPassRef>) -> bool {
+    ap.and_then(|a| a.scopes.as_deref()).is_none_or(|s| super::oauth::ScopeSet::new(s).allows_account("email", "read"))
 }
 
 async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = user_did(&creds)?;
     let acct =
         app.account(&did).await.map_err(|_| invalid_request(format!("Could not find user info for account: {did}")))?;
-    let include_email = !matches!(creds, Credentials::OAuth { .. }) || creds.allows_account("email", "read");
+    let scoped = matches!(creds, Credentials::OAuth { .. }) || creds.app_pass_scopes().is_some();
+    let include_email = !scoped || creds.allows_account("email", "read");
     Ok(Json(session_info(&app, &acct, include_email).await))
 }
 
@@ -1696,8 +1735,9 @@ async fn refresh_session(State(app): AppState, headers: HeaderMap) -> XResult<Js
     // an economy: the conditional write is what is correct across nodes
     let _g = e.lock(&did).await;
     let (st, next) = rotate_refresh(&app, &did, &rid).await?;
-    let (access, refresh) = issue_pair(&app, &did, access_scope(&st.app_password), &st.family, &next);
-    let mut out = session_info(&app, &acct, true).await;
+    let ap_scope = st.app_password.as_ref().and_then(|a| a.scopes.as_deref());
+    let (access, refresh) = issue_pair(&app, &did, access_scope(&st.app_password), ap_scope, &st.family, &next);
+    let mut out = session_info(&app, &acct, shows_email(st.app_password.as_ref())).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
     Ok(Json(out))
@@ -1758,6 +1798,39 @@ struct CreateAppPasswordIn {
     name: String,
     #[serde(default)]
     privileged: Option<bool>,
+    /// vlpds extension: OAuth scopes the password's sessions are held to.
+    #[serde(default)]
+    scopes: Option<String>,
+}
+
+/// Every access token of the password's sessions carries them.
+const MAX_APP_PASSWORD_SCOPES_LEN: usize = 2048;
+
+/// `scopes` normalized to single spaces, None if blank. `include:` is
+/// refused: a permission set resolves over the network when an OAuth grant
+/// is made, and an app password has no such step, so its grant would change
+/// under it whenever the set's lexicon does.
+fn app_password_scopes(scopes: Option<&str>) -> XResult<Option<String>> {
+    let Some(raw) = scopes else { return Ok(None) };
+    let mut out: Vec<&str> = Vec::new();
+    for s in raw.split_whitespace() {
+        if crate::oauth::scopes::IncludeScope::parse(s).is_some() {
+            return Err(invalid_request(format!(
+                "Permission sets (include:) can't be used in app password scopes: {s}"
+            )));
+        }
+        if !crate::oauth::scopes::is_atproto_oauth_scope(s) {
+            return Err(invalid_request(format!("Invalid scope: {s}")));
+        }
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    let joined = out.join(" ");
+    if joined.len() > MAX_APP_PASSWORD_SCOPES_LEN {
+        return Err(invalid_request("Too many scopes"));
+    }
+    Ok((!joined.is_empty()).then_some(joined))
 }
 
 async fn create_app_password(
@@ -1775,6 +1848,7 @@ async fn create_app_password(
         return Err(invalid_request("Invalid app password name"));
     }
     let privileged = inp.privileged.unwrap_or(false);
+    let scopes = app_password_scopes(inp.scopes.as_deref())?;
     let e = ext(&app);
     let _g = e.lock(&did).await;
     if app.get_private(&did, &format!("apppass/{name}")).await?.is_some() {
@@ -1784,13 +1858,18 @@ async fn create_app_password(
     let password = format!("{}-{}-{}-{}", &s[0..4], &s[4..8], &s[8..12], &s[12..16]);
     let created_at = crate::events::now_rfc3339();
     let h = app_password_hash(&did, &password);
-    let meta = json!({"name": name, "createdAt": created_at, "privileged": privileged, "hash": h});
+    let mut meta = json!({"name": name, "createdAt": created_at, "privileged": privileged, "hash": h});
+    let mut out = json!({"name": name, "password": password, "createdAt": created_at, "privileged": privileged});
+    if let Some(s) = &scopes {
+        meta["scopes"] = json!(s);
+        out["scopes"] = json!(s);
+    }
     let muts = vec![
         pmut(&did, &format!("apppass/{name}"), Some(to_json_bytes(&meta))),
         pmut(&did, &format!("apphash/{h}"), Some(name.as_bytes().to_vec())),
     ];
     app.put_private(&did, muts).await?;
-    Ok(Json(json!({"name": name, "password": password, "createdAt": created_at, "privileged": privileged})))
+    Ok(Json(out))
 }
 
 async fn list_app_passwords(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
@@ -1799,10 +1878,21 @@ async fn list_app_passwords(State(app): AppState, Auth(creds): Auth) -> XResult<
         .await?
         .into_iter()
         .filter_map(|(_, v)| serde_json::from_slice::<J>(&v).ok())
-        .map(|m| json!({"name": m["name"], "createdAt": m["createdAt"], "privileged": m["privileged"].as_bool().unwrap_or(false)}))
+        .map(|m| {
+            let mut p = json!({"name": m["name"], "createdAt": m["createdAt"], "privileged": m["privileged"].as_bool().unwrap_or(false)});
+            if let Some(s) = m["scopes"].as_str() {
+                p["scopes"] = json!(s);
+            }
+            p
+        })
         .collect();
     out.sort_by(|a, b| b["createdAt"].as_str().cmp(&a["createdAt"].as_str()));
-    Ok(Json(json!({"passwords": out})))
+    let mut res = json!({"passwords": out});
+    // vlpds: the audience a "read only" scope names (the account page's preset)
+    if let Some((_, did)) = &app.config.appview {
+        res["appviewAud"] = json!(format!("{did}#bsky_appview"));
+    }
+    Ok(Json(res))
 }
 
 #[derive(Deserialize)]
@@ -2702,16 +2792,17 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
     if !is_atproto_did(aud_did) || fragment.is_some_and(|f| f.is_empty()) {
         return Err(invalid_request("aud must be a valid atproto DID or did#serviceId reference"));
     }
-    match &creds {
-        Credentials::OAuth { .. } => creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?,
-        Credentials::AppPassword { privileged: false, .. } => {
-            if let Some(l) = lxm.filter(|l| privileged_method(l)) {
-                return Err(invalid_request(format!(
-                    "insufficient access to request a service auth token for the following method: {l}"
-                )));
-            }
+    if let Credentials::AppPassword { privileged: false, .. } = &creds {
+        if let Some(l) = lxm.filter(|l| privileged_method(l)) {
+            return Err(invalid_request(format!(
+                "insufficient access to request a service auth token for the following method: {l}"
+            )));
         }
-        _ => {}
+    }
+    // a scoped app password is held to its scopes here as OAuth is: else a
+    // service token would carry what the scopes withhold
+    if matches!(creds, Credentials::OAuth { .. }) || creds.app_pass_scopes().is_some() {
+        creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?;
     }
     let acct = app.account(&did).await?;
     if is_takendown_account(&acct) && lxm != Some("com.atproto.server.createAccount") {
@@ -2935,6 +3026,27 @@ async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Jso
     Ok(Json(out))
 }
 
+/// A scoped app password and one of its sessions (`super::private_rows`).
+pub(super) fn scoped_app_password_fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
+    use super::private_rows::enc;
+    let scopes = "atproto repo:app.bsky.feed.post?action=create blob:image/*";
+    let st = RefreshState {
+        family: "0006439b2a1c0000aabbccddeeff0022".into(),
+        exp: 1_797_776_000,
+        app_password: Some(AppPassRef { name: "bot".into(), privileged: false, scopes: Some(scopes.into()) }),
+        created_at: 1_790_000_000,
+        next_id: None,
+    };
+    let hash = "5e2d1cf1".repeat(8);
+    let meta = json!({"name": "bot", "createdAt": "2026-10-01T00:00:00.000Z", "privileged": false, "hash": hash, "scopes": scopes});
+    let r = |name: String, v: Vec<u8>| (did.to_string(), name, v);
+    vec![
+        r("sess/00112233445566778899aabbccddeeff0011223344556611".into(), enc(&st)),
+        r("apppass/bot".into(), enc(&meta)),
+        r(format!("apphash/{hash}"), b"bot".to_vec()),
+    ]
+}
+
 /// Golden fixtures (`super::private_rows`); the `json!` rows repeat their
 /// writers' shapes.
 pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
@@ -2943,7 +3055,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
     let st = RefreshState {
         family: fam.into(),
         exp: 1_797_776_000,
-        app_password: Some(AppPassRef { name: "ci".into(), privileged: true }),
+        app_password: Some(AppPassRef { name: "ci".into(), privileged: true, scopes: None }),
         created_at: 1_790_000_000,
         next_id: Some("00112233445566778899aabbccddeeff0011223344556677".into()),
     };
@@ -3011,6 +3123,11 @@ pub(super) fn check_row(routing: &str, name: &str, val: &[u8]) -> Option<anyhow:
         typed_row::<RefreshState>("session", val)
     } else if name.starts_with("apppass/") {
         json_row("app password", val, &[("name", 's'), ("createdAt", 's'), ("privileged", 'b'), ("hash", 's')])
+            .and_then(|k| {
+                let scopes = serde_json::from_slice::<J>(val)?["scopes"].clone();
+                anyhow::ensure!(scopes.is_null() || scopes.is_string(), "app password: scopes is not a string");
+                Ok(k)
+            })
     } else if name.starts_with("apphash/") {
         utf8_row("app password hash", val)
     } else if name.starts_with("etok/") {
