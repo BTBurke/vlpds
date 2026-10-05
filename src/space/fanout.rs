@@ -146,12 +146,37 @@ pub struct Fanout {
     retry_base: Duration,
 }
 
-/// The `host:port` that sends to `endpoint` share.
+/// Second-level labels under a country code that are sold like TLDs
+/// (`example.co.uk`), so the registrable domain is one label longer.
+const SECOND_LEVELS: &[&str] = &["co", "com", "net", "org", "gov", "edu", "ac", "ne", "or", "go"];
+
+/// What sends to `endpoint` share a host cap by: its registrable domain
+/// (approximately: the last two labels, three under a ccTLD's `co.`-style
+/// second level), an IPv4 address, or an IPv6 /64. Ports don't count. So
+/// many service ids under one domain, or one machine on many ports,
+/// can't multiply what a write sends one victim. Grouping is coarse on
+/// shared suffixes (`x.github.io`), which only makes the cap stricter.
 fn host_of(endpoint: &str) -> String {
-    match reqwest::Url::parse(endpoint) {
-        Ok(u) => format!("{}:{}", u.host_str().unwrap_or_default(), u.port_or_known_default().unwrap_or(0)),
-        Err(_) => endpoint.to_string(),
+    let Some(host) = reqwest::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) else {
+        return endpoint.to_string();
+    };
+    if let Some(v6) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        if let Ok(ip) = v6.parse::<std::net::Ipv6Addr>() {
+            let s = ip.segments();
+            return format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3]);
+        }
     }
+    if host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return host;
+    }
+    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    let n = labels.len();
+    let keep = match n {
+        0..=2 => n,
+        _ if labels[n - 1].len() == 2 && SECOND_LEVELS.contains(&labels[n - 2]) => 3,
+        _ => 2,
+    };
+    labels[n - keep..].join(".")
 }
 
 /// `base` doubling to a minute, then 50-100% of that.
@@ -378,6 +403,26 @@ impl Fanout {
 mod tests {
     use super::*;
 
+    #[test]
+    fn host_caps_are_shared_by_domain_and_address() {
+        let h = |e: &str| host_of(e);
+        // many service hosts under one domain, and one host on many ports
+        assert_eq!(h("https://f1.attacker.example"), "attacker.example");
+        assert_eq!(h("https://a.b.f2.Attacker.Example:8443/x"), "attacker.example");
+        assert_eq!(h("https://attacker.example."), "attacker.example");
+        assert_eq!(h("https://victim.example:1"), h("https://victim.example:2"));
+        // a ccTLD's sold second level keeps one more label
+        assert_eq!(h("https://syncer.bob.co.uk"), "bob.co.uk");
+        assert_ne!(h("https://bob.co.uk"), h("https://alice.co.uk"));
+        assert_eq!(h("https://sync.example.de"), "example.de");
+        // addresses: v4 exact, v6 by /64
+        assert_eq!(h("http://10.0.0.1:2583"), h("http://10.0.0.1:80"));
+        assert_ne!(h("http://10.0.0.1"), h("http://10.0.0.2"));
+        assert_eq!(h("http://[2001:db8:1:2::5]:80"), h("http://[2001:db8:1:2:ffff::9]"));
+        assert_ne!(h("http://[2001:db8:1:2::5]"), h("http://[2001:db8:1:3::5]"));
+        assert_eq!(h("http://localhost:1234"), "localhost");
+    }
+
     fn fanout() -> Arc<Fanout> {
         Arc::new(Fanout::new(16, RETRY_BASE))
     }
@@ -440,7 +485,7 @@ mod tests {
             assert_eq!(q.len(), LANE);
             assert_eq!(q[0].1, 6, "the oldest went");
             assert!(q[0].2, "after a gap");
-            assert_eq!(f.state.lock().hosts["syncer.example:443"].queued, LANE);
+            assert_eq!(f.state.lock().hosts["syncer.example"].queued, LANE);
         });
     }
 

@@ -5338,7 +5338,10 @@ last spaceRev that lane delivered, so coalescing leaves no gap. A failed
 send is retried with jittered backoff from 1 s only while nothing newer
 from its writer waits. Bounds: 256 per lane, 4,096 queued and 16 in flight
 per service host, 4,096 per dispatcher, 512 sends in flight in all, and
-256 registrations per space. Sends go through the pooled, SSRF-guarded
+256 registrations per space. A "host" is the endpoint's registrable domain
+(the last two labels, three under a `co.uk`-style suffix), IPv4 address
+or IPv6 /64, ports ignored, so a DID document listing many hostnames under
+one domain can't multiply what a write sends one machine. Sends go through the pooled, SSRF-guarded
 client. Lanes are best effort and in memory. When a shard opens, each of
 its spaces with a live registration sends one forward of its newest writer,
 naming the spaceRev before it, so a syncer that missed one sees the gap and
