@@ -320,8 +320,10 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
     if app.config.spaces && !publicly_referenced(&app, &q.did, &cid_s).await? {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
-    // a public ref settles it: only a blob none names pays for the sc/ scan
+    // an account no space record names a blob of reads nothing more; a
+    // public ref settles it: only a blob none names pays for the sc/ scan
     if !app.config.spaces
+        && app.space_blob_accounts.has_refs(&app, &q.did).await?
         && !publicly_referenced(&app, &q.did, &cid_s).await?
         && space_referenced(&app, &q.did, &cid_s).await?
     {
@@ -379,6 +381,54 @@ async fn publicly_referenced(app: &App, did: &str, cid: &str) -> XResult<bool> {
             return Ok(false);
         }
         gen = now;
+    }
+}
+
+/// Which accounts have space blob refs (`sc/` rows), for sync.getBlob with
+/// `--spaces` off, where the common answer (none) lets it skip every ref
+/// read. Only consulted with the flag off, when this node writes no space
+/// rows: a shard's rows written elsewhere arrive with a new partition,
+/// which the entries are keyed by, so each is computed once per partition
+/// and never goes stale.
+pub struct SpaceBlobAccounts {
+    inner: parking_lot::Mutex<lru::LruCache<Box<str>, (PartitionKey, bool)>>,
+}
+
+/// A partition's identity on this node: its shard, epoch and open DB.
+type PartitionKey = (crate::slots::ShardId, u64, usize);
+
+/// Accounts held; a miss costs one prefix scan.
+const SPACE_BLOB_ACCOUNTS: usize = 16 * 1024;
+
+impl Default for SpaceBlobAccounts {
+    fn default() -> Self {
+        let cap = std::num::NonZeroUsize::new(SPACE_BLOB_ACCOUNTS).expect("non-zero");
+        SpaceBlobAccounts { inner: parking_lot::Mutex::new(lru::LruCache::new(cap)) }
+    }
+}
+
+impl SpaceBlobAccounts {
+    /// Whether `did` has an `sc/` row.
+    pub async fn has_refs(&self, app: &App, did: &str) -> XResult<bool> {
+        let p = app.partition(did)?;
+        let key = (p.id, p.epoch, Arc::as_ptr(&p.db) as usize);
+        if let Some(has) = self.cached(did, key) {
+            return Ok(has);
+        }
+        let prefix = state::space_blob_cid_did_prefix(did);
+        let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+        let has = iter.next().await.map_err(XrpcError::from_err)?.is_some();
+        self.inner.lock().put(did.into(), (key, has));
+        Ok(has)
+    }
+
+    fn cached(&self, did: &str, key: PartitionKey) -> Option<bool> {
+        self.inner.lock().get(did).filter(|(k, _)| *k == key).map(|(_, has)| *has)
+    }
+
+    /// The held answer for `did`, if any (tests).
+    pub fn peek(&self, did: &str) -> Option<bool> {
+        self.inner.lock().peek(did).map(|(_, has)| *has)
     }
 }
 

@@ -263,7 +263,8 @@ async fn sync_get_blob_rule_follows_the_flag() {
 /// A blob only space records name stays private when a node comes back
 /// without `--spaces` (its space refs, which keep it from the GC, outlive
 /// the flag); one a public record names, or an upload nothing names, is as
-/// it was without the flag.
+/// it was without the flag. An account with no space blob ref is held as
+/// such, so its getBlobs read no ref at all, as before Spaces.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn space_only_blob_stays_private_with_the_flag_off() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -276,9 +277,22 @@ async fn space_only_blob_stays_private_with_the_flag_off() {
     owner.create_record(&space, COLL, Some("a"), rec("a", &[&private, &shared])).await.ok();
     on.create_record(&legacy(&owner), "app.bsky.feed.post", image_post("public", &shared)).await;
     on.get_blob(&owner.did, &cid(&private)).await.err(400, "BlobNotFound");
+    // an account no space record names a blob of
+    let plain = SpaceClient::new(&on, "sby", OWNER).await;
+    let (plain_stray, _) = upload(&on, &plain, 4).await;
+    let (plain_public, _) = upload(&on, &plain, 5).await;
+    on.create_record(&legacy(&plain), "app.bsky.feed.post", image_post("public", &plain_public)).await;
     vlpds::server::shutdown(&on.app).await;
 
     let off = cluster_node("sbx", store.clone(), 8, |c| c.spaces = false).await;
+    let held = |did: &str| off.app.space_blob_accounts.peek(did);
+    assert_eq!((held(&owner.did), held(&plain.did)), (None, None), "worked out on first use");
+    off.get_blob(&owner.did, &cid(&private)).await.err(400, "BlobNotFound");
+    assert_eq!(held(&owner.did), Some(true));
+    for b in [&plain_stray, &plain_public] {
+        assert_eq!(off.get_blob(&plain.did, &cid(b)).await.status, 200);
+    }
+    assert_eq!(held(&plain.did), Some(false), "no sc/ row: no ref is read");
     off.get_blob(&owner.did, &cid(&private)).await.err(400, "BlobNotFound");
     assert_eq!(off.get_blob(&owner.did, &cid(&shared)).await.status, 200);
     assert_eq!(off.get_blob(&owner.did, &cid(&stray)).await.status, 200, "serve-before-reference, as without spaces");
@@ -352,4 +366,40 @@ async fn missing_space_blobs_are_listed() {
         cursor = r["cursor"].as_str().map(String::from);
     }
     assert_eq!(paged, got.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>());
+}
+
+/// sync.getBlob's cost with `--spaces` off for an account no space record
+/// names a blob of: a blob a public record names and a fresh upload, timed
+/// over HTTP. `cargo test --profile dev-release --test all
+/// spaces_blobs::get_blob_flag_off_cost -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "bench"]
+async fn get_blob_flag_off_cost() {
+    let s = TestServer::spawn_with(|c| c.spaces = false).await;
+    let a = s.create_account("gbc").await;
+    let public = s.upload_blob(&a, &random_png(1), "image/png").await;
+    s.create_record(&a, "app.bsky.feed.post", image_post("p", &public)).await;
+    let fresh = s.upload_blob(&a, &random_png(2), "image/png").await;
+    let http = reqwest::Client::new();
+    for (what, blob) in [("public", &public), ("unreferenced", &fresh)] {
+        let url = format!("{}/xrpc/com.atproto.sync.getBlob?did={}&cid={}", s.url, a.did, cid(blob));
+        let mut us = Vec::with_capacity(5000);
+        for i in 0..5200 {
+            let t = std::time::Instant::now();
+            let r = http.get(&url).send().await.unwrap();
+            assert_eq!(r.status(), 200);
+            r.bytes().await.unwrap();
+            if i >= 200 {
+                us.push(t.elapsed().as_micros() as u64);
+            }
+        }
+        us.sort();
+        let p = |q: f64| us[((us.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "getBlob {what}: p50 {} us, p99 {} us, mean {} us",
+            p(0.5),
+            p(0.99),
+            us.iter().sum::<u64>() / us.len() as u64
+        );
+    }
 }

@@ -564,6 +564,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
 
     let app = Arc::new(xrpc::App {
         spaces,
+        space_blob_accounts: Default::default(),
         jwt: auth::Jwt::new(&cfg.jwt_secret, &cfg.service_did),
         store: state_store,
         workers,

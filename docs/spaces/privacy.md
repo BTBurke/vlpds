@@ -89,6 +89,12 @@ Space refs outlive the flag, since the GC keeps their blobs whether it's on or n
 comes back without `--spaces` still answers `BlobNotFound` for a blob only space records name.
 Everything else is served as it was without the flag.
 
+That check costs nothing for most accounts. The node works out once per account whether any space
+record names one of its blobs, and keeps the answer for as long as it holds the account's shard. An
+account with no space blob refs reads no ref at all, so its getBlob is what it was before Spaces:
+p50 30 µs against 37–43 µs with the per-blob check, over HTTP on one in-process node. An account
+with space blob refs still checks each blob.
+
 ## Operator access
 
 Nothing is encrypted, so whoever runs a PDS can read the space data on it. vlpds makes that an

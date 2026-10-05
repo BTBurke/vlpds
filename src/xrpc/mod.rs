@@ -133,6 +133,7 @@ pub struct App {
     /// `--spaces` (src/space): space repo heads, the notifyWrite outbox,
     /// revocations. None without the flag.
     pub spaces: Option<Arc<crate::space::Spaces>>,
+    pub space_blob_accounts: blobs::SpaceBlobAccounts,
 }
 
 type AppState = State<Arc<App>>;

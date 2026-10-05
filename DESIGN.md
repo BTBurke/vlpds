@@ -5455,7 +5455,12 @@ the space row, and counts a mismatch in
   with the old owner sees the gap and pulls listRepos.
 - With `--spaces` on, `sync.getBlob` serves a blob only once a public
   record names it (the reference rule). Without the flag an upload is
-  served before any record names it, as before. A blob that only
+  served before any record names it, as before, except a blob only space
+  records name, since space refs outlive the flag. The node remembers
+  per account (and per partition it opened) whether the account has any
+  `sc/` row, so an account with none reads no ref at all, which was
+  getBlob's cost before Spaces. An account with refs checks `b/`, then
+  `sc/`. A blob that only
   taken-down space records name is hidden from space.getBlob and
   listBlobs.
 - Space takedowns (`sec/td/space/{sid}` on the authority) are a vlpds
