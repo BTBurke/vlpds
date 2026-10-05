@@ -227,3 +227,31 @@ grid 10k accounts / 5k active at 25 ms injected PUT latency, two rounds in alter
 The 50k/s step is the knee, and its p99 swings by 2x between identical runs (it ran 350 to 700 ms
 across earlier rounds). The reads (`getRecord`, `getLatestCommit`) and `createRecord` matched within
 1-2%. Results are in `bench/results/spaces1-ab-2026-10-05/`.
+
+### On Cloudflare R2
+
+The harness also ran against a real R2 bucket from the same desktop on wired home internet (a
+release build of `spaces-2c`, one node with 16 shards, and a 3-node cluster at the default 10 s
+lease TTL). Everything follows from R2's PUT latency. A 64 KiB PUT takes ~200 ms p50 (380 ms p99),
+and a GET ~60 ms, while the TCP and TLS round trip to the edge is under 20 ms. So the time goes to
+R2's storage path.
+
+| | R2 |
+|---|---|
+| Space write ack | ~200 ms p50 · 413 ms p99, one segment PUT (the rest of the commit path adds 0.5 ms) |
+| Notify, write readable → syncer notified | 219 ms p50 · 374 ms p99, one more PUT for the authority's entry |
+| No-op `listRepoOps` poll, client | 0.57 ms p50 · 1.25 ms p99 · 0 bucket ops |
+| Delta pull, client | 1.3 ms p50 · 3.0 ms p99 |
+| Public commit p99, alone → with 8 space writers | 643 → 630 ms |
+| Cluster `kill -9` of one node during a 16-writer board load | 0 acked writes lost, all of its shards owned again ~10 s after the kill |
+
+- Polls and delta pulls never touch the bucket, so R2 doesn't slow them down. They stay well
+  under the 1 ms and few-ms targets.
+- A lone writer gets ~4-5 sequential writes a second per repo, since each write waits for its PUT.
+- The space load didn't move public commit p99, and p50 moved by 43 ms (305 → 348 ms).
+- Expect a wide tail. One control-plane GET at cluster start took over 3 s, which is why the
+  cluster ran at the 10 s lease TTL. R2 also answered two 429s on lease-object writes, and
+  object_store's retry absorbed both.
+
+The full write-up, with the bucket-op counts and the failover timeline, is in
+`bench/results/spaces-r2-2026-10-05.md`.
