@@ -2834,9 +2834,14 @@ table.data.firehose-subs td.ua {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-table.data.firehose-subs .client .trunc {
+/* AS number, a gap, then the name; truncated names keep the full text in the cell's tooltip */
+table.data.firehose-subs td.net a {
+  margin-right: 8px;
+}
+table.data.firehose-subs td.net .trunc,
+table.data.firehose-subs td.ptr .trunc {
   display: inline-block;
-  max-width: 180px;
+  max-width: 200px;
   overflow: hidden;
   text-overflow: ellipsis;
   vertical-align: bottom;
@@ -2852,7 +2857,8 @@ table.data.firehose-subs td .pill {
   table.data.firehose-subs td.ua {
     max-width: 160px;
   }
-  table.data.firehose-subs .client .trunc {
-    max-width: 100px;
+  table.data.firehose-subs td.net .trunc,
+  table.data.firehose-subs td.ptr .trunc {
+    max-width: 110px;
   }
 }

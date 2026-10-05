@@ -90,28 +90,32 @@ function Cursor({ seq }: { seq: string }) {
 }
 
 /** IP · AS · verified PTR on one line; an unverified PTR is only a claim, so it stays in the tooltip. */
-function Client({ s }: { s: Subscriber }) {
-  const as = s.asn != null ? `AS${s.asn}${s.asName ? ` ${s.asName}` : ''}${s.asCountry ? ` (${s.asCountry})` : ''}` : null
-  const tip = [s.ip ?? 'unknown', as, s.ptr ? (s.ptrVerified ? s.ptr : `${s.ptr} (unverified)`) : null].filter(Boolean).join(' · ')
+/** Client, Network and Reverse DNS cells: one line, each column aligned, full detail in tooltips. */
+function ClientCells({ s }: { s: Subscriber }) {
+  const as = s.asn != null ? `AS${s.asn}${s.asName ? ` ${s.asName}` : ''}${s.asCountry ? ` (${s.asCountry})` : ''}` : undefined
+  const ptrTip = s.ptr ? (s.ptrVerified ? s.ptr : `${s.ptr} (unverified)`) : undefined
   return (
-    <span className="client" title={tip}>
-      <span className="mono">{s.ip ?? 'unknown'}</span>
-      {s.asn != null && (
-        <span className="muted">
-          {' · '}
-          <a href={`https://bgp.tools/as/${s.asn}`} target="_blank" rel="noreferrer">
-            AS{s.asn}
-          </a>
-          {s.asName && <span className="trunc"> {s.asName}</span>}
-        </span>
-      )}
-      {s.ptr && s.ptrVerified && (
-        <span className="muted">
-          {' · '}
-          <span className="trunc mono">{s.ptr}</span>
-        </span>
-      )}
-    </span>
+    <>
+      <td>
+        <span className="mono">{s.ip ?? 'unknown'}</span>
+        {s.relay && <span className="pill accent">{s.relay}</span>}
+      </td>
+      <td className="net" title={as}>
+        {s.asn != null ? (
+          <>
+            <a href={`https://bgp.tools/as/${s.asn}`} target="_blank" rel="noreferrer" className="mono">
+              AS{s.asn}
+            </a>
+            {s.asName && <span className="trunc">{s.asName}</span>}
+          </>
+        ) : (
+          <span className="muted">—</span>
+        )}
+      </td>
+      <td className="ptr" title={ptrTip}>
+        {s.ptr && s.ptrVerified ? <span className="trunc mono muted">{s.ptr}</span> : <span className="muted">—</span>}
+      </td>
+    </>
   )
 }
 
@@ -229,6 +233,8 @@ export function Firehose() {
                 <tr>
                   <th>Conn</th>
                   <th>Client</th>
+                  <th>Network</th>
+                  <th>Reverse DNS</th>
                   <th>State</th>
                   <th className="num">Lag</th>
                   <th className="num" title="Events sent per second, against this PDS's firehose rate">
@@ -256,10 +262,7 @@ export function Firehose() {
                         )}
                         {multi && <span className="muted mono small"> {s.node}</span>}
                       </td>
-                      <td>
-                        <Client s={s} />
-                        {s.relay && <span className="pill accent">{s.relay}</span>}
-                      </td>
+                      <ClientCells s={s} />
                       <td>{s.state === 'live' ? <Status kind="ok">Live</Status> : <Status kind="warn">Backfilling</Status>}</td>
                       <td className="num">
                         {lag(s)}
@@ -299,6 +302,8 @@ export function Firehose() {
                 <tr>
                   <th>Conn</th>
                   <th>Client</th>
+                  <th>Network</th>
+                  <th>Reverse DNS</th>
                   <th>Reason</th>
                   <th className="num">Left</th>
                   <th className="num">Stayed</th>
@@ -313,10 +318,7 @@ export function Firehose() {
                       <span className="mono">#{s.conn}</span>
                       {multi && <span className="muted mono small"> {s.node}</span>}
                     </td>
-                    <td>
-                      <Client s={s} />
-                      {s.relay && <span className="pill accent">{s.relay}</span>}
-                    </td>
+                    <ClientCells s={s} />
                     <td>
                       {s.reason == 'too_slow' || s.reason === 'write_stalled' || s.reason === 'backfill_failed' ? (
                         <Status kind="bad">{REASONS[s.reason]}</Status>
