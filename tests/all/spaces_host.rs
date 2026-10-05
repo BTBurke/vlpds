@@ -719,8 +719,12 @@ async fn notify_write_from_another_vlpds() {
     let aud = format!("{}#atproto_space_host", owner.did);
     let body =
         |repo: &str, rev: &str| json!({"space": space, "repo": repo, "repoRev": rev, "hash": b64_bytes(&[7; 32])});
-    // the same repoRev, and an older one: no-ops
-    notify(&b, &a, &member.did, &aud, body(&member.did, &rev2)).await.ok();
+    // the same repoRev with the hash held, and an older one: no-ops (the
+    // same rev with another hash is a takedown's adjusted view, sequenced
+    // again: spaces_side::takedowns)
+    let held = repos().await[0]["hash"].clone();
+    let dup = json!({"space": space, "repo": member.did, "repoRev": rev2, "hash": held});
+    notify(&b, &a, &member.did, &aud, dup).await.ok();
     notify(&b, &a, &member.did, &owner.did, body(&member.did, &rev1)).await.ok();
     assert_eq!(repos().await[0]["spaceRev"], json!(space_rev2));
     let future = rev_at(vlpds::tid::now_micros() + 10 * 60 * 1_000_000);

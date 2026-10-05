@@ -671,9 +671,12 @@ async fn notify_write_ignores_duplicate_and_older_revisions() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let before = list_repos(&net, &cred, &space, &[]).await;
     let calls = syncer.calls_to(NOTIFY_WRITE).len();
-    for rev in [&older, &newest] {
-        notify(&net, &bob, None, notify_body(&space, &bob.did, rev, &[0; 32])).await.ok();
-    }
+    // a duplicate is the newest rev with the hash the authority holds: an
+    // equal rev with another hash is a takedown's adjusted view, which vlpds
+    // sequences again (a divergence, tests/REFERENCE_COVERAGE.md)
+    let held = super::fuzz::bytes_field(&before["repos"][0]["hash"]);
+    notify(&net, &bob, None, notify_body(&space, &bob.did, &older, &[0; 32])).await.ok();
+    notify(&net, &bob, None, notify_body(&space, &bob.did, &newest, &held)).await.ok();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(list_repos(&net, &cred, &space, &[]).await, before);
     assert_eq!(syncer.calls_to(NOTIFY_WRITE).len(), calls);
