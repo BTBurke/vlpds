@@ -52,7 +52,9 @@ Members (`_M` > 0) need simplespace `putMember` (C3), and syncers need
 - Bucket ops per space write: object-store requests by op and component
   (`vlpds_object_store_requests_total`) while 16 public writers run, first alone
   and then with space writes on top. Added PUTs per space write is the PUT rate
-  difference over the space write rate.
+  difference over the space write rate. That moves with the public commit rate,
+  so the bench also prints PUTs per write of either kind, which drops when space
+  writes share segments with public ones.
 - Public commit p99 under load: client-side `createRecord` latency for the
   public writers, alone and then with N x M space writers, K pollers per space
   and the syncers' notify-driven pulls running.
@@ -90,6 +92,7 @@ Not run yet.
 | Commits/s, space writes/s | C1 | | |
 | PUT/s | C1 | | |
 | Added PUTs per space write | C1 | | |
+| PUTs per write (public + space) | C1 | | |
 
 | Public commit latency | Needs | p50 | p99 |
 |---|---|---|---|

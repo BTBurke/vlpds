@@ -799,6 +799,13 @@ async fn bench_bucket(
         "bucket: added PUTs per space write ~{:.4} (PUT/s difference over space writes/s; target 0)",
         (puts(&with) / w2 - puts(&alone) / w1) / (space_writes / w2).max(1e-9)
     ));
+    // the rate difference moves with the public commit rate; PUTs per write
+    // of either kind doesn't, and drops when space writes share segments
+    out.say(format!(
+        "bucket: PUTs per write {:.3} alone, {:.3} with space writes (public + space)",
+        puts(&alone) / commits1.max(1.0),
+        puts(&with) / (commits2 + space_writes).max(1.0)
+    ));
     let keys: std::collections::BTreeSet<_> = alone.keys().chain(with.keys()).cloned().collect();
     for k in keys {
         out.say(format!(
