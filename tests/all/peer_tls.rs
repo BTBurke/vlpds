@@ -213,7 +213,7 @@ fn no_client_cert() -> reqwest::Client {
         .with_root_certificates(roots)
         .with_no_client_auth();
     cfg.alpn_protocols = vec![b"h2".to_vec()];
-    reqwest::Client::builder().use_preconfigured_tls(cfg).http2_prior_knowledge().build().unwrap()
+    reqwest::Client::builder().tls_backend_preconfigured(cfg).http2_prior_knowledge().build().unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

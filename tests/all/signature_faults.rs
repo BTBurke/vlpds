@@ -31,7 +31,7 @@ async fn faulty_signatures_are_never_emitted_and_repeats_fail_stop() {
     let s = TestServer::spawn().await;
     let a = s.create_account("sigfault").await;
     let vk = s.signing_key(&a.did).await;
-    let key_id = vk.to_encoded_point(true).as_bytes().to_vec();
+    let key_id = vk.to_sec1_point(true).as_bytes().to_vec();
     let mut sub = s.subscribe_from_now().await;
     let c0 = failures(Purpose::Commit);
 

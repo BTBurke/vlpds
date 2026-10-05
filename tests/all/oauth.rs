@@ -8,6 +8,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
+use p256::elliptic_curve::Generate;
 use reqwest::header::HeaderMap;
 use serde_json::{json, Value as J};
 use sha2::{Digest, Sha256};
@@ -106,11 +107,11 @@ pub(crate) struct DpopKey {
 
 impl DpopKey {
     pub(crate) fn new() -> DpopKey {
-        DpopKey { sk: SigningKey::random(&mut rand::rngs::OsRng), nonce: Default::default() }
+        DpopKey { sk: SigningKey::generate(), nonce: Default::default() }
     }
 
     fn jwk(&self) -> J {
-        let pt = self.sk.verifying_key().to_encoded_point(false);
+        let pt = self.sk.verifying_key().to_sec1_point(false);
         json!({"kty": "EC", "crv": "P-256", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap())})
     }
 
@@ -157,8 +158,8 @@ fn sign_jwt(sk: &SigningKey, header: &J, payload: &J) -> String {
 
 /// A client signing key and its public JWK (kid "k1").
 fn client_key() -> (SigningKey, J) {
-    let sk = SigningKey::random(&mut rand::rngs::OsRng);
-    let pt = sk.verifying_key().to_encoded_point(false);
+    let sk = SigningKey::generate();
+    let pt = sk.verifying_key().to_sec1_point(false);
     let jwk = json!({"kty": "EC", "crv": "P-256", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap()), "kid": "k1", "alg": "ES256", "use": "sig"});
     (sk, jwk)
 }
@@ -1463,7 +1464,7 @@ async fn jar_request_objects() {
     expect_invalid(par(with("iat", Some(json!(now() - 120)))).await, "\"iat\"");
     expect_invalid(par(with("jti", None)).await, "\"jti\"");
     expect_invalid(par(with("iss", Some(json!("https://someone.else/client.json")))).await, "\"iss\"");
-    let other = SigningKey::random(&mut rand::rngs::OsRng);
+    let other = SigningKey::generate();
     expect_invalid(par(sign_jwt(&other, &jar_header, &claims())).await, "signature verification failed");
     expect_invalid(par(unsecured_jwt(&claims())).await, "unsecured");
     expect_invalid(par(with("client_id", Some(json!("http://localhost")))).await, "does not match");
@@ -1520,7 +1521,7 @@ async fn jar_unsecured_request_objects() {
     let r =
         as_post(&s, &key, "/oauth/par", &[("client_id", &client_id), ("request", &unsecured_jwt(&payload()))]).await;
     assert_eq!(r.status, 201, "{}", r.body);
-    let signed = sign_jwt(&SigningKey::random(&mut rand::rngs::OsRng), &json!({"alg": "ES256"}), &payload());
+    let signed = sign_jwt(&SigningKey::generate(), &json!({"alg": "ES256"}), &payload());
     let r = as_post(&s, &key, "/oauth/par", &[("client_id", &client_id), ("request", &signed)]).await;
     assert_eq!(r.status, 400, "{}", r.body);
     assert!(r.body["error_description"].as_str().unwrap().contains("unsecured"));

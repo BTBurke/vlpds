@@ -842,6 +842,7 @@ fn validate_metadata(client_id: &str, md: J, loopback: bool, dev_mode: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use p256::elliptic_curve::Generate;
 
     #[test]
     fn loopback_ids() {
@@ -935,7 +936,7 @@ mod tests {
     fn assertion_claim_is_bounded_by_iat_not_exp() {
         use super::super::util::b64u;
         use p256::ecdsa::signature::Signer;
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let sk = p256::ecdsa::SigningKey::generate();
         let mut jwk = super::super::jose::key_to_jwk(sk.verifying_key());
         jwk["kid"] = json!("k1");
         let id = "https://app.example/client-metadata.json";

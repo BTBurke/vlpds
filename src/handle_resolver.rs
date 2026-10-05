@@ -5,6 +5,7 @@
 //! HTTPS fetch is the caller's (SSRF-guarded: `xrpc::identity`).
 
 use futures::future::BoxFuture;
+use hickory_resolver::proto::rr::RData;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ impl std::fmt::Debug for TxtResolverRef {
 struct SystemTxt;
 
 static SYSTEM: LazyLock<Option<hickory_resolver::TokioResolver>> =
-    LazyLock::new(|| hickory_resolver::TokioResolver::builder_tokio().ok().map(|b| b.build()));
+    LazyLock::new(|| hickory_resolver::TokioResolver::builder_tokio().and_then(|b| b.build()).ok());
 
 impl TxtResolver for SystemTxt {
     fn txt<'a>(&'a self, name: &'a str) -> BoxFuture<'a, Result<Vec<String>, String>> {
@@ -43,9 +44,14 @@ impl TxtResolver for SystemTxt {
             let r = SYSTEM.as_ref().ok_or("DNS resolver unavailable")?;
             let lookup = r.txt_lookup(name).await.map_err(|e| e.to_string())?;
             Ok(lookup
+                .answers()
                 .iter()
+                .filter_map(|r| match &r.data {
+                    RData::TXT(txt) => Some(txt),
+                    _ => None,
+                })
                 .take(MAX_TXT_RECORDS)
-                .map(|txt| txt.txt_data().iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect::<String>())
+                .map(|txt| txt.txt_data.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect::<String>())
                 .collect())
         })
     }

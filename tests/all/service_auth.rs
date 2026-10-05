@@ -32,7 +32,7 @@ fn verify_jwt(j: &Jwt, key: &k256::ecdsa::VerifyingKey) -> anyhow::Result<()> {
     anyhow::ensure!(j.header["alg"] == json!("ES256K"), "alg {}", j.header["alg"]);
     anyhow::ensure!(j.sig.len() == 64, "signature is {} bytes, want 64 (compact r||s)", j.sig.len());
     let sig = k256::ecdsa::Signature::from_slice(&j.sig)?;
-    anyhow::ensure!(sig.normalize_s().is_none(), "signature is not low-S");
+    anyhow::ensure!(sig.normalize_s() == sig, "signature is not low-S");
     key.verify(j.signing_input.as_bytes(), &sig)?;
     Ok(())
 }

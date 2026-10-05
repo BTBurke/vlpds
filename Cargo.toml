@@ -46,7 +46,7 @@ zstd = "0.13"
 # flate2 tower-http already links)
 flate2 = "1"
 # brotli (`br`) decoding of proxied AppView bodies for read-after-write
-brotli-decompressor = "5"
+brotli-decompressor = "6"
 object_store = { version = "0.14", features = ["aws"] }
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["ws", "macros", "http2"] }
@@ -55,8 +55,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # K-256 signing/verification: libsecp256k1 (vendored C via cc), ~1.7x
 # faster signing and ~2.7x faster verification than RustCrypto k256.
-secp256k1 = { version = "0.30", features = ["global-context"] }
-sha2 = { version = "0.10", features = ["asm"] }
+secp256k1 = { version = "0.33", features = ["global-context"] }
+sha2 = "0.11"
 rand = "0.8"
 # explicit-slur handle filter (src/handle_policy.rs; the reference's regexes)
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
@@ -69,20 +69,20 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 clap = { version = "4", features = ["derive", "env"] }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
-lru = "0.12"
-base64 = "0.22"
-hmac = "0.12"
-sha1 = "0.10"
+lru = "0.18"
+base64 = "0.23"
+hmac = "0.13"
+sha1 = "0.11"
 futures = "0.3"
 hdrhistogram = "7"
-reqwest = { version = "0.12", default-features = false, features = ["json", "http2", "rustls-tls", "stream"] }
-tokio-tungstenite = { version = "0.26", features = ["__rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "query", "http2", "rustls", "stream"] }
+tokio-tungstenite = { version = "0.29", features = ["__rustls-tls"] }
 tikv-jemallocator = { version = "0.7", optional = true }
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"], optional = true }
 mimalloc = { version = "0.1", optional = true }
 pyroscope = { version = "2.1", default-features = false, features = ["backend-pprof-rs"], optional = true }
 prost = { version = "0.14", optional = true }
-inferno = { version = "0.11", default-features = false, optional = true }
+inferno = { version = "0.12", default-features = false, optional = true }
 slatedb-common = { version = "0.17", optional = true }
 prometheus = { version = "0.14", default-features = false }
 hyper = { version = "1", features = ["server", "client", "http1", "http2"] }
@@ -92,8 +92,8 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # OAuth (src/oauth): ES256 (P-256) for DPoP proofs, client assertions and access tokens;
 # DNS TXT lookups for lexicon authority resolution (include: permission sets).
-p256 = { version = "0.13", features = ["ecdsa"] }
-hickory-resolver = "0.25"
+p256 = { version = "0.14", features = ["ecdsa", "getrandom"] }
+hickory-resolver = "0.26"
 # HTTP: server-wide CORS, response compression (json/car) and request
 # Content-Encoding decoding, as the reference PDS does.
 # grapheme counts for lexicon maxGraphemes (src/lexicon.rs)
@@ -105,7 +105,7 @@ tower-http = { version = "0.6", features = ["compression-gzip", "decompression-g
 # outbound email (src/mail.rs): async SMTP over rustls (ring, webpki roots), no native-tls
 # secrets at rest (src/secrets.rs): XChaCha20-Poly1305 under the local KEK;
 # unwrapped key material is zeroized on drop
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 zeroize = { version = "1", features = ["derive"] }
 # GCP service-account JWTs (RS256) for Cloud KMS tokens (src/secrets.rs);
 # already in the tree via rustls
@@ -218,9 +218,9 @@ codegen-units = 16
 
 [dev-dependencies]
 # brotli-encoded stub AppView bodies (read-after-write tests)
-brotli = "8"
+brotli = "9"
 # tests cross-check libsecp256k1 signatures against RustCrypto
-k256 = { version = "0.13", features = ["ecdsa"] }
+k256 = { version = "0.14", features = ["ecdsa"] }
 # differential tests (tests/all/differential_shrike.rs): a second atproto
 # implementation (DAG-CBOR, CID, CAR, MST, proofs, crypto, syntax, lexicon)
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "repo", "car", "lexicon"] }

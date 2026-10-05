@@ -33,7 +33,7 @@ fn atproto_verify_k256(key: &k256::ecdsa::VerifyingKey, msg: &[u8], sig: &[u8]) 
     let Ok(sig) = k256::ecdsa::Signature::from_slice(sig) else {
         return false;
     };
-    if sig.normalize_s().is_some() {
+    if sig.normalize_s() != sig {
         return false; // high-S
     }
     key.verify(msg, &sig).is_ok()
@@ -48,7 +48,7 @@ fn w3c_did_key_k256_from_private_key() {
         assert_eq!(kp.did_key(), c.public_did_key);
         // and the did:key decodes back to the same public key
         let vk = decode_did_key_k256(&c.public_did_key).unwrap();
-        assert_eq!(vk.to_encoded_point(true).as_bytes(), &kp.public_key_sec1()[..]);
+        assert_eq!(vk.to_sec1_point(true).as_bytes(), &kp.public_key_sec1()[..]);
         // and to_bytes round-trips the fixture's private key
         assert_eq!(hex::encode(kp.to_bytes()), c.private_key_bytes_hex.to_lowercase());
     }
@@ -78,7 +78,7 @@ fn signature_fixtures_k256() {
         let ok = atproto_verify_k256(&key, &msg, &sig);
         assert_eq!(ok, c.valid_signature, "{}", c.comment);
         // the production verifier (libsecp256k1) agrees, incl. rejecting high-S
-        let pk = key.to_encoded_point(true);
+        let pk = key.to_sec1_point(true);
         let ours = vlpds::crypto::verify_k256(pk.as_bytes(), &msg, &sig).unwrap_or(false);
         assert_eq!(ours, c.valid_signature, "vlpds::crypto::verify_k256: {}", c.comment);
     }
@@ -91,7 +91,7 @@ fn harness_commit_verifier_rejects_high_s() {
     let cases: Vec<SigFixture> = serde_json::from_str(&read_fixture("interop/crypto/signature-fixtures.json")).unwrap();
     let c = cases.iter().find(|c| c.algorithm == "ES256K" && c.comment.contains("non-low-S")).unwrap();
     let sig = k256::ecdsa::Signature::from_slice(&b64_decode(&c.signature_base64)).unwrap();
-    assert!(sig.normalize_s().is_some(), "fixture should be high-S");
+    assert!(sig.normalize_s() != sig, "fixture should be high-S");
 }
 
 #[test]
@@ -141,11 +141,11 @@ fn signatures_byte_identical_to_rustcrypto_k256() {
     for k in 0..16u32 {
         let kp = vlpds::crypto::Keypair::generate();
         let sk = k256::ecdsa::SigningKey::from_slice(&kp.to_bytes()).unwrap();
-        assert_eq!(sk.verifying_key().to_encoded_point(true).as_bytes(), &kp.public_key_sec1()[..]);
+        assert_eq!(sk.verifying_key().to_sec1_point(true).as_bytes(), &kp.public_key_sec1()[..]);
         for i in 0..64u32 {
             let msg = format!("commit {k} {i} {}", "x".repeat(i as usize));
             let theirs: k256::ecdsa::Signature = sk.sign(msg.as_bytes());
-            let theirs = theirs.normalize_s().unwrap_or(theirs);
+            let theirs = theirs.normalize_s();
             assert_eq!(kp.sign_deterministic(msg.as_bytes())[..], theirs.to_bytes()[..], "key {k} msg {i}");
             let hedged = kp.sign_verified(vlpds::crypto::Purpose::Commit, msg.as_bytes()).unwrap();
             assert_ne!(hedged, kp.sign_deterministic(msg.as_bytes()));

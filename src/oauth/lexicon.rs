@@ -260,13 +260,12 @@ fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) 
             use p256::ecdsa::signature::Verifier;
             let vk = p256::ecdsa::VerifyingKey::from_sec1_bytes(key).map_err(|e| e.to_string())?;
             let s = p256::ecdsa::Signature::from_slice(sig).map_err(|e| e.to_string())?;
-            // `p256` itself accepts both forms; Some = it was high-S
-            let s = match s.normalize_s() {
-                Some(_) if !allow_high_s => return Ok(false),
-                Some(low) => low,
-                None => s,
-            };
-            Ok(vk.verify(msg, &s).is_ok())
+            // `p256` itself accepts both forms; a different low-S form = it was high-S
+            let low = s.normalize_s();
+            if low != s && !allow_high_s {
+                return Ok(false);
+            }
+            Ok(vk.verify(msg, &low).is_ok())
         }
         _ => Err("unsupported key type".into()),
     }
@@ -355,20 +354,22 @@ pub async fn permission_sets_for_scope(app: &App, scope: &str) -> Result<Vec<(In
 
 #[cfg(test)]
 mod tests {
+    use p256::elliptic_curve::Generate;
+
     /// Record proofs (commit signatures) take low-S only; service-auth JWTs
     /// also take the high-S form, for both curves.
     #[test]
     fn signature_malleability() {
         let msg = b"signed bytes";
         // P-256
-        let sk = p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng);
+        let sk = p256::ecdsa::SigningKey::generate();
         let mut mk = vec![0x80, 0x24];
-        mk.extend_from_slice(sk.verifying_key().to_encoded_point(true).as_bytes());
+        mk.extend_from_slice(sk.verifying_key().to_sec1_point(true).as_bytes());
         let p256_key = format!("z{}", bs58::encode(mk).into_string());
         let sig: p256::ecdsa::Signature = p256::ecdsa::signature::Signer::sign(&sk, msg);
-        let low = sig.normalize_s().unwrap_or(sig);
+        let low = sig.normalize_s();
         let high = p256::ecdsa::Signature::from_scalars(low.r(), -*low.s()).unwrap();
-        assert!(high.normalize_s().is_some(), "high-S form");
+        assert!(high.normalize_s() != high, "high-S form");
         for (key, low, high) in [(p256_key, low.to_bytes().to_vec(), high.to_bytes().to_vec()), {
             // K-256
             let kp = crate::crypto::Keypair::generate();

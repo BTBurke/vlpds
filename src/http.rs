@@ -72,16 +72,11 @@ pub fn dedicated(
     ca_only: bool,
 ) -> anyhow::Result<reqwest::Client> {
     let mut b = outbound(role, max_idle).no_proxy();
-    if ca_only {
-        anyhow::ensure!(ca_pem.is_some(), "trusting only the CA bundle needs one");
-        b = b.tls_built_in_root_certs(false);
-    }
+    anyhow::ensure!(!ca_only || ca_pem.is_some(), "trusting only the CA bundle needs one");
     if let Some(pem) = ca_pem {
         let certs = reqwest::Certificate::from_pem_bundle(pem).map_err(|e| anyhow::anyhow!("CA bundle: {e}"))?;
         anyhow::ensure!(!certs.is_empty(), "CA bundle holds no PEM certificate");
-        for c in certs {
-            b = b.add_root_certificate(c);
-        }
+        b = if ca_only { b.tls_certs_only(certs) } else { b.tls_certs_merge(certs) };
     }
     Ok(b.build()?)
 }
@@ -805,7 +800,7 @@ fn refusing() -> &'static reqwest::Client {
             .expect("TLS 1.3 with the ring provider")
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
-        base("peer").https_only(true).use_preconfigured_tls(tls).build().expect("reqwest client")
+        base("peer").https_only(true).tls_backend_preconfigured(tls).build().expect("reqwest client")
     });
     &C
 }
@@ -853,7 +848,7 @@ impl PeerClient {
         let (reg, key) = (inner.registry.clone(), o.clone());
         let expect = crate::peer_tls::Expect::Lookup(Arc::new(move || reg.get().map(|r| r(&key))));
         let config = tls.client_config(expect, &[b"h2"]);
-        let pool = Pool::build(inner.n, || peer_builder().https_only(true).use_preconfigured_tls(config.clone()))
+        let pool = Pool::build(inner.n, || peer_builder().https_only(true).tls_backend_preconfigured(config.clone()))
             .map(Arc::new)
             .unwrap_or_else(|e| {
                 tracing::error!(origin, "peer TLS client: {e}");

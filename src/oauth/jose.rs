@@ -4,7 +4,7 @@
 use super::util::{b64u, b64u_decode, derive_secret, hmac_sha256, now_secs, sha256_b64u, Replay};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use p256::EncodedPoint;
+use p256::Sec1Point;
 use serde_json::{json, Value as J};
 
 /// For DPoP proofs and client assertions.
@@ -25,15 +25,15 @@ pub fn jwk_to_key(jwk: &J) -> Result<VerifyingKey, String> {
     }
     let x = jwk.get("x").and_then(|v| v.as_str()).and_then(b64u_decode).ok_or("JWK missing x")?;
     let y = jwk.get("y").and_then(|v| v.as_str()).and_then(b64u_decode).ok_or("JWK missing y")?;
-    if x.len() != 32 || y.len() != 32 {
+    let (Ok(x), Ok(y)) = (p256::FieldBytes::try_from(x.as_slice()), p256::FieldBytes::try_from(y.as_slice())) else {
         return Err("invalid JWK coordinates".into());
-    }
-    let pt = EncodedPoint::from_affine_coordinates(x.as_slice().into(), y.as_slice().into(), false);
-    VerifyingKey::from_encoded_point(&pt).map_err(|_| "invalid JWK point".to_string())
+    };
+    let pt = Sec1Point::from_affine_coordinates(&x, &y, false);
+    VerifyingKey::from_sec1_point(&pt).map_err(|_| "invalid JWK point".to_string())
 }
 
 pub fn key_to_jwk(k: &VerifyingKey) -> J {
-    let pt = k.to_encoded_point(false);
+    let pt = k.to_sec1_point(false);
     json!({"kty": "EC", "crv": "P-256", "x": b64u(pt.x().unwrap()), "y": b64u(pt.y().unwrap())})
 }
 
@@ -134,14 +134,15 @@ impl ServerKey {
     pub fn sign(&self, typ: &str, payload: &J) -> Result<String, crate::crypto::SignatureFault> {
         use crate::crypto::{fault, record_fault, Purpose, SignatureFault};
         use p256::ecdsa::signature::RandomizedSigner;
+        use p256::elliptic_curve::{common::getrandom::SysRng, rand_core::UnwrapErr};
         let header = json!({"alg": "ES256", "typ": typ, "kid": self.kid});
         let input =
             format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(payload).unwrap()));
         let vk = self.sk.verifying_key();
         for _ in 0..2 {
-            let sig: Signature = self.sk.sign_with_rng(&mut rand::thread_rng(), input.as_bytes());
+            let sig: Signature = self.sk.sign_with_rng(&mut UnwrapErr(SysRng), input.as_bytes());
             let mut bytes = sig.to_bytes();
-            if fault::armed() && fault::take(vk.to_encoded_point(true).as_bytes()).is_some() {
+            if fault::armed() && fault::take(vk.to_sec1_point(true).as_bytes()).is_some() {
                 bytes[40] ^= 0x04;
             }
             let ok = Signature::from_slice(&bytes).is_ok_and(|s| vk.verify(input.as_bytes(), &s).is_ok());
@@ -310,6 +311,7 @@ pub fn check_proof(
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Signer;
+    use p256::elliptic_curve::Generate;
 
     fn proof(sk: &SigningKey, htm: &str, htu: &str, nonce: Option<&str>, ath: Option<&str>) -> String {
         let jwk = key_to_jwk(sk.verifying_key());
@@ -331,7 +333,7 @@ mod tests {
     #[test]
     fn dpop_roundtrip() {
         let nonces = DpopNonces::new("secret");
-        let sk = SigningKey::random(&mut rand::rngs::OsRng);
+        let sk = SigningKey::generate();
         let htu = "https://pds.example/xrpc/foo";
         let p = proof(&sk, "POST", htu, None, None);
         assert!(matches!(check_proof(&p, "POST", htu, None, &nonces), Err(DpopError::UseNonce(_))));
@@ -370,7 +372,7 @@ mod tests {
     fn server_key_faults_are_caught() {
         use crate::crypto::fault::{inject, Fault};
         let a = ServerKey::derive("fault-test");
-        let id = a.sk.verifying_key().to_encoded_point(true);
+        let id = a.sk.verifying_key().to_sec1_point(true);
         let failures = || crate::metrics::SIGNATURE_VERIFY_FAILURES.with_label_values(&["oauth_token"]).get();
         let before = failures();
         inject(id.as_bytes(), Fault::Signature, 1);

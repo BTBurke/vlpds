@@ -1437,7 +1437,7 @@ impl Series {
     fn new(fh: &Arc<Firehose>, id: u64, ip: Option<std::net::IpAddr>, relay: Option<&str>) -> Series {
         let own = fh
             .labelled
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < fh.max_labelled).then_some(n + 1))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < fh.max_labelled).then_some(n + 1))
             .is_ok();
         let labels = if own {
             [

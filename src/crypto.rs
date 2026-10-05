@@ -38,18 +38,18 @@ impl Keypair {
             // a uniformly random 32-byte string is a valid scalar except
             // with negligible (~2^-128) probability
             let b: [u8; 32] = rand::random();
-            if let Ok(sk) = SecretKey::from_byte_array(&b) {
+            if let Ok(sk) = SecretKey::from_secret_bytes(b) {
                 return Keypair::new(sk);
             }
         }
     }
 
     pub fn from_bytes(b: &[u8]) -> anyhow::Result<Keypair> {
-        Ok(Keypair::new(SecretKey::from_slice(b)?))
+        Ok(Keypair::new(SecretKey::from_secret_bytes(b.try_into()?)?))
     }
 
     pub fn to_bytes(&self) -> zeroize::Zeroizing<Vec<u8>> {
-        let mut b = self.sk.secret_bytes();
+        let mut b = self.sk.to_secret_bytes();
         let v = zeroize::Zeroizing::new(b.to_vec());
         zeroize::Zeroize::zeroize(&mut b);
         v
@@ -88,9 +88,9 @@ impl Keypair {
                 }
                 Some(fault::Fault::Secret) => {
                     // a bit of the scalar flipped while signing
-                    let mut b = self.sk.secret_bytes();
+                    let mut b = self.sk.to_secret_bytes();
                     b[31] ^= 0x10;
-                    let flipped = SecretKey::from_byte_array(&b).expect("flipped scalar");
+                    let flipped = SecretKey::from_secret_bytes(b).expect("flipped scalar");
                     b.fill(0);
                     sign_hedged(&flipped, &digest)
                 }
@@ -107,12 +107,12 @@ impl Keypair {
     /// Whether the scalar still derives the cached public key and
     /// `multibase` (empty: the cached key only).
     pub fn matches_public(&self, multibase: &str) -> bool {
-        let fresh = PublicKey::from_secret_key(SECP256K1, &self.sk);
+        let fresh = PublicKey::from_secret_key(&self.sk);
         fresh == *self.public_key() && (multibase.is_empty() || self.public_multibase() == multibase)
     }
 
     fn public_key(&self) -> &PublicKey {
-        self.pk.get_or_init(|| PublicKey::from_secret_key(SECP256K1, &self.sk))
+        self.pk.get_or_init(|| PublicKey::from_secret_key(&self.sk))
     }
 
     pub fn public_key_sec1(&self) -> [u8; 33] {
@@ -168,7 +168,7 @@ fn sign_digest(sk: &SecretKey, digest: &[u8; 32], extra: Option<&[u8; 32]>) -> S
 fn verify_compact(pk: &PublicKey, data: &[u8], sig: &[u8; 64]) -> bool {
     let Ok(sig) = Signature::from_compact(sig) else { return false };
     let digest: [u8; 32] = Sha256::digest(data).into();
-    SECP256K1.verify_ecdsa(&Message::from_digest(digest), &sig, pk).is_ok()
+    secp256k1::ecdsa::verify(&sig, Message::from_digest(digest), pk).is_ok()
 }
 
 /// The secp256k1 group order n.
@@ -299,7 +299,7 @@ fn verify_k256_inner(pubkey_sec1: &[u8], msg: &[u8], sig: &[u8], malleable: bool
         sig.normalize_s();
     }
     let digest: [u8; 32] = Sha256::digest(msg).into();
-    Ok(SECP256K1.verify_ecdsa(&Message::from_digest(digest), &sig, &pk).is_ok())
+    Ok(secp256k1::ecdsa::verify(&sig, Message::from_digest(digest), &pk).is_ok())
 }
 
 /// The `purpose` label of `vlpds_signature_verify_failures_total`.
@@ -532,11 +532,11 @@ mod tests {
             let mut data = vec![0u8; rng.gen_range(0..400)];
             rng.fill(&mut data[..]);
             let digest: [u8; 32] = Sha256::digest(&data).into();
-            let mut want = SECP256K1.sign_ecdsa(&Message::from_digest(digest), &kp.sk);
+            let mut want = secp256k1::ecdsa::sign(Message::from_digest(digest), &kp.sk);
             want.normalize_s();
             assert_eq!(kp.sign_deterministic(&data), want.serialize_compact(), "signature {i}");
             let nd: [u8; 32] = rng.r#gen();
-            let mut want = SECP256K1.sign_ecdsa_with_noncedata(&Message::from_digest(digest), &kp.sk, &nd);
+            let mut want = secp256k1::ecdsa::sign_with_noncedata(Message::from_digest(digest), &kp.sk, &nd);
             want.normalize_s();
             let mut got = sign_digest(&kp.sk, &digest, Some(&nd));
             got.normalize_s();
@@ -545,7 +545,7 @@ mod tests {
         // digests at and above the group order
         let kp = Keypair::generate();
         for d in edge_messages() {
-            let mut want = SECP256K1.sign_ecdsa(&Message::from_digest(d), &kp.sk);
+            let mut want = secp256k1::ecdsa::sign(Message::from_digest(d), &kp.sk);
             want.normalize_s();
             let mut got = sign_digest(&kp.sk, &d, None);
             got.normalize_s();
@@ -618,9 +618,9 @@ mod tests {
         assert!(kp.matches_public(""));
         assert!(!kp.matches_public(&Keypair::generate().public_multibase()));
         // a scalar that changed after its public key was cached
-        let mut b = kp.sk.secret_bytes();
+        let mut b = kp.sk.to_secret_bytes();
         b[0] ^= 1;
-        let flipped = Keypair { sk: SecretKey::from_byte_array(&b).unwrap(), pk: OnceLock::from(*kp.public_key()) };
+        let flipped = Keypair { sk: SecretKey::from_secret_bytes(b).unwrap(), pk: OnceLock::from(*kp.public_key()) };
         assert!(!flipped.matches_public(&mb));
         assert!(!flipped.matches_public(""));
     }

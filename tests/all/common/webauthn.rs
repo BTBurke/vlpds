@@ -6,6 +6,7 @@ use super::*;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use base64::Engine;
 use p256::ecdsa::signature::Signer;
+use p256::elliptic_curve::Generate;
 use sha2::{Digest, Sha256};
 
 pub fn b64u(b: impl AsRef<[u8]>) -> String {
@@ -46,7 +47,7 @@ impl SoftKey {
     /// A hardware-style key (counts up) for `server`.
     pub fn new(origin: &str) -> SoftKey {
         SoftKey {
-            sk: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
+            sk: p256::ecdsa::SigningKey::generate(),
             id: rand::random::<[u8; 32]>().to_vec(),
             count: 0,
             synced: false,
@@ -68,7 +69,7 @@ impl SoftKey {
     }
 
     fn cose(&self) -> Vec<u8> {
-        let p = self.sk.verifying_key().to_encoded_point(false);
+        let p = self.sk.verifying_key().to_sec1_point(false);
         let mut out = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
         out.extend_from_slice(p.x().unwrap());
         out.extend_from_slice(&[0x22, 0x58, 0x20]);

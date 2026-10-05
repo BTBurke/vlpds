@@ -696,6 +696,7 @@ mod tests {
     use super::*;
     use crate::oauth::util::b64u;
     use p256::ecdsa::signature::Signer;
+    use p256::elliptic_curve::Generate;
 
     fn d(s: &str) -> Vec<u8> {
         b64u_decode(s).unwrap()
@@ -810,7 +811,7 @@ mod tests {
     }
 
     fn cose_es256(sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
-        let p = sk.verifying_key().to_encoded_point(false);
+        let p = sk.verifying_key().to_sec1_point(false);
         let mut out = vec![0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01, 0x21, 0x58, 0x20];
         out.extend_from_slice(p.x().unwrap());
         out.extend_from_slice(&[0x22, 0x58, 0x20]);
@@ -853,10 +854,7 @@ mod tests {
 
     impl Auth {
         fn new() -> Auth {
-            Auth {
-                sk: p256::ecdsa::SigningKey::random(&mut rand::rngs::OsRng),
-                id: rand::random::<[u8; 16]>().to_vec(),
-            }
+            Auth { sk: p256::ecdsa::SigningKey::generate(), id: rand::random::<[u8; 16]>().to_vec() }
         }
 
         fn key(&self) -> PublicKey {
