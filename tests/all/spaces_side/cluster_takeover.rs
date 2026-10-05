@@ -11,6 +11,11 @@
 //! - the remote authority hears each writer's newest rev, the revs it hears
 //!   per writer never go back, and the syncer gets the local space's
 //!   updates in spaceRev order.
+//!
+//! And with no writes in flight: when the authority's shard moves, the new
+//! owner sends each live registration one coalesced catch-up forward with
+//! the space's current head and spaceRev (the docs-draft decision 3), so a
+//! syncer whose queued forward died with the old owner hears within seconds.
 
 use super::cluster::{client_on, settle_front, Plc};
 use super::durability::{burst, by_did, consistent, create, latest, list_repos, scope, signed_post, Burst};
@@ -208,4 +213,85 @@ async fn three_node_takeover_mid_burst_with_the_authority_on_a_survivor() {
 #[ignore = "spaces core: C3"]
 async fn three_node_takeover_mid_burst_with_the_authority_on_the_victim() {
     takeover_mid_burst(true).await;
+}
+
+/// The authority's shard is on the victim; three syncers are registered and
+/// have heard every write. With nothing written after it, a kill -9 moves
+/// the shard and the new owner sends each registration exactly one forward
+/// within a few seconds, carrying the newest sequenced (repo, repoRev,
+/// spaceRev) as listRepos shows it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "spaces phase 3: takeover catch-up forward"]
+async fn takeover_sends_each_registration_one_catch_up_forward() {
+    let (bucket, front, plc) = (Default::default(), Front::new().await, Plc::start().await);
+    let mut nodes = Vec::new();
+    for i in 1..=3 {
+        nodes.push(hooked_node_with(&format!("tc-{i}"), &bucket, SHARDS, &front, |c| plc.apply(c)).await);
+    }
+    let [(n1, _), (n2, s2), (n3, _)] = &nodes[..] else { unreachable!() };
+    balanced(&[n1, n2, n3]).await;
+    let t = tag();
+    let (st, coll) = (format!("com.example.tc{t}.space"), format!("com.example.tc{t}.note"));
+    let sc = scope(&st, &coll);
+    let mut auth = client_on(&front, n2, "tca", &sc).await;
+    let mut writers = vec![client_on(&front, n1, "tcw", &sc).await, client_on(&front, n3, "tcw", &sc).await];
+    let mut all: Vec<&mut SpaceClient> = writers.iter_mut().collect();
+    all.push(&mut auth);
+    settle_front(&front, n1, &mut all);
+
+    let local = auth.create_space(&st, "tc").await;
+    for w in &writers {
+        let m = json!({"space": local, "did": w.did, "read": true, "write": true});
+        auth.post("com.atproto.simplespace.putMember", m).await.ok();
+    }
+    let cred = auth.credential(&local).await;
+    let mut syncers = Vec::new();
+    for _ in 0..3 {
+        let s = StubDid::spawn().await;
+        let reg = json!({"space": local, "service": format!("{}#atproto_space_syncer", s.did)});
+        signed_post(&auth, "com.atproto.space.registerNotify", reg, &cred, &auth.did).await.ok();
+        syncers.push(s);
+    }
+    for (i, w) in writers.iter().enumerate() {
+        for j in 0..3 {
+            create(w, &local, &coll, &format!("w{i}-{j}"), "before the kill").await.ok();
+        }
+    }
+    let newest = |repos: &[J]| repos.iter().map(|r| r["spaceRev"].as_str().unwrap().to_string()).max();
+    let before = list_repos(&auth, &local, &cred).await.unwrap();
+    let head = newest(&before).expect("sequenced writes");
+    eventually(Duration::from_secs(20), || async {
+        syncers
+            .iter()
+            .all(|s| s.accepted().iter().any(|n| n.body["spaceRev"].as_str() == Some(head.as_str())))
+            .then_some(())
+    })
+    .await
+    .expect("the syncers never heard the newest write before the kill");
+
+    kill9(n2, s2);
+    let killed_at = Instant::now();
+    wait_until("the survivors take the victim's shards", Duration::from_secs(30), || {
+        owned(n1) + owned(n3) == SHARDS as usize
+    })
+    .await;
+    let took = killed_at.elapsed();
+    let after = list_repos(&auth, &local, &cred).await.unwrap();
+    assert_eq!(newest(&after), Some(head.clone()), "nothing was written after the kill");
+    let row = after.iter().find(|r| r["spaceRev"].as_str() == Some(head.as_str())).unwrap().clone();
+
+    let caught_up = eventually(took + Duration::from_secs(5), || async {
+        syncers.iter().all(|s| s.accepted().iter().any(|n| n.at > killed_at)).then_some(())
+    })
+    .await;
+    assert!(caught_up.is_some(), "a registration heard nothing within 5 s of the takeover");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for (i, s) in syncers.iter().enumerate() {
+        let late: Vec<Notified> = s.accepted().into_iter().filter(|n| n.at > killed_at).collect();
+        assert_eq!(late.len(), 1, "syncer {i}: one catch-up forward per takeover: {late:?}");
+        let b = &late[0].body;
+        assert_eq!(b["space"], json!(local), "syncer {i}: {b}");
+        assert_eq!(b["spaceRev"], json!(head), "syncer {i}: the current spaceRev: {b}");
+        assert_eq!((b["repo"].clone(), b["repoRev"].clone()), (row["did"].clone(), row["repoRev"].clone()), "syncer {i}: the head's repo and rev: {b}");
+    }
 }
