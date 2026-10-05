@@ -1169,7 +1169,13 @@ async fn subscribe_repos(State(app): AppState, Query(q): Query<SubQ>, req: axum:
     // a peer-forwarded request's vouched-for client, not the forwarding node
     let client = crate::ratelimit::request_client_ip(req.headers(), req.extensions(), &app.ratelimit.trusted);
     let ua = req.headers().get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
-    let relay = app.crawlers.relay_hint(&app.store, client, ua, None);
+    // cache reads only: a miss starts a background lookup, the listing fills in later
+    let ptr = client.and_then(|ip| app.ptr.get(ip));
+    if let Some(ip) = client {
+        app.asn.get(ip);
+    }
+    let verified = ptr.as_ref().filter(|p| p.verified).and_then(|p| p.name.as_deref());
+    let relay = app.crawlers.relay_hint(&app.store, client, ua, verified);
     app.firehose.upgrade(req, q.cursor, shard, client, relay)
 }
 

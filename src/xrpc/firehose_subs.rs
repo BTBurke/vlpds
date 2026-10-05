@@ -36,8 +36,29 @@ struct NodeList {
     bytes_sent: u64,
 }
 
+/// PTR and AS from the caches (never waiting on DNS or whois), and the relay a
+/// verified PTR names when the connect-time hint had none.
+fn annotate(app: &App, s: &mut SubscriberView) {
+    let Some(ip) = s.ip.as_deref().and_then(|i| i.parse::<std::net::IpAddr>().ok()) else { return };
+    if let Some(p) = app.ptr.get(ip) {
+        if s.relay.is_none() && p.verified {
+            s.relay = app.crawlers.relay_hint(&app.store, Some(ip), &s.user_agent, p.name.as_deref());
+        }
+        s.ptr_verified = p.verified;
+        s.ptr = p.name;
+    }
+    if let Some(a) = app.asn.get(ip) {
+        s.asn = Some(a.asn);
+        s.as_name = a.name;
+        s.as_country = a.country;
+    }
+}
+
 fn local(app: &App) -> NodeList {
-    let (mut subscribers, recent) = app.firehose.subscribers();
+    let (mut subscribers, mut recent) = app.firehose.subscribers();
+    for s in subscribers.iter_mut().chain(recent.iter_mut()) {
+        annotate(app, s);
+    }
     let total = subscribers.len();
     let backfilling = subscribers.iter().filter(|s| s.state == "backfilling").count();
     subscribers.truncate(MAX_LISTED);

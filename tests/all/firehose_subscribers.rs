@@ -28,7 +28,7 @@ async fn lists_subscribers_until_they_leave() {
 
     // the relay hints are cached in the background: wait for them first
     eventually(Duration::from_secs(10), || async {
-        s.app.crawlers.relay_hint(&s.app.store, None, "relay.example.com").map(|_| ())
+        s.app.crawlers.relay_hint(&s.app.store, None, "relay.example.com", None).map(|_| ())
     })
     .await
     .expect("relay hints loaded");
