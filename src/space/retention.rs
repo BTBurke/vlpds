@@ -21,18 +21,20 @@ const EVERY: Duration = Duration::from_secs(6 * 3600);
 /// Deletes per entry.
 const BATCH: usize = 500;
 
-/// Starts the node's sweeps (with `--spaces` and a retention window): the
-/// first a few minutes after start, so a node restarted more often than
-/// [`EVERY`] still sweeps.
+/// Starts the node's sweeps (with `--spaces`): the first a few minutes
+/// after start, so a node restarted more often than [`EVERY`] still sweeps.
+/// Without a retention window a sweep only counts the space repos
+/// (`vlpds_space_repos`).
 pub fn start(app: &Arc<App>) {
-    let Some(window) = app.spaces.as_ref().and_then(|s| s.limits.oplog_retention) else { return };
+    let Some(sp) = app.spaces.as_ref() else { return };
+    let window = sp.limits.oplog_retention;
     let weak = Arc::downgrade(app);
     tokio::spawn(async move {
         let mut wait = Duration::from_secs(60).mul_f64(1.0 + 9.0 * rand::random::<f64>());
         loop {
             tokio::time::sleep(wait).await;
             let Some(app) = weak.upgrade() else { return };
-            let cutoff = crate::tid::now_micros().saturating_sub(window.as_micros() as u64);
+            let cutoff = window.map_or(0, |w| crate::tid::now_micros().saturating_sub(w.as_micros() as u64));
             match prune_before(&app, cutoff).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(ops = n, "space oplog retention pruned ops"),
@@ -47,13 +49,14 @@ pub fn start(app: &Arc<App>) {
 /// in the shards this node owns. Returns how many went.
 pub async fn prune_before(app: &App, cutoff: u64) -> anyhow::Result<usize> {
     let below = Tid::from_parts(cutoff, 0).0.to_be_bytes();
-    let mut pruned = 0;
+    let (mut pruned, mut repos_seen) = (0, 0);
     for p in app.partitions.owned() {
         let opts = slatedb::config::ScanOptions::default();
         let mut heads = state::FamilyScan::new(&*p.db, state::SPACE_HEAD_FAMILY, None, &opts).await?;
         let mut repos: Vec<(String, SpaceId)> = Vec::new();
         while let Some(kv) = heads.next().await? {
             let Some((did, sid)) = super::rows::did_sid(&kv.key) else { continue };
+            repos_seen += 1;
             if super::rows::HeadRow::decode(&kv.value)?.created < cutoff {
                 repos.push((did.to_string(), sid));
             }
@@ -73,6 +76,7 @@ pub async fn prune_before(app: &App, cutoff: u64) -> anyhow::Result<usize> {
         }
         pruned += flush(&p, &mut muts).await?;
     }
+    crate::metrics::space_repos(repos_seen);
     Ok(pruned)
 }
 

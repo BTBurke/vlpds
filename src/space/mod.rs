@@ -71,6 +71,9 @@ pub struct Spaces {
     pub limits: Limits,
     /// notifyWrites received from the cluster's other nodes' outboxes.
     pub peer_notifies: std::sync::atomic::AtomicU64,
+    /// (account, space) -> the importRepo staging it on this node. Not
+    /// with the worker's state, which can be evicted mid-import.
+    imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
 }
 
 fn now_secs() -> i64 {
@@ -82,6 +85,7 @@ impl Spaces {
         Spaces {
             limits,
             peer_notifies: Default::default(),
+            imports: Default::default(),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
             fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE, fanout::RETRY_BASE)),
@@ -138,6 +142,29 @@ impl Spaces {
         });
     }
 
+    /// Claims (did, sid) for import `nonce`; false if another holds it.
+    pub fn begin_import(&self, did: &str, sid: crate::state::SpaceId, nonce: u64) -> bool {
+        let mut m = self.imports.lock();
+        match m.entry((did.to_string(), sid)) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert(nonce);
+                true
+            }
+        }
+    }
+
+    pub fn import_nonce(&self, did: &str, sid: crate::state::SpaceId) -> Option<u64> {
+        self.imports.lock().get(&(did.to_string(), sid)).copied()
+    }
+
+    pub fn end_import(&self, did: &str, sid: crate::state::SpaceId, nonce: u64) {
+        let mut m = self.imports.lock();
+        if m.get(&(did.to_string(), sid)) == Some(&nonce) {
+            m.remove(&(did.to_string(), sid));
+        }
+    }
+
     /// A space `did` governed is deleted: its own repo there is gone.
     pub fn forget_space(&self, did: &str, sid: &crate::state::SpaceId) {
         self.heads.drop_space(did, sid);
@@ -163,8 +190,67 @@ impl Spaces {
                     Ok(_) => {}
                     Err(e) => tracing::warn!(shard = shard.0, "space notify outbox rescan failed: {e:#}"),
                 }
+                match self.catch_up_registrations(&db).await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(shard = shard.0, spaces = n, "space syncers sent a catch-up notify")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(shard = shard.0, "space syncer catch-up failed: {e:#}"),
+                }
             }
         });
+    }
+
+    /// Fan-out lanes live in memory, so a forward queued on the shard's
+    /// last owner may be gone. Each space of the shard with a live
+    /// registration gets one forward of its newest sequenced writer, naming
+    /// the spaceRev before it: a syncer that's current ignores it, one that
+    /// missed something sees the gap and pulls listRepos. Once per shard
+    /// open, nothing in steady state.
+    async fn catch_up_registrations(&self, db: &slatedb::Db) -> anyhow::Result<usize> {
+        use crate::state::{self, SpaceId};
+        let opts = slatedb::config::ScanOptions::default();
+        let mut scan = state::FamilyScan::new(db, state::SPACE_NOTIFY_FAMILY, None, &opts).await?;
+        let now = crate::tid::now_micros();
+        let mut spaces: Vec<(String, SpaceId)> = Vec::new();
+        while let Some(kv) = scan.next().await? {
+            let Some((did, sid)) = rows::did_sid_head(&kv.key) else { continue };
+            if rows::NotifyRow::decode(&kv.value)?.expires <= now {
+                continue;
+            }
+            if spaces.last().is_none_or(|(d, s)| d != did || *s != sid) {
+                spaces.push((did.to_string(), sid));
+            }
+        }
+        drop(scan);
+        let mut sent = 0;
+        for (authority, sid) in spaces {
+            let Some(v) = db.get(state::space_key(&authority, &sid)).await? else { continue };
+            let space = rows::SpaceRow::decode(&v)?;
+            if !space.live() {
+                continue;
+            }
+            let prefix = state::space_prefix(state::SPACE_SEQ_FAMILY, &authority, &sid);
+            let desc = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
+            let mut it = db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &desc).await?;
+            let Some(last) = it.next().await? else { continue };
+            let prev = it.next().await?.and_then(|kv| rows::seq_rev(&kv.key));
+            let Some(space_rev) = rows::seq_rev(&last.key) else { continue };
+            let writer = std::str::from_utf8(&last.value)?.to_string();
+            let Some(w) = db.get(state::space_writer_key(&authority, &sid, &writer)).await? else { continue };
+            let w = rows::WriterRow::decode(&w)?;
+            self.fanout.notify(fanout::Job {
+                authority: authority.into(),
+                uri: space.uri.as_str().into(),
+                sid,
+                writer,
+                repo_rev: w.repo_rev,
+                hash: w.hash,
+                seq: repo::Sequenced { space_rev, prev },
+            });
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     async fn rescan_outbox(&self, db: &slatedb::Db) -> anyhow::Result<usize> {

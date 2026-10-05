@@ -159,6 +159,58 @@ impl SpaceClient {
         unreachable!()
     }
 
+    /// A POST of raw bytes (importRepo's CAR) with a query.
+    pub async fn post_bytes(&self, nsid: &str, query: &[(&str, &str)], body: Vec<u8>, ctype: &str) -> Resp {
+        let url = xrpc_url(&self.srv.base, nsid, query);
+        for attempt in 0..2 {
+            let r = self
+                .srv
+                .http
+                .post(&url)
+                .header("dpop", self.key.proof("POST", &url, Some(&self.access)))
+                .header("authorization", format!("DPoP {}", self.access))
+                .header("content-type", ctype)
+                .body(body.clone())
+                .send()
+                .await
+                .unwrap();
+            self.key.update_nonce(r.headers());
+            let out = resp(r).await;
+            if attempt == 0 && out.json["error"] == "use_dpop_nonce" {
+                continue;
+            }
+            return out;
+        }
+        unreachable!()
+    }
+
+    /// An existing account on `s` (its password `oauth::PASSWORD`),
+    /// which a loopback client is granted `scope` for.
+    pub async fn for_account(s: &TestServer, did: &str, handle: &str, session_jwt: &str, scope: &str) -> SpaceClient {
+        let srv = Srv {
+            app: s.app.clone(),
+            base: s.url.clone(),
+            http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+        };
+        let acct = oauth::Account { did: did.into(), handle: handle.into(), jwt: session_jwt.into() };
+        let scope = match scope.split(' ').any(|x| x == "atproto") {
+            true => scope.to_string(),
+            false => format!("atproto {scope}"),
+        };
+        let key = DpopKey::new();
+        let t = oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&scope, &key), &acct).await;
+        SpaceClient {
+            srv,
+            did: acct.did,
+            handle: acct.handle,
+            session_jwt: acct.jwt,
+            key,
+            access: t.access,
+            scope: t.scope,
+            holder: Holder::new(),
+        }
+    }
+
     pub async fn post(&self, nsid: &str, body: J) -> Resp {
         oauth_resp(oauth::xrpc_dpop(&self.srv, &self.key, &self.access, "POST", nsid, Some(body)).await)
     }

@@ -155,7 +155,11 @@ fn query_target(query: Option<&str>, admin: bool) -> (Option<String>, Option<Str
     (None, handle)
 }
 
+/// A space record's account is its author, not the space's authority.
 fn uri_did(uri: &str) -> Option<&str> {
+    if let Some(u) = crate::xrpc::syntax::parse_space_uri(uri) {
+        return Some(u.record.map_or(u.authority, |(author, _, _)| author));
+    }
     uri.strip_prefix("at://")?.split('/').next().filter(|d| d.starts_with("did:"))
 }
 

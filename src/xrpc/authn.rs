@@ -75,6 +75,9 @@ pub const MODERATOR_METHODS: &[&str] = &[
     "com.atproto.admin.getSubjectStatus",
     "com.atproto.admin.sendEmail",
     "com.atproto.admin.updateSubjectStatus",
+    "vlpds.admin.getSpaceRecord",
+    "vlpds.admin.getSpaceRepo",
+    "vlpds.admin.listSpaceRecords",
 ];
 
 /// Reference `authorizationOrModService`.

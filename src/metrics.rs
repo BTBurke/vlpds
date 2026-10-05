@@ -717,6 +717,81 @@ pub fn space_credential_issued(result: &str) {
     SPACE_CREDENTIALS_ISSUED.with_label_values(&[result]).inc();
 }
 
+lazy!(SPACE_SIGN_SECONDS: Histogram = register_histogram!("vlpds_space_sign_seconds", "Signing one space commit for a reader (getLatestCommit, listRepoOps, getRepo: a fresh ikm per response)", exponential_buckets(0.000_005, 2.0, 16).unwrap()));
+lazy!(SPACE_DIGEST_MISMATCH: IntCounter = register_int_counter!("vlpds_space_digest_mismatch_total", "Space repos whose stored head disagreed with the set hash recomputed from their records (vlpds.admin.checkSpace): an integrity bug, never load"));
+lazy!(SPACE_REPOS: IntGauge = register_int_gauge!("vlpds_space_repos", "Space repos (an account's repo in one space) in the shards this node owns, counted by the oplog retention sweep (every ~6 h)"));
+lazy!(SPACE_IMPORTS: IntCounterVec = register_int_counter_vec!("vlpds_space_imports_total", "vlpds.space.importRepo calls by result (ok; refused: a bad CAR, signature, MAC or set hash, or a repo already there; error)", &["result"]));
+lazy!(SPACE_OPERATOR_READS: IntCounterVec = register_int_counter_vec!("vlpds_space_operator_reads_total", "Audited operator reads of space data (vlpds.admin.getSpaceRepo, listSpaceRecords, getSpaceRecord) by method", &["method"]));
+
+pub fn space_sign(took: std::time::Duration) {
+    SPACE_SIGN_SECONDS.observe(took.as_secs_f64());
+}
+
+pub fn space_digest_mismatch() {
+    SPACE_DIGEST_MISMATCH.inc();
+}
+
+pub fn space_repos(n: usize) {
+    SPACE_REPOS.set(n as i64);
+}
+
+pub fn space_import(result: &str) {
+    SPACE_IMPORTS.with_label_values(&[result]).inc();
+}
+
+pub fn space_operator_read(method: &str) {
+    SPACE_OPERATOR_READS.with_label_values(&[method]).inc();
+}
+
+/// With `--spaces`: the series its alerts and dashboard row read, at 0
+/// before their first event (a node without the flag exports none).
+pub fn init_space_counters() {
+    for hop in ["out", "in", "fanout"] {
+        let results: &[&str] = match hop {
+            "out" => &["ok", "refused", "gone", "expired", "retry", "wait"],
+            "in" => &["ok", "noop", "refused", "error"],
+            _ => &["ok", "refused", "error"],
+        };
+        for r in results {
+            SPACE_NOTIFY.with_label_values(&[hop, r]);
+        }
+    }
+    for r in ["ok", "bad_sig", "expired", "revoked", "audience", "space"] {
+        SPACE_CREDENTIAL_CHECKS.with_label_values(&[r]);
+    }
+    for r in ["hit", "miss"] {
+        SPACE_CREDENTIAL_CACHE.with_label_values(&[r]);
+    }
+    for path in ["noop", "scan"] {
+        SPACE_LIST_REPO_OPS.with_label_values(&[path]);
+        SPACE_LIST_REPO_OPS_SECONDS.with_label_values(&[path]);
+    }
+    for r in ["queue_full", "lane_full", "host_full", "gave_up", "expired"] {
+        SPACE_FANOUT_DROPPED.with_label_values(&[r]);
+    }
+    for r in ["ok", "bad_token", "refused", "error"] {
+        SPACE_CREDENTIALS_ISSUED.with_label_values(&[r]);
+    }
+    for r in ["ok", "refused", "error"] {
+        SPACE_IMPORTS.with_label_values(&[r]);
+    }
+    for c in [
+        &SPACE_DELEGATIONS,
+        &SPACE_DIGEST_MISMATCH,
+        &SPACE_FANOUT_COALESCED,
+        &SPACE_OUTBOX_OVERFLOW,
+        &SPACE_OPLOG_PRUNED,
+    ] {
+        LazyLock::force(c);
+    }
+    for g in [&SPACE_OUTBOX_ROWS, &SPACE_FANOUT_DEPTH, &SPACE_REVOCATIONS] {
+        LazyLock::force(g);
+    }
+    LazyLock::force(&SPACE_OUTBOX_OLDEST);
+    LazyLock::force(&SPACE_NOTIFY_ACK);
+    LazyLock::force(&SPACE_SIGN_SECONDS);
+}
+
 pub fn init_reshard_gc_counters() {
     for r in ["ok", "error"] {
         RESHARD_GC_PASSES.with_label_values(&[r]);

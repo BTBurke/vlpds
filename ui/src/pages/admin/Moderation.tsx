@@ -5,8 +5,9 @@ import { useAction, useLoad } from '../../lib/hooks'
 import { Link, navigate, useSearch } from '../../lib/router'
 import { admin } from '../../lib/xrpc'
 
-type Kind = 'account' | 'record' | 'blob'
-type SubjectRef = { kind: Kind; did: string; uri?: string; cid?: string }
+type Kind = 'account' | 'record' | 'blob' | 'space'
+/** `spaceRepo`: an audited operator read of an account's repo in a space (audit entries only). */
+type SubjectRef = { kind: Kind | 'spaceRepo'; did: string; uri?: string; cid?: string }
 type Resolved = { kind: Kind; did: string; handle: string; uri?: string; cid?: string }
 type BlobView = {
   cid: string
@@ -32,6 +33,9 @@ type SubjectDetail = {
   quota: Quota
   record?: { uri: string; exists: boolean; takendown: boolean; cid?: string; value?: unknown; blobs?: BlobView[] }
   blob?: BlobView
+  /** What a space record is, never what it says (reading it is audited). */
+  spaceRecord?: { uri: string; space: string; exists: boolean; takendown: boolean; cid?: string }
+  space?: { uri: string; exists: boolean; deleted: boolean; takendown: boolean }
 }
 type CaseAction = { at: string; auditId: string; action: string; subject: SubjectRef; reason?: string; actor: string }
 type Case = {
@@ -71,17 +75,19 @@ const SEMANTICS: Record<Kind, string> = {
   record:
     "Hidden from this PDS's record reads (getRecord, listRecords). It is still in the signed repo and visible to relays and AppViews until the user deletes it; ask Bluesky Trust & Safety to act on their copy.",
   blob: 'Stops being served at once, cannot be re-uploaded or referenced, and its bytes move to quarantine. They are deleted after the quarantine period unless restored. Copies already in AppView/CDN caches are not purged by this.',
+  space:
+    'No one gets a credential to read the space, syncers can no longer list its writers or register for its notifications, and members\' notifies are dropped. The records stay on their authors\' PDSes.',
 }
 
 /** Decimal units, as --blob-quota-gb. */
 const fmtGB = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${(n / 1e3).toFixed(1)} kB`)
 const lookupUrl = (q: string, caseId?: string) => `/admin/moderation?q=${encodeURIComponent(q)}${caseId ? `&case=${encodeURIComponent(caseId)}` : ''}`
-const subjectQuery = (s: SubjectRef) => (s.kind === 'record' ? s.uri! : s.kind === 'blob' ? `${s.did} ${s.cid}` : s.did)
+const subjectQuery = (s: SubjectRef) => (s.kind === 'record' || s.kind === 'space' || s.kind === 'spaceRepo' ? s.uri! : s.kind === 'blob' ? `${s.did} ${s.cid}` : s.did)
 
 function SubjectText({ s }: { s: SubjectRef }) {
   return (
     <Link to={lookupUrl(subjectQuery(s))} className="mono small break">
-      {s.kind === 'record' ? s.uri : s.kind === 'blob' ? `${s.did} · ${s.cid}` : s.did}
+      {s.kind === 'record' || s.kind === 'space' ? s.uri : s.kind === 'spaceRepo' ? `${s.uri} · ${s.did}` : s.kind === 'blob' ? `${s.did} · ${s.cid}` : s.did}
     </Link>
   )
 }
@@ -138,7 +144,7 @@ function Lookup({ q }: { q: string }) {
           type="search"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="bsky.app URL, at:// URI, @handle, DID, or DID + blob CID"
+          placeholder="bsky.app URL, at:// URI (a space's too), @handle, DID, or DID + blob CID"
           aria-label="Subject to look up"
           spellCheck={false}
           autoCapitalize="none"
@@ -163,10 +169,12 @@ function Lookup({ q }: { q: string }) {
         <>
           <ErrorNotice error={detail.error} />
           {d && (
-            <div className={d.record || d.blob ? 'mod-grid' : 'grid2'}>
+            <div className={d.record || d.blob || d.spaceRecord || d.space ? 'mod-grid' : 'grid2'}>
               <div className="stack">
                 {d.record && <RecordCard did={r.did} rec={d.record} onDone={reload} />}
                 {d.blob && <BlobCard did={r.did} b={d.blob} onDone={reload} />}
+                {d.spaceRecord && <SpaceRecordCard did={r.did} rec={d.spaceRecord} onDone={reload} />}
+                {d.space && <SpaceCard did={r.did} sp={d.space} onDone={reload} />}
               </div>
               <div className="stack">
                 <AccountCard d={d} onDone={reload} />
@@ -247,6 +255,88 @@ function RecordCard({ did, rec, onDone }: { did: string; rec: NonNullable<Subjec
           )}
         </>
       )}
+    </Panel>
+  )
+}
+
+/** at://{authority}/space/{type}/{skey}/{author}/{collection}/{rkey} */
+function spaceRecordParts(uri: string) {
+  const p = uri.replace(/^at:\/\//, '').split('/')
+  return { space: `at://${p.slice(0, 4).join('/')}`, collection: p[5], rkey: p[6] }
+}
+
+function SpaceRecordCard({ did, rec, onDone }: { did: string; rec: NonNullable<SubjectDetail['spaceRecord']>; onDone: () => void }) {
+  const [asking, setAsking] = useState(false)
+  const [reason, setReason] = useState('')
+  const [value, setValue] = useState<unknown>()
+  const read = useAction(async () => {
+    const { space, collection, rkey } = spaceRecordParts(rec.uri)
+    const r: { value: unknown } = await admin('vlpds.admin.getSpaceRecord', { params: { space, repo: did, collection, rkey, reason: reason.trim() } })
+    setValue(r.value)
+    setAsking(false)
+  })
+  return (
+    <Panel
+      title="Space record"
+      desc={<span className="mono small break">{rec.uri}</span>}
+      actions={rec.exists || rec.takendown ? <ModerateButton subject={{ kind: 'record', did, uri: rec.uri }} applied={rec.takendown} onDone={onDone} /> : undefined}
+    >
+      {!rec.exists ? (
+        <Notice kind="warn">No such record in this repo (deleted, or never existed).</Notice>
+      ) : (
+        <>
+          <div className="row between">
+            <TakedownBadge on={rec.takendown}>Hidden from space reads</TakedownBadge>
+            {value === undefined && !asking && (
+              <button type="button" className="btn sm" onClick={() => setAsking(true)}>
+                Read record…
+              </button>
+            )}
+          </div>
+          <p className="muted small">
+            Space records are private to the space's members. Reading one here is written to the audit log with your reason.
+          </p>
+          {asking && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (reason.trim()) read.run()
+              }}
+            >
+              <ErrorNotice error={read.error} />
+              <Field label="Reason (required, kept in the audit log)">
+                <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2} required autoFocus maxLength={2000} />
+              </Field>
+              <div className="row end">
+                <button type="button" className="btn" onClick={() => setAsking(false)}>
+                  Cancel
+                </button>
+                <button className="btn primary" disabled={!reason.trim() || read.busy}>
+                  {read.busy && <Spinner />}
+                  Read record
+                </button>
+              </div>
+            </form>
+          )}
+          {value !== undefined && <JsonView value={value} />}
+        </>
+      )}
+    </Panel>
+  )
+}
+
+function SpaceCard({ did, sp, onDone }: { did: string; sp: NonNullable<SubjectDetail['space']>; onDone: () => void }) {
+  return (
+    <Panel
+      title="Space"
+      desc={<span className="mono small break">{sp.uri}</span>}
+      actions={<ModerateButton subject={{ kind: 'space', did, uri: sp.uri }} applied={sp.takendown} onDone={onDone} />}
+    >
+      <div className="row">
+        <TakedownBadge on={sp.takendown}>Taken down</TakedownBadge>
+        {!sp.exists && <span className="pill">never created here</span>}
+        {sp.deleted && <span className="pill">deleted by its owner</span>}
+      </div>
     </Panel>
   )
 }
@@ -463,7 +553,7 @@ function ModerateDialog({ subject, restore, caseId, onClose, onDone }: { subject
     })
     onDone()
   })
-  const what = subject.kind === 'account' ? 'account' : subject.kind === 'record' ? 'record' : 'blob'
+  const what = subject.kind === 'account' ? 'account' : subject.kind === 'record' ? 'record' : subject.kind === 'space' ? 'space' : 'blob'
   return (
     <dialog ref={ref} className="modal mod-dialog" onClose={onClose} aria-labelledby="mod-title">
       <form
@@ -475,7 +565,7 @@ function ModerateDialog({ subject, restore, caseId, onClose, onDone }: { subject
       >
         <h2 id="mod-title">{restore ? `Restore this ${what}?` : `Take down this ${what}?`}</h2>
         <p className="mono small break">{subjectQuery(subject)}</p>
-        <p className="muted small">{restore ? 'Lifts the takedown and puts any quarantined bytes back.' : SEMANTICS[subject.kind]}</p>
+        <p className="muted small">{restore ? 'Lifts the takedown and puts any quarantined bytes back.' : SEMANTICS[subject.kind as Kind]}</p>
         <ErrorNotice error={act.error} />
         <Field label="Reason (required, kept in the audit log)">
           <textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={3} required autoFocus maxLength={2000} />
@@ -515,7 +605,7 @@ function Takedowns() {
     <>
       <div className="row between">
         <div className="seg" role="group" aria-label="Kind">
-          {(['', 'account', 'record', 'blob'] as const).map((k) => (
+          {(['', 'account', 'record', 'blob', 'space'] as const).map((k) => (
             <button key={k} type="button" aria-pressed={kind === k} onClick={() => setKind(k)}>
               {k ? `${k[0].toUpperCase()}${k.slice(1)}s` : 'All'}
             </button>
@@ -587,7 +677,7 @@ function AuditLog() {
   return (
     <>
       <ErrorNotice error={l.error} />
-      <Panel flush title="Audit log" desc="Every takedown, restore, purge, case, quota change and second-factor reset: who, from where, and why. Newest first." actions={<button className="btn sm" onClick={l.reload}>Refresh</button>}>
+      <Panel flush title="Audit log" desc="Every takedown, restore, purge, case, quota change, second-factor reset and read of space data: who, from where, and why. Newest first." actions={<button className="btn sm" onClick={l.reload}>Refresh</button>}>
         {!l.data ? <Loading /> : l.data.entries.length === 0 ? <Empty title="Nothing yet" /> : <AuditTable entries={l.data.entries} />}
       </Panel>
     </>

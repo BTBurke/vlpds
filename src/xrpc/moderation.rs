@@ -97,10 +97,21 @@ impl SubjectRef {
         SubjectRef { kind: "record".into(), did: did.into(), uri: Some(uri.into()), cid: None }
     }
 
+    /// `did`'s repo in the space `uri` (operator reads; never taken down).
+    pub fn space_repo(uri: &str, did: &str) -> SubjectRef {
+        SubjectRef { kind: "spaceRepo".into(), did: did.into(), uri: Some(uri.into()), cid: None }
+    }
+
+    /// A space (`uri`) at its authority `did`.
+    pub fn space(uri: &str, did: &str) -> SubjectRef {
+        SubjectRef { kind: "space".into(), did: did.into(), uri: Some(uri.into()), cid: None }
+    }
+
     /// Distinguishes the subject within its kind (index key, case de-dup).
     fn key(&self) -> String {
         match self.kind.as_str() {
-            "record" => self.uri.clone().unwrap_or_default(),
+            "record" | "space" => self.uri.clone().unwrap_or_default(),
+            "spaceRepo" => format!("{} {}", self.uri.as_deref().unwrap_or(""), self.did),
             "blob" => format!("{}/{}", self.did, self.cid.as_deref().unwrap_or("")),
             _ => self.did.clone(),
         }
@@ -246,6 +257,14 @@ fn takedown_name(s: &SubjectRef) -> XResult<String> {
             "blob/{}",
             s.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a blob subject needs cid"))?
         )),
+        "space" => {
+            let uri = s.uri.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a space subject needs uri"))?;
+            let space = super::space::Space::parse(uri)?;
+            if space.authority != s.did {
+                return Err(XrpcError::bad("InvalidRequest", "a space is taken down at its authority"));
+            }
+            Ok(super::space::space_takedown_name(&space.sid))
+        }
         k => Err(XrpcError::bad("InvalidRequest", format!("no takedown row for kind {k}"))),
     }
 }
@@ -261,7 +280,7 @@ pub(super) async fn apply(app: &App, s: &SubjectRef, act: &Action, who: &Who) ->
             let r = act.applied.then(|| r.clone().unwrap_or_else(crate::events::now_rfc3339));
             super::admin::takedown_account(app, &s.did, r).await?;
         }
-        "record" => {
+        "record" | "space" => {
             let name = takedown_name(s)?;
             let v = act.applied.then(|| json!({"uri": s.uri, "did": s.did, "cid": s.cid, "ref": r}));
             super::admin::set_subject_takedown(app, &s.did, &name, v).await?;
@@ -653,6 +672,23 @@ fn not_here(m: impl Into<String>) -> XrpcError {
 /// any node); the console then reads it with getSubject.
 async fn resolve_subject(State(app): AppState, Auth(creds): Auth, Query(q): Query<ResolveQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
+    if let Some(u) = super::syntax::parse_space_uri(q.q.trim()) {
+        let space = format!("at://{}/space/{}/{}", u.authority, u.space_type, u.skey);
+        let (did, kind, uri) = match u.record {
+            Some((author, c, r)) => (author, "record", format!("{space}/{author}/{c}/{r}")),
+            None => (u.authority, "space", space),
+        };
+        let acct = super::internal::account_anywhere(&app, did).await.map_err(|e| {
+            if e.error == "AccountNotFound" {
+                not_here(format!(
+                    "{did} has no account on this PDS: only spaces and space records stored here can be acted on here"
+                ))
+            } else {
+                e
+            }
+        })?;
+        return Ok(Json(json!({"did": did, "handle": acct.handle, "kind": kind, "uri": uri})));
+    }
     let p = parse_input(&q.q).map_err(|m| XrpcError::bad("InvalidRequest", m))?;
     let actor = p.actor.clone().unwrap_or_default();
     let did = if actor.starts_with("did:") {
@@ -739,7 +775,41 @@ async fn get_subject(State(app): AppState, Auth(creds): Auth, Query(q): Query<Su
         },
         "quota": super::blob_quota::view(&app, &q.did).await?,
     });
-    if let Some(uri) = &q.uri {
+    if let Some(u) = q.uri.as_deref().and_then(super::syntax::parse_space_uri) {
+        let uri = q.uri.as_deref().unwrap_or_default();
+        let space = super::space::Space::parse(&format!("at://{}/space/{}/{}", u.authority, u.space_type, u.skey))?;
+        let p = app.partition(&q.did)?;
+        match u.record {
+            // what a space record is, never what it says: reading it is
+            // vlpds.admin.getSpaceRecord, with a reason and an audit entry
+            Some((_, c, r)) => {
+                let name = super::admin::record_takedown_name(uri, &q.did)?;
+                let path = format!("{c}/{r}");
+                let v =
+                    p.db.get(state::space_record_key(&q.did, &space.sid, &path)).await.map_err(XrpcError::from_err)?;
+                let mut rec = json!({"uri": uri, "space": space.uri, "takendown": ctl.has_takedown(&name), "exists": v.is_some()});
+                if let Some(v) = v {
+                    let (cid, _) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
+                    rec["cid"] = json!(cid.to_string());
+                }
+                out["spaceRecord"] = rec;
+            }
+            None => {
+                if space.authority != q.did {
+                    return Err(XrpcError::bad("InvalidRequest", "a space is looked up at its authority"));
+                }
+                let row = p.db.get(state::space_key(&q.did, &space.sid)).await.map_err(XrpcError::from_err)?;
+                let row =
+                    row.map(|v| crate::space::rows::SpaceRow::decode(&v)).transpose().map_err(XrpcError::from_err)?;
+                out["space"] = json!({
+                    "uri": space.uri,
+                    "takendown": ctl.has_takedown(&super::space::space_takedown_name(&space.sid)),
+                    "exists": row.is_some(),
+                    "deleted": row.as_ref().is_some_and(|r| !r.live()),
+                });
+            }
+        }
+    } else if let Some(uri) = &q.uri {
         let rpath = super::admin::record_path(uri, &q.did)?;
         let takendown = ctl.has_takedown(&format!("rec/{rpath}"));
         let mut rec = json!({"uri": uri, "takendown": takendown, "exists": false});
@@ -820,7 +890,18 @@ async fn moderate(
             &inp.did,
             inp.cid.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "cid required"))?,
         ),
-        k => return Err(XrpcError::bad("InvalidRequest", format!("kind must be account, record or blob, not {k}"))),
+        "space" => {
+            let uri = inp.uri.ok_or_else(|| XrpcError::bad("InvalidRequest", "uri required"))?;
+            let s = SubjectRef::space(&super::space::Space::parse(&uri)?.uri, &inp.did);
+            takedown_name(&s)?;
+            s
+        }
+        k => {
+            return Err(XrpcError::bad(
+                "InvalidRequest",
+                format!("kind must be account, record, blob or space, not {k}"),
+            ))
+        }
     };
     app.account(&inp.did).await.map_err(|e| {
         if e.error == "AccountNotFound" {
@@ -847,9 +928,9 @@ struct KindQ {
 async fn list_takedowns(State(app): AppState, Auth(creds): Auth, Query(q): Query<KindQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
     let kinds: Vec<&str> = match q.kind.as_deref().filter(|k| !k.is_empty()) {
-        Some(k @ ("account" | "record" | "blob")) => vec![k],
+        Some(k @ ("account" | "record" | "blob" | "space")) => vec![k],
         Some(k) => return Err(XrpcError::bad("InvalidRequest", format!("unknown kind {k}"))),
-        None => vec!["account", "record", "blob"],
+        None => vec!["account", "record", "blob", "space"],
     };
     let mut out = Vec::new();
     for k in kinds {

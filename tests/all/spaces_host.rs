@@ -925,3 +925,44 @@ async fn get_repo_car() {
         .await;
     r.err(400, "RepoNotFound");
 }
+
+/// Fan-out lanes are in memory, so when a shard opens (a start, a
+/// takeover) each registered space gets one forward of its newest writer,
+/// naming the spaceRev before it: a syncer that missed one sees the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shard_open_sends_registrations_a_catch_up() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "shcu", OWNER).await;
+    let member = SpaceClient::new(&s, "shcm", ANY).await;
+    let space = owner.create_space(TYPE, "main").await;
+    put_member(&owner, &space, &member.did, true, true).await.ok();
+    let syncer = stub("atproto_space_syncer").await;
+    let cred = owner.credential(&space).await;
+    let reg = json!({"space": space, "service": syncer.service("atproto_space_syncer")});
+    owner.signed_post(&s.url, "com.atproto.space.registerNotify", reg, &cred, &owner.did).await.ok();
+    let notifies = || syncer.calls("/xrpc/com.atproto.space.notifyWrite");
+    owner.create_record(&space, COLL, Some("0"), rec("zero")).await.ok();
+    member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
+    member.create_record(&space, COLL, Some("2"), rec("two")).await.ok();
+    let rev2 = head(&member, &space).await;
+    assert!(
+        eventually(Duration::from_secs(10), || async { notifies().iter().any(|n| n.body["repoRev"] == json!(rev2)) })
+            .await
+    );
+    let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await.ok();
+    let repos = r["repos"].as_array().unwrap();
+    let (before, newest) = (repos[repos.len() - 2].clone(), repos[repos.len() - 1].clone());
+    let sent = notifies().len();
+
+    // as a shard open does: one forward of the newest writer
+    let p = s.app.partition(&owner.did).ok().expect("local partition");
+    s.app.spaces.clone().unwrap().spawn_outbox_rescan(vec![(p.id, p.db.clone())]);
+    assert!(eventually(Duration::from_secs(10), || async { notifies().len() > sent }).await, "no catch-up");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let all = notifies();
+    assert_eq!(all.len(), sent + 1, "one per registered space");
+    let catch_up = &all[sent].body;
+    assert_eq!((catch_up["repo"].clone(), catch_up["repoRev"].clone()), (json!(member.did), json!(rev2)));
+    assert_eq!(catch_up["spaceRev"], newest["spaceRev"]);
+    assert_eq!(catch_up["prevSpaceRev"], before["spaceRev"], "{catch_up}");
+}

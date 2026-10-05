@@ -588,6 +588,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         ui,
     });
     if let Some(s) = &app.spaces {
+        crate::metrics::init_space_counters();
         s.outbox.start(Arc::downgrade(&app));
         s.fanout.start(Arc::downgrade(&app));
         crate::space::retention::start(&app);

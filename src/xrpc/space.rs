@@ -429,13 +429,24 @@ pub(super) fn takedown_name(sid: &SpaceId, path: &str) -> String {
     format!("space/{}/{path}", hex::encode(sid))
 }
 
+/// A space's own takedown (a vlpds extension), on its authority's account
+/// beside its records' (`sec/td/space/{sid}`): no credentials, no
+/// listRepos or registrations, and writers' notifies dropped.
+pub(super) fn space_takedown_name(sid: &SpaceId) -> String {
+    format!("space/{}", hex::encode(sid))
+}
+
+pub(super) async fn space_takendown(app: &App, space: &Space) -> XResult<bool> {
+    Ok(super::server::ctl(app, &space.authority).await?.has_takedown(&space_takedown_name(&space.sid)))
+}
+
 /// The repo's records taken down in this space, by path. Record takedowns
 /// are a vlpds extension (the reference has none for space records): the
 /// sync views leave these records out of the index, the blocks and the
 /// ops, and sign a commit over the set without them, so what's served
 /// still verifies and a syncer that held one sees its digest mismatch and
 /// refetches. A reversal flips it back the same way.
-async fn hidden_paths(app: &App, repo: &str, sid: &SpaceId) -> XResult<Vec<String>> {
+pub(super) async fn hidden_paths(app: &App, repo: &str, sid: &SpaceId) -> XResult<Vec<String>> {
     let ctl = super::server::ctl(app, repo).await?;
     Ok(ctl.takedowns_under(&takedown_name(sid, "")))
 }
@@ -527,7 +538,7 @@ fn head_of(row: HeadRow, space: &Space, p: &crate::partition::Partition) -> XRes
 
 /// `repo`'s durable head in `space`: from the heads map, else read once.
 /// None: the account never wrote there.
-async fn load_head(
+pub(super) async fn load_head(
     sp: &Spaces,
     p: &crate::partition::Partition,
     repo: &str,
@@ -563,10 +574,12 @@ fn signed_commit(
 ) -> XResult<J> {
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author, rev: &rev };
+    let t = Instant::now();
     let c = crate::space::commit::sign(set.unwrap_or(&head.hash), &ctx, rand::random(), |b| {
         Ok::<_, std::convert::Infallible>(key.sign(b))
     })
     .map_err(|_| XrpcError::internal("space commit context too long"))?;
+    metrics::space_sign(t.elapsed());
     Ok(
         json!({"ver": c.ver, "hash": b64(&c.hash), "ikm": b64(&c.ikm), "sig": b64(&c.sig), "mac": b64(&c.mac), "rev": c.rev}),
     )
@@ -733,9 +746,19 @@ async fn get_blob(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     if load_head(sp, &p, &q.repo, &space).await?.is_none() {
         return Err(not_found());
     }
+    // named by some record that isn't taken down
+    let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
     let prefix = state::space_blob_prefix(&q.repo, &space.sid, &cid);
     let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
-    if iter.next().await.map_err(XrpcError::from_err)?.is_none() {
+    let mut named = false;
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        let path = std::str::from_utf8(&kv.key[prefix.len()..]).map_err(XrpcError::from_err)?;
+        if !hidden.iter().any(|h| h == path) {
+            named = true;
+            break;
+        }
+    }
+    if !named {
         return Err(not_found());
     }
     if super::admin::is_blob_takendown(&app, &q.repo, &q.cid).await? {
@@ -787,6 +810,8 @@ async fn list_blobs(
     };
     let opts = slatedb::config::ScanOptions::default();
     let mut iter = p.db.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
+    // a blob only taken-down records name is left out, as getBlob refuses it
+    let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
     let mut cids: Vec<String> = Vec::new();
     'scan: loop {
         let rows = iter.next_batch(limit.max(64)).await.map_err(XrpcError::from_err)?;
@@ -794,12 +819,15 @@ async fn list_blobs(
             break;
         }
         for kv in rows {
-            let (cid, _) = crate::space::rows::blob_ref_parts(&kv.key[prefix.len()..])
+            let (cid, path) = crate::space::rows::blob_ref_parts(&kv.key[prefix.len()..])
                 .ok_or_else(|| XrpcError::internal("bad space blob ref key"))?;
             if cids.last().is_some_and(|c| c == cid) {
                 continue;
             }
             if since.is_some_and(|s| crate::space::rows::blob_ref_rev(&kv.value) <= s) {
+                continue;
+            }
+            if hidden.iter().any(|h| h == path) {
                 continue;
             }
             if cids.len() == limit {
@@ -1053,6 +1081,26 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
         // notifySpaceDeleted
         return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
     }
+    if space_takendown(app, &space).await? {
+        return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
+    }
+    // vlpds: no credential names a taken-down authority or member (the
+    // reference admits both)
+    let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
+    if matches!(status.as_deref(), Some("takendown" | "suspended")) {
+        return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
+    }
+    if d.user != space.authority {
+        match super::internal::account_anywhere(app, &d.user).await {
+            Ok(a) if matches!(a.status.as_deref(), Some("takendown" | "suspended")) => {
+                return Err(XrpcError::bad("AccountTakedown", "User account has been taken down"));
+            }
+            Ok(_) => {}
+            // another host's account: its own host refuses it delegation tokens
+            Err(e) if e.error == "AccountNotFound" => {}
+            Err(e) => return Err(e),
+        }
+    }
     // the app perimeter first: decided from the config alone, so a refused
     // app is never disclosed to a managing app
     if let crate::space::rows::AppAccess::AllowList { allowed } = &row.app_access {
@@ -1063,7 +1111,6 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
     if !super::simplespace::authorize_user(app, &space, &row, &d.user, "read", client_id.as_deref()).await? {
         return Err(XrpcError::bad("UserNotAuthorized", "User not authorized for this space"));
     }
-    let (key, _) = super::proxy::account_key_status(app, &space.authority).await?;
     let mint = token::Mint { iss: &space.authority, sub: &space.uri, key_id: Some(&d.key_id), ..Default::default() };
     let now = crate::tid::now_micros() as i64 / 1_000_000;
     let cred = token::encode(TokenType::Credential, &mint, "ES256K", now, &token::new_jti(), |b| {
@@ -1484,9 +1531,11 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     drop(iter);
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author: &q.repo, rev: &rev };
+    let t = Instant::now();
     let commit =
         crate::space::commit::sign(&set, &ctx, rand::random(), |b| Ok::<_, std::convert::Infallible>(key.sign(b)))
             .map_err(|_| XrpcError::internal("space commit context too long"))?;
+    metrics::space_sign(t.elapsed());
     let (stall, repo) = (app.config.export_stall, q.repo.clone());
     Ok(super::sync::export_body(slot, "application/vnd.ipld.car", move |tx| async move {
         const CHUNK: usize = super::sync::EXPORT_CHUNK;
@@ -1577,6 +1626,10 @@ pub(super) async fn process_notify_write(
         return Err(XrpcError::bad("FutureRev", "Repo revision is in the future"));
     }
     let row = super::simplespace::live_space(app, space).await?;
+    if space_takendown(app, space).await? {
+        tracing::debug!(space = %space.uri, writer, "notifyWrite to a taken-down space dropped");
+        return Ok(None);
+    }
     let managing_app = match &row.write_policy {
         crate::space::rows::Policy::ManagingApp { .. } if writer != space.authority => {
             Some(super::simplespace::authorize_user(app, space, &row, writer, "write", None).await?)
@@ -1690,6 +1743,9 @@ async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<Li
     let limit = super::extract::limit_param(q.limit, 100, 1, 1000)?;
     host_credential(&app, &headers, &space).await?;
     super::simplespace::live_space(&app, &space).await?;
+    if space_takendown(&app, &space).await? {
+        return Err(super::simplespace::space_not_found());
+    }
     metrics::space_read("listRepos", "credential");
     let p = app.partition(&space.authority)?;
     let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
@@ -1747,6 +1803,9 @@ async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Js
     let space = Space::parse(&inp.space)?;
     host_credential(&app, &headers, &space).await?;
     super::simplespace::assert_space_host(&app, &space).await?;
+    if space_takendown(&app, &space).await? {
+        return Err(super::simplespace::space_not_found());
+    }
     let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
         return Err(XrpcError::bad(
             "ServiceNotResolvable",

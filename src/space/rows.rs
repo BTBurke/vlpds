@@ -201,6 +201,15 @@ pub fn did_sid(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
     Some((std::str::from_utf8(&body[..at]).ok()?, body[at + 1..].try_into().ok()?))
 }
 
+/// The DID and space id that begin a key with more after them (`sN`'s
+/// service, `sW`'s writer).
+pub fn did_sid_head(key: &[u8]) -> Option<(&str, crate::state::SpaceId)> {
+    let body = crate::state::key_body(key).get(3..)?;
+    let at = body.iter().position(|b| *b == 0)?;
+    let sid = body.get(at + 1..at + 1 + crate::state::SPACE_ID_LEN)?;
+    Some((std::str::from_utf8(&body[..at]).ok()?, sid.try_into().ok()?))
+}
+
 /// `sW`: a writer's latest state as its repo host reported it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WriterRow {

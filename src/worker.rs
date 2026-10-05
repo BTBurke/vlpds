@@ -2445,6 +2445,11 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 let _ = reply.send(Err(WriteError::RepoInactive(s).into()));
                 return Ok(());
             }
+            if spaces.import_nonce(&did, sid).is_some() {
+                let m = "an import of this space repo is in progress; retry once it is done";
+                let _ = reply.send(Err(WriteError::Invalid(m.into()).into()));
+                return Ok(());
+            }
             let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let delivered = spaces.outbox.take_delivered(&did);
             let max = spaces.limits.max_records;
@@ -2509,6 +2514,62 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 }
             }
         }
+        // an import moves an account in (deactivated until it's done)
+        SpaceOp::ImportBegin { .. } | SpaceOp::ImportCommit { .. }
+            if status.as_deref().is_some_and(|s| s != "deactivated") =>
+        {
+            let _ = reply.send(Err(WriteError::RepoInactive(status.unwrap_or_default()).into()));
+            return Ok(());
+        }
+        SpaceOp::ImportBegin { nonce } => {
+            if let Err(e) = sr::import_begin(&st.spaces, sid, &uri) {
+                let _ = reply.send(Err(e));
+                return Ok(());
+            }
+            if !spaces.begin_import(&did, sid, nonce) {
+                let m = "an import of this space repo is in progress";
+                let _ = reply.send(Err(WriteError::Invalid(m.into()).into()));
+                return Ok(());
+            }
+            return space_noop(st, reply, SpaceAck::Host);
+        }
+        SpaceOp::ImportCommit { nonce, rev, hash, records } => {
+            if spaces.import_nonce(&did, sid) != Some(nonce) {
+                let _ = reply.send(Err(SpaceError::Write(WriteError::Internal("space import not claimed".into()))));
+                return Ok(());
+            }
+            let b = match sr::import_commit(&mut st.spaces, &did, sid, &uri, rev, *hash, records, clock_id) {
+                Ok(b) => b,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return Ok(());
+                }
+            };
+            let mut head = b.head;
+            (head.shard, head.epoch) = (st.partition.id, st.partition.epoch);
+            let (head, notify) = (Arc::new(head), b.notify);
+            let fanout = b.sequenced.map(|seq| crate::space::fanout::Job {
+                authority: did.clone(),
+                uri: uri.clone(),
+                sid,
+                writer: did.to_string(),
+                repo_rev: rev,
+                hash: head.hash.digest(),
+                seq,
+            });
+            let (sp, d) = (spaces.clone(), did.clone());
+            let ack = move || {
+                sp.heads.publish(&d, &sid, head);
+                if let Some(n) = notify {
+                    sp.outbox.enqueue(&d, sid, &n.uri, n.repo_rev, n.hash, true);
+                }
+                if let Some(job) = fanout {
+                    sp.fanout.notify(job);
+                }
+                SpaceAck::Write { rev: Some(rev), results: Vec::new() }
+            };
+            (b.muts, Box::new(ack))
+        }
         // the space host's management ops are the authority's own: refused
         // while its account is inactive
         SpaceOp::CreateSpace { .. }
@@ -2548,7 +2609,10 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                     Ok(None) => Ok((Vec::new(), SpaceAck::Deleted { already: true })),
                     Err(e) => Err(e),
                 },
-                SpaceOp::Write { .. } | SpaceOp::RecordWriter { .. } => unreachable!("matched above"),
+                SpaceOp::Write { .. }
+                | SpaceOp::RecordWriter { .. }
+                | SpaceOp::ImportBegin { .. }
+                | SpaceOp::ImportCommit { .. } => unreachable!("matched above"),
             };
             match r {
                 Err(e) => {

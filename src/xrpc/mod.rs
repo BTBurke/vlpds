@@ -33,6 +33,8 @@ mod server;
 mod signin;
 mod simplespace;
 pub mod space;
+mod space_admin;
+mod space_import;
 pub mod staged_import;
 mod sync;
 pub mod syntax;
@@ -332,7 +334,10 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(admin_tools::routes())
                 .merge(crawlers::routes())
                 .merge(match app.config.spaces {
-                    true => space::routes().merge(simplespace::routes()),
+                    true => space::routes()
+                        .merge(simplespace::routes())
+                        .merge(space_admin::routes())
+                        .merge(space_import::routes()),
                     false => Router::new(),
                 }),
         ))

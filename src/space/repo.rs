@@ -122,6 +122,19 @@ pub enum SpaceOp {
     UnregisterNotify {
         service: String,
     },
+    /// vlpds.space.importRepo: claims the space for an import (`nonce`),
+    /// the account having no repo there; its writes there wait it out.
+    ImportBegin {
+        nonce: u64,
+    },
+    /// The imported records are durable in `sR`: the head goes in, at the
+    /// imported rev, with an empty oplog.
+    ImportCommit {
+        nonce: u64,
+        rev: Tid,
+        hash: Box<LtHash>,
+        records: u64,
+    },
 }
 
 pub struct SpaceReq {
@@ -381,6 +394,14 @@ impl SpaceNeed {
             SpaceOp::DeleteSpace { .. } => {
                 self.host(st, sid, uri);
                 self.head(st, sid, uri);
+            }
+            SpaceOp::ImportBegin { .. } => self.head(st, sid, uri),
+            SpaceOp::ImportCommit { .. } => {
+                self.head(st, sid, uri);
+                if authority(uri) == Some(did) {
+                    self.host(st, sid, uri);
+                    self.writer(st, sid, did);
+                }
             }
             SpaceOp::UpdateSpace { .. }
             | SpaceOp::PutMember { .. }
@@ -746,6 +767,54 @@ pub fn record_writer(
     }
     let mut muts = Vec::with_capacity(3);
     Ok(sequence(host, authority, sid, writer, repo_rev, hash, clock_id, &mut muts)?.map(|s| (muts, s)))
+}
+
+/// importRepo's claim: only into a space the account holds no repo in.
+pub fn import_begin(st: &SpaceStates, sid: SpaceId, uri: &str) -> Result<(), SpaceError> {
+    let head = st.repos.get(&sid).ok_or_else(|| internal("space head not loaded"))?;
+    if *head.uri != *uri {
+        return Err(internal(format!("space id collision: {} and {uri}", head.uri)));
+    }
+    if head.rev.is_some() {
+        return Err(SpaceError::Write(WriteError::Invalid(
+            "this account already has a repo in the space; delete its records first".into(),
+        )));
+    }
+    Ok(())
+}
+
+/// importRepo's head: the `sH` row at the imported rev, and the notify the
+/// authority is owed (or, the account being the authority, its writer
+/// state), as a write's entry has.
+#[allow(clippy::too_many_arguments)]
+pub fn import_commit(
+    st: &mut SpaceStates,
+    did: &str,
+    sid: SpaceId,
+    uri: &Arc<str>,
+    rev: Tid,
+    hash: LtHash,
+    records: u64,
+    clock_id: u64,
+) -> Result<BuiltWrite, SpaceError> {
+    import_begin(st, sid, uri)?;
+    let created = tid::now_micros();
+    let mut head = SpaceHead::new(uri.clone(), None);
+    (head.rev, head.hash, head.records, head.created) = (Some(rev), hash.clone(), records, created);
+    st.repos.insert(sid, head);
+    let row = HeadRow { uri: uri.to_string(), rev, hash: hash.clone(), records, created };
+    let mut muts = vec![put(state::space_head_key(did, &sid), row.encode())];
+    let digest = hash.digest();
+    let (notify, sequenced) = if authority(uri) == Some(did) {
+        (None, record_self(st, did, sid, rev, digest, clock_id, &mut muts)?)
+    } else {
+        let o = OutboxRow { uri: uri.to_string(), repo_rev: rev, hash: digest };
+        muts.push(put(state::space_outbox_key(did, &sid), o.encode()));
+        (Some(o), None)
+    };
+    let head =
+        DurableSpaceHead { uri: uri.clone(), rev, hash, records, created, shard: crate::slots::ShardId(0), epoch: 0 };
+    Ok(BuiltWrite { muts, rev, head, notify, sequenced, results: Vec::new() })
 }
 
 /// simplespace.createSpace: refused while a live space has the URI. Over a

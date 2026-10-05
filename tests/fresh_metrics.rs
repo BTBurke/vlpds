@@ -116,6 +116,37 @@ const AT_ZERO: &[&str] = &[
     r#"vlpds_mail_suppressed_total{purpose="auth_factor",reason="dedup"}"#,
 ];
 
+/// With `--spaces`: what its alerts (ops/alerts.yml vlpds-spaces) and the
+/// dashboard's Spaces row read, at 0 on a fresh node.
+const SPACES_AT_ZERO: &[&str] = &[
+    "vlpds_space_digest_mismatch_total",
+    "vlpds_space_outbox_oldest_seconds",
+    "vlpds_space_outbox_rows",
+    "vlpds_space_notify_ack_seconds_count",
+    r#"vlpds_space_notify_total{hop="fanout",result="ok"}"#,
+    r#"vlpds_space_notify_total{hop="fanout",result="error"}"#,
+    r#"vlpds_space_notify_total{hop="fanout",result="refused"}"#,
+    r#"vlpds_space_notify_total{hop="out",result="ok"}"#,
+    r#"vlpds_space_notify_total{hop="out",result="retry"}"#,
+    r#"vlpds_space_notify_total{hop="in",result="ok"}"#,
+    r#"vlpds_space_credential_checks_total{result="ok"}"#,
+    r#"vlpds_space_credential_checks_total{result="bad_sig"}"#,
+    r#"vlpds_space_credential_checks_total{result="expired"}"#,
+    r#"vlpds_space_credential_checks_total{result="revoked"}"#,
+    r#"vlpds_space_credential_checks_total{result="audience"}"#,
+    r#"vlpds_space_credential_checks_total{result="space"}"#,
+    r#"vlpds_space_credential_cache_total{result="hit"}"#,
+    r#"vlpds_space_credential_cache_total{result="miss"}"#,
+    r#"vlpds_space_list_repo_ops_total{path="noop"}"#,
+    r#"vlpds_space_list_repo_ops_total{path="scan"}"#,
+    r#"vlpds_space_fanout_dropped_total{reason="queue_full"}"#,
+    r#"vlpds_space_fanout_dropped_total{reason="gave_up"}"#,
+    "vlpds_space_fanout_queue_depth",
+    "vlpds_space_revocations",
+    "vlpds_space_sign_seconds_count",
+    r#"vlpds_space_imports_total{result="refused"}"#,
+];
+
 /// Exported from the start; startup itself may move them.
 const PRESENT: &[&str] = &[
     r#"vlpds_lease_events_total{event="opened"}"#,
@@ -161,6 +192,8 @@ async fn fresh_node_exports_alerting_counters_at_zero() {
     let r = relay.clone();
     let s = TestServer::spawn_with(move |c| c.crawlers = vec![r]).await;
     let text = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
+    // without --spaces, none of its series (a node with it starts below)
+    assert!(!text.contains("vlpds_space_"), "space series without --spaces");
     let series = parse(&text);
     // per configured relay; the startup ask may already have counted "ok"
     for result in ["failed", "rejected"] {
@@ -184,4 +217,11 @@ async fn fresh_node_exports_alerting_counters_at_zero() {
     }
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     assert!(series.get(r#"vlpds_process_cpu_seconds_total{mode="user"}"#).is_some_and(|v| *v > 0.0), "user CPU");
+
+    let s = TestServer::spawn_with(|c| c.spaces = true).await;
+    let text = reqwest::get(format!("{}/metrics", s.url)).await.unwrap().text().await.unwrap();
+    let series = parse(&text);
+    for name in SPACES_AT_ZERO {
+        assert_eq!(series.get(*name), Some(&0.0), "{name} at 0 on a fresh --spaces node");
+    }
 }

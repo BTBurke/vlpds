@@ -754,8 +754,20 @@ struct UpdateSubjectStatusIn {
 
 enum Subject {
     Repo(String),
-    Record { uri: String, did: String, cid: Option<String> },
-    Blob { did: String, cid: String },
+    Record {
+        uri: String,
+        did: String,
+        cid: Option<String>,
+    },
+    Blob {
+        did: String,
+        cid: String,
+    },
+    /// A whole space, at its authority (a vlpds extension).
+    Space {
+        uri: String,
+        did: String,
+    },
 }
 
 fn parse_subject(s: &J) -> XResult<Subject> {
@@ -766,6 +778,10 @@ fn parse_subject(s: &J) -> XResult<Subject> {
         "com.atproto.admin.defs#repoRef" => Ok(Subject::Repo(field("did")?)),
         "com.atproto.repo.strongRef" => {
             let uri = field("uri")?;
+            if let Some(u) = super::syntax::parse_space_uri(&uri).filter(|u| u.record.is_none()) {
+                let did = u.authority.to_string();
+                return Ok(Subject::Space { uri: format!("at://{did}/space/{}/{}", u.space_type, u.skey), did });
+            }
             let did = record_uri_did(&uri).ok_or_else(|| invalid_request("invalid at-uri"))?.to_string();
             Ok(Subject::Record { uri, did, cid: s["cid"].as_str().map(str::to_string) })
         }
@@ -803,6 +819,7 @@ async fn update_subject_status(
                 SubjectRef { kind: "record".into(), did: did.clone(), uri: Some(uri.clone()), cid: cid.clone() }
             }
             Subject::Blob { did, cid } => SubjectRef::blob(did, cid),
+            Subject::Space { uri, did } => SubjectRef::space(uri, did),
         };
         let actor = match &creds {
             Credentials::ModService { iss } => iss.clone(),
