@@ -609,7 +609,7 @@ async fn search_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Quer
 /// Marks a scatter-gather result incomplete: `unsupportedNodes` lack the
 /// endpoint (a rolling deploy), `missingShards` hold slots >= `from` but no
 /// answering node owned them (e.g. mid-move).
-fn partial_fields(
+pub(super) fn partial_fields(
     app: &App,
     res: &mut J,
     unreachable: Vec<String>,

@@ -148,6 +148,7 @@ mod spaces;
 mod spaces_admin;
 mod spaces_auth;
 mod spaces_blobs;
+mod spaces_console;
 mod spaces_e2e;
 mod spaces_host;
 mod spaces_scopes;

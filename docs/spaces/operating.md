@@ -123,6 +123,34 @@ permissions, and the space data stays in the bucket. Space-only blobs stay priva
 without the flag still answers `BlobNotFound` for a blob only space records name
 ([Blobs](privacy.md#blobs)).
 
+## Console
+
+The operator console has a Spaces tab. On a node without `--spaces` it says Spaces is off, and the
+methods behind it answer 501.
+
+- The overview counts the spaces your accounts govern, the space repos stored here, their members,
+  writers and records. Its health cards read this node's `/metrics` every 5 s and go amber or red at
+  the thresholds of the four `VlpdsSpace*` alerts. The table lists every space hosted in the
+  cluster, sorted by last write, members, writers or records. Records only count space repos stored
+  here, since a writer on another PDS keeps its own.
+- A space's page shows its policies, members, writers (repoRev, spaceRev and the first 8 bytes of
+  the set hash), the newest spaceRev of each writer, its notify registrations (the endpoint's host
+  only), its records taken down here and its audit entries. You can take the space down or restore
+  it, and remove a registration with a reason. A removed service can register again with a
+  credential, so take the space down to keep it out.
+- An account's page lists the spaces it writes in and the ones it governs.
+- The audit log has a Spaces filter.
+
+Everything on these pages is metadata (DIDs, revs, counts, times and policies), and none of it
+writes an audit entry. A record's value only shows after you ask for it with a reason. Writers'
+"Records…" and the lookup's "Read record…" go through `listSpaceRecords` and `getSpaceRecord`,
+which write a `space.read` entry first, one per page ([Operator access](privacy.md#operator-access)).
+Removing a registration writes `space.registration.remove`.
+
+The console can't show when a member was added, since member rows only hold read and write. It also
+can't show each registration's last delivery, since fan-out keeps that in memory only. There's no
+"revoke every credential for this space" button yet.
+
 ## Flags
 
 | Flag | Default | What it does |
