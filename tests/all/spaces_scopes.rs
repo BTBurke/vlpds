@@ -270,6 +270,78 @@ async fn refresh_without_approved_collections_needs_a_new_grant() {
     assert!(again.scope.contains("collection=com.c6pre.thread"), "{}", again.scope);
 }
 
+/// A code issued without any UI, as `prompt=none` needs.
+async fn silent_code(srv: &Srv, b: &mut Browser, f: &Flow<'_>) -> (String, oauth::Pkce) {
+    let p = oauth::pkce();
+    let ru = f.request_uri(srv, &p, "auto").await;
+    let (st, h, body) = b.authorize(srv, f, &ru).await;
+    assert_eq!(st, 303, "{body}");
+    (oauth::location_params(&h).1.get("code").expect("auto-approved").clone(), p)
+}
+
+/// A login that skips consent (a confidential client the account already
+/// approved, here with prompt=none) looks up only the declarations of bare
+/// grants that write, the only ones the token needs, so a login without
+/// any waits on no lookup, and one with them gets their collections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_approved_login_looks_up_only_bare_writing_grants() {
+    use vlpds::oauth::lexicon::{forget_cached, is_cached};
+    let s = spawn().await;
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6auto").await;
+    let (ro, named, bare) = ("com.c6autoro.forum", "com.c6autonm.forum", "com.c6autobr.forum");
+    for (t, coll) in [(ro, "com.c6autoro.thread"), (named, "com.c6autonm.thread"), (bare, "com.c6autobr.thread")] {
+        publish(&s, t, json!({"type": "space", "name": "Forum", "collections": [coll]})).await;
+    }
+    let lean = format!("atproto space:{ro}?action=read space:{named}?collection=com.c6autonm.thread&action=create");
+    let full = format!("{lean} space:{bare}?action=create");
+
+    let (sk, jwk) = oauth::client_key();
+    let redirect = "https://app.example.com/callback";
+    let client_id = oauth::serve_metadata(|id| {
+        let mut md = oauth::confidential_metadata(id, redirect, &jwk);
+        md["scope"] = J::String(full.clone());
+        md
+    })
+    .await;
+    let assertion = || oauth::client_assertion(&sk, &client_id, &srv.base);
+    let key = DpopKey::new();
+    let flow = |scope: &str, silent: bool| {
+        let f = Flow::new(&client_id, redirect, scope, &key)
+            .with("client_assertion_type", oauth::JWT_BEARER)
+            .with("client_assertion", &assertion());
+        if silent {
+            f.with("prompt", "none")
+        } else {
+            f
+        }
+    };
+    let mut b = Browser::default();
+    let p = oauth::pkce();
+    oauth::authorize_interactive(&srv, &mut b, &flow(&full, false), &acct, &p).await;
+
+    for t in [ro, named, bare] {
+        forget_cached(t);
+    }
+    silent_code(&srv, &mut b, &flow(&lean, true)).await;
+    assert!(!is_cached(ro) && !is_cached(named) && !is_cached(bare), "a login without bare writing grants looked up");
+
+    let (code, p) = silent_code(&srv, &mut b, &flow(&full, true)).await;
+    assert!(is_cached(bare), "the bare writing grant's declaration");
+    assert!(!is_cached(ro) && !is_cached(named), "grants that need no declaration were looked up");
+    let auth = assertion();
+    let r = oauth::exchange(
+        &srv,
+        &flow(&full, true),
+        &code,
+        &p,
+        &[("client_assertion_type", oauth::JWT_BEARER), ("client_assertion", &auth)],
+    )
+    .await;
+    let t = oauth::tokens(&r);
+    assert!(t.scope.contains("collection=com.c6autobr.thread"), "{}", t.scope);
+}
+
 /// `authority=self` is resolved to the account when the token is issued, so
 /// the grant covers only the account's own spaces; a type or an authority
 /// not granted is refused, and so is an action.

@@ -967,21 +967,17 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
         Ok(r) => r,
         Err(e) => return server_error_page(app, "Authorization failed", &e.description),
     };
-    if !required && !app.config.spaces {
-        return issue_code(app, flow, did).await;
+    if !required {
+        return approve_without_consent(app, flow, did).await;
     }
     let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
     let names = match app.config.spaces {
-        true => Some(space_names(app, &flow.req.params.scope, &sets, required).await),
+        true => Some(space_names(app, &flow.req.params.scope, &sets, true).await),
         false => None,
     };
     // what the screen shows is exactly what the token will carry
     let resolved = names.as_ref().filter(|n| !n.decls.is_empty());
-    flow.req.space_collections =
-        resolved.map(|n| n.decls.iter().map(|(t, d)| (t.clone(), d.collections.clone())).collect());
-    if !required {
-        return issue_code(app, flow, did).await;
-    }
+    flow.req.space_collections = resolved.map(space_collections);
     if resolved.is_some() {
         if let Err(e) = store::put_request(app, &flow.id, Some(&flow.req)).await {
             return server_error_page(app, "Authorization failed", &e.description);
@@ -994,15 +990,32 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
     flow.page(app, body)
 }
 
+/// A login the account already approved for this client: with `--spaces`,
+/// its bare writing grants take the collections their types declare now.
+async fn approve_without_consent(app: &App, mut flow: Flow, did: &str) -> Response {
+    if app.config.spaces {
+        let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
+        let names = space_names(app, &flow.req.params.scope, &sets, false).await;
+        flow.req.space_collections = (!names.decls.is_empty()).then(|| space_collections(&names));
+    }
+    issue_code(app, flow, did).await
+}
+
+fn space_collections(n: &ui::SpaceNames) -> std::collections::BTreeMap<String, Vec<String>> {
+    n.decls.iter().map(|(t, d)| (t.clone(), d.collections.clone())).collect()
+}
+
 /// The consent screen's names for the `space:` grants requested, directly
 /// or through permission sets (reference `getSpacesFromScope` and
 /// `getSpaceHandlesFromScope`), each looked up in bounded time and shown
-/// raw when it doesn't resolve. `handles`: false when no screen is shown.
+/// raw when it doesn't resolve. Without a screen (`screen` false), only
+/// the declarations the token needs: an auto-approved login whose grants
+/// all name their collections or only read waits on no lookup.
 async fn space_names(
     app: &App,
     scope: &str,
     sets: &[(crate::oauth::scopes::IncludeScope, J)],
-    handles: bool,
+    screen: bool,
 ) -> ui::SpaceNames {
     use crate::oauth::scopes::Permission;
     const MAX_LOOKUPS: usize = 16;
@@ -1013,10 +1026,10 @@ async fn space_names(
     let (mut types, mut dids) = (Vec::new(), Vec::new());
     for p in perms {
         let Permission::Space(p) = p else { continue };
-        if p.space_type != "*" && !types.contains(&p.space_type) {
+        if p.space_type != "*" && (screen || p.needs_declaration()) && !types.contains(&p.space_type) {
             types.push(p.space_type.clone());
         }
-        if handles && !["*", "self"].contains(&p.authority.as_str()) && !dids.contains(&p.authority) {
+        if screen && !["*", "self"].contains(&p.authority.as_str()) && !dids.contains(&p.authority) {
             dids.push(p.authority);
         }
     }
@@ -1115,7 +1128,7 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
                 }
             };
             match consent_required(&app, &flow, &chosen.0).await {
-                Ok(false) => issue_code(&app, flow, &chosen.0).await,
+                Ok(false) => approve_without_consent(&app, flow, &chosen.0).await,
                 Ok(true) => redirect_error(&app, &params, "consent_required", "Consent is required"),
                 Err(e) => redirect_error(&app, &params, "server_error", &e.description),
             }

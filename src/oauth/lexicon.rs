@@ -82,6 +82,12 @@ pub fn forget_cached(nsid: &str) {
     CACHE.lock().remove(nsid);
 }
 
+/// Tests: whether `nsid` has an in-memory copy, i.e. whether it was looked
+/// up since [`forget_cached`].
+pub fn is_cached(nsid: &str) -> bool {
+    CACHE.lock().contains_key(nsid)
+}
+
 /// All segments but the name, reversed.
 pub fn nsid_authority(nsid: &str) -> String {
     let segs: Vec<&str> = nsid.split('.').collect();
@@ -441,9 +447,7 @@ pub async fn build_token_scope_cached(
             concrete.push(s);
             continue;
         };
-        // collections only name write targets, so a grant that writes
-        // nothing needs no declaration
-        let p = if p.collection.is_none() && p.space_type != "*" && p.writes() {
+        let p = if p.needs_declaration() {
             match consented.and_then(|c| c.get(&p.space_type)) {
                 Some(c) => p.with_default_collections(c),
                 None => {

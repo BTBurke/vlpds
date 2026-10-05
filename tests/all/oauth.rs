@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 pub(crate) const PASSWORD: &str = "correct horse battery staple";
 pub(crate) const REDIRECT: &str = "http://127.0.0.1/cb";
-const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+pub(crate) const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const FORM: &str = "application/x-www-form-urlencoded";
 
 fn b64(b: impl AsRef<[u8]>) -> String {
@@ -165,7 +165,7 @@ pub(crate) fn client_key() -> (SigningKey, J) {
 }
 
 /// A private_key_jwt client assertion for `aud`.
-fn client_assertion(sk: &SigningKey, client_id: &str, aud: &str) -> String {
+pub(crate) fn client_assertion(sk: &SigningKey, client_id: &str, aud: &str) -> String {
     let payload =
         json!({"iss": client_id, "sub": client_id, "aud": aud, "jti": rand_str(12), "iat": now(), "exp": now() + 60});
     sign_jwt(sk, &json!({"alg": "ES256", "kid": "k1", "typ": "JWT"}), &payload)
