@@ -67,6 +67,10 @@ pub enum KeyKind {
     Node,
     /// One counter for the whole cluster ([`CLUSTER_KEY`]), in the bucket.
     Cluster,
+    /// A space credential's `jti`.
+    Credential,
+    /// `{did} {did}`: an account and a space authority.
+    DidPair,
 }
 
 pub const NODE_KEY: &str = "node";
@@ -342,9 +346,44 @@ limit!(
     100
 );
 
+// Spaces (vlpds additions; the reference limits only space writes, which
+// share the repo-write buckets). Space reads are counted on the repo's
+// owner, getSpaceCredential (a durable jti claim each) and inbound
+// notifyWrite (a durable entry each) on the authority's, and
+// notifyCredentialRevoked (a cluster-wide CAS write each) where it lands.
+limit!(
+    SPACE_READ_CREDENTIAL,
+    37,
+    "space-read-credential",
+    Credential,
+    "com.atproto.space reads and space host methods with one space credential",
+    5 * MINUTE,
+    3000
+);
+limit!(
+    SPACE_READ_ACCOUNT,
+    38,
+    "space-read-account",
+    Did,
+    "com.atproto.space reads by an account's own OAuth session",
+    5 * MINUTE,
+    3000
+);
+limit!(
+    SPACE_CREDENTIAL,
+    39,
+    "space-credential",
+    DidPair,
+    "space.getSpaceCredential per account and space authority",
+    HOUR,
+    300
+);
+limit!(SPACE_NOTIFY_IN, 40, "space-notify-in", Did, "space.notifyWrite received, per writer", 5 * MINUTE, 1000);
+limit!(SPACE_REVOKE, 41, "space-revoke", Did, "space.notifyCredentialRevoked received, per space authority", HOUR, 100);
+
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 37] = [
+pub const BUILTIN: [&Limit; 42] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -382,6 +421,11 @@ pub const BUILTIN: [&Limit; 37] = [
     &CHECK_HANDLE_DAY,
     &PASSKEY_REGISTER_ACCOUNT,
     &PASSKEY_SIGN_IN_IP,
+    &SPACE_READ_CREDENTIAL,
+    &SPACE_READ_ACCOUNT,
+    &SPACE_CREDENTIAL,
+    &SPACE_NOTIFY_IN,
+    &SPACE_REVOKE,
 ];
 
 /// A confidential client's backend calls these for all of its users from
@@ -540,7 +584,7 @@ impl Policy {
         let ip = match spec.key {
             KeyKind::Ip => parse(key),
             KeyKind::IdentifierIp => key.rsplit_once('-').and_then(|(_, ip)| parse(ip)),
-            KeyKind::Did | KeyKind::Node | KeyKind::Cluster => None,
+            KeyKind::Did | KeyKind::Node | KeyKind::Cluster | KeyKind::Credential | KeyKind::DidPair => None,
         };
         match self.override_for(&spec.name, key, &self.ip_matches(ip)) {
             Some(Action::Exempt) => None,

@@ -617,7 +617,11 @@ impl Resp {
     pub fn text(&self) -> String {
         let s = String::from_utf8_lossy(&self.body);
         if s.len() > 2000 {
-            format!("{}…", &s[..2000])
+            let mut end = 2000;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &s[..end])
         } else {
             s.to_string()
         }

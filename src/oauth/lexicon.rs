@@ -1,6 +1,7 @@
-//! Permission-set lexicons for `include:` scopes, resolved the atproto way
-//! (DNS `_lexicon` authority, then a getRecord proof verified end to end)
-//! and persisted, so token refreshes keep working while a publisher is
+//! Permission-set lexicons for `include:` scopes, and space type
+//! declarations for bare `space:` grants, resolved the atproto way (DNS
+//! `_lexicon` authority, then a getRecord proof verified end to end) and
+//! persisted, so token refreshes keep working while a publisher is
 //! unreachable (as the reference LexiconGetter does).
 //!
 //! The token endpoint never waits on a publisher it has a copy from: it uses
@@ -8,11 +9,12 @@
 //! slow publisher can't hold a code exchange or refresh open (and with it
 //! the window in which it races a revocation).
 
-use super::scopes::{is_nsid, IncludeScope};
+use super::scopes::{is_nsid, IncludeScope, Permission};
 use super::store::{self, StoredLexicon};
 use super::util::now_secs;
 use crate::cbor::Value;
 use crate::cid::Cid;
+use crate::lexicon::SpaceDecl;
 use crate::xrpc::App;
 use serde_json::Value as J;
 use std::collections::HashMap;
@@ -48,34 +50,42 @@ pub fn nsid_authority(nsid: &str) -> String {
     segs[..segs.len().saturating_sub(1)].iter().rev().cloned().collect::<Vec<_>>().join(".").to_ascii_lowercase()
 }
 
+/// What a lexicon document must be to be used (and cached), and what is
+/// taken from it.
+type Check<T> = fn(&str, &J) -> Result<T, String>;
+
 /// `defs.main`.
 async fn permission_set(app: &App, nsid: &str) -> Result<J, String> {
+    lexicon(app, nsid, main_def).await
+}
+
+async fn lexicon<T: Send>(app: &App, nsid: &str, check: Check<T>) -> Result<T, String> {
     if !is_nsid(nsid) {
         return Err(format!("invalid NSID {nsid}"));
     }
     if let Some((at, doc)) = CACHE.lock().get(nsid) {
         if at.elapsed() < REFRESH {
-            return main_def(nsid, doc);
+            return check(nsid, doc);
         }
     }
     match resolve(app, nsid).await {
         Ok((uri, doc)) => {
-            main_def(nsid, &doc)?;
+            let out = check(nsid, &doc)?;
             cache_put(nsid, Instant::now(), doc.clone());
-            let stored = StoredLexicon { uri, doc: doc.clone(), updated_at: now_secs() };
+            let stored = StoredLexicon { uri, doc, updated_at: now_secs() };
             if let Err(e) = store::put_lexicon(app, nsid, &stored).await {
                 tracing::warn!(nsid, "persisting lexicon failed: {}", e.description);
             }
-            main_def(nsid, &doc)
+            Ok(out)
         }
         Err(e) => {
             // the last good copy: memory, then durable
             if let Some((_, doc)) = CACHE.lock().get(nsid) {
-                return main_def(nsid, doc);
+                return check(nsid, doc);
             }
             if let Ok(Some(l)) = store::get_lexicon(app, nsid).await {
                 cache_put(nsid, Instant::now() - REFRESH + Duration::from_secs(30), l.doc.clone());
-                return main_def(nsid, &l.doc);
+                return check(nsid, &l.doc);
             }
             Err(e)
         }
@@ -272,6 +282,10 @@ fn verify_multikey(multibase: &str, msg: &[u8], sig: &[u8], allow_high_s: bool) 
 }
 
 async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> {
+    lexicon_cached(app, nsid, main_def).await
+}
+
+async fn lexicon_cached<T: Send + 'static>(app: &Arc<App>, nsid: &str, check: Check<T>) -> Result<T, String> {
     if !is_nsid(nsid) {
         return Err(format!("invalid NSID {nsid}"));
     }
@@ -289,25 +303,25 @@ async fn permission_set_cached(app: &Arc<App>, nsid: &str) -> Result<J, String> 
     match cached {
         Some((stale, doc)) => {
             if stale {
-                refresh_in_background(app, nsid);
+                refresh_in_background(app, nsid, check);
             }
-            main_def(nsid, &doc)
+            check(nsid, &doc)
         }
-        None => tokio::time::timeout(INLINE_BUDGET, permission_set(app, nsid))
+        None => tokio::time::timeout(INLINE_BUDGET, lexicon(app, nsid, check))
             .await
-            .map_err(|_| format!("Timed out resolving permission set {nsid}"))?,
+            .map_err(|_| format!("Timed out resolving lexicon {nsid}"))?,
     }
 }
 
-fn refresh_in_background(app: &Arc<App>, nsid: &str) {
+fn refresh_in_background<T: Send + 'static>(app: &Arc<App>, nsid: &str, check: Check<T>) {
     if !IN_FLIGHT.lock().insert(nsid.to_string()) {
         return;
     }
     let (app, nsid) = (app.clone(), nsid.to_string());
     tokio::spawn(async move {
-        let _ = permission_set(&app, &nsid).await;
+        let _ = lexicon(&app, &nsid, check).await;
         {
-            // still stale = the resolution failed (permission_set fell back
+            // still stale = the resolution failed (lexicon() fell back
             // to the old copy): back off instead of retrying on every call
             let mut m = CACHE.lock();
             if let Some((at, _)) = m.get_mut(&nsid) {
@@ -320,10 +334,54 @@ fn refresh_in_background(app: &Arc<App>, nsid: &str) {
     });
 }
 
-/// `include:` scopes replaced by the permissions their sets grant
-/// (`LexiconManager.buildTokenScope`), in bounded time.
-pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<String, String> {
-    if !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
+fn space_decl(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
+    crate::lexicon::space_declaration(nsid, doc)
+}
+
+/// A space type's declaration, for the consent screen (`name`, or its
+/// `title` once proposals #118 lands).
+pub async fn space_declaration(app: &App, nsid: &str) -> Result<SpaceDecl, String> {
+    tokio::time::timeout(INLINE_BUDGET, lexicon(app, nsid, space_decl))
+        .await
+        .map_err(|_| format!("Timed out resolving space type {nsid}"))?
+}
+
+/// Recent failures, so a bare grant of a type that doesn't resolve costs
+/// its token requests no more than one inline attempt per [`RETRY_AFTER`].
+static SPACE_MISSES: LazyLock<parking_lot::Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+
+async fn space_declaration_cached(app: &Arc<App>, nsid: &str) -> Result<SpaceDecl, String> {
+    if SPACE_MISSES.lock().get(nsid).is_some_and(|at| at.elapsed() < RETRY_AFTER) {
+        return Err(format!("space type {nsid} did not resolve"));
+    }
+    let r = lexicon_cached(app, nsid, space_decl).await;
+    let mut misses = SPACE_MISSES.lock();
+    match &r {
+        Ok(_) => {
+            misses.remove(nsid);
+        }
+        Err(_) => {
+            if misses.len() >= 1024 {
+                misses.retain(|_, at| at.elapsed() < RETRY_AFTER);
+            }
+            if misses.len() < 1024 {
+                misses.insert(nsid.to_string(), Instant::now());
+            }
+        }
+    }
+    r
+}
+
+/// `include:` scopes replaced by the permissions their sets grant, then
+/// with `--spaces` each `space:` grant made concrete
+/// (`LexiconManager.buildTokenScope`), in bounded time: a bare grant that
+/// writes takes its type declaration's collections, and `self` becomes
+/// `did`. A declaration that doesn't resolve leaves the grant with no write
+/// targets, where the reference fails the token request.
+pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str, did: &str) -> Result<String, String> {
+    let spaces = app.config.spaces;
+    let has_space = spaces && scope.split(' ').any(super::scopes::is_space_scope);
+    if !has_space && !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
         return Ok(scope.to_string());
     }
     let mut out: Vec<String> = Vec::new();
@@ -332,13 +390,37 @@ pub async fn build_token_scope_cached(app: &Arc<App>, scope: &str) -> Result<Str
         match IncludeScope::parse(s) {
             Some(inc) => {
                 let set = permission_set_cached(app, &inc.nsid).await?;
-                out.extend(inc.to_permissions(&set).iter().map(|p| p.to_scope_string()));
+                out.extend(inc.to_permissions(&set, spaces).iter().map(|p| p.to_scope_string()));
             }
             None => others.push(s.to_string()),
         }
     }
     out.extend(others);
-    Ok(out.join(" "))
+    if !spaces {
+        return Ok(out.join(" "));
+    }
+    let mut concrete = Vec::with_capacity(out.len());
+    for s in out {
+        let Some(Permission::Space(p)) = Permission::parse(&s) else {
+            concrete.push(s);
+            continue;
+        };
+        // collections only name write targets, so a grant that writes
+        // nothing needs no declaration
+        let p = if p.collection.is_none() && p.space_type != "*" && p.writes() {
+            match space_declaration_cached(app, &p.space_type).await {
+                Ok(d) => p.with_default_collections(&d.collections),
+                Err(e) => {
+                    tracing::debug!(space_type = %p.space_type, "space grant without write targets: {e}");
+                    p
+                }
+            }
+        } else {
+            p
+        };
+        concrete.push(Permission::Space(p.with_resolved_authority(did)).to_scope_string());
+    }
+    Ok(concrete.join(" "))
 }
 
 pub async fn permission_sets_for_scope(app: &App, scope: &str) -> Result<Vec<(IncludeScope, J)>, String> {

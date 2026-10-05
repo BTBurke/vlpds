@@ -404,6 +404,11 @@ impl Ctl {
     pub(super) fn has_takedown(&self, name: &str) -> bool {
         !self.takedowns.is_empty() && self.takedowns.contains(name)
     }
+
+    /// What follows `prefix` in each name under it.
+    pub(super) fn takedowns_under(&self, prefix: &str) -> Vec<String> {
+        self.takedowns.iter().filter_map(|n| n.strip_prefix(prefix)).map(String::from).collect()
+    }
 }
 
 fn family_micros(jti: &str) -> Option<u64> {

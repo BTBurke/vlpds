@@ -12,6 +12,7 @@ use super::*;
 use crate::cbor::JsonValue;
 use crate::oauth::scopes::{SpaceAccess, SpaceTarget};
 use crate::space::heads::DurableSpaceHead;
+use crate::space::lthash::LtHash;
 use crate::space::outbox::{Outcome, Pending};
 use crate::space::repo::{PutScopes, SpaceAck, SpaceError, SpaceOp, SpaceOutcome, SpaceReq, SpaceWrite, MAX_WRITES};
 use crate::space::rows::{HeadRow, OpRow};
@@ -428,6 +429,60 @@ pub(super) fn takedown_name(sid: &SpaceId, path: &str) -> String {
     format!("space/{}/{path}", hex::encode(sid))
 }
 
+/// The repo's records taken down in this space, by path. Record takedowns
+/// are a vlpds extension (the reference has none for space records): the
+/// sync views leave these records out of the index, the blocks and the
+/// ops, and sign a commit over the set without them, so what's served
+/// still verifies and a syncer that held one sees its digest mismatch and
+/// refetches. A reversal flips it back the same way.
+async fn hidden_paths(app: &App, repo: &str, sid: &SpaceId) -> XResult<Vec<String>> {
+    let ctl = super::server::ctl(app, repo).await?;
+    Ok(ctl.takedowns_under(&takedown_name(sid, "")))
+}
+
+/// `set` less the hidden records as `snap` holds them.
+async fn served_set(
+    snap: &slatedb::DbSnapshot,
+    repo: &str,
+    sid: &SpaceId,
+    set: &LtHash,
+    hidden: &[String],
+) -> XResult<LtHash> {
+    let mut set = set.clone();
+    for path in hidden {
+        let Some(v) = snap.get(state::space_record_key(repo, sid, path)).await.map_err(XrpcError::from_err)? else {
+            continue;
+        };
+        let (cid, _) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
+        let (collection, rkey) = path.split_once('/').ok_or_else(|| XrpcError::internal("malformed takedown path"))?;
+        set.remove(&crate::space::commit::element(collection, rkey, &cid.to_string()));
+    }
+    Ok(set)
+}
+
+/// The head and the set to sign for it, read from one snapshot when some
+/// record is hidden (a write between the two reads would remove the wrong
+/// element); from the heads map otherwise.
+async fn served_head(
+    app: &App,
+    sp: &Spaces,
+    p: &crate::partition::Partition,
+    repo: &str,
+    space: &Space,
+) -> XResult<Option<(Arc<DurableSpaceHead>, Option<LtHash>)>> {
+    let hidden = hidden_paths(app, repo, &space.sid).await?;
+    if hidden.is_empty() {
+        return Ok(load_head(sp, p, repo, space).await?.map(|h| (h, None)));
+    }
+    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let Some(v) = snap.get(state::space_head_key(repo, &space.sid)).await.map_err(XrpcError::from_err)? else {
+        return Ok(None);
+    };
+    let head = head_of(HeadRow::decode(&v).map_err(XrpcError::from_err)?, space, p)?;
+    let set = served_set(&snap, repo, &space.sid, &head.hash, &hidden).await?;
+    Ok(Some((Arc::new(head), Some(set))))
+}
+
 fn auth_label(creds: &Credentials) -> &'static str {
     match creds {
         Credentials::SpaceCredential { .. } => "credential",
@@ -497,11 +552,18 @@ fn b64(b: &[u8]) -> J {
     json!({"$bytes": base64::engine::general_purpose::STANDARD_NO_PAD.encode(b)})
 }
 
-/// `buildSignedCommit`: a fresh ikm per response, signed by the author.
-fn signed_commit(key: &Keypair, space: &Space, author: &str, head: &DurableSpaceHead) -> XResult<J> {
+/// `buildSignedCommit`: a fresh ikm per response, signed by the author,
+/// over `set` (the head's unless records are hidden).
+fn signed_commit(
+    key: &Keypair,
+    space: &Space,
+    author: &str,
+    head: &DurableSpaceHead,
+    set: Option<&LtHash>,
+) -> XResult<J> {
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author, rev: &rev };
-    let c = crate::space::commit::sign(&head.hash, &ctx, rand::random(), |b| {
+    let c = crate::space::commit::sign(set.unwrap_or(&head.hash), &ctx, rand::random(), |b| {
         Ok::<_, std::convert::Infallible>(key.sign(b))
     })
     .map_err(|_| XrpcError::internal("space commit context too long"))?;
@@ -770,10 +832,10 @@ async fn get_latest_commit(
     let key = available(&app, &q.repo, self_read).await?;
     metrics::space_read("getLatestCommit", auth_label(&creds));
     let p = app.partition(&q.repo)?;
-    let head = load_head(sp, &p, &q.repo, &space)
+    let (head, set) = served_head(&app, sp, &p, &q.repo, &space)
         .await?
         .ok_or_else(|| XrpcError::bad("RepoNotFound", format!("Could not find repo for space: {}", space.uri)))?;
-    Ok(Json(json!({"commit": signed_commit(&key, &space, &q.repo, &head)?})))
+    Ok(Json(json!({"commit": signed_commit(&key, &space, &q.repo, &head, set.as_ref())?})))
 }
 
 #[derive(Deserialize)]
@@ -817,19 +879,22 @@ async fn list_repo_ops(
     metrics::space_read("listRepoOps", auth_label(&creds));
     let start = Instant::now();
     let p = app.partition(&q.repo)?;
-    let head = load_head(sp, &p, &q.repo, &space).await?;
-    let caught_up = match (&head, cursor, since) {
-        (None, ..) => true,
-        (Some(h), None, Some(s)) => s >= h.rev,
-        _ => false,
-    };
-    if caught_up {
-        let mut out = json!({"ops": []});
-        if let Some(h) = &head {
-            out["commit"] = signed_commit(&key, &space, &q.repo, h)?;
+    let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
+    if hidden.is_empty() {
+        let head = load_head(sp, &p, &q.repo, &space).await?;
+        let caught_up = match (&head, cursor, since) {
+            (None, ..) => true,
+            (Some(h), None, Some(s)) => s >= h.rev,
+            _ => false,
+        };
+        if caught_up {
+            let mut out = json!({"ops": []});
+            if let Some(h) = &head {
+                out["commit"] = signed_commit(&key, &space, &q.repo, h, None)?;
+            }
+            metrics::space_list_repo_ops("noop", start.elapsed());
+            return Ok(Json(out));
         }
-        metrics::space_list_repo_ops("noop", start.elapsed());
-        return Ok(Json(out));
     }
     // one snapshot: the commit describes exactly the ops' end state
     let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
@@ -855,21 +920,26 @@ async fn list_repo_ops(
     let opts = slatedb::config::ScanOptions::default();
     let mut iter = snap.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
     let values = !q.exclude_values.unwrap_or(false);
-    let takedowns = match values {
-        true => Some(super::server::ctl(&app, &q.repo).await?),
-        false => None,
-    };
     let mut ops = Vec::with_capacity(limit.min(256));
     let mut last = None;
-    while ops.len() < limit {
-        let rows = iter.next_batch(limit - ops.len()).await.map_err(XrpcError::from_err)?;
+    // a page is `limit` ops scanned, hidden ones included, so the cursor and
+    // whether the page reaches the head don't depend on what's hidden
+    let mut rows_seen = 0;
+    while rows_seen < limit {
+        let rows = iter.next_batch(limit - rows_seen).await.map_err(XrpcError::from_err)?;
         if rows.is_empty() {
             break;
         }
+        rows_seen += rows.len();
         for kv in rows {
             let (rev, idx) = crate::space::rows::oplog_position(&kv.key)
                 .ok_or_else(|| XrpcError::internal("malformed space oplog key"))?;
             let op = OpRow::decode(&kv.value).map_err(XrpcError::from_err)?;
+            last = Some((rev, idx));
+            let path = format!("{}/{}", op.collection, op.rkey);
+            if hidden.contains(&path) {
+                continue;
+            }
             let mut o = json!({
                 "rev": rev.to_string(),
                 "collection": op.collection,
@@ -877,16 +947,9 @@ async fn list_repo_ops(
                 "cid": op.cid.map(|c| c.to_string()),
                 "prev": op.prev.map(|c| c.to_string()),
             });
-            if let (Some(td), Some(cid)) = (&takedowns, op.cid) {
-                let path = format!("{}/{}", op.collection, op.rkey);
-                let hidden = td.has_takedown(&takedown_name(&space.sid, &path));
-                let cur = match hidden {
-                    true => None,
-                    false => snap
-                        .get(state::space_record_key(&q.repo, &space.sid, &path))
-                        .await
-                        .map_err(XrpcError::from_err)?,
-                };
+            if let (true, Some(cid)) = (values, op.cid) {
+                let cur =
+                    snap.get(state::space_record_key(&q.repo, &space.sid, &path)).await.map_err(XrpcError::from_err)?;
                 if let Some(v) = cur {
                     let (c, bytes) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
                     if c == cid {
@@ -897,12 +960,15 @@ async fn list_repo_ops(
                 }
             }
             ops.push(o);
-            last = Some((rev, idx));
         }
     }
     let mut out = json!({});
-    if ops.len() < limit {
-        out["commit"] = signed_commit(&key, &space, &q.repo, &head)?;
+    if rows_seen < limit {
+        let set = match hidden.is_empty() {
+            true => None,
+            false => Some(served_set(&snap, &q.repo, &space.sid, &head.hash, &hidden).await?),
+        };
+        out["commit"] = signed_commit(&key, &space, &q.repo, &head, set.as_ref())?;
     } else if let Some((rev, idx)) = last {
         out["cursor"] = json!(format!("{rev}/{idx}"));
     }
@@ -1035,6 +1101,7 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
         skey: "*",
     };
     creds.need_space(&target, SpaceAccess::ReadSelf)?;
+    super::authn::check_space_read_account(&creds)?;
     let did = creds.user_did()?.to_string();
     let p = app.partition(&did)?;
     let mut uris = std::collections::BTreeSet::new();
@@ -1099,6 +1166,7 @@ async fn notify_credential_revoked(
     if auth.iss != space.authority {
         return Err(forbidden("Revocation issuer is not the space authority"));
     }
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, 1)?;
     let hosted = super::syntax::valid_did(&auth.aud)
         && match super::internal::account_anywhere(&app, &auth.aud).await {
             Ok(_) => true,
@@ -1378,8 +1446,9 @@ fn commit_block(c: &crate::space::commit::SignedCommit) -> Vec<u8> {
 /// snapshot (src/space/car.rs) under an export slot (`--max-exports`), and
 /// ended for a client that reads nothing for `--export-stall-secs`. Pass 1
 /// holds the paths and CIDs only: at most `--space-repo-max-records` of
-/// them. A record taken down keeps its index entry (the commit's hash
-/// covers it) but not its block; with `excludeValues` only the roots go.
+/// them. A record taken down is left out of the index and the blocks, and
+/// the commit is signed over the set without it ([`hidden_paths`]); with
+/// `excludeValues` only the roots go.
 async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Query<GetRepoQ>) -> XResult<Response> {
     use crate::space::car::{Car, Entries, RepoEncoder};
     spaces(&app)?;
@@ -1394,10 +1463,8 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     let v = snap.get(state::space_head_key(&q.repo, &space.sid)).await.map_err(XrpcError::from_err)?;
     let head = head_of(HeadRow::decode(&v.ok_or_else(not_found)?).map_err(XrpcError::from_err)?, &space, &p)?;
     let values = !q.exclude_values.unwrap_or(false);
-    let takedowns = match values {
-        true => Some(super::server::ctl(&app, &q.repo).await?),
-        false => None,
-    };
+    let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
+    let mut set = head.hash.clone();
     let prefix = state::space_prefix(state::SPACE_RECORD_FAMILY, &q.repo, &space.sid);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, cache_blocks: true, ..Default::default() };
     let mut iter = state::BatchedScan::new(
@@ -1407,16 +1474,20 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
         let path = std::str::from_utf8(&kv.key[prefix.len()..]).map_err(XrpcError::from_err)?;
         let (cid, _) = state::record_value_parts(&kv.value).map_err(XrpcError::from_err)?;
+        if !hidden.is_empty() && hidden.iter().any(|h| h == path) {
+            let (collection, rkey) = path.split_once('/').ok_or_else(|| XrpcError::internal("malformed space path"))?;
+            set.remove(&crate::space::commit::element(collection, rkey, &cid.to_string()));
+            continue;
+        }
         entries.push(path, cid);
     }
     drop(iter);
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author: &q.repo, rev: &rev };
-    let commit = crate::space::commit::sign(&head.hash, &ctx, rand::random(), |b| {
-        Ok::<_, std::convert::Infallible>(key.sign(b))
-    })
-    .map_err(|_| XrpcError::internal("space commit context too long"))?;
-    let (stall, repo, sid) = (app.config.export_stall, q.repo.clone(), space.sid);
+    let commit =
+        crate::space::commit::sign(&set, &ctx, rand::random(), |b| Ok::<_, std::convert::Infallible>(key.sign(b)))
+            .map_err(|_| XrpcError::internal("space commit context too long"))?;
+    let (stall, repo) = (app.config.export_stall, q.repo.clone());
     Ok(super::sync::export_body(slot, "application/vnd.ipld.car", move |tx| async move {
         const CHUNK: usize = super::sync::EXPORT_CHUNK;
         let mut car = Car::new(commit_block(&commit));
@@ -1431,7 +1502,6 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
             flush_chunk(&tx, &mut buf, stall).await?;
         }
         if values {
-            let td = takedowns.as_ref().expect("read with values");
             for run in &order {
                 let (first, last) = (entries.path(run.start), entries.path(run.end - 1));
                 let lo = [&prefix[..], first.as_bytes()].concat();
@@ -1444,12 +1514,16 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
                     }
                 };
                 for i in run.clone() {
-                    let kv = match it.next().await {
-                        Ok(Some(kv)) => kv,
-                        Ok(None) => return Err("error"),
-                        Err(e) => {
-                            tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
-                            return Err("error");
+                    // a run's range also spans the hidden records among its paths
+                    let kv = loop {
+                        match it.next().await {
+                            Ok(Some(kv)) if hidden.iter().any(|h| h.as_bytes() == &kv.key[prefix.len()..]) => {}
+                            Ok(Some(kv)) => break kv,
+                            Ok(None) => return Err("error"),
+                            Err(e) => {
+                                tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
+                                return Err("error");
+                            }
                         }
                     };
                     let path = entries.path(i);
@@ -1460,9 +1534,6 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
                             return Err("error");
                         }
                     };
-                    if td.has_takedown(&takedown_name(&sid, path)) {
-                        continue;
-                    }
                     car.record(&cid, bytes, &mut buf);
                     if buf.len() >= CHUNK {
                         flush_chunk(&tx, &mut buf, stall).await?;
@@ -1563,6 +1634,7 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
     if auth.iss != repo {
         return Err(forbidden("notifyWrite iss does not match claimed writer"));
     }
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_NOTIFY_IN], &auth.iss, 1)?;
     if auth.aud != space.authority && auth.aud != token::space_host_aud(&space.authority) {
         return Err(forbidden("notifyWrite aud does not match the space authority"));
     }

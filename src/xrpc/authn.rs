@@ -203,7 +203,7 @@ impl Credentials {
     /// reference lets legacy auth read and write space records).
     pub fn allows_space(&self, t: &SpaceTarget, access: SpaceAccess) -> bool {
         match self {
-            Credentials::OAuth { did, scopes, .. } => scopes.allows_space(t, access, did),
+            Credentials::OAuth { scopes, .. } => scopes.allows_space(t, access),
             _ => false,
         }
     }
@@ -742,6 +742,10 @@ pub async fn verify_space_credential(app: &App, headers: &HeaderMap) -> XResult<
     if let Some(result) = refused {
         crate::metrics::space_credential_check(result);
     }
+    if let Ok(Credentials::SpaceCredential { iss, jti, .. }) = &r {
+        use crate::ratelimit::{check, SPACE_READ_CREDENTIAL};
+        check(&[&SPACE_READ_CREDENTIAL], &format!("{iss} {jti}"), 1)?;
+    }
     r
 }
 
@@ -827,11 +831,21 @@ pub async fn verify_delegation(app: &App, headers: &HeaderMap) -> XResult<Delega
         return Err(space_auth_err("BadSpaceSignature", "request requires exactly one \"authorization\" field"));
     }
     let key_id = crate::space::httpsig::verify(headers, None).map_err(sig_err)?;
+    // before the claim, which a refused exchange would otherwise spend
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_CREDENTIAL], &format!("{} {authority}", t.claims.iss), 1)?;
     let claim = format!("space-delegation:{}:{}", t.claims.iss, t.claims.jti);
     if !super::internal::claim_replay_anywhere(app, &authority, &claim, t.claims.exp.ceil() as i64).await? {
         return Err(space_auth_err("JwtReplayed", "delegation token has already been used"));
     }
     Ok(Delegation { user: t.claims.iss.clone(), space, authority, key_id })
+}
+
+/// An account reading its own space data.
+pub fn check_space_read_account(creds: &Credentials) -> XResult<()> {
+    match creds.did() {
+        Some(did) => crate::ratelimit::check(&[&crate::ratelimit::SPACE_READ_ACCOUNT], did, 1),
+        None => Ok(()),
+    }
 }
 
 /// The space read methods: a space credential, or the account's own auth.
@@ -843,6 +857,8 @@ impl FromRequestParts<Arc<App>> for SpaceAuth {
         if is_space_credential(&parts.headers)? {
             return verify_space_credential(app, &parts.headers).await.map(SpaceAuth);
         }
-        authenticate_within(app, parts).await.map(SpaceAuth)
+        let creds = authenticate_within(app, parts).await?;
+        check_space_read_account(&creds)?;
+        Ok(SpaceAuth(creds))
     }
 }

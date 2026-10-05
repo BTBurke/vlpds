@@ -968,11 +968,49 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
         Err(e) => return server_error_page(app, "Authorization failed", &e.description),
     }
     let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
-    let rows = ui::describe_scopes(&flow.req.params.scope, &sets);
+    let names = match app.config.spaces {
+        true => Some(space_names(app, &flow.req.params.scope, &sets).await),
+        false => None,
+    };
+    let rows = ui::describe_scopes(&flow.req.params.scope, &sets, names.as_ref());
     let csrf = flow.csrf(app);
     let name = server_name(app);
     let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &rows);
     flow.page(app, body)
+}
+
+/// The consent screen's names for the `space:` grants requested, directly
+/// or through permission sets (reference `getSpacesFromScope` and
+/// `getSpaceHandlesFromScope`), each looked up in bounded time and shown
+/// raw when it doesn't resolve.
+async fn space_names(app: &App, scope: &str, sets: &[(crate::oauth::scopes::IncludeScope, J)]) -> ui::SpaceNames {
+    use crate::oauth::scopes::Permission;
+    const MAX_LOOKUPS: usize = 16;
+    let mut perms: Vec<Permission> = scope.split(' ').filter_map(Permission::parse).collect();
+    for (inc, set) in sets {
+        perms.extend(inc.to_permissions(set, true));
+    }
+    let (mut types, mut dids) = (Vec::new(), Vec::new());
+    for p in perms {
+        let Permission::Space(p) = p else { continue };
+        if p.space_type != "*" && !types.contains(&p.space_type) {
+            types.push(p.space_type.clone());
+        }
+        if !["*", "self"].contains(&p.authority.as_str()) && !dids.contains(&p.authority) {
+            dids.push(p.authority);
+        }
+    }
+    let budget = std::time::Duration::from_secs(3);
+    let decls = futures::future::join_all(types.into_iter().take(MAX_LOOKUPS).map(|t| async move {
+        let d = lexicon::space_declaration(app, &t).await.ok();
+        d.map(|d| (t, d))
+    }));
+    let handles = futures::future::join_all(dids.into_iter().take(MAX_LOOKUPS).map(|did| async move {
+        let h = tokio::time::timeout(budget, super::identity::verified_handle(app, &did)).await.ok().flatten();
+        h.map(|h| (did, h))
+    }));
+    let (decls, handles) = tokio::join!(decls, handles);
+    ui::SpaceNames { decls: decls.into_iter().flatten().collect(), handles: handles.into_iter().flatten().collect() }
 }
 
 /// `RequestManager.setAuthorized`.
@@ -1846,8 +1884,9 @@ async fn code_grant(
     if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
         return Err(fail("The passkey that approved this code was removed"));
     }
-    let token_scope =
-        lexicon::build_token_scope_cached(app, &params.scope).await.map_err(|e| OAuthError::invalid_request(&e))?;
+    let token_scope = lexicon::build_token_scope_cached(app, &params.scope, &did)
+        .await
+        .map_err(|e| OAuthError::invalid_request(&e))?;
     let now = now_secs();
     let mut s = Session {
         id: ou::random_id("ses-", 16),
@@ -1978,7 +2017,8 @@ async fn refresh_grant(
         return Err(OAuthError::invalid_grant("Refresh token expired"));
     }
     ensure_active_any(app, &s.did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope).await.map_err(|e| OAuthError::server_error(&e))?;
+    s.token_scope =
+        lexicon::build_token_scope_cached(app, &s.scope, &s.did).await.map_err(|e| OAuthError::server_error(&e))?;
     s.refresh_gen += 1;
     super::cas::pause_point("oauth_refresh", &s.did).await;
     // only if the row is still the one read: a revocation since is not undone

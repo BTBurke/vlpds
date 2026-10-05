@@ -217,6 +217,111 @@ async fn get_repo_streams_a_verifiable_car() {
     assert_eq!(r.status, 401, "{r:?}");
 }
 
+/// A syncer's reads of one repo in a space, through a credential.
+struct Viewer<'a> {
+    s: &'a TestServer,
+    owner: &'a SpaceClient,
+    cred: String,
+    space: String,
+    repo: String,
+    key: String,
+}
+
+impl Viewer<'_> {
+    async fn read(&self, nsid: &str, extra: &[(&str, &str)]) -> Resp {
+        let mut q = vec![("space", self.space.as_str()), ("repo", self.repo.as_str())];
+        q.extend_from_slice(extra);
+        self.owner.signed_get(&self.s.url, nsid, &q, &self.cred, &self.repo).await
+    }
+
+    /// getRepo, the ops replayed page by page, and the latest commit and an
+    /// at-head poll: all must agree.
+    async fn view(&self, values: bool) -> Car {
+        let extra: &[(&str, &str)] = if values { &[] } else { &[("excludeValues", "true")] };
+        let r = self.read("com.atproto.space.getRepo", extra).await;
+        assert_eq!(r.status, 200, "{r:?}");
+        assert_eq!(r.headers["content-type"], "application/vnd.ipld.car", "{r:?}");
+        let car = verify_car(&r.body, &self.space, &self.repo, &self.key, values);
+        let mut set = LtHash::default();
+        let mut cursor: Option<String> = None;
+        let last = loop {
+            let mut extra = vec![("limit", "2")];
+            if let Some(c) = &cursor {
+                extra.push(("cursor", c.as_str()));
+            }
+            let page = self.read("com.atproto.space.listRepoOps", &extra).await.ok();
+            apply_ops(&mut set, &page["ops"]);
+            match page["cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break page["commit"].clone(),
+            }
+        };
+        let ops_commit = signed_commit(&last);
+        let ctx = commit::CommitCtx { space: &self.space, author: &self.repo, rev: &ops_commit.rev };
+        assert!(commit::verify(&ops_commit, &ctx, &self.key));
+        assert!(commit::matches(&set, &ops_commit), "the ops replay to the signed hash");
+        assert_eq!(ops_commit.hash, car.commit.hash, "listRepoOps and getRepo agree");
+        let latest = self.read("com.atproto.space.getLatestCommit", &[]).await.ok();
+        assert_eq!(bytes(&latest["commit"]["hash"]), car.commit.hash);
+        let noop = self.read("com.atproto.space.listRepoOps", &[("since", &car.commit.rev)]).await.ok();
+        assert_eq!(noop["ops"], json!([]));
+        assert_eq!(bytes(&noop["commit"]["hash"]), car.commit.hash, "the at-head poll signs the same view");
+        car
+    }
+}
+
+/// A record takedown (a vlpds extension) serves a view without the record
+/// that still verifies: getRepo's index and blocks leave it out and fold
+/// to the signed hash, listRepoOps leaves its ops out and replays to the
+/// same hash as getLatestCommit, and a syncer holding the old view sees a
+/// mismatch at the same rev. Reversing it serves the full repo again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_takedown_serves_a_consistent_view() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "sstd1", OWNER).await;
+    let member = SpaceClient::new(&s, "sstd2", ANY).await;
+    let space = owner.create_space(TYPE, "td").await;
+    put_member(&owner, &space, &member.did).await;
+    for rkey in ["a", "b", "c"] {
+        member.create_record(&space, COLL, Some(rkey), rec(rkey)).await.ok();
+    }
+    member.put_record(&space, COLL, "b", rec("b again")).await.ok();
+    let key = did_key(&s, &member.did).await;
+    let v = Viewer {
+        s: &s,
+        owner: &owner,
+        cred: owner.credential(&space).await,
+        space: space.clone(),
+        repo: member.did.clone(),
+        key,
+    };
+    let view = |values: bool| v.view(values);
+    let full = view(true).await;
+    assert_eq!(full.paths, [format!("{COLL}/a"), format!("{COLL}/b"), format!("{COLL}/c")]);
+
+    let uri = format!("{space}/{}/{COLL}/b", member.did);
+    let set = |applied: bool| {
+        let body = json!({
+            "subject": {"$type": "com.atproto.repo.strongRef", "uri": uri, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"},
+            "takedown": {"applied": applied, "ref": "t"},
+        });
+        let s = &s;
+        async move { s.xrpc.post("com.atproto.admin.updateSubjectStatus", &body, &Auth::Admin).await.ok() }
+    };
+    set(true).await;
+    let hidden = view(true).await;
+    assert_eq!(hidden.paths, [format!("{COLL}/a"), format!("{COLL}/c")]);
+    assert_eq!(hidden.commit.rev, full.commit.rev);
+    assert_ne!(hidden.commit.hash, full.commit.hash, "a syncer holding b mismatches at the same rev");
+    assert_eq!(view(false).await.paths, hidden.paths);
+    // a write while it's hidden keeps the view consistent
+    member.create_record(&space, COLL, Some("d"), rec("d")).await.ok();
+    assert_eq!(view(true).await.paths, [format!("{COLL}/a"), format!("{COLL}/c"), format!("{COLL}/d")]);
+    set(false).await;
+    let back = view(true).await;
+    assert_eq!(back.paths.len(), 4);
+}
+
 /// A 100k-record space repo: the next create is refused, and getRepo
 /// streams it holding only its paths and CIDs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

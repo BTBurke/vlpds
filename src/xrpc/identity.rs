@@ -294,6 +294,12 @@ async fn resolve_did(State(app): AppState, Query(q): Query<DidQ>) -> XResult<Jso
     Ok(Json(json!({"didDoc": doc})))
 }
 
+/// `did`'s handle when its document claims one that resolves back to it.
+pub(crate) async fn verified_handle(app: &App, did: &str) -> Option<String> {
+    let (_, info) = identity_info(app, did, false).await.ok()?;
+    info["handle"].as_str().filter(|h| *h != "handle.invalid").map(String::from)
+}
+
 /// (the account, if hosted here; {did, handle, didDoc}) of anyone, so a
 /// client can look up any identity through its PDS. The handle is
 /// "handle.invalid" unless it resolves back to the DID. `fresh` skips the

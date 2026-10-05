@@ -319,22 +319,25 @@ pub fn space_declaration(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
         Some(J::String(v)) => Ok(Some(v.clone())),
         Some(_) => Err(bad(k)),
     };
+    // proposals #118 renames `name` to `title`; either is taken
+    let field = if main.get("name").is_none() && main.get("title").is_some() { "title" } else { "name" };
     // zod's string length: UTF-16 code units
-    let name = main["name"]
+    let name = main[field]
         .as_str()
         .filter(|n| (1..=64).contains(&n.encode_utf16().count()))
-        .ok_or_else(|| bad("name"))?
+        .ok_or_else(|| bad(field))?
         .to_string();
-    let name_lang = match main.get("name:lang") {
+    let lang_field = format!("{field}:lang");
+    let name_lang = match main.get(&lang_field) {
         None => Vec::new(),
         Some(J::Object(m)) => m
             .iter()
             .map(|(lang, v)| match v.as_str() {
                 Some(v) if valid_language(lang) => Ok((lang.clone(), v.to_string())),
-                _ => Err(bad("name:lang")),
+                _ => Err(bad(&lang_field)),
             })
             .collect::<Result<_, _>>()?,
-        Some(_) => return Err(bad("name:lang")),
+        Some(_) => return Err(bad(&lang_field)),
     };
     let collections = main["collections"]
         .as_array()
@@ -1625,6 +1628,15 @@ mod tests {
         assert!(with(&|d| d["defs"]["main"]["name:lang"] = serde_json::json!({"not a tag": "x"})).is_err());
         assert!(with(&|d| d["defs"]["main"]["key"] = 1.into()).is_err());
         assert!(with(&|d| d["defs"]["main"]["type"] = "record".into()).is_err());
+        let titled = with(&|d| {
+            let m = d["defs"]["main"].as_object_mut().unwrap();
+            let name = m.remove("name").unwrap();
+            m.remove("name:lang");
+            m.insert("title".into(), name);
+            m.insert("title:lang".into(), serde_json::json!({"pt-BR": "Grupo"}));
+        });
+        assert_eq!(titled.as_ref().map(|d| (d.name.as_str(), d.name_lang.len())), Ok(("Group", 1)));
+        assert!(with(&|d| d["defs"]["main"].as_object_mut().unwrap().remove("name").map(drop).unwrap()).is_err());
         assert!(with(&|d| d["id"] = "com.example.other".into()).is_err());
         assert_eq!(
             with(&|d| d["defs"]["other"] = serde_json::json!({"type": "space", "name": "x", "collections": []})),

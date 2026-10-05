@@ -362,7 +362,9 @@ async fn outbox_waits_out_deactivation() {
 }
 
 /// A taken-down space record is hidden from getRecord, listRecords and
-/// listRepoOps values; the commit still covers it.
+/// listRepoOps, and the served commit is signed over the set without it
+/// (spaces_sync::record_takedown_serves_a_consistent_view has the sync
+/// side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn record_takedown_hides_the_record() {
     let s = spawn().await;
@@ -391,20 +393,19 @@ async fn record_takedown_hides_the_record() {
             let ops = a.signed_get(&s.url, "com.atproto.space.listRepoOps", &lr, cred, &a.did).await.ok();
             let rkeys: Vec<&str> =
                 list["records"].as_array().unwrap().iter().map(|r| r["rkey"].as_str().unwrap()).collect();
-            let op = ops["ops"].as_array().unwrap().iter().find(|o| o["rkey"] == json!("hidden")).unwrap().clone();
+            let op = ops["ops"].as_array().unwrap().iter().find(|o| o["rkey"] == json!("hidden")).cloned();
             let shown = ops["ops"].as_array().unwrap().iter().find(|o| o["rkey"] == json!("shown")).unwrap();
             assert!(shown.get("value").is_some(), "{ops}");
             if hidden {
                 own.err(400, "RecordNotFound");
                 viacred.err(400, "RecordNotFound");
                 assert_eq!(rkeys, ["shown"]);
-                assert!(op.get("value").is_none(), "{op}");
-                assert!(op["cid"].is_string(), "the op itself stays");
+                assert!(op.is_none(), "{ops}");
             } else {
                 own.ok();
                 viacred.ok();
                 assert_eq!(rkeys, ["shown", "hidden"]);
-                assert_eq!(op["value"]["text"], json!("x"));
+                assert_eq!(op.unwrap()["value"]["text"], json!("x"));
             }
             ops["commit"]["hash"].clone()
         }
@@ -412,9 +413,9 @@ async fn record_takedown_hides_the_record() {
     let before = check(false).await;
     set(true).await;
     let during = check(true).await;
-    assert_eq!(before, during, "the commit keeps the record (as for a public repo)");
+    assert_ne!(before, during, "the served commit leaves the record out");
     set(false).await;
-    check(false).await;
+    assert_eq!(check(false).await, before);
 }
 
 async fn space_keys(s: &TestServer, did: &str) -> Vec<String> {

@@ -27,7 +27,7 @@ const num = (expr) =>
     return acc * v;
   }, 1);
 
-const KEY = { Ip: "IP", IdentifierIp: "identifier + IP", Did: "DID", Node: "node", Cluster: "cluster" };
+const KEY = { Ip: "IP", IdentifierIp: "identifier + IP", Did: "DID", Node: "node", Cluster: "cluster", Credential: "space credential", DidPair: "DID + authority" };
 const fmtWindow = (ms) => (ms % consts.DAY === 0 ? `${ms / consts.DAY} day` : ms % consts.HOUR === 0 ? `${ms / consts.HOUR} h` : `${ms / consts.MINUTE} min`);
 
 const re = /limit!\(\s*\w+,\s*\d+,\s*"([^"]+)",\s*(\w+),\s*"(?:[^"\\]|\\.)*",\s*([^,]+?),\s*([^,]+?),?\s*\);/gs;

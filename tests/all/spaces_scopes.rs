@@ -1,0 +1,473 @@
+//! `space:` OAuth scopes end to end (`--spaces`; src/oauth/scopes.rs,
+//! src/oauth/lexicon.rs, src/oauth/ui.rs, src/xrpc/authn.rs): grants made
+//! concrete when the token is issued (a bare grant takes its type
+//! declaration's collections, `self` becomes the account, `include:` sets
+//! carry space permissions), collections and actions enforced on writes,
+//! read vs read_self, the consent screen's names and warning, and the
+//! Spaces rate-limit buckets.
+
+use crate::common::spaces::{resp, SpaceClient};
+use crate::common::*;
+use crate::oauth::{self, Browser, DpopKey, Flow, Srv};
+
+async fn spawn() -> TestServer {
+    TestServer::spawn_with(|c| c.spaces = true).await
+}
+
+fn srv(s: &TestServer) -> Srv {
+    Srv {
+        app: s.app.clone(),
+        base: s.url.clone(),
+        http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap(),
+    }
+}
+
+/// Publishes `doc` as `nsid`'s lexicon from a new account and pins the
+/// NSID authority's DNS lookup to it. Each test uses its own authority:
+/// the pin is process-wide.
+async fn publish(s: &TestServer, nsid: &str, main: J) {
+    let publisher = s.create_account("lexpub").await;
+    let lex = json!({"$type": "com.atproto.lexicon.schema", "lexicon": 1, "id": nsid, "defs": {"main": main}});
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": publisher.did, "collection": "com.atproto.lexicon.schema", "rkey": nsid, "record": lex, "validate": false}),
+            &publisher.auth(),
+        )
+        .await
+        .ok();
+    vlpds::oauth::lexicon::override_authority(&vlpds::oauth::lexicon::nsid_authority(nsid), &publisher.did);
+}
+
+fn rec(coll: &str) -> J {
+    json!({"$type": coll, "text": "hi", "createdAt": "2026-10-01T00:00:00.000Z"})
+}
+
+/// Another grant of `scope` to `c`'s account, by a new client key.
+async fn regrant(c: &SpaceClient, scope: &str) -> SpaceClient {
+    let acct = oauth::Account { did: c.did.clone(), handle: c.handle.clone(), jwt: c.session_jwt.clone() };
+    let key = DpopKey::new();
+    let t =
+        oauth::grant(&c.srv, &mut Browser::default(), &Flow::loopback(&format!("atproto {scope}"), &key), &acct).await;
+    SpaceClient {
+        srv: Srv { app: c.srv.app.clone(), base: c.srv.base.clone(), http: c.srv.http.clone() },
+        did: c.did.clone(),
+        handle: c.handle.clone(),
+        session_jwt: c.session_jwt.clone(),
+        key,
+        access: t.access,
+        scope: t.scope,
+        holder: Default::default(),
+    }
+}
+
+fn scopes(c: &SpaceClient) -> Vec<&str> {
+    c.scope.split(' ').collect()
+}
+
+/// A bare grant that writes takes its declaration's collections when the
+/// token is issued; one whose declaration doesn't resolve gets no write
+/// targets, and reads still work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bare_grant_takes_declared_collections() {
+    let s = spawn().await;
+    let ty = "com.c6decl.forum";
+    publish(
+        &s,
+        ty,
+        json!({"type": "space", "name": "Forum", "collections": ["com.c6decl.thread", "com.c6decl.reply"]}),
+    )
+    .await;
+    let a = SpaceClient::new(&s, "c6bare", &format!("space:{ty}?manage=create")).await;
+    let want = format!(
+        "space:{ty}?authority={}&collection=com.c6decl.reply&collection=com.c6decl.thread&manage=create",
+        a.did
+    );
+    assert!(scopes(&a).contains(&want.as_str()), "{}", a.scope);
+    let space = a.create_space(ty, "main").await;
+    a.create_record(&space, "com.c6decl.thread", Some("t1"), rec("com.c6decl.thread")).await.ok();
+    a.create_record(&space, "com.c6decl.reply", Some("r1"), rec("com.c6decl.reply")).await.ok();
+    let r = a.create_record(&space, "com.c6decl.other", None, rec("com.c6decl.other")).await;
+    r.err(403, "ScopeMissingError");
+    assert!(r.json["message"].as_str().unwrap().contains("collection=com.c6decl.other&action=create"), "{}", r.json);
+    // the grant's default actions include update and delete
+    a.put_record(&space, "com.c6decl.thread", "t1", rec("com.c6decl.thread")).await.ok();
+    a.delete_record(&space, "com.c6decl.reply", "r1").await.ok();
+
+    // a declaration naming `title` (proposals #118) works the same
+    let titled = "com.c6title.album";
+    publish(&s, titled, json!({"type": "space", "title": "Album", "collections": ["com.c6title.photo"]})).await;
+    let t = regrant(&a, &format!("space:{titled}?action=create&manage=create")).await;
+    let sp2 = t.create_space(titled, "pics").await;
+    t.create_record(&sp2, "com.c6title.photo", None, rec("com.c6title.photo")).await.ok();
+
+    // unresolvable: no write targets (fail closed); the grant still reads
+    let missing = "com.c6nodecl.forum";
+    vlpds::oauth::lexicon::override_authority(&vlpds::oauth::lexicon::nsid_authority(missing), &a.did);
+    let m = SpaceClient::new(&s, "c6miss", &format!("space:{missing}?manage=create")).await;
+    let bare = format!("space:{missing}?authority={}&manage=create", m.did);
+    assert!(scopes(&m).contains(&bare.as_str()), "{}", m.scope);
+    let sp3 = m.create_space(missing, "x").await;
+    m.create_record(&sp3, "com.c6nodecl.thread", None, rec("com.c6nodecl.thread")).await.err(403, "ScopeMissingError");
+    m.get("com.atproto.space.listRecords", &[("space", &sp3), ("repo", &m.did)]).await.ok();
+
+    // a declaration that isn't a space type fails closed too
+    let not_space = "com.c6notspace.forum";
+    publish(&s, not_space, json!({"type": "permission-set", "permissions": []})).await;
+    let n = regrant(&a, &format!("space:{not_space}?manage=create")).await;
+    let sp4 = n.create_space(not_space, "y").await;
+    n.create_record(&sp4, "com.c6notspace.thread", None, rec("com.c6notspace.thread"))
+        .await
+        .err(403, "ScopeMissingError");
+}
+
+/// `authority=self` is resolved to the account when the token is issued, so
+/// the grant covers only the account's own spaces; a type or an authority
+/// not granted is refused, and so is an action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn types_authorities_and_actions_are_enforced() {
+    let s = spawn().await;
+    let ty = "com.c6enf.group";
+    let coll = "com.c6enf.post";
+    let a = SpaceClient::new(
+        &s,
+        "c6enf",
+        &format!("space:{ty}?collection={coll}&action=read&action=create&manage=create space:com.c6enf.other?authority=*&action=read_self&manage=create"),
+    )
+    .await;
+    assert!(a.scope.contains(&format!("space:{ty}?authority={}&collection={coll}", a.did)), "{}", a.scope);
+    assert!(!a.scope.contains("authority=self"), "{}", a.scope);
+    let space = a.create_space(ty, "main").await;
+    a.create_record(&space, coll, Some("p1"), rec(coll)).await.ok();
+
+    // a collection not granted
+    let r = a.create_record(&space, "com.c6enf.reply", None, rec("com.c6enf.reply")).await;
+    r.err(403, "ScopeMissingError");
+    // actions not granted: update (putRecord over an existing record) and delete
+    let r = a.put_record(&space, coll, "p1", rec(coll)).await;
+    r.err(403, "ScopeMissingError");
+    assert!(r.json["message"].as_str().unwrap().contains("action=update"), "{}", r.json);
+    a.put_record(&space, coll, "p2", rec(coll)).await.ok();
+    let r = a.delete_record(&space, coll, "p1").await;
+    r.err(403, "ScopeMissingError");
+    assert!(r.json["message"].as_str().unwrap().contains("action=delete"), "{}", r.json);
+    let r = a
+        .apply_writes(
+            &space,
+            json!([{"$type": "com.atproto.space.applyWrites#delete", "collection": coll, "rkey": "p1"}]),
+        )
+        .await;
+    r.err(403, "ScopeMissingError");
+
+    // a type not granted for writing: its grant reads only
+    let other = a.create_space("com.c6enf.other", "o").await;
+    a.create_record(&other, coll, None, rec(coll)).await.err(403, "ScopeMissingError");
+    a.get("com.atproto.space.listRecords", &[("space", &other), ("repo", &a.did)]).await.ok();
+    // a type with no grant at all
+    let r = a
+        .post(
+            "com.atproto.simplespace.createSpace",
+            json!({
+                "spaceType": "com.c6enf.third",
+                "skey": "t",
+                "readPolicy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"},
+                "writePolicy": {"$type": "com.atproto.simplespace.defs#memberListPolicy"},
+                "appAccess": {"$type": "com.atproto.simplespace.defs#open"},
+            }),
+        )
+        .await;
+    r.err(403, "ScopeMissingError");
+
+    // an authority not granted: another account's space of the granted type
+    let b = SpaceClient::new(&s, "c6enfb", &format!("space:{ty}?collection={coll}&manage=create")).await;
+    let theirs = b.create_space(ty, "main").await;
+    let r = a.create_record(&theirs, coll, None, rec(coll)).await;
+    r.err(403, "ScopeMissingError");
+    assert!(r.json["message"].as_str().unwrap().contains(&format!("authority={}", b.did)), "{}", r.json);
+    let r = a.get("com.atproto.space.listRecords", &[("space", &theirs), ("repo", &a.did)]).await;
+    r.err(403, "ScopeMissingError");
+    a.delegation_token(&theirs).await.err(403, "ScopeMissingError");
+
+    // putRecord resolves to update: an update-only grant updates without create
+    let u = regrant(&a, &format!("space:{ty}?collection={coll}&action=update")).await;
+    u.put_record(&space, coll, "p1", rec(coll)).await.ok();
+    let r = u.put_record(&space, coll, "p9", rec(coll)).await;
+    r.err(403, "ScopeMissingError");
+    assert!(r.json["message"].as_str().unwrap().contains("action=create"), "{}", r.json);
+    u.create_record(&space, coll, None, rec(coll)).await.err(403, "ScopeMissingError");
+}
+
+/// read_self reads only the account's own repo and never mints a
+/// delegation token; read reads the whole space, and its token exchanges
+/// for a credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn read_self_vs_read() {
+    let s = spawn().await;
+    let ty = "com.c6read.group";
+    let coll = "com.c6read.post";
+    let a = SpaceClient::new(
+        &s,
+        "c6rs",
+        &format!("space:{ty}?collection={coll}&action=read_self&action=create&manage=create"),
+    )
+    .await;
+    let space = a.create_space(ty, "main").await;
+    a.create_record(&space, coll, Some("x"), rec(coll)).await.ok();
+    a.get("com.atproto.space.getRecord", &[("space", &space), ("repo", &a.did), ("collection", coll), ("rkey", "x")])
+        .await
+        .ok();
+    a.get("com.atproto.space.getLatestCommit", &[("space", &space), ("repo", &a.did)]).await.ok();
+    let r = a.delegation_token(&space).await;
+    r.err(403, "ScopeMissingError");
+    assert_eq!(
+        r.json["message"],
+        format!(r#"Missing required scope "space:{ty}?authority={}&skey=main&action=read""#, a.did)
+    );
+
+    let full = regrant(&a, &format!("space:{ty}?action=read")).await;
+    let cred = full.credential(&space).await;
+    let q = [("space", space.as_str()), ("repo", a.did.as_str()), ("collection", coll), ("rkey", "x")];
+    full.signed_get(&s.url, "com.atproto.space.getRecord", &q, &cred, &a.did).await.ok();
+}
+
+/// listSpaces unfiltered needs a wildcard grant (the filters are the scope
+/// target); a filtered listing needs the type.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_spaces_wildcard() {
+    let s = spawn().await;
+    let ty = "com.c6list.group";
+    let a = SpaceClient::new(&s, "c6ls", &format!("space:{ty}?action=read_self&manage=create")).await;
+    let space = a.create_space(ty, "main").await;
+    // `self` resolved: a filter naming the account is covered, any authority isn't
+    a.get("com.atproto.space.listSpaces", &[("spaceType", ty), ("did", &a.did)]).await.ok();
+    a.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await.err(403, "ScopeMissingError");
+    a.get("com.atproto.space.listSpaces", &[]).await.err(403, "ScopeMissingError");
+    let w = regrant(&a, "space:*?authority=*&action=read_self").await;
+    let all = w.get("com.atproto.space.listSpaces", &[]).await.ok();
+    assert_eq!(all["spaces"][0]["uri"], space.as_str());
+    w.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await.ok();
+    // a wildcard type at one authority covers that authority only
+    let one = regrant(&a, &format!("space:*?authority={}&action=read_self", a.did)).await;
+    one.get("com.atproto.space.listSpaces", &[("did", &a.did)]).await.ok();
+    one.get("com.atproto.space.listSpaces", &[]).await.err(403, "ScopeMissingError");
+}
+
+/// An `include:` permission set's space permissions (under its own NSID
+/// group) are granted, made concrete like a direct grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn include_carries_space_permissions() {
+    let s = spawn().await;
+    let set = "com.c6inc.auth";
+    publish(
+        &s,
+        set,
+        json!({"type": "permission-set", "title": "Group chat", "permissions": [
+            {"type": "permission", "resource": "space", "spaceType": "com.c6inc.group",
+             "collection": ["com.c6inc.msg"], "action": ["read", "create"], "manage": ["create"]},
+            {"type": "permission", "resource": "space", "spaceType": "app.bsky.group", "collection": ["*"]},
+            {"type": "permission", "resource": "space", "spaceType": "*"},
+        ]}),
+    )
+    .await;
+    let a = SpaceClient::new(&s, "c6inc", &format!("include:{set}")).await;
+    assert_eq!(
+        scopes(&a),
+        [
+            format!(
+                "space:com.c6inc.group?authority={}&collection=com.c6inc.msg&action=read&action=create&manage=create",
+                a.did
+            )
+            .as_str(),
+            "atproto"
+        ]
+    );
+    let space = a.create_space("com.c6inc.group", "chat").await;
+    a.create_record(&space, "com.c6inc.msg", None, rec("com.c6inc.msg")).await.ok();
+    a.delegation_token(&space).await.ok();
+}
+
+fn consent_html_has(html: &str, needles: &[&str]) {
+    for n in needles {
+        assert!(html.contains(n), "consent page should show {n:?}: {html}");
+    }
+}
+
+/// The consent page names a space type by its declaration, an authority by
+/// its verified handle (else its DID), and warns about every space on the
+/// network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn consent_names_and_warning() {
+    let s = spawn().await;
+    let ty = "com.c6ui.forum";
+    publish(&s, ty, json!({"type": "space", "name": "Book Club", "collections": ["com.c6ui.thread"]})).await;
+    let srv = srv(&s);
+    let owner = oauth::create_account(&srv, "c6owner").await;
+    let user = oauth::create_account(&srv, "c6user").await;
+    // its document never resolves, so no handle is shown
+    let stranger = "did:web:localhost";
+    let scope = format!(
+        "atproto space:{ty}?authority={} space:{ty}?authority={stranger}&action=read_self space:com.c6ui.nodecl?action=read space:*?authority=*&action=read_self",
+        owner.did
+    );
+    let key = DpopKey::new();
+    let f = Flow::loopback(&scope, &key);
+    let mut b = Browser::default();
+    let ru = f.request_uri(&srv, &oauth::pkce(), "c6").await;
+    let csrf = oauth::csrf_of(&b.authorize(&srv, &f, &ru).await.2);
+    let (st, _, html) = b.sign_in(&srv, &ru, &csrf, &user.handle, oauth::PASSWORD).await;
+    assert_eq!(st, 200, "{html}");
+    consent_html_has(
+        &html,
+        &[
+            // the declaration's name and the bare grant's declared collections
+            &format!(
+                "Book Club spaces on @{}: read everything and create, update and delete records (com.c6ui.thread)",
+                owner.handle
+            ),
+            &format!("Book Club spaces on {stranger}: read only your own data"),
+            "com.c6ui.nodecl spaces on your account: read everything",
+            "All spaces on the network: read only your own data",
+            "every space on the network",
+        ],
+    );
+    assert_eq!(html.matches("class=\"warn\"").count(), 1, "one warning, on the universal grant: {html}");
+
+    // a narrower grant gets no warning
+    let f2 = Flow::loopback(&format!("atproto space:*?authority={}&action=read", owner.did), &key);
+    let ru = f2.request_uri(&srv, &oauth::pkce(), "c6b").await;
+    let mut b = Browser::default();
+    let csrf = oauth::csrf_of(&b.authorize(&srv, &f2, &ru).await.2);
+    let (_, _, html) = b.sign_in(&srv, &ru, &csrf, &user.handle, oauth::PASSWORD).await;
+    consent_html_has(&html, &[&format!("All spaces on @{}: read everything", owner.handle)]);
+    assert!(!html.contains("every space on the network"), "{html}");
+}
+
+async fn set_limits(s: &TestServer, limiters: J) {
+    s.xrpc
+        .post(
+            "vlpds.admin.updateRateLimits",
+            &json!({"config": {"limiters": limiters}, "ifVersion": 0, "actor": "it-test"}),
+            &Auth::Admin,
+        )
+        .await
+        .ok();
+}
+
+async fn service_jwt(s: &TestServer, iss: &str, aud: &str, lxm: &str) -> String {
+    let acct = s.app.account(iss).await.ok().unwrap();
+    let key = s.app.secrets.account_signing_key(&acct).await.unwrap();
+    vlpds::auth::service_auth_jwt(&key, iss, aud, Some(lxm), 60).unwrap()
+}
+
+async fn signed_read(s: &TestServer, who: &SpaceClient, space: &str, repo: &str, cred: &str) -> Resp {
+    let q = [("space", space), ("repo", repo)];
+    who.signed_get(&s.url, "com.atproto.space.getLatestCommit", &q, cred, repo).await
+}
+
+async fn bearer_post(s: &TestServer, nsid: &str, jwt: &str, body: J) -> Resp {
+    let r = reqwest::Client::new().post(format!("{}/xrpc/{nsid}", s.url)).bearer_auth(jwt).json(&body).send().await;
+    resp(r.unwrap()).await
+}
+
+/// Each Spaces bucket answers 429 once its points are spent: reads per
+/// credential and per account, getSpaceCredential per (account,
+/// authority), inbound notifyWrite per writer, revocations per authority.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_rate_buckets_trip() {
+    let s = TestServer::spawn_with(|c| {
+        c.spaces = true;
+        c.rate_limits_enabled = true;
+    })
+    .await;
+    let ty = "com.c6rl.group";
+    let coll = "com.c6rl.post";
+    let full =
+        format!("space:{ty}?authority=*&collection={coll}&action=read&action=create&manage=create&manage=update");
+    let a = SpaceClient::new(&s, "c6rla", &full).await;
+    let b = SpaceClient::new(&s, "c6rlb", &full).await;
+    let space = a.create_space(ty, "main").await;
+    a.create_record(&space, coll, Some("x"), rec(coll)).await.ok();
+    a.post("com.atproto.simplespace.putMember", json!({"space": space, "did": b.did, "read": true, "write": true}))
+        .await
+        .ok();
+    set_limits(
+        &s,
+        json!({
+            "space-read-account": {"points": 2},
+            "space-read-credential": {"points": 2},
+            "space-credential": {"points": 2},
+            "space-notify-in": {"points": 1},
+            "space-revoke": {"points": 1},
+        }),
+    )
+    .await;
+    let tripped = |r: &Resp, limit: i64| {
+        r.err(429, "RateLimitExceeded");
+        assert_eq!(r.header("ratelimit-limit").and_then(|v| v.parse::<i64>().ok()), Some(limit), "{r:?}");
+    };
+
+    // space-read-account: the account's own OAuth reads
+    let own = [("space", space.as_str()), ("repo", a.did.as_str())];
+    for _ in 0..2 {
+        a.get("com.atproto.space.getLatestCommit", &own).await.ok();
+    }
+    tripped(&a.get("com.atproto.space.listRecords", &own).await, 2);
+    tripped(&a.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await, 2);
+    // another account has its own budget
+    b.get("com.atproto.space.listSpaces", &[("spaceType", ty)]).await.ok();
+
+    // space-credential: per (account, authority); a refused exchange keeps its token
+    let c1 = b.credential(&space).await;
+    b.credential(&space).await;
+    let token = b.delegation_token(&space).await.ok()["token"].as_str().unwrap().to_string();
+    tripped(&b.exchange(&s.url, &space, &token).await, 2);
+    a.credential(&space).await;
+
+    // space-read-credential: per credential
+    for _ in 0..2 {
+        signed_read(&s, &b, &space, &a.did, &c1).await.ok();
+    }
+    tripped(&signed_read(&s, &b, &space, &a.did, &c1).await, 2);
+    let c2 = a.credential(&space).await;
+    signed_read(&s, &a, &space, &a.did, &c2).await.ok();
+
+    // space-notify-in: per writer (b's notifyWrite reaching its authority)
+    let notify = json!({"space": space, "repo": b.did, "repoRev": "3l2cqzy5yf22a", "hash": {"$bytes": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}});
+    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyWrite").await;
+    let first = bearer_post(&s, "com.atproto.space.notifyWrite", &jwt, notify.clone()).await;
+    assert_ne!(first.status, 429, "{first:?}");
+    let jwt = service_jwt(&s, &b.did, &a.did, "com.atproto.space.notifyWrite").await;
+    tripped(&bearer_post(&s, "com.atproto.space.notifyWrite", &jwt, notify).await, 1);
+
+    // space-revoke: per authority
+    let revoke = |jti: &str| json!({"space": space, "credentials": [jti]});
+    let lxm = "com.atproto.space.notifyCredentialRevoked";
+    let jwt = service_jwt(&s, &a.did, &b.did, lxm).await;
+    bearer_post(&s, lxm, &jwt, revoke("3l2cqzy5yf22b")).await.ok();
+    let jwt = service_jwt(&s, &a.did, &b.did, lxm).await;
+    tripped(&bearer_post(&s, lxm, &jwt, revoke("3l2cqzy5yf22c")).await, 1);
+}
+
+/// With `--spaces` off nothing changes: `space:` scopes aren't offered and
+/// a permission set's space permissions are dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flag_off_grants_no_space_permissions() {
+    let s = TestServer::spawn().await;
+    let set = "com.c6off.auth";
+    publish(
+        &s,
+        set,
+        json!({"type": "permission-set", "permissions": [
+            {"type": "permission", "resource": "space", "spaceType": "com.c6off.group", "collection": ["*"]},
+            {"type": "permission", "resource": "repo", "collection": ["com.c6off.thing"]},
+        ]}),
+    )
+    .await;
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6off").await;
+    let key = DpopKey::new();
+    let t =
+        oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&format!("atproto include:{set}"), &key), &acct)
+            .await;
+    assert_eq!(t.scope, "repo:com.c6off.thing atproto");
+}

@@ -4,7 +4,7 @@
 //! only on its pages: the auto-submit of the `response_mode=form_post`
 //! page, and the passkey ceremony on the sign-in pages ([`PASSKEY_JS`]).
 
-use super::scopes::{IncludeScope, Permission};
+use super::scopes::{IncludeScope, Permission, SpacePermission};
 use super::util::{html_escape as e, sha256};
 use base64::Engine;
 use serde_json::Value as J;
@@ -483,8 +483,21 @@ and it can't be narrowed. Untick it to refuse it entirely.";
 const CHAT_WARNING: &str =
     "A broad grant covering all of your private messages. It only works together with full access to your account.";
 
-/// One row per requested scope, in request order.
-pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<ScopeRow> {
+const SPACE_UNIVERSAL_WARNING: &str = "This app is asking for every space on the network: whatever anyone \
+shares with you in a space, anywhere. That's a very broad grant. Only allow it for an app you trust completely.";
+
+/// Names for `space:` grants on the consent screen (`--spaces`): type
+/// declarations by NSID and the handles of authority DIDs that resolve back
+/// to them. A missing one shows the NSID or the DID.
+#[derive(Debug, Default)]
+pub struct SpaceNames {
+    pub decls: std::collections::HashMap<String, crate::lexicon::SpaceDecl>,
+    pub handles: std::collections::HashMap<String, String>,
+}
+
+/// One row per requested scope, in request order. `names`: Some with
+/// `--spaces`.
+pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)], names: Option<&SpaceNames>) -> Vec<ScopeRow> {
     let mut out = Vec::new();
     for s in scope.split(' ').filter(|s| !s.is_empty()) {
         let row = |title: &str, warning| ScopeRow {
@@ -503,7 +516,10 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<ScopeRow>
             "transition:chat.bsky" => out.push(row("Read and send your Bluesky private messages", Some(CHAT_WARNING))),
             "transition:email" => out.push(row("Read your email address", None)),
             _ => {
-                if let Some(p) = Permission::parse(s) {
+                if let (Some(Permission::Space(p)), Some(names)) = (Permission::parse(s), names) {
+                    let universal = p.space_type == "*" && p.authority == "*";
+                    out.push(row(&describe_space(&p, names), universal.then_some(SPACE_UNIVERSAL_WARNING)));
+                } else if let Some(p) = Permission::parse(s) {
                     out.push(row(&describe_permission(&p), None));
                 } else if let Some(inc) = IncludeScope::parse(s) {
                     let set = sets.iter().find(|(i, _)| i == &inc).map(|(_, j)| j);
@@ -513,7 +529,14 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<ScopeRow>
                         r.detail.push_str(&format!("<p class=\"sd\">{}</p>", e(d)));
                     }
                     if let Some(set) = set {
-                        let inner: Vec<String> = inc.to_permissions(set).iter().map(describe_permission).collect();
+                        let inner: Vec<String> = inc
+                            .to_permissions(set, names.is_some())
+                            .iter()
+                            .map(|p| match (p, names) {
+                                (Permission::Space(p), Some(n)) => describe_space(p, n),
+                                _ => describe_permission(p),
+                            })
+                            .collect();
                         if !inner.is_empty() {
                             r.detail.push_str("<ul class=\"perms\">");
                             for i in inner {
@@ -619,33 +642,55 @@ pub fn describe_permission(p: &Permission) -> String {
                 "Manage your identity (handle and DID document)".into()
             }
         }
-        Permission::Space(p) => {
-            let kind = if p.space_type == "*" { "any type".to_string() } else { p.space_type.clone() };
-            let whose = match p.authority.as_str() {
-                "self" => "your own spaces".to_string(),
-                "*" => "any account's spaces".to_string(),
-                did => format!("spaces of {did}"),
+        Permission::Space(p) => describe_space(p, &SpaceNames::default()),
+    }
+}
+
+/// Reference consent `SpaceRow`: the declaration's name for the type, the
+/// authority's verified handle (else its DID), and a bare grant's writes as
+/// its declaration's collections, which is what the token will carry.
+pub fn describe_space(p: &SpacePermission, names: &SpaceNames) -> String {
+    let decl = names.decls.get(&p.space_type);
+    let p = match decl {
+        Some(d) if p.space_type != "*" => p.clone().with_default_collections(&d.collections),
+        _ => p.clone(),
+    };
+    let owner = match p.authority.as_str() {
+        "self" => "your account".to_string(),
+        did => names.handles.get(did).map(|h| format!("@{h}")).unwrap_or_else(|| did.to_string()),
+    };
+    let kind = decl.map(|d| d.name.clone()).unwrap_or_else(|| p.space_type.clone());
+    let what = match (p.space_type.as_str(), p.authority.as_str()) {
+        ("*", "*") => "All spaces on the network".to_string(),
+        ("*", _) => format!("All spaces on {owner}"),
+        (_, "*") => format!("{kind} spaces"),
+        _ => format!("{kind} spaces on {owner}"),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if p.action.iter().any(|a| a == "read") {
+        parts.push("read everything".into());
+    } else if p.action.iter().any(|a| a == "read_self") {
+        parts.push("read only your own data".into());
+    }
+    if let Some(c) = &p.collection {
+        let verbs: Vec<&str> =
+            p.action.iter().map(String::as_str).filter(|a| ["create", "update", "delete"].contains(a)).collect();
+        if !verbs.is_empty() {
+            let colls = match c.iter().any(|c| c == "*") {
+                true => "of any kind".to_string(),
+                false => format!("({})", c.join(", ")),
             };
-            let mut verbs: Vec<&str> = Vec::new();
-            if p.action.iter().any(|a| a == "read") {
-                verbs.push("read");
-            } else if p.action.iter().any(|a| a == "read_self") {
-                verbs.push("read your own records in");
-            }
-            if p.collection.is_some() {
-                verbs.extend(p.action.iter().filter_map(|a| match a.as_str() {
-                    "create" => Some("create"),
-                    "update" => Some("update"),
-                    "delete" => Some("delete"),
-                    _ => None,
-                }));
-            }
-            if p.manage.is_some() {
-                verbs.push("manage");
-            }
-            format!("{} {whose} ({kind})", capitalize(&join_and(&verbs)))
+            parts.push(format!("{} records {colls}", join_and(&verbs)));
         }
     }
+    if p.manage.is_some() {
+        parts.push("manage the space and its members".into());
+    }
+    if parts.is_empty() {
+        parts.push("no access".into());
+    }
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+    format!("{what}: {}", join_and(&parts))
 }
 
 fn capitalize(s: &str) -> String {

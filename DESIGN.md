@@ -5251,10 +5251,24 @@ Deliberate divergences from the reference:
   The reference resolves the key on every request. Revocation and the
   request's own signature are still checked on every read.
 - A taken-down space record (`sec/td/space/{sid}/{collection}/{rkey}`) is
-  hidden from getRecord, listRecords and listRepoOps values, but it stays
-  in the repo's LtHash, the way a taken-down public record stays in the
-  signed repo. A syncer that compares hashes then sees a mismatch and
-  falls back to getRepo. The reference has no space record takedowns.
+  left out of everything served: getRecord, listRecords, listRepoOps (its
+  ops too), getRepo's index and blocks. The commit getLatestCommit,
+  listRepoOps and getRepo sign is over the LtHash less that record's
+  element, so the view still verifies. A syncer that held the record sees
+  a mismatch at the same rev, falls back to getRepo and converges, and a
+  reversal flips it back the same way. The reference has no space record
+  takedowns, and its LtHash has no answer for one (Q11). This is one
+  upstream could adopt. The set taken down is tiny and comes from the
+  account's cached takedowns, so an untouched space pays nothing for it.
+- A bare `space:` grant that writes takes its type declaration's
+  collections when the token is issued, as in the reference. If the
+  declaration doesn't resolve, the reference fails the token request.
+  vlpds issues the token with no write targets instead (still fail
+  closed), so one unpublished type doesn't break a whole grant, and it
+  doesn't refuse the authorization request either. A grant that only reads
+  or manages skips the lookup, since collections only name write targets.
+- `space:` scopes also take indigo's `spaceType` parameter for the type
+  (`space?spaceType=…`). The reference only knows `type`.
 - The oplog keeps 7 days of ops (`--space-oplog-retention`). The reference
   keeps every op, and the spec only says a host may drop them. A node
   sweeps its shards' oplogs every ~6 h in frameless entries, never per
