@@ -3004,14 +3004,20 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
             )));
         }
     }
-    // The PDS mints space-method tokens itself (notifyWrite as a writer,
-    // notifyCredentialRevoked as an authority), whatever --spaces says: one
-    // in an app's hands forges the account's writer state or revokes
-    // credentials in spaces it governs.
+    // A space-method token carries authority (a notifyWrite as a writer, a
+    // revocation as an authority) to another host: OAuth apps get one only
+    // with a space: grant covering it, never from transition:generic or rpc:
+    // alone, and other credentials never (space data is OAuth-only).
     if let Some(l) = lxm.filter(|l| crate::space::is_space_nsid(l)) {
-        return Err(invalid_request(format!(
-            "cannot request a service auth token for the following protected method: {l}"
-        )));
+        let ok = match &creds {
+            Credentials::OAuth { scopes, .. } => scopes.allows_space_service_auth(l, &did),
+            _ => false,
+        };
+        if !ok {
+            return Err(invalid_request(format!(
+                "insufficient access to request a service auth token for the following method: {l} (needs an OAuth space: grant covering it)"
+            )));
+        }
     }
     // a scoped app password is held to its scopes here as OAuth is: else a
     // service token would carry what the scopes withhold

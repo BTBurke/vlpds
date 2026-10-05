@@ -1012,6 +1012,25 @@ impl ScopeSet {
     pub fn allows_space(&self, t: &SpaceTarget, access: SpaceAccess) -> bool {
         self.perms.iter().any(|p| matches!(p, Permission::Space(s) if s.matches(t, access)))
     }
+
+    /// Whether a `space:` grant covers a service token for space method
+    /// `lxm`, which an app sends to another host as `user`: a revocation
+    /// needs authority powers (`manage`, or the user's own spaces), a
+    /// notifyWrite a write action, anything else some space grant.
+    /// `transition:generic` and `rpc:` alone never do.
+    pub fn allows_space_service_auth(&self, lxm: &str, user: &str) -> bool {
+        let lxm = lxm.to_ascii_lowercase();
+        self.perms.iter().any(|p| match p {
+            Permission::Space(s) => match lxm.as_str() {
+                "com.atproto.space.notifycredentialrevoked" => {
+                    s.manage.as_ref().is_some_and(|m| !m.is_empty()) || s.authority == user
+                }
+                "com.atproto.space.notifywrite" => s.writes(),
+                _ => true,
+            },
+            _ => false,
+        })
+    }
 }
 
 #[cfg(test)]

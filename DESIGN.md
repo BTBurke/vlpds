@@ -5550,11 +5550,16 @@ the space row, and counts a mismatch in
   catches up with listRepos as it would with the reference.
 - Space data is OAuth-only. App passwords (scoped or not) and password
   sessions are refused on every space and simplespace method, delegation
-  tokens included. `getServiceAuth` mints nobody a token for a
-  `com.atproto.space.*` or `com.atproto.simplespace.*` method, OAuth
-  and `--spaces` off included: the PDS mints notifyWrite and
-  notifyCredentialRevoked itself, and an app holding one could forge the
-  account's writer state or revoke credentials in its spaces. The
+  tokens included. `getServiceAuth` mints a token for a
+  `com.atproto.space.*` or `com.atproto.simplespace.*` method (with
+  `--spaces` on or off) only to an OAuth app whose `space:` grant covers
+  the action: `manage` or the account's own spaces for
+  notifyCredentialRevoked (an authority's app revoking at member hosts),
+  a write action for notifyWrite, some space grant for the rest.
+  `transition:generic` or `rpc:` alone never does, where the reference
+  checks only `rpc:`; otherwise an app could forge the account's writer
+  state or revoke credentials in its spaces. The `atproto-proxy`
+  pipethrough never carries a space method. The
   reference lets them read and write the account's own space records.
   `vlpds.space.importRepo` is no exception, so an account moving in
   imports after it's activated (see below).

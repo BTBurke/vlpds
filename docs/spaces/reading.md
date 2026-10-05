@@ -64,11 +64,13 @@ failover.
 
 Space data is OAuth-only on vlpds. The reference lets legacy app passwords read and write the
 account's own space records, so this is a deliberate divergence
-([Interop](interop.md#where-vlpds-differs)). `getServiceAuth` goes further: nobody gets a service
-token for a `com.atproto.space.*` or `com.atproto.simplespace.*` method, OAuth apps included, with
-`--spaces` on or off. vlpds mints those itself (a `notifyWrite` as the writer, a
-`notifyCredentialRevoked` as the authority), and an app holding one could fake the account's writes
-to an authority or revoke credentials in spaces the account runs. `vlpds.space.importRepo` is OAuth
+([Interop](interop.md#where-vlpds-differs)). `getServiceAuth` follows the same rule for a
+`com.atproto.space.*` or `com.atproto.simplespace.*` method, with `--spaces` on or off: an app
+password or password session never gets a token for one, and an OAuth app needs a `space:` grant
+that covers it. `transition:generic` or `rpc:` alone isn't enough. A `notifyCredentialRevoked`
+token (an authority's app revoking at member hosts) needs `manage` or the account's own spaces, a
+`notifyWrite` token a write action, and any other space method some `space:` grant. Otherwise an
+app could fake the account's writes to an authority or revoke credentials in spaces it runs. `vlpds.space.importRepo` is OAuth
 too, so an account moving in imports after it's activated ([Moving a repo in](storage.md#moving-a-repo-in)). The consent screen names a space type by its
 declaration, an authority by its handle when the handle resolves back to it (else the DID), and
 warns on `space:*?authority=*`.
