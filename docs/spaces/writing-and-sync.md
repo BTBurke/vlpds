@@ -134,7 +134,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 - title: Check the rev
   body: "`repoRev` more than 5 min in the future gets `FutureRev`. The writer must pass the space's `writePolicy` (a managing app is asked with `checkUserAccess`)."
 - title: Sequence it on the authority's worker
-  body: "A `repoRev` at or below the writer's last one is a no-op, so a resent notify is harmless. Otherwise the worker assigns the next `spaceRev` (a TID) and writes `sW` plus the `sQ` swap as one private entry. One worker per authority means no lock."
+  body: "A `repoRev` below the writer's last one is a no-op, and so is the same `repoRev` with the same hash, so a resent notify is harmless. The same `repoRev` with another hash is a record takedown or its reversal changing what the writer serves ([Privacy](privacy.md#takedowns)), so it's sequenced again. Otherwise the worker assigns the next `spaceRev` (a TID) and writes `sW` plus the `sQ` swap as one private entry. One worker per authority means no lock."
 - title: Answer 200 once it's durable
   body: "The writer's outbox only drops its row after this."
 - title: Fan out

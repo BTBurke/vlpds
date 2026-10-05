@@ -5321,8 +5321,15 @@ at most 8 to one authority and 32 in all to authorities whose last send
 failed, so a tarpit authority holds up nobody else.
 
 At the authority, a `repoRev` more than 5 min ahead gets `FutureRev`, the
-writer must pass the space's write policy, and a `repoRev` at or below the
-writer's last is a no-op. Otherwise the authority's worker assigns the next
+writer must pass the space's write policy, and a `repoRev` below the
+writer's last, or equal to it with the same hash, is a no-op. The same
+`repoRev` with another hash is sequenced again: a record takedown or its
+reversal changes what the writer serves at the same rev, and its host
+pushes that (an outbox renotify, or the authority's own entry when the
+repo is its own), so syncers get a forward with the spec's "same rev,
+new hash" signal and refetch at once. Every outbox send works out the
+served hash when it goes, so a resent row can't put the old one back.
+Otherwise the authority's worker assigns the next
 spaceRev (a TID) and writes `sW` and the `sQ` swap as one private entry
 before the 200. One worker per authority means no lock.
 

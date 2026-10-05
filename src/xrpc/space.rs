@@ -116,13 +116,22 @@ fn forbidden(m: impl Into<String>) -> XrpcError {
 /// first write over rows an import or a sweep left behind clears them and
 /// runs again.
 pub(super) async fn submit_space(app: &App, did: &str, space: &Space, op: SpaceOp) -> XResult<SpaceAck> {
-    match submit_space_once(app, did, space, op).await? {
+    let ack = match submit_space_once(app, did, space, op).await? {
         Err(SpaceError::Unswept(writes)) => {
             super::space_import::sweep_unheaded(app, did, space).await?;
             submit_space_once(app, did, space, SpaceOp::Write { writes }).await?.map_err(space_error)
         }
         r => r.map_err(space_error),
+    }?;
+    // the authority's own write sequenced its whole set: with records of it
+    // taken down, what it serves (and so listRepos) is the set without them
+    if matches!(ack, SpaceAck::Write { rev: Some(_), .. })
+        && did == space.authority
+        && !hidden_paths(app, did, &space.sid).await?.is_empty()
+    {
+        push_served_hash(app, did, space.sid).await?;
     }
+    Ok(ack)
 }
 
 pub(super) async fn submit_space_once(
@@ -482,6 +491,73 @@ pub(crate) async fn space_sid_takendown(app: &App, authority: &str, sid: &SpaceI
 pub(super) async fn hidden_paths(app: &App, repo: &str, sid: &SpaceId) -> XResult<Vec<String>> {
     let ctl = super::server::ctl(app, repo).await?;
     Ok(ctl.takedowns_under(&takedown_name(sid, "")))
+}
+
+/// The hash `repo` serves in `space` at `rev` when records of it there are
+/// taken down: its set less those, which is what its authority should hold.
+/// None: nothing is hidden, or the head is past `rev` (a newer notify
+/// follows).
+async fn served_digest(app: &App, repo: &str, space: &Space, rev: Tid) -> XResult<Option<[u8; 32]>> {
+    let hidden = hidden_paths(app, repo, &space.sid).await?;
+    if hidden.is_empty() {
+        return Ok(None);
+    }
+    let p = app.partition(repo)?;
+    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let Some(v) = snap.get(state::space_head_key(repo, &space.sid)).await.map_err(XrpcError::from_err)? else {
+        return Ok(None);
+    };
+    let row = HeadRow::decode(&v).map_err(XrpcError::from_err)?;
+    if row.rev != rev {
+        return Ok(None);
+    }
+    Ok(Some(served_set(&snap, repo, &space.sid, &row.hash, &hidden).await?.digest()))
+}
+
+/// A record takedown or its reversal in `sid` changed what `repo` serves
+/// there at its current rev, so its authority (and through it the space's
+/// syncers) hears the new hash at the same rev: from the outbox, or at
+/// once when the repo is the authority's own. Best effort: syncers polling
+/// see it anyway.
+async fn push_served_hash(app: &App, repo: &str, sid: SpaceId) -> XResult<()> {
+    let sp = spaces(app)?;
+    let p = app.partition(repo)?;
+    let Some(v) = p.db.get(state::space_head_key(repo, &sid)).await.map_err(XrpcError::from_err)? else {
+        return Ok(());
+    };
+    let row = HeadRow::decode(&v).map_err(XrpcError::from_err)?;
+    let space = Space::parse(&row.uri)?;
+    if space.authority != repo {
+        sp.outbox.renotify(repo, sid, &row.uri, row.rev, row.hash.digest());
+        return Ok(());
+    }
+    let hash = served_digest(app, repo, &space, row.rev).await?.unwrap_or_else(|| row.hash.digest());
+    let op = SpaceOp::RecordWriter { writer: repo.to_string(), repo_rev: row.rev, hash, managing_app: None };
+    submit_space_once(app, repo, &space, op).await?.map(|_| ()).map_err(space_error)
+}
+
+/// After `muts` were written to `did`'s private state here (its shard's
+/// owner): a space record takedown or reversal among them is pushed.
+pub(super) async fn sec_written(app: &App, did: &str, muts: &[crate::segment::Mutation]) {
+    if app.spaces.is_none() || app.remote_owner(did).is_some() {
+        return;
+    }
+    let prefix = state::private_key(did, &format!("{}space/", super::server::TAKEDOWN));
+    let mut sids: Vec<SpaceId> = Vec::new();
+    for m in muts {
+        let Some(rest) = m.key.strip_prefix(prefix.as_slice()) else { continue };
+        // a record's (`{sid}/{path}`), not the space's own (`{sid}`)
+        let Some((hex_sid, path)) = std::str::from_utf8(rest).ok().and_then(|r| r.split_once('/')) else { continue };
+        let Some(sid) = hex::decode(hex_sid).ok().and_then(|b| SpaceId::try_from(b).ok()) else { continue };
+        if !path.is_empty() && !sids.contains(&sid) {
+            sids.push(sid);
+        }
+    }
+    for sid in sids {
+        if let Err(e) = push_served_hash(app, did, sid).await {
+            tracing::info!(%did, space = %hex::encode(sid), "space takedown push failed: {}", e.message);
+        }
+    }
 }
 
 /// `set` less the hidden records as `snap` holds them.
@@ -1487,6 +1563,12 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         None => {}
     }
     let Ok(space) = Space::parse(&p.uri) else { return Outcome::Refused("not a space uri".into()) };
+    // worked out now, so a resent row (a rescan, a takedown's renotify)
+    // never hands the authority a hash the repo no longer serves
+    let hash = match served_digest(app, &p.did, &space, p.repo_rev).await {
+        Ok(h) => h.unwrap_or(p.hash),
+        Err(e) => return Outcome::Retry(format!("{}: {}", e.error, e.message)),
+    };
     let outcome = |r: XResult<()>| match r {
         Ok(()) => Outcome::Delivered,
         Err(e) if e.status.is_server_error() => Outcome::Retry(format!("{}: {}", e.error, e.message)),
@@ -1495,7 +1577,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     // an authority hosted by this cluster is told without HTTP or service
     // auth: here, or at its shard's owner
     if let Some(owner) = app.remote_owner(&space.authority) {
-        match notify_owner(app, &owner, &space, p).await {
+        match notify_owner(app, &owner, &space, p, hash).await {
             Ok(Some(r)) => return outcome(r),
             Ok(None) => {}
             Err(e) => return Outcome::Retry(format!("{}: {}", e.error, e.message)),
@@ -1503,7 +1585,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     } else if app.partition(&space.authority).is_ok()
         && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some())
     {
-        let r = process_notify_write(app, &space, &p.did, p.repo_rev, p.hash).await;
+        let r = process_notify_write(app, &space, &p.did, p.repo_rev, hash).await;
         metrics::space_notify("in", notify_in_result(&r));
         return outcome(r.map(|_| ()));
     }
@@ -1523,7 +1605,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         "space": space.uri,
         "repo": &*p.did,
         "repoRev": p.repo_rev.to_string(),
-        "hash": b64(&p.hash),
+        "hash": b64(&hash),
     });
     let url = format!("{}/xrpc/{lxm}", endpoint.trim_end_matches('/'));
     let req = match crate::http::guarded(app.config.dev_mode).request(reqwest::Method::POST, &url) {
@@ -1551,12 +1633,18 @@ struct InternalNotify {
 /// An outbox send to the owner of the authority's shard, another node of
 /// this cluster. Ok(None): the authority isn't an account of the cluster;
 /// Ok(Some(the authority's answer)); Err: the owner couldn't be asked.
-async fn notify_owner(app: &App, owner: &str, space: &Space, p: &Pending) -> XResult<Option<XResult<()>>> {
+async fn notify_owner(
+    app: &App,
+    owner: &str,
+    space: &Space,
+    p: &Pending,
+    hash: [u8; 32],
+) -> XResult<Option<XResult<()>>> {
     let body = InternalNotify {
         space: space.uri.clone(),
         repo: p.did.to_string(),
         repo_rev: p.repo_rev.to_string(),
-        hash: base64::engine::general_purpose::STANDARD_NO_PAD.encode(p.hash),
+        hash: base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash),
     };
     let r = app
         .http

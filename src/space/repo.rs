@@ -754,7 +754,9 @@ fn sequence(
     muts: &mut Vec<Mutation>,
 ) -> Result<Option<Sequenced>, SpaceError> {
     let old = *host.writers.get(writer).ok_or_else(|| internal("space writer state not loaded"))?;
-    if old.is_some_and(|o| o.repo_rev >= repo_rev) {
+    // the same rev with another hash is sequenced again: a record takedown
+    // or its reversal changes the hash a repo serves without a new rev
+    if old.is_some_and(|o| o.repo_rev > repo_rev || (o.repo_rev == repo_rev && o.hash == hash)) {
         return Ok(None);
     }
     let prev = host.max_space_rev;
@@ -1257,6 +1259,16 @@ mod tests {
         assert_eq!(muts.len(), 3, "the old sQ entry goes");
         assert!(s2.space_rev > s1.space_rev);
         assert_eq!(s2.prev, Some(s1.space_rev));
+        // the same rev with another hash (a takedown's adjusted view): again
+        let (_, s3) =
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [2; 32], None, 1).unwrap().unwrap();
+        assert_eq!(s3.prev, Some(s2.space_rev));
+        assert!(record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [2; 32], None, 1)
+            .unwrap()
+            .is_none());
+        assert!(record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [3; 32], None, 1)
+            .unwrap()
+            .is_none());
         // not a member
         let e = record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:x", Tid(10), [1; 32], None, 1).err().unwrap();
         assert!(matches!(e, SpaceError::NotAuthorized(_)));
