@@ -44,6 +44,39 @@ The drivers start vlpds themselves (`lib/vlpds.mjs`) with `--dev-mode --spaces` 
 fault sim can kill it. `CLUSTER=1` starts 3 nodes on MinIO behind a small round-robin balancer on
 the same port, as in `tests/E2E.md`. `MEMORY=1` uses `--memory` instead of MinIO.
 
+## Real R2
+
+`STORE=r2` runs vlpds on a real bucket instead of MinIO, so latency and request counts are the
+network's and not loopback's. The PLC and the reference PDSes stay local.
+
+```
+STORE=r2 VLPDS_BIN=... bench/spaces/run.sh cost
+STORE=r2 SCALE=r2 bench/spaces/run.sh boards all-vlpds
+bench/spaces/r2-clean.sh bench/<run-id>          # afterwards, with the prefix run.sh printed
+```
+
+- `run.sh` loads `R2_ENV` (default `~/.config/cloudflare/vlpds-bench-r2.env`, mode 600) with `set -a`.
+  It holds `VLPDS_BENCH_ENDPOINT`, `VLPDS_BENCH_BUCKET`, `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`. The keys reach vlpds as `VLPDS_S3_ACCESS_KEY` / `VLPDS_S3_SECRET_KEY` in its
+  environment, never on the command line the log prints, and vlpds redacts them in its own config
+  dump. Nothing here should print the file.
+- Each run gets its own prefix, `bench/<utc time>-<mode>` (or `R2_PREFIX`), with `--s3-region auto`.
+  A single node runs with `--shards 16` (`R2_SHARDS`), the same as the cluster, since every shard
+  polls and checkpoints on its own and idle requests are billed. `CLUSTER=1` uses the vlpds default
+  `--lease-ttl-ms 10000` here (3000 on MinIO). Its control-plane deadline is min(TTL, 5 s), and an R2
+  GET can take over 3 s.
+- The driver samples `vlpds_object_store_requests_total` on every node every 2 s into
+  `out/r2-ops.json`, carrying counts over restarts (a `kill -9` loses up to 2 s of them), and logs the
+  run's total when it stops vlpds. Past `R2_OPS_LIMIT` (45,000) it kills vlpds and exits 4. MinIO's
+  counters don't exist here, so the cost run's `minio_ops_per_write` reads 0.
+- `r2-clean.sh` lists and deletes the prefix with the aws CLI and prints the requests that took. The
+  bucket's 1-day expiry is only a backstop.
+- `SCALE=r2` shrinks boards story 10 to 10 members, 80 posts, 300 comments and 800 votes.
+
+On Linux, the reference PDS containers can't reach host ports bound to 127.0.0.1 (Docker Desktop's
+`host.docker.internal` can), so on a Linux host stick to configs where only vlpds holds spaces
+(the cost run on vlpds, boards all-vlpds).
+
 ## How the driver acts like an app
 
 The wire is what a real app sends. Calls go through `@atproto/api` at the Spaces alpha

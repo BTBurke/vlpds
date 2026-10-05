@@ -1,19 +1,33 @@
 // The vlpds under test, run by the driver so the fault sim can kill it: one
-// node on MinIO (or --memory), or a 3-node cluster on MinIO behind a small
-// round-robin HTTP balancer on the public port, as in tests/E2E.md. Logs go
-// to out/vlpds-*.log. Dev mode only, with the harness's test keys.
+// node on MinIO (or --memory, or a real R2 bucket with STORE=r2), or a 3-node
+// cluster behind a small round-robin HTTP balancer on the public port, as in
+// tests/E2E.md. Logs go to out/vlpds-*.log. Dev mode only, with the harness's
+// test keys.
 import { spawn } from 'node:child_process'
-import { createWriteStream, mkdirSync } from 'node:fs'
+import { createWriteStream, mkdirSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
-import { OUT, PORTS, URLS, VLPDS_ROTATION_KEY, log } from './env.mjs'
+import { OUT, PORTS, R2, URLS, VLPDS_ROTATION_KEY, log } from './env.mjs'
 import { hostUrl, sleep } from './http.mjs'
 
 const BIN = process.env.VLPDS_BIN
 
 function cleanEnv(extra = {}) {
   const env = {}
-  for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('VLPDS_') || k === 'VLPDS_BIN') env[k] = v
+  for (const [k, v] of Object.entries(process.env)) if ((!k.startsWith('VLPDS_') || k === 'VLPDS_BIN') && !k.startsWith('AWS_')) env[k] = v
+  // R2 keys go in by env, never argv: the log's start line prints the args
+  if (R2) Object.assign(env, { VLPDS_S3_ACCESS_KEY: process.env.AWS_ACCESS_KEY_ID, VLPDS_S3_SECRET_KEY: process.env.AWS_SECRET_ACCESS_KEY })
   return { ...env, RUST_LOG: process.env.VLPDS_RUST_LOG ?? 'info', ...extra }
+}
+
+/** vlpds_object_store_requests_total by op from one node's /metrics text. */
+function storeOpsOf(txt) {
+  const m = new Map()
+  for (const line of txt.split('\n')) {
+    if (!line.startsWith('vlpds_object_store_requests_total{')) continue
+    const op = /op="([^"]+)"/.exec(line)?.[1] ?? '?'
+    m.set(op, (m.get(op) ?? 0) + Number(line.slice(line.lastIndexOf(' ') + 1)))
+  }
+  return m
 }
 
 class Node {
@@ -24,6 +38,9 @@ class Node {
     this.url = `http://127.0.0.1:${this.port}`
     this.proc = null
     this.starts = 0
+    // bucket ops of earlier processes (a restart zeroes the counters), and the last sample of this one
+    this.carried = new Map()
+    this.lastOps = new Map()
   }
 
   args() {
@@ -42,14 +59,19 @@ class Node {
       '--memory-budget-mb', process.env.VLPDS_MEMORY_MB ?? '6144',
     ]
     if (o.memory) a.push('--memory')
-    else a.push('--s3-endpoint', URLS.minio, '--s3-bucket', 'vlpds', '--prefix', o.prefix)
+    else if (R2) {
+      a.push('--s3-endpoint', R2.endpoint, '--s3-bucket', R2.bucket, '--s3-region', 'auto', '--prefix', o.prefix)
+      // fewer shards than the default 64: each one polls and checkpoints on its own, and idle requests are billed
+      if (!o.cluster) a.push('--shards', process.env.R2_SHARDS ?? '16')
+    } else a.push('--s3-endpoint', URLS.minio, '--s3-bucket', 'vlpds', '--prefix', o.prefix)
     if (o.cluster) {
       a.push(
         '--node-id', `n${this.i}`,
         '--peer-listen', `127.0.0.1:${PORTS.vlpdsPeers[this.i]}`,
         '--advertise-url', `https://127.0.0.1:${PORTS.vlpdsPeers[this.i]}`,
         '--peer-tls-dir', `${OUT}peer-tls`,
-        '--lease-ttl-ms', String(o.leaseTtlMs ?? 3000),
+        // 3 s fails over fast on MinIO; on R2 the 3 s control-plane deadline it implies (min(TTL, 5 s)) is too tight for R2's tail
+        '--lease-ttl-ms', String(o.leaseTtlMs ?? (R2 ? 10_000 : 3000)),
         '--shards', '16',
         '--workers', '2',
       )
@@ -59,6 +81,8 @@ class Node {
 
   async start() {
     this.starts++
+    for (const [k, v] of this.lastOps) this.carried.set(k, (this.carried.get(k) ?? 0) + v)
+    this.lastOps = new Map()
     mkdirSync(OUT, { recursive: true })
     const logf = createWriteStream(`${OUT}vlpds-n${this.i}.log`, { flags: 'a' })
     logf.write(`\n==== start ${this.starts} ${new Date().toISOString()} ${BIN} ${this.args().join(' ')}\n`)
@@ -94,7 +118,8 @@ class Node {
 }
 
 export class Vlpds {
-  constructor({ cluster = false, memory = false, prefix = `spaces-${Date.now().toString(36)}`, extra = [] } = {}) {
+  constructor({ cluster = false, memory = false, prefix = R2 ? R2.prefix : `spaces-${Date.now().toString(36)}`, extra = [] } = {}) {
+    if (R2 && !(R2.endpoint && R2.bucket && R2.prefix && process.env.AWS_ACCESS_KEY_ID)) throw new Error('STORE=r2 needs VLPDS_BENCH_ENDPOINT, VLPDS_BENCH_BUCKET, R2_PREFIX and the AWS_* keys (run.sh loads them)')
     this.cluster = cluster
     this.prefix = prefix
     const opts = { cluster, memory, prefix, extra }
@@ -104,6 +129,8 @@ export class Vlpds {
 
   async start() {
     if (!BIN) throw new Error('VLPDS_BIN is not set (run.sh builds it)')
+    // a driver that dies (a node that never got healthy, say) must not leave the others running
+    if (!this.exitHook) process.once('exit', (this.exitHook = () => this.nodes.forEach((n) => n.alive() && n.proc.kill('SIGKILL'))))
     if (this.cluster) {
       await this.startBalancer()
       for (const n of this.nodes) await n.start()
@@ -111,8 +138,38 @@ export class Vlpds {
     } else {
       await this.nodes[0].start()
     }
-    log(`vlpds up: ${this.cluster ? '3-node cluster behind ' : ''}${URLS.vlpds} (${this.nodes[0].opts.memory ? 'memory' : `MinIO prefix ${this.prefix}`})`)
+    log(`vlpds up: ${this.cluster ? '3-node cluster behind ' : ''}${URLS.vlpds} (${this.nodes[0].opts.memory ? 'memory' : `${R2 ? 'R2' : 'MinIO'} prefix ${this.prefix}`})`)
+    if (R2) this.watchOps()
     return this
+  }
+
+  /**
+   * STORE=r2: samples every node's bucket request counters every 2 s into
+   * out/r2-ops.json, and kills everything past R2.opsLimit. A kill -9 loses
+   * at most the 2 s since a node's last sample.
+   */
+  watchOps() {
+    this.opsTimer = setInterval(() => this.sampleOps().catch(() => {}), 2000)
+  }
+
+  async sampleOps() {
+    for (const n of this.nodes) {
+      if (!n.alive()) continue
+      const txt = await fetch(`${n.url}/metrics`).then((r) => (r.ok ? r.text() : null)).catch(() => null)
+      if (txt) n.lastOps = storeOpsOf(txt)
+    }
+    const by = {}
+    for (const n of this.nodes) for (const m of [n.carried, n.lastOps]) for (const [k, v] of m) by[k] = (by[k] ?? 0) + v
+    const total = Object.values(by).reduce((a, b) => a + b, 0)
+    this.ops = { prefix: this.prefix, total, by_op: by, at: new Date().toISOString() }
+    writeFileSync(`${OUT}r2-ops.json`, JSON.stringify(this.ops, null, 1))
+    if (total > R2.opsLimit && !this.overBudget) {
+      this.overBudget = true
+      log(`R2 ops ${total} > limit ${R2.opsLimit}: killing vlpds and exiting`)
+      this.nodes.forEach((n) => n.alive() && n.proc.kill('SIGKILL'))
+      process.exit(4)
+    }
+    return this.ops
   }
 
   /** Every shard of the layout owned by a live node, and every live node owning some (vlpds_owned_partitions). */
@@ -189,6 +246,11 @@ export class Vlpds {
   }
 
   async stop() {
+    if (this.opsTimer) {
+      clearInterval(this.opsTimer)
+      const o = await this.sampleOps()
+      log(`R2 bucket ops this run: ${o.total} ${JSON.stringify(o.by_op)}`)
+    }
     for (const n of this.nodes) await n.kill('SIGTERM')
     this.lb?.closeAllConnections?.()
     await new Promise((r) => (this.lb ? this.lb.close(r) : r()))

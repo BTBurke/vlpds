@@ -12,7 +12,9 @@
 #
 # Env: VLPDS_BIN (skip the build), BRANCH (default: origin/spaces-1, else
 # origin/spaces-0), CLUSTER=1 (3 vlpds nodes on MinIO behind a balancer),
-# MEMORY=1 (vlpds --memory), KEEP=1, REF_PDS_IMAGE (use a prebuilt image).
+# MEMORY=1 (vlpds --memory), KEEP=1, REF_PDS_IMAGE (use a prebuilt image),
+# STORE=r2 (vlpds on a real bucket under bench/<run-id>/, keys from R2_ENV,
+# default ~/.config/cloudflare/vlpds-bench-r2.env; README.md "Real R2").
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 cd "$here"
@@ -47,8 +49,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-docker compose up -d --wait ref-a ref-b minio
-docker compose run --rm minio-init >/dev/null
+if [ "${STORE:-minio}" = r2 ]; then
+  r2env="${R2_ENV:-$HOME/.config/cloudflare/vlpds-bench-r2.env}"
+  [ -r "$r2env" ] || { echo "STORE=r2: no $r2env" >&2; exit 2; }
+  set -a
+  . "$r2env"
+  set +a
+  export STORE R2_PREFIX="${R2_PREFIX:-bench/$(date -u +%Y%m%d-%H%M%S)-$mode}"
+  echo "STORE=r2: prefix $R2_PREFIX (delete it afterwards: ./r2-clean.sh $R2_PREFIX)"
+  docker compose up -d --wait ref-a ref-b
+else
+  docker compose up -d --wait ref-a ref-b minio
+  docker compose run --rm minio-init >/dev/null
+fi
 
 mkdir -p out
 case "$mode" in

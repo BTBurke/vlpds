@@ -23,6 +23,19 @@ export const PORTS = {
   hostProxy: { 'ref-a': 2880, 'ref-b': 2881, vlpds: 2882 }, // fault proxies in front of space hosts
 }
 
+// STORE=r2 puts vlpds on a real S3-compatible bucket (README.md "Real R2") under
+// R2_PREFIX; the endpoint, bucket and keys come from the env file run.sh loads.
+export const STORE = process.env.STORE ?? 'minio'
+export const R2 = STORE === 'r2'
+  ? {
+      endpoint: process.env.VLPDS_BENCH_ENDPOINT,
+      bucket: process.env.VLPDS_BENCH_BUCKET,
+      prefix: process.env.R2_PREFIX,
+      // vlpds_object_store_requests_total across every node and restart; past this the driver kills vlpds and exits 4
+      opsLimit: int('R2_OPS_LIMIT', 45_000),
+    }
+  : null
+
 export const URLS = {
   plc: `http://127.0.0.1:${PORTS.plc}`,
   refA: `http://localhost:${PORTS.refA}`,

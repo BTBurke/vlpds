@@ -5,7 +5,7 @@
 // against direct space reads (what the hosts serve).
 //
 //   node boards/scenarios.mjs [config ...]   configs: all-vlpds vlpds-owner ref-owner
-//   (VLPDS_BIN starts vlpds; CLUSTER=1 for 3 nodes; SEED, SCALE=small|full)
+//   (VLPDS_BIN starts vlpds; CLUSTER=1 for 3 nodes; SEED, SCALE=small|r2|full)
 import { execFileSync } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -33,7 +33,12 @@ export const CONFIGS = {
 
 const CLUSTER = !!process.env.CLUSTER
 const SEED = Number(process.env.SEED ?? 7)
-const SCALE = process.env.SCALE === 'small' ? { members: 6, posts: 30, comments: 120, votes: 300 } : { members: 20, posts: 200, comments: 1000, votes: 3000 }
+const SCALES = {
+  small: { members: 6, posts: 30, comments: 120, votes: 300 },
+  r2: { members: 10, posts: 80, comments: 300, votes: 800 }, // a real bucket bills every request
+  full: { members: 20, posts: 200, comments: 1000, votes: 3000 },
+}
+const SCALE = SCALES[process.env.SCALE] ?? SCALES.full
 const CONC = Number(process.env.BOARDS_CONC ?? 16)
 const NOTIFY_PORT = 2871
 const API_PORT = 2888
