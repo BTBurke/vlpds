@@ -81,6 +81,7 @@ function SignIn() {
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
   const [needCode, setNeedCode] = useState(false)
+  const [trust, setTrust] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
 
@@ -90,7 +91,12 @@ function SignIn() {
     setError(undefined)
     try {
       const out = await call('com.atproto.server.createSession', {
-        body: { identifier: identifier.trim().replace(/^@/, ''), password, authFactorToken: needCode ? code.trim() : undefined },
+        body: {
+          identifier: identifier.trim().replace(/^@/, ''),
+          password,
+          authFactorToken: needCode ? code.trim() : undefined,
+          trustDevice: needCode && trust ? true : undefined,
+        },
       })
       setSession(out)
     } catch (err) {
@@ -154,6 +160,15 @@ function SignIn() {
                       autoFocus
                     />
                   </Field>
+                  <label className="check">
+                    <input type="checkbox" checked={trust} onChange={(e) => setTrust(e.target.checked)} />
+                    <span>
+                      Trust this browser
+                      <span className="small muted" style={{ display: 'block' }}>
+                        Skip the code here for a while. Leave it unticked on a shared computer.
+                      </span>
+                    </span>
+                  </label>
                 </>
               )}
               <div className="row between">

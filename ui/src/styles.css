@@ -1029,6 +1029,18 @@ dialog.modal h2 {
   .hide-sm {
     display: none;
   }
+  .show-sm {
+    display: block;
+  }
+}
+.show-sm {
+  display: none;
+}
+.sub-h {
+  margin: 20px 0 10px;
+}
+.sub-h:first-of-type {
+  margin-top: 0;
 }
 
 /* Sign-in */
