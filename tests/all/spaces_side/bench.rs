@@ -6,10 +6,10 @@
 //!   spaces_side::bench::spaces_microbench -- --ignored --nocapture --test-threads=1
 //! ```
 //!
-//! (or `just spaces-microbench`). One node, `--spaces` on, log segment PUTs
+//! (or `just spaces-microbench`). One node (three for `cluster`), `--spaces` on, log segment PUTs
 //! delayed like S3 (`SPACES_BENCH_PUT_MS`, default 25 ms median, lognormal
-//! sigma 0.3). Sections, picked with `SPACES_BENCH_ONLY=noop,delta,cred,conc,bucket,load`
-//! (default all):
+//! sigma 0.3). Sections, picked with
+//! `SPACES_BENCH_ONLY=noop,delta,cred,conc,bucket,load,cluster` (default all):
 //!
 //! - `noop`: listRepoOps with `since` at the head, client p50/p99, the
 //!   server's own histogram, and process CPU per request over a `_health`
@@ -27,6 +27,12 @@
 //! - `load`: public commit latency alone, then under a spaces load of
 //!   `SPACES_BENCH_N` spaces x `_M` members x `_K` pollers each, plus
 //!   `_SYNCERS` registered syncers per space that pull on every notify.
+//! - `cluster`: write -> notify ack on a three-node cluster (the same PUT
+//!   delay), each space's authority on one node and its members (at least
+//!   two) on the others, so every notify crosses nodes and every syncer pull
+//!   is forwarded: the server's write ack -> authority ack histogram and, at
+//!   each syncer (at least one), write sent -> notified and notified ->
+//!   pulled.
 //!
 //! Metrics are process-wide, so run it alone (`--test-threads=1`, no other
 //! test filter). `SPACES_BENCH_SECS` sets each timed window (default 20).
@@ -34,6 +40,7 @@
 //! syncers need registerNotify and fan-out (C3, C4). With C1 alone run
 //! `SPACES_BENCH_M=0 SPACES_BENCH_SYNCERS=0`.
 
+use super::cluster::Plc;
 use crate::common::spaces::{xrpc_url, Holder, SpaceClient};
 use crate::common::*;
 use parking_lot::Mutex;
@@ -66,7 +73,7 @@ struct Cfg {
 
 impl Cfg {
     fn from_env() -> Cfg {
-        let only = env_or("SPACES_BENCH_ONLY", "noop,delta,cred,conc,bucket,load".to_string());
+        let only = env_or("SPACES_BENCH_ONLY", "noop,delta,cred,conc,bucket,load,cluster".to_string());
         Cfg {
             sections: only.split(',').map(|s| s.trim().to_string()).collect(),
             put_ms: env_or("SPACES_BENCH_PUT_MS", 25.0),
@@ -356,12 +363,19 @@ struct Fixture {
 
 impl Fixture {
     async fn new(s: &TestServer, members: usize) -> Fixture {
+        Fixture::spread(&[s], members).await
+    }
+
+    /// The authority on `nodes[0]`, member i on `nodes[(i + 1) % n]` (an
+    /// account lives on the node that created it).
+    async fn spread(nodes: &[&TestServer], members: usize) -> Fixture {
+        let s = nodes[0];
         let authority = SpaceClient::new(s, &unique_name("sba"), &authority_scope()).await;
         let skey = format!("b{}", unique_name("k").replace(['.', '-', '_'], ""));
         let space = authority.create_space(SPACE_TYPE, &skey).await;
         let mut ms = Vec::new();
-        for _ in 0..members {
-            let m = SpaceClient::new(s, &unique_name("sbm"), &member_scope()).await;
+        for i in 0..members {
+            let m = SpaceClient::new(nodes[(i + 1) % nodes.len()], &unique_name("sbm"), &member_scope()).await;
             authority
                 .post(
                     "com.atproto.simplespace.putMember",
@@ -972,7 +986,78 @@ async fn bench_load(
             sy.pulled.lock().line()
         ));
     }
-    let notify = |t: &str| {
+    for (k, v) in notify_counts(&m0, &m1) {
+        out.say(format!("load: notify {k}: +{v}"));
+    }
+}
+
+async fn bench_cluster(cfg: &Cfg, out: &mut Report) {
+    let (bucket, plc) = (Arc::new(object_store::memory::InMemory::new()), Plc::start().await);
+    let put_ms = cfg.put_ms;
+    let mut nodes = Vec::new();
+    for i in 0..3 {
+        let n = cluster_node(&format!("sbc-{i}"), bucket.clone(), 6, |c| {
+            plc.apply(c);
+            c.spaces = true;
+            c.inject_latency = (put_ms > 0.0).then_some((put_ms, 0.3));
+        })
+        .await;
+        nodes.push(n);
+    }
+    let refs: Vec<&TestServer> = nodes.iter().collect();
+    balanced(&refs).await;
+    let mut fixtures = Vec::new();
+    for _ in 0..cfg.spaces {
+        fixtures.push(Fixture::spread(&refs, cfg.members.max(2)).await);
+    }
+    let fixtures = Arc::new(fixtures);
+    let sent: Arc<Mutex<HashMap<String, Instant>>> = Arc::default();
+    let mut syncers = Vec::new();
+    for _ in 0..cfg.syncers.max(1) {
+        let sy = Syncer::spawn(fixtures.clone(), sent.clone()).await;
+        for fx in fixtures.iter() {
+            sy.register(fx).await;
+        }
+        syncers.push(sy);
+    }
+    let (stop, acked) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+    let writers = space_writes(&fixtures, cfg.space_write_every, &stop, &sent, &acked);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (m0, a0) = (vlpds::metrics::render(), acked.load(Ordering::Relaxed));
+    tokio::time::sleep(Duration::from_secs_f64(cfg.secs)).await;
+    let (m1, a1) = (vlpds::metrics::render(), acked.load(Ordering::Relaxed));
+    stop.store(true, Ordering::Relaxed);
+    for h in writers {
+        h.await.unwrap();
+    }
+    // the last writes' notifies and pulls land
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let members = fixtures.first().map_or(0, |f| f.members.len());
+    out.say(format!(
+        "cluster: 3 nodes, {} spaces x {members} members (authority on one node, members on the others), {} syncers/space, {} space writes in the window",
+        fixtures.len(),
+        syncers.len(),
+        a1 - a0
+    ));
+    let ack = HistDelta::new(&m0, &m1, "vlpds_space_notify_ack_seconds", &[]);
+    out.say(format!("cluster: write ack -> authority notify ack: {}", ack.line()));
+    for (i, sy) in syncers.iter().enumerate() {
+        out.say(format!(
+            "cluster: syncer {i}: {} notifies; write sent -> notified {}; notified -> pulled {}",
+            sy.notifies.load(Ordering::Relaxed),
+            sy.notified.lock().line(),
+            sy.pulled.lock().line()
+        ));
+    }
+    for (k, v) in notify_counts(&m0, &m1) {
+        out.say(format!("cluster: notify {k}: +{v}"));
+    }
+}
+
+/// `vlpds_space_notify_total` by hop/result between two scrapes.
+fn notify_counts(before: &str, after: &str) -> BTreeMap<String, f64> {
+    let tally = |t: &str| {
         let mut m: BTreeMap<String, f64> = BTreeMap::new();
         for (l, v) in series(t, "vlpds_space_notify_total") {
             *m.entry(format!("{}/{}", l.get("hop").map_or("", |s| s), l.get("result").map_or("", |s| s)))
@@ -980,10 +1065,8 @@ async fn bench_load(
         }
         m
     };
-    let (n0, n1) = (notify(&m0), notify(&m1));
-    for (k, v) in &n1 {
-        out.say(format!("load: notify {k}: +{}", v - n0.get(k).copied().unwrap_or(0.0)));
-    }
+    let (b, a) = (tally(before), tally(after));
+    a.into_iter().map(|(k, v)| (k.clone(), v - b.get(&k).copied().unwrap_or(0.0))).collect()
 }
 
 async fn run(cfg: Cfg) -> Report {
@@ -1024,6 +1107,9 @@ async fn run(cfg: Cfg) -> Report {
             bench_load(&s, &fixtures, &publics, &cfg, &mut out).await;
         }
     }
+    if cfg.on("cluster") {
+        bench_cluster(&cfg, &mut out).await;
+    }
     out
 }
 
@@ -1049,6 +1135,18 @@ async fn spaces_microbench_smoke() {
     ] {
         assert!(out.0.iter().any(|l| l.contains(want)), "no {want:?} in:\n{}", out.0.join("\n"));
     }
+}
+
+/// The cluster section at a tiny size: notifies cross nodes and reach the
+/// syncer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spaces core: C3"]
+async fn spaces_microbench_cluster_smoke() {
+    let out = run(Cfg { sections: vec!["cluster".into()], ..Cfg::tiny() }).await;
+    let text = out.0.join("\n");
+    let line = |want: &str| out.0.iter().find(|l| l.contains(want)).unwrap_or_else(|| panic!("no {want:?} in:\n{text}"));
+    assert!(!line("write ack -> authority notify ack").contains("n=0 "), "no notify acked:\n{text}");
+    assert!(!line("syncer 0:").contains(" 0 notifies"), "the syncer heard nothing:\n{text}");
 }
 
 #[test]
