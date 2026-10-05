@@ -166,9 +166,13 @@ edges:
 
 - A forward waiting in a lane is replaced by a newer one from the same writer, since only a writer's
   newest state is worth sending.
-- The `prevSpaceRev` a lane sends is the last spaceRev it delivered, so a replaced forward leaves no
-  gap. A forward lost for good (a full queue, retries run out) does leave one, and the syncer catches
-  up with `listRepos`.
+- The `prevSpaceRev` a lane sends is the last spaceRev it tried to send, delivered or not, so a
+  replaced forward leaves no gap. After a forward lost for good (a full queue, retries run out), and
+  on the first forward to each registration after the shard changes hands, it's the spaceRev
+  sequenced just before, which `sQ` keeps. The syncer may never have heard that one, and the gap
+  sends it to `listRepos`. That's fine. What must never happen is two forwards naming one
+  `prevSpaceRev` with different successors, a fork in the chain the syncer follows, and a lane's
+  memory from before a takeover could do that. The takeover tests check no syncer ever sees one.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
 - Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned.

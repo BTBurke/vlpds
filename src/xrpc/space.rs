@@ -1950,8 +1950,8 @@ async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<Li
         for kv in rows {
             let space_rev =
                 crate::space::rows::seq_rev(&kv.key).ok_or_else(|| XrpcError::internal("malformed space seq key"))?;
-            let writer = std::str::from_utf8(&kv.value).map_err(XrpcError::from_err)?;
-            let k = state::space_writer_key(&space.authority, &space.sid, writer);
+            let writer = crate::space::rows::SeqRow::decode(&kv.value).map_err(XrpcError::from_err)?.writer;
+            let k = state::space_writer_key(&space.authority, &space.sid, &writer);
             let Some(v) = snap.get(k).await.map_err(XrpcError::from_err)? else { continue };
             let w = crate::space::rows::WriterRow::decode(&v).map_err(XrpcError::from_err)?;
             repos.push(json!({

@@ -50,7 +50,7 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 | `sS/{auth}\0{sid}` | the authority | the space as JSON: URI, policies, created, and `deleted` for a tombstone |
 | `sM/{auth}\0{sid}{member}` | the authority | a member's read and write access |
 | `sW/{auth}\0{sid}{writer}` | the authority | writer state: repoRev, hash, spaceRev |
-| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listRepos` order. It holds each writer's latest state only |
+| `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listRepos` order, and the spaceRev sequenced just before it. It holds each writer's latest state only, so the row before isn't always that one |
 | `sN/{auth}\0{sid}{service}` | the authority | a notify registration: endpoint and expiry (24 h) |
 | `sb/{did}\0{sid}{cid}\0{path}` | the author | a space record's blob ref, at the rev that wrote it. `space.listBlobs` scans it in CID order |
 | `sc/{did}\0{cid}\0{sid}{path}` | the author | the same ref, CID first, so the blob GC and `sync.getBlob` find a blob's space refs in one scan |

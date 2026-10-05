@@ -197,6 +197,7 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     // the syncer got the local space's updates in spaceRev order. The new
     // owner's catch-up forward (docs-draft decision 3) may repeat the head
     // the old owner already delivered: once, after the kill.
+    syncer.assert_no_fork("the syncer");
     let got = syncer.accepted();
     let revs: Vec<&str> = got.iter().map(|n| n.body["spaceRev"].as_str().expect("spaceRev")).collect();
     assert!(revs.windows(2).all(|w| w[0] <= w[1]), "fan-out out of order: {revs:?}");
@@ -289,6 +290,7 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
     assert!(caught_up.is_some(), "a registration heard nothing within 5 s of the takeover");
     tokio::time::sleep(Duration::from_secs(2)).await;
     for (i, s) in syncers.iter().enumerate() {
+        s.assert_no_fork(&format!("syncer {i}"));
         let late: Vec<Notified> = s.accepted().into_iter().filter(|n| n.at > killed_at).collect();
         assert_eq!(late.len(), 1, "syncer {i}: one catch-up forward per takeover: {late:?}");
         let b = &late[0].body;

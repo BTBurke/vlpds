@@ -16,7 +16,9 @@
 
 use super::heads::DurableSpaceHead;
 use super::lthash::LtHash;
-use super::rows::{AppAccess, HeadRow, MemberRow, NotifyRow, OpAction, OpRow, OutboxRow, Policy, SpaceRow, WriterRow};
+use super::rows::{
+    AppAccess, HeadRow, MemberRow, NotifyRow, OpAction, OpRow, OutboxRow, Policy, SeqRow, SpaceRow, WriterRow,
+};
 use crate::cid::Cid;
 use crate::segment::Mutation;
 use crate::state::{self, SpaceId};
@@ -760,7 +762,8 @@ fn sequence(
     if let Some(o) = old {
         muts.push(del(state::space_seq_key(authority, &sid, o.space_rev.0)));
     }
-    muts.push(put(state::space_seq_key(authority, &sid, space_rev.0), Bytes::copy_from_slice(writer.as_bytes())));
+    let seq = SeqRow { prev, writer: writer.to_string() };
+    muts.push(put(state::space_seq_key(authority, &sid, space_rev.0), seq.encode()));
     let row = WriterRow { repo_rev, hash, space_rev };
     muts.push(put(state::space_writer_key(authority, &sid, writer), row.encode()));
     host.writers.insert(writer.to_string(), Some(row));
