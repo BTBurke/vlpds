@@ -330,7 +330,7 @@ function AppPasswords() {
           <p className="small muted" style={{ margin: '0 0 8px' }}>
             What may the app do?
           </p>
-          {choice('full', 'Full access (like today)', 'Everything a Bluesky app needs: read your feeds, post, follow, edit your profile and settings.')}
+          {choice('full', 'Full access', 'Everything a Bluesky app needs: read your feeds, post, follow, edit your profile and settings.')}
           {choice(
             'post',
             'Post only',
