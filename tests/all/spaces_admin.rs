@@ -494,8 +494,9 @@ async fn import_repo_round_trip_and_refusals() {
     // the imported record's blob hasn't come over yet
     let lm = y.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &session).await.ok();
     assert_eq!(lm["blobs"], json!([{"cid": blob_cid, "recordUri": format!("{space}/{}/{COLL}/aa", a.did)}]), "{lm}");
-    // the same rev again isn't newer
-    import(exported.clone()).await.err(400, "InvalidRequest");
+    // the same export again is a retry: answered as before, nothing written
+    let again = import(exported.clone()).await.ok();
+    assert_eq!((again["rev"].clone(), again["records"].clone()), (at_x["rev"].clone(), json!(2)));
 
     let at_y = b.get("com.atproto.space.getLatestCommit", &rq).await.ok()["commit"].clone();
     assert_eq!((at_y["hash"].clone(), at_y["rev"].clone()), (at_x["hash"].clone(), at_x["rev"].clone()));
