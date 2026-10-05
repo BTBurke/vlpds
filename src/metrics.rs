@@ -636,6 +636,9 @@ lazy!(SPACE_NOTIFY_ACK: Histogram = register_histogram!("vlpds_space_notify_ack_
 lazy!(SPACE_OUTBOX_ROWS: IntGauge = register_int_gauge!("vlpds_space_outbox_rows", "notifyWrite outbox rows this node owes (one per repo and space)"));
 lazy!(SPACE_OUTBOX_OLDEST: Gauge = register_gauge!("vlpds_space_outbox_oldest_seconds", "Age of the oldest notifyWrite outbox row"));
 lazy!(SPACE_DELEGATIONS: IntCounter = register_int_counter!("vlpds_space_delegations_total", "Delegation tokens minted (getDelegationToken)"));
+lazy!(SPACE_CREDENTIAL_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_cache_total", "Space credential verifications by cache result (hit: a verified credential, only the request signature checked; miss: the whole chain)", &["result"]));
+lazy!(SPACE_CREDENTIAL_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_checks_total", "Space credential checks by result (ok, bad_sig, expired, revoked, audience, space)", &["result"]));
+lazy!(SPACE_REVOCATIONS: IntGauge = register_int_gauge!("vlpds_space_revocations", "Revoked space credentials this node enforces (until they would have expired)"));
 lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "getSpaceCredential answers as a space authority, by result", &["result"]));
 
 pub fn space_write(op: &str, result: &str) {
@@ -666,6 +669,18 @@ pub fn space_outbox_gauges(rows: usize, oldest_secs: f64) {
 
 pub fn space_delegation() {
     SPACE_DELEGATIONS.inc();
+}
+
+pub fn space_credential_cache(hit: bool) {
+    SPACE_CREDENTIAL_CACHE.with_label_values(&[if hit { "hit" } else { "miss" }]).inc();
+}
+
+pub fn space_credential_check(result: &str) {
+    SPACE_CREDENTIAL_CHECKS.with_label_values(&[result]).inc();
+}
+
+pub fn space_revocations(n: usize) {
+    SPACE_REVOCATIONS.set(n as i64);
 }
 
 pub fn space_credential_issued(result: &str) {

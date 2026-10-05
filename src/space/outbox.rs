@@ -126,6 +126,27 @@ impl Outbox {
         d.remove(did).unwrap_or_default()
     }
 
+    /// `did`'s account is active again: its waiting rows send now.
+    pub fn resume(&self, did: &str) {
+        let now = Instant::now();
+        let mut any = false;
+        for ((d, _), r) in self.rows.lock().iter_mut() {
+            if &**d == did && !r.in_flight {
+                r.next_at = now;
+                any = true;
+            }
+        }
+        if any {
+            self.wake.notify_one();
+        }
+    }
+
+    /// `did`'s account is gone with its rows.
+    pub fn drop_did(&self, did: &str) {
+        self.rows.lock().retain(|(d, _), _| &**d != did);
+        self.delivered.lock().remove(did);
+    }
+
     pub fn len(&self) -> usize {
         self.rows.lock().len()
     }

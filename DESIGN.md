@@ -5245,6 +5245,16 @@ Deliberate divergences from the reference:
 - A commit's MAC key travels in the commit, so a verified commit is the
   author's claim only when fetched from the author's host, never relayed.
   This is the design's deniability, the same in the reference.
+- Space credentials are cached by token hash once verified, until they
+  expire (an hour at most). So if an authority rotates its key, a
+  credential this node already verified keeps working until it expires.
+  The reference resolves the key on every request. Revocation and the
+  request's own signature are still checked on every read.
+- A taken-down space record (`sec/td/space/{sid}/{collection}/{rkey}`) is
+  hidden from getRecord, listRecords and listRepoOps values, but it stays
+  in the repo's LtHash, the way a taken-down public record stays in the
+  signed repo. A syncer that compares hashes then sees a mismatch and
+  falls back to getRepo. The reference has no space record takedowns.
 
 ## Reference test divergences (`tests/REFERENCE_COVERAGE.md`)
 

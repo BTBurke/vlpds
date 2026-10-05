@@ -145,6 +145,7 @@ mod sign_in_security;
 mod signature_faults;
 mod smtp_mail;
 mod spaces;
+mod spaces_auth;
 mod spaces_e2e;
 mod staged_import;
 mod subscribe_repos;

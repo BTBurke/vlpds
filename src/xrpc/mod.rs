@@ -339,6 +339,10 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(proxy::routes())
         .merge(oauth::routes())
         .merge(internal::routes())
+        .merge(match app.config.spaces {
+            true => space::internal_routes(),
+            false => Router::new(),
+        })
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
         .merge(firehose_subs::routes())
@@ -668,7 +672,13 @@ impl App {
         match (out_rx.try_recv(), res) {
             (Ok(Err(e)), _) => Err(e),
             (_, Err(e)) => Err(e),
-            (Ok(Ok(accts)), Ok(_)) => Ok(accts),
+            (Ok(Ok(accts)), Ok(_)) => {
+                // notifies that waited out a takedown or deactivation
+                if let (Some(sp), Some(_), None) = (&self.spaces, &accts.0.status, &accts.1.status) {
+                    sp.outbox.resume(did);
+                }
+                Ok(accts)
+            }
             (Err(_), Ok(_)) => Err(XrpcError::internal("account mutation did not run")),
         }
     }

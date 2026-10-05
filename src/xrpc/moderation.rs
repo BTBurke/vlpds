@@ -240,7 +240,7 @@ fn takedown_name(s: &SubjectRef) -> XResult<String> {
     match s.kind.as_str() {
         "record" => {
             let uri = s.uri.as_deref().ok_or_else(|| XrpcError::bad("InvalidRequest", "a record subject needs uri"))?;
-            Ok(format!("rec/{}", super::admin::record_path(uri, &s.did)?))
+            super::admin::record_takedown_name(uri, &s.did)
         }
         "blob" => Ok(format!(
             "blob/{}",
@@ -813,7 +813,7 @@ async fn moderate(
         "account" => SubjectRef::account(&inp.did),
         "record" => {
             let uri = inp.uri.ok_or_else(|| XrpcError::bad("InvalidRequest", "uri required"))?;
-            super::admin::record_path(&uri, &inp.did)?;
+            super::admin::record_takedown_name(&uri, &inp.did)?;
             SubjectRef { kind: "record".into(), did: inp.did.clone(), uri: Some(uri), cid: inp.cid }
         }
         "blob" => SubjectRef::blob(
@@ -934,7 +934,7 @@ fn check_subject(s: &SubjectRef) -> XResult<()> {
     match s.kind.as_str() {
         "account" => {}
         "record" => {
-            super::admin::record_path(s.uri.as_deref().unwrap_or(""), &s.did)?;
+            super::admin::record_takedown_name(s.uri.as_deref().unwrap_or(""), &s.did)?;
         }
         "blob" => {
             Cid::parse(s.cid.as_deref().unwrap_or("")).map_err(|_| XrpcError::bad("InvalidRequest", "Invalid cid"))?;

@@ -578,6 +578,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     });
     if let Some(s) = &app.spaces {
         s.outbox.start(Arc::downgrade(&app));
+        s.start_revocations(app.store.clone()).await;
     }
     Ok(app)
 }

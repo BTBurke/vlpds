@@ -332,7 +332,7 @@ async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credent
         return Err(service_auth_err("UntrustedIss", "Untrusted issuer"));
     };
     let trusted = [m.to_string(), format!("{m}#atproto_labeler")];
-    let sa = verify_jwt(app, tok, Some(nsid), Some(&trusted), false).await?;
+    let sa = verify_jwt(app, tok, Some(nsid), Some(&trusted), false, false).await?;
     Ok(Credentials::ModService { iss: sa.iss })
 }
 
@@ -340,7 +340,7 @@ async fn verify_mod_service(app: &App, tok: &str, nsid: &str) -> XResult<Credent
 /// as there (getServiceAuth tokens live at most an hour). Account status is
 /// the handler's business.
 async fn verify_user_service_auth(app: &App, tok: &str, nsid: &str) -> XResult<Credentials> {
-    let sa = verify_jwt(app, tok, Some(nsid), None, true).await?;
+    let sa = verify_jwt(app, tok, Some(nsid), None, true, false).await?;
     Ok(Credentials::UserServiceAuth { did: sa.iss })
 }
 
@@ -478,6 +478,7 @@ pub async fn authed_repo(app: &App, creds: &Credentials, repo: &str) -> XResult<
 #[derive(Clone, Debug)]
 pub struct ServiceAuth {
     pub iss: String,
+    pub aud: String,
 }
 
 fn service_auth_err(error: &str, message: &str) -> XrpcError {
@@ -523,7 +524,21 @@ async fn issuer_key(app: &App, iss: &str, fresh: bool) -> XResult<String> {
 /// (xrpc-server verifyJwt). High-S signatures are accepted, as the
 /// reference does for service JWTs (`allowMalleableSig`).
 pub async fn verify_service_jwt(app: &App, token: &str, lxm: Option<&str>) -> XResult<ServiceAuth> {
-    verify_jwt(app, token, lxm, None, false).await
+    verify_jwt(app, token, lxm, None, false, false).await
+}
+
+/// Service auth for the space methods whose audience depends on the
+/// request (reference `serviceAuth`, `audience: null`): notifyWrite to a
+/// space host (`{authority}#atproto_space_host` or the bare authority DID)
+/// and notifyCredentialRevoked to a repo host (a local account's DID).
+/// `lxm` must be the method. The handler checks `aud`, as the reference's
+/// do (403).
+pub async fn verify_space_service_jwt(app: &App, headers: &HeaderMap, lxm: &str) -> XResult<ServiceAuth> {
+    let tok = match authorization(headers)? {
+        Some((scheme, tok)) if scheme.eq_ignore_ascii_case("bearer") => tok,
+        _ => return Err(service_auth_err("MissingJwt", "missing jwt")),
+    };
+    verify_jwt(app, tok, Some(lxm), None, false, true).await
 }
 
 /// `trusted` (exact `iss`) and `local_iss` are checked before the issuer's
@@ -535,6 +550,7 @@ async fn verify_jwt(
     lxm: Option<&str>,
     trusted: Option<&[String]>,
     local_iss: bool,
+    any_aud: bool,
 ) -> XResult<ServiceAuth> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
     use base64::Engine;
@@ -555,7 +571,12 @@ async fn verify_jwt(
     if (crate::tid::now_micros() as f64) / 1e6 > exp {
         return Err(service_auth_err("JwtExpired", "jwt expired"));
     }
-    if payload["aud"].as_str() != Some(app.jwt.service_did.as_str()) {
+    let aud = payload["aud"].as_str().unwrap_or("");
+    if any_aud {
+        if aud.is_empty() {
+            return Err(service_auth_err("BadJwt", "poorly formatted jwt"));
+        }
+    } else if aud != app.jwt.service_did {
         return Err(service_auth_err("BadJwtAudience", "jwt audience does not match service did"));
     }
     if let Some(lxm) = lxm {
@@ -592,7 +613,7 @@ async fn verify_jwt(
             return Err(service_auth_err("BadJwtSignature", "jwt signature does not match jwt issuer"));
         }
     }
-    Ok(ServiceAuth { iss: iss.to_string() })
+    Ok(ServiceAuth { iss: iss.to_string(), aud: aud.to_string() })
 }
 
 /// Reference `userServiceAuthOptional`: a Bearer token must be a valid
@@ -601,7 +622,7 @@ pub async fn optional_service_auth(app: &App, headers: &HeaderMap, lxm: &str) ->
     let bearer =
         headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
     match bearer {
-        Some(tok) => verify_jwt(app, tok.trim(), Some(lxm), None, false).await.map(Some),
+        Some(tok) => verify_jwt(app, tok.trim(), Some(lxm), None, false, false).await.map(Some),
         None => Ok(None),
     }
 }
@@ -702,16 +723,60 @@ async fn verify_space_token(app: &App, t: &token::SpaceToken) -> XResult<()> {
 /// authority; a DID audience; the request signed by the credential's key
 /// over exactly the authorization and audience headers, each sent once;
 /// not revoked. The handler checks the space and the audience against the
-/// request.
+/// request ([`super::space::assert_credential_space`]).
+///
+/// A credential verified once is cached until it expires
+/// ([`crate::space::credcache`]): later requests with it skip the chain
+/// but still check revocation and their own signature.
 pub async fn verify_space_credential(app: &App, headers: &HeaderMap) -> XResult<Credentials> {
+    let r = check_space_credential(app, headers).await;
+    // `ok`, and the audience and space checks, are counted by the handler
+    let refused = match &r {
+        Err(e) if e.status.is_server_error() => None,
+        Err(e) if e.error == "JwtExpired" => Some("expired"),
+        Err(e) if e.error == "CredentialRevoked" => Some("revoked"),
+        Err(e) if e.message.contains("audience") => Some("audience"),
+        Err(_) => Some("bad_sig"),
+        Ok(_) => None,
+    };
+    if let Some(result) = refused {
+        crate::metrics::space_credential_check(result);
+    }
+    r
+}
+
+async fn check_space_credential(app: &App, headers: &HeaderMap) -> XResult<Credentials> {
     let tok = match authorization(headers)? {
         Some((scheme, tok)) if scheme.eq_ignore_ascii_case(SPACE_SCHEME) => tok,
         _ => return Err(space_auth_err("MissingJwt", "missing space credential")),
     };
-    let t = token::parse(TokenType::Credential, tok).map_err(token_err)?;
-    verify_space_token(app, &t).await?;
-    let space = token::check_credential(&t).map_err(token_err)?;
-    let space = format!("at://{}/space/{}/{}", space.authority, space.space_type, space.skey);
+    let Some(sp) = app.spaces.as_ref() else {
+        return Err(space_auth_err("MissingJwt", "missing space credential"));
+    };
+    if !sp.revocations.loaded() {
+        return Err(XrpcError::unavailable("Unavailable", "space credential revocations are not loaded yet; retry"));
+    }
+    let now = crate::tid::now_micros() as i64 / 1_000_000;
+    let key = crate::space::credcache::key(tok);
+    let cached = sp.credentials.get(&key, now);
+    crate::metrics::space_credential_cache(cached.is_some());
+    let v = match cached {
+        Some(v) => v,
+        None => {
+            let t = token::parse(TokenType::Credential, tok).map_err(token_err)?;
+            verify_space_token(app, &t).await?;
+            let space = token::check_credential(&t).map_err(token_err)?;
+            let v = Arc::new(crate::space::credcache::Verified {
+                space: format!("at://{}/space/{}/{}", space.authority, space.space_type, space.skey),
+                iss: t.claims.iss.clone(),
+                jti: t.claims.jti.clone(),
+                exp: t.claims.exp,
+                cnf_kid: t.claims.cnf_kid.clone().unwrap_or_default(),
+            });
+            sp.credentials.insert(key, v.clone());
+            v
+        }
+    };
     let audience = single_header(headers, crate::space::httpsig::AUDIENCE_HEADER)
         .filter(|a| super::syntax::valid_did(a))
         .ok_or_else(|| space_auth_err("BadSpaceSignature", "missing or invalid space audience DID"))?
@@ -719,19 +784,16 @@ pub async fn verify_space_credential(app: &App, headers: &HeaderMap) -> XResult<
     if headers.get_all(header::AUTHORIZATION).iter().count() != 1 {
         return Err(space_auth_err("BadSpaceSignature", "request requires exactly one \"authorization\" field"));
     }
-    let cnf_kid = t.claims.cnf_kid.clone().unwrap_or_default();
-    crate::space::httpsig::verify(headers, Some(&cnf_kid)).map_err(sig_err)?;
-    let now = crate::tid::now_micros() as i64 / 1_000_000;
-    let revoked = app.spaces.as_ref().is_some_and(|s| s.revocations.is_revoked(&space, &t.claims.jti, now));
-    if revoked {
+    crate::space::httpsig::verify(headers, Some(&v.cnf_kid)).map_err(sig_err)?;
+    if sp.revocations.is_revoked(&v.space, &v.jti, now) {
         return Err(space_auth_err("CredentialRevoked", "space credential has been revoked"));
     }
     Ok(Credentials::SpaceCredential {
-        space,
-        iss: t.claims.iss.clone(),
-        jti: t.claims.jti.clone(),
-        exp: t.claims.exp as i64,
-        cnf_kid,
+        space: v.space.clone(),
+        iss: v.iss.clone(),
+        jti: v.jti.clone(),
+        exp: v.exp as i64,
+        cnf_kid: v.cnf_kid.clone(),
         audience,
     })
 }

@@ -406,6 +406,30 @@ pub(super) async fn set_subject_takedown(app: &App, did: &str, name: &str, val: 
 }
 
 /// `{collection}/{rkey}` of an at:// URI naming a record of `did`.
+/// A record takedown's name below `sec/td/`, in `did`'s account: a repo
+/// record's `rec/{collection}/{rkey}`, or a space record's
+/// (`at://{authority}/space/{type}/{skey}/{did}/{collection}/{rkey}`)
+/// `space/{sid}/{collection}/{rkey}`.
+pub(super) fn record_takedown_name(uri: &str, did: &str) -> XResult<String> {
+    if let Some(u) = super::syntax::parse_space_uri(uri) {
+        let (author, collection, rkey) = u.record.ok_or_else(|| invalid_request("not a space record uri"))?;
+        if author != did {
+            return Err(invalid_request("invalid at-uri"));
+        }
+        let sid = state::space_id(&format!("at://{}/space/{}/{}", u.authority, u.space_type, u.skey));
+        return Ok(super::space::takedown_name(&sid, &format!("{collection}/{rkey}")));
+    }
+    Ok(format!("rec/{}", record_path(uri, did)?))
+}
+
+/// The account a record subject's URI names: a space record's author.
+fn record_uri_did(uri: &str) -> Option<&str> {
+    if let Some(u) = super::syntax::parse_space_uri(uri) {
+        return u.record.map(|(author, _, _)| author);
+    }
+    uri.strip_prefix("at://").and_then(|r| r.split('/').next()).filter(|d| d.starts_with("did:"))
+}
+
 pub(super) fn record_path<'a>(uri: &'a str, did: &str) -> XResult<&'a str> {
     uri.strip_prefix("at://")
         .and_then(|r| r.strip_prefix(did))
@@ -742,12 +766,7 @@ fn parse_subject(s: &J) -> XResult<Subject> {
         "com.atproto.admin.defs#repoRef" => Ok(Subject::Repo(field("did")?)),
         "com.atproto.repo.strongRef" => {
             let uri = field("uri")?;
-            let did = uri
-                .strip_prefix("at://")
-                .and_then(|r| r.split('/').next())
-                .filter(|d| d.starts_with("did:"))
-                .ok_or_else(|| invalid_request("invalid at-uri"))?
-                .to_string();
+            let did = record_uri_did(&uri).ok_or_else(|| invalid_request("invalid at-uri"))?.to_string();
             Ok(Subject::Record { uri, did, cid: s["cid"].as_str().map(str::to_string) })
         }
         "com.atproto.admin.defs#repoBlobRef" => Ok(Subject::Blob { did: field("did")?, cid: field("cid")? }),

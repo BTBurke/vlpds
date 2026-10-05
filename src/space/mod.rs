@@ -18,8 +18,10 @@
 //! - [`heads`]: durable space repo heads for reads.
 //! - [`outbox`]: delivery of notifyWrite to space authorities.
 //! - [`revocations`]: revoked credentials.
+//! - [`credcache`]: verified credentials, until they expire.
 
 pub mod commit;
+pub mod credcache;
 pub mod heads;
 pub mod httpsig;
 pub mod lthash;
@@ -37,6 +39,11 @@ pub struct Spaces {
     pub heads: heads::Heads,
     pub outbox: Arc<outbox::Outbox>,
     pub revocations: revocations::Revocations,
+    pub credentials: credcache::CredCache,
+}
+
+fn now_secs() -> i64 {
+    crate::tid::now_micros() as i64 / 1_000_000
 }
 
 impl Spaces {
@@ -45,7 +52,62 @@ impl Spaces {
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
             revocations: Default::default(),
+            credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
+    }
+
+    /// Re-reads the revocations object; cached credentials it newly
+    /// revokes are dropped.
+    pub async fn refresh_revocations(&self, store: &crate::store::Store) -> anyhow::Result<()> {
+        let added = self.revocations.refresh(store, now_secs()).await?;
+        self.credentials.invalidate(&added);
+        Ok(())
+    }
+
+    /// Revokes `jtis` of `space` cluster-wide (durable on return; peers
+    /// learn of it by a nudge or their next re-read).
+    pub async fn revoke(&self, store: &crate::store::Store, space: &str, jtis: &[String]) -> anyhow::Result<()> {
+        let added = self.revocations.revoke(store, space, jtis, now_secs()).await?;
+        self.credentials.invalidate(&added);
+        Ok(())
+    }
+
+    /// Loads the revocations (credential reads answer 503 until a load
+    /// succeeds), then keeps them fresh in the background: every
+    /// [`revocations::REFRESH_EVERY`], or at once when woken by a peer.
+    pub async fn start_revocations(self: &Arc<Self>, store: crate::store::Store) {
+        if self.revocations.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let mut ok = match self.refresh_revocations(&store).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("space revocations unreadable (credential reads wait for them): {e:#}");
+                false
+            }
+        };
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                let wait = if ok { revocations::REFRESH_EVERY } else { revocations::RETRY_EVERY };
+                let Some(wake) = weak.upgrade().map(|me| me.revocations.wake.clone()) else { return };
+                let _ = tokio::time::timeout(wait, wake.notified()).await;
+                let Some(me) = weak.upgrade() else { return };
+                ok = match me.refresh_revocations(&store).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!("space revocations re-read failed (retrying): {e:#}");
+                        false
+                    }
+                };
+            }
+        });
+    }
+
+    /// An account deleted: nothing of it is served or sent any more.
+    pub fn forget_account(&self, did: &str) {
+        self.heads.drop_did(did);
+        self.outbox.drop_did(did);
     }
 
     /// Enqueues the `sP` rows of shards just opened (a start, a takeover, a

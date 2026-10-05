@@ -24,7 +24,7 @@ const METHODS: &[(&str, bool)] = &[
 /// locally.
 const UNIMPLEMENTED: &[(&str, bool)] = &[
     ("com.atproto.space.getRepo?repo=did:plc:x", false),
-    ("com.atproto.space.listSpaces", false),
+    ("com.atproto.space.listRepos", false),
     ("com.atproto.space.notifyWrite", true),
     ("com.atproto.simplespace.putMember", true),
     // NSID authorities are case-insensitive

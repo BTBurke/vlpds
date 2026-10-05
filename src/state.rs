@@ -254,6 +254,11 @@ pub fn is_space_key(key: &[u8]) -> bool {
     key_slot(key).is_some() && SPACE_FAMILIES.iter().any(|f| key_body(key).starts_with(f))
 }
 
+/// `fam ‖ did ‖ \0`: all of one account's rows of a Spaces family.
+pub fn space_did_prefix(fam: &[u8], did: &str) -> Vec<u8> {
+    keyed(did, fam, &[did.as_bytes(), b"\0"])
+}
+
 /// `fam ‖ did ‖ \0 ‖ sid`: one (account, space)'s rows of a family.
 pub fn space_prefix(fam: &[u8], did: &str, sid: &SpaceId) -> Vec<u8> {
     keyed(did, fam, &[did.as_bytes(), b"\0", sid])

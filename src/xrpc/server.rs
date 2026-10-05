@@ -2403,6 +2403,7 @@ pub(super) async fn finish_delete(
     if DELETE_HOOKS.fires(did, "deleted") {
         return Err(XrpcError::internal(format!("deletion of {did} stopped after the repo delete (crash hook)")));
     }
+    super::space::delete_account_rows(app, did).await?;
     if let Some(d) = &intent {
         try_release_handle(app, &d.handle, did).await?;
         if let Some(e) = &d.email {

@@ -33,6 +33,12 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.space.listRepoOps", get(list_repo_ops))
         .route("/xrpc/com.atproto.space.getDelegationToken", get(get_delegation_token))
         .route("/xrpc/com.atproto.space.getSpaceCredential", post(get_space_credential))
+        .route("/xrpc/com.atproto.space.listSpaces", get(list_spaces))
+        .route("/xrpc/com.atproto.space.notifyCredentialRevoked", post(notify_credential_revoked))
+}
+
+pub fn internal_routes() -> Router<Arc<App>> {
+    Router::new().route("/internal/v1/space/revocations/reload", post(internal_reload_revocations))
 }
 
 pub(super) fn spaces(app: &App) -> XResult<&Arc<Spaces>> {
@@ -383,6 +389,7 @@ pub(super) fn assert_space_read(creds: &Credentials, space: &Space, repo: &str) 
 /// these checks are what bind a signature to this request.
 pub(super) fn assert_credential_space(audience: &str, cred_space: &str, space: &Space, target: &str) -> XResult<()> {
     if audience != target {
+        metrics::space_credential_check("audience");
         return Err(XrpcError {
             status: StatusCode::UNAUTHORIZED,
             error: "BadSpaceAudience".into(),
@@ -390,9 +397,18 @@ pub(super) fn assert_credential_space(audience: &str, cred_space: &str, space: &
         });
     }
     if cred_space != space.uri {
+        metrics::space_credential_check("space");
         return Err(XrpcError::bad("InvalidCredential", "Credential is not scoped to this space"));
     }
+    metrics::space_credential_check("ok");
     Ok(())
+}
+
+/// A space record's takedown, beside the account's `rec/` ones
+/// (`sec/td/space/{sid}/{collection}/{rkey}`). The space's id rather than
+/// its URI keeps the name short; the record's author is the account.
+pub(super) fn takedown_name(sid: &SpaceId, path: &str) -> String {
+    format!("space/{}/{path}", hex::encode(sid))
 }
 
 fn auth_label(creds: &Credentials) -> &'static str {
@@ -500,6 +516,9 @@ async fn get_record(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q):
     if load_head(sp, &p, &q.repo, &space).await?.is_none() {
         return Err(not_found());
     }
+    if super::server::ctl(&app, &q.repo).await?.has_takedown(&takedown_name(&space.sid, &path)) {
+        return Err(not_found());
+    }
     let key = state::space_record_key(&q.repo, &space.sid, &path);
     let v = p.db.get(key).await.map_err(XrpcError::from_err)?.ok_or_else(not_found)?;
     let (cid, bytes) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
@@ -568,6 +587,7 @@ async fn list_records(
     }
     let order = if ascending { slatedb::IterationOrder::Ascending } else { slatedb::IterationOrder::Descending };
     let opts = slatedb::config::ScanOptions::default().with_order(order);
+    let takedowns = super::server::ctl(&app, &q.repo).await?;
     let mut iter = p.db.scan_with_options(lo..hi, &opts).await.map_err(XrpcError::from_err)?;
     let (mut n, mut last) = (0, None);
     while n < limit {
@@ -577,6 +597,10 @@ async fn list_records(
         }
         for kv in rows {
             let path = std::str::from_utf8(&kv.key[base.len()..]).map_err(XrpcError::from_err)?;
+            if takedowns.has_takedown(&takedown_name(&space.sid, path)) {
+                last = Some(path.to_string());
+                continue;
+            }
             let (collection, rkey) = path.split_once('/').unwrap_or((path, ""));
             let (cid, bytes) = state::record_value_parts(&kv.value).map_err(XrpcError::from_err)?;
             if n > 0 {
@@ -709,6 +733,10 @@ async fn list_repo_ops(
     let opts = slatedb::config::ScanOptions::default();
     let mut iter = snap.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
     let values = !q.exclude_values.unwrap_or(false);
+    let takedowns = match values {
+        true => Some(super::server::ctl(&app, &q.repo).await?),
+        false => None,
+    };
     let mut ops = Vec::with_capacity(limit.min(256));
     let mut last = None;
     while ops.len() < limit {
@@ -727,10 +755,16 @@ async fn list_repo_ops(
                 "cid": op.cid.map(|c| c.to_string()),
                 "prev": op.prev.map(|c| c.to_string()),
             });
-            if let (true, Some(cid)) = (values, op.cid) {
+            if let (Some(td), Some(cid)) = (&takedowns, op.cid) {
                 let path = format!("{}/{}", op.collection, op.rkey);
-                let cur =
-                    snap.get(state::space_record_key(&q.repo, &space.sid, &path)).await.map_err(XrpcError::from_err)?;
+                let hidden = td.has_takedown(&takedown_name(&space.sid, &path));
+                let cur = match hidden {
+                    true => None,
+                    false => snap
+                        .get(state::space_record_key(&q.repo, &space.sid, &path))
+                        .await
+                        .map_err(XrpcError::from_err)?,
+                };
                 if let Some(v) = cur {
                     let (c, bytes) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
                     if c == cid {
@@ -839,6 +873,173 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
     })
     .map_err(|e| XrpcError::internal(format!("space credential: {e:?}")))?;
     Ok(Json(json!({"credential": cred})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListSpacesQ {
+    space_type: Option<String>,
+    did: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// Reference listSpaces: the spaces the account holds a repo in, plus
+/// those it governs (the reference's `ensureSpace` at createSpace), by
+/// URI. The filters are the scope target, so an unfiltered listing needs
+/// a wildcard grant.
+async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<ListSpacesQ>) -> XResult<Json<J>> {
+    spaces(&app)?;
+    if q.space_type.as_deref().is_some_and(|t| !super::syntax::valid_nsid(t)) {
+        return Err(XrpcError::bad("InvalidRequest", "spaceType must be an NSID"));
+    }
+    if q.did.as_deref().is_some_and(|d| !super::syntax::valid_did(d)) {
+        return Err(XrpcError::bad("InvalidRequest", "did must be a DID"));
+    }
+    let limit = super::extract::limit_param(q.limit, 50, 1, 100)?;
+    let target = SpaceTarget {
+        space_type: q.space_type.as_deref().unwrap_or("*"),
+        authority: q.did.as_deref().unwrap_or("*"),
+        skey: "*",
+    };
+    creds.need_space(&target, SpaceAccess::ReadSelf)?;
+    let did = creds.user_did()?.to_string();
+    let p = app.partition(&did)?;
+    let mut uris = std::collections::BTreeSet::new();
+    for fam in [state::SPACE_HEAD_FAMILY, state::SPACE_FAMILY] {
+        let prefix = state::space_did_prefix(fam, &did);
+        let opts = slatedb::config::ScanOptions::default();
+        let mut iter =
+            p.db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts)
+                .await
+                .map_err(XrpcError::from_err)?;
+        while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+            let uri = match fam == state::SPACE_HEAD_FAMILY {
+                true => HeadRow::decode(&kv.value).map_err(XrpcError::from_err)?.uri,
+                false => match crate::space::rows::SpaceRow::decode(&kv.value).map_err(XrpcError::from_err)? {
+                    row if row.deleted_at.is_none() => row.uri,
+                    _ => continue,
+                },
+            };
+            let Some(u) = super::syntax::parse_space_uri(&uri) else { continue };
+            let keep = q.space_type.as_deref().is_none_or(|t| t == u.space_type)
+                && q.did.as_deref().is_none_or(|d| d == u.authority)
+                && q.cursor.as_deref().is_none_or(|c| uri.as_str() > c);
+            if keep {
+                uris.insert(uri);
+            }
+        }
+    }
+    let page: Vec<String> = uris.into_iter().take(limit).collect();
+    let mut out = json!({"spaces": page.iter().map(|u| json!({"uri": u})).collect::<Vec<_>>()});
+    if page.len() == limit {
+        out["cursor"] = json!(page.last());
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct RevokedIn {
+    space: String,
+    credentials: Vec<String>,
+}
+
+const REVOKE_NUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Reference notifyCredentialRevoked: the space's authority, by service
+/// auth addressed to an account hosted here, revokes credentials of its
+/// space. Enforced cluster-wide: the 200 comes once the revocation is in
+/// the bucket's control object and the live peers were asked to reload it
+/// (each given a second to answer; one that misses it re-reads it within
+/// minutes).
+async fn notify_credential_revoked(
+    State(app): AppState,
+    headers: HeaderMap,
+    Json(inp): Json<RevokedIn>,
+) -> XResult<StatusCode> {
+    let sp = spaces(&app)?.clone();
+    let lxm = "com.atproto.space.notifyCredentialRevoked";
+    let auth = super::authn::verify_space_service_jwt(&app, &headers, lxm).await?;
+    let space = Space::parse(&inp.space)?;
+    if inp.credentials.is_empty() || inp.credentials.len() > 100 || inp.credentials.iter().any(String::is_empty) {
+        return Err(XrpcError::bad("InvalidRequest", "credentials must hold 1 to 100 non-empty jtis"));
+    }
+    if auth.iss != space.authority {
+        return Err(forbidden("Revocation issuer is not the space authority"));
+    }
+    let hosted = super::syntax::valid_did(&auth.aud)
+        && match super::internal::account_anywhere(&app, &auth.aud).await {
+            Ok(_) => true,
+            Err(e) if e.error == "AccountNotFound" => false,
+            Err(e) => return Err(e),
+        };
+    if !hosted {
+        return Err(forbidden("Revocation audience does not match a repo hosted here"));
+    }
+    sp.revoke(&app.store, &space.uri, &inp.credentials)
+        .await
+        .map_err(|e| XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}")))?;
+    nudge_revocation_peers(&app).await;
+    Ok(StatusCode::OK)
+}
+
+async fn nudge_revocation_peers(app: &Arc<App>) {
+    let Some(c) = &app.cluster else { return };
+    let me = c.cfg.node_id.clone();
+    let sends = c.peers().into_iter().filter(|l| l.node_id != me).map(|l| {
+        let app = app.clone();
+        async move {
+            let r = app
+                .http
+                .post(format!("{}/internal/v1/space/revocations/reload", l.addr.trim_end_matches('/')))
+                .header(super::internal::HDR, &app.config.internal_token)
+                .timeout(REVOKE_NUDGE_TIMEOUT)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status());
+            if let Err(e) = r {
+                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (it re-reads on its own): {e}");
+            }
+        }
+    });
+    futures::future::join_all(sends).await;
+}
+
+async fn internal_reload_revocations(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
+    super::internal::check(&app, &headers)?;
+    let sp = spaces(&app)?;
+    sp.refresh_revocations(&app.store)
+        .await
+        .map_err(|e| XrpcError::unavailable("Unavailable", format!("revocations unreadable: {e:#}")))?;
+    Ok(Json(json!({"revocations": sp.revocations.len()})))
+}
+
+const SWEEP_BATCH: usize = 500;
+
+/// Deletes every Spaces row of `did` (its repos in spaces, the spaces it
+/// governs and their host state), in bounded entries, whether or not
+/// `--spaces` is on now. Rerun by a deletion that stopped part way.
+pub(super) async fn delete_account_rows(app: &App, did: &str) -> XResult<()> {
+    let p = app.partition(did)?;
+    for fam in state::SPACE_FAMILIES {
+        let prefix = state::space_did_prefix(fam, did);
+        let end = state::prefix_end(&prefix);
+        loop {
+            let opts = slatedb::config::ScanOptions::default();
+            let mut iter =
+                p.db.scan_with_options(prefix.clone()..end.clone(), &opts).await.map_err(XrpcError::from_err)?;
+            let rows = iter.next_batch(SWEEP_BATCH).await.map_err(XrpcError::from_err)?;
+            if rows.is_empty() {
+                break;
+            }
+            let muts = rows.into_iter().map(|kv| crate::segment::Mutation { key: kv.key, val: None }).collect();
+            super::write_private_local(&p, muts).await?;
+        }
+    }
+    if let Some(sp) = &app.spaces {
+        sp.forget_account(did);
+    }
+    Ok(())
 }
 
 /// Whether `outcome` is worth another try: the reference retries network
