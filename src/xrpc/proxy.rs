@@ -999,9 +999,10 @@ async fn proxy_request_admitted(app: &App, req: Request, slot: &mut Option<InFli
     if !valid_nsid(&lxm) {
         return Err(XrpcError::bad("InvalidRequest", "invalid xrpc path"));
     }
-    // never proxied: an atproto-proxy header would otherwise get service
-    // auth minted for these methods sent wherever it names
-    if app.config.spaces && crate::space::is_space_nsid(&lxm) {
+    // never proxied, with --spaces on or off: an atproto-proxy header would
+    // otherwise get service auth minted for these methods (a notifyWrite as
+    // the account) sent wherever it names
+    if crate::space::is_space_nsid(&lxm) {
         return Err(xerr(StatusCode::NOT_IMPLEMENTED, "MethodNotImplemented", "Method Not Implemented"));
     }
     let method = req.method().clone();

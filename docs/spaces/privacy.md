@@ -56,7 +56,9 @@ every configuration, and it passes too.
 
 With `--spaces` on, every `com.atproto.space.*` and `com.atproto.simplespace.*` method is answered on
 this node. One that isn't built yet answers 501 `MethodNotImplemented`. It never reaches the
-`atproto-proxy` fallback, where vlpds would mint service auth for it and send it to another host.
+`atproto-proxy` fallback, where vlpds would mint service auth for it and send it to another host. With
+`--spaces` off they answer 501 too and are never proxied either, so an app can't get the node to
+sign a `notifyWrite` as one of its users and send it somewhere.
 
 ## Blobs
 

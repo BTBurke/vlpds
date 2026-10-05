@@ -95,20 +95,23 @@ async fn spaces_methods_answer_501_locally_with_the_flag() {
     assert_eq!(seen.lock().len(), 1);
 }
 
-/// Without the flag a Spaces NSID is like any other unknown method: 501
-/// without a proxy header, proxied with one.
+/// Without the flag a Spaces NSID still answers 501 here and is never
+/// proxied: the proxy would mint service auth for it (a notifyWrite as the
+/// account) and send it wherever the header names.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn spaces_methods_without_the_flag_are_unchanged() {
+async fn spaces_methods_without_the_flag_are_never_proxied() {
     let (proxy, seen) = upstream().await;
     let s = TestServer::spawn().await;
     let a = s.create_account("spo").await;
     for &(nsid, post) in METHODS {
-        let r = call(&s, &a, nsid, post, None).await;
-        assert_eq!((r.status, r.error_name()), (501, Some("MethodNotImplemented")), "{nsid}: {r:?}");
-        let r = call(&s, &a, nsid, post, Some(&proxy)).await;
-        assert_eq!(r.ok(), json!({"upstream": true}), "{nsid}");
+        for p in [None, Some(proxy.as_str())] {
+            let r = call(&s, &a, nsid, post, p).await;
+            assert_eq!((r.status, r.error_name()), (501, Some("MethodNotImplemented")), "{nsid} proxy={p:?}: {r:?}");
+        }
     }
-    assert_eq!(seen.lock().len(), METHODS.len());
+    assert!(seen.lock().is_empty(), "reached the upstream: {:?}", seen.lock());
+    let r = call(&s, &a, "com.example.ok", false, Some(&proxy)).await;
+    assert_eq!(r.ok(), json!({"upstream": true}));
 }
 
 /// A public record whose `at-uri` field names a record in a space (or the
