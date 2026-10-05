@@ -115,6 +115,32 @@ edges:
   `--cache-dir`, so keep that directory on a disk that survives restarts. See
   [exit codes](runbook.md#exit-codes-and-fail-stops).
 
+### Per-connection firehose series
+
+| Metric | Labels | What it counts |
+|---|---|---|
+| `vlpds_firehose_subscribers` | none | subscribeRepos connections open on this node |
+| `vlpds_firehose_connections_total` | `mode` | connections upgraded: `live` (no cursor) or `backfill` (with a cursor) |
+| `vlpds_firehose_disconnects_total` | `reason` | `client_gone`, `client_closed`, `too_slow`, `write_stalled`, `future_cursor`, `backfill_failed`, `kicked`, `shutdown` |
+| `vlpds_firehose_rejected_total` | `reason` | refused before the upgrade (`per_ip`: over `--firehose-max-per-ip`) |
+| `vlpds_firehose_events_total` | none | events this node's merger put on the firehose, once each (the rate a caught-up subscriber gets) |
+| `vlpds_firehose_subscriber_events_total` | `ip`, `conn`, `relay` | events sent to one connection |
+| `vlpds_firehose_subscriber_bytes_total` | `ip`, `conn`, `relay` | websocket bytes sent to one connection |
+
+The two per-subscriber counters have one series per connection. `ip` is the client address
+(`--trusted-proxies` aware, IPv6 cut to its /64), `conn` is the node-local connection number the
+console's Firehose page shows, and `relay` is the configured relay it matched (empty if none). A
+connection's series are removed when it closes. Past 1,000 open connections on a node, the newer ones
+share one `ip="other", conn="other"` series, which keeps `/metrics` small if someone opens thousands.
+The operator dashboard's "Firehose: events/s per connection vs this PDS" panel draws each connection
+against `vlpds_firehose_events_total`.
+
+> [!NOTE]
+> These labels carry subscriber IP addresses, so they end up in your metrics store. If you don't want
+> that, drop them at scrape time. In Prometheus that's
+> `metric_relabel_configs: [{source_labels: [__name__], regex: "vlpds_firehose_subscriber_(events|bytes)_total", action: drop}]`,
+> and in Alloy a `prometheus.relabel` rule with the same `source_labels`, `regex` and `action = "drop"`.
+
 ## Dashboards
 
 ```facts
@@ -126,7 +152,8 @@ edges:
 - `vlpds` (uid `vlpds`) is for someone running a PDS for a community. It shows request outcomes,
   how long common actions take, accounts and sign-ups, sign-in security (second factors, trusted
   browsers, new-device alerts, OAuth-only refusals, app permissions) and scheduled deletions, posts
-  and likes written, relay and PLC health, moderation actions, resources and cost, and firing alerts. It reads the same for one
+  and likes written, relay and PLC health (firehose subscribers, connects and drops, events/s per
+  connection against the PDS's own), moderation actions, resources and cost, and firing alerts. It reads the same for one
   server and for a cluster.
 - `vlpds internals` (uid `vlpds-internals`) opens on a Health row (requests, 5xx, 429s, read and
   write p99, commit p99, firehose lag, nodes up, shards owned, lease renewal ÷ TTL, store errors and

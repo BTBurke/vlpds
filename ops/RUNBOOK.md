@@ -989,7 +989,8 @@ problem. A high rate across subscribers points at the server.
 
 **Confirm:** `vlpds_firehose_subscribers`, the `vlpds_firehose_bytes_sent_total`
 rate against the NIC, `vlpds_runtime_tick_late_seconds`, and `--firehose-threads`
-(default 4) CPU.
+(default 4) CPU. The console's Firehose page lists each subscriber's lag and the
+recent disconnects with their reason.
 
 **Do:** server-side, look at the network or the firehose threads. Consumer-side,
 there's nothing to do.

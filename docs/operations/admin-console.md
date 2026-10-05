@@ -3,7 +3,7 @@ title: Admin console and CLI
 section: Operations
 order: 111
 status: ready
-summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, cluster status and metrics."
+summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, firehose subscribers, cluster status and metrics."
 ---
 
 ```hero
@@ -24,7 +24,7 @@ diagram:
     - "api -> owner: per DID"
     - { from: caddy.t, to: api.b, label: never public, dash: true, arrow: none }
 facts:
-  - { value: "6", unit: pages, label: in the console, note: "cluster, live metrics, accounts, invites, rate limits, relays" }
+  - { value: "8", unit: pages, label: in the console, note: "cluster, live metrics, accounts, moderation, invites, rate limits, relays, firehose" }
   - { value: "2 s", label: cluster view refresh, note: "getClusterStatus polled from the node you opened", tone: blue }
   - { value: "pdsadmin", label: every command covered, note: "plus the reference's maintenance scripts and cluster ops", tone: violet }
   - { value: "0", label: direct bucket access, note: "the CLI needs only a node URL and the admin token", tone: amber }
@@ -83,10 +83,21 @@ cluster, and account pages are routed to each account's owner.
 | Invite codes | Every code, newest first, with uses remaining, who used it, who it's for and when it was made | Create codes (count, uses, for an account) · disable selected codes. |
 | Rate limits | Each bucket's busiest key, 429s in the last minute and 15 minutes, a 429/s chart, top keys, recent 429s by route, and each node's applied config version | Change a bucket's points, window or on/off · add routes · add IP, CIDR or DID overrides (exempt or a custom limit) · a global off switch. Changes apply to every node within seconds and are kept, with your name, in the last 50 changes. See [Rate limits](rate-limits.md#changing-limits-live). |
 | Relays | The relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, and the minimum interval | Add or remove relays, reset to the flag's list, change the interval, request a crawl now. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
+| Firehose | Every subscribeRepos connection on every node, every 5 s: subscribers, live vs backfilling, this PDS's events/s and the bytes/s sent · per connection its `#conn` number and node, client address, the relay it matched, user agent (first 120 characters), how long it's been connected, start cursor and shard, state, lag, events/s against the PDS's rate, and events and bytes sent · the last 50 disconnects per node with their reason | Read only. A live connection well under the PDS's events/s is falling behind. |
 
 The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
 every node reads the same one. `{}` means the built-in defaults. The relay list lives next to it in
 `config/crawlers.json`.
+
+Each node serves its own firehose subscribers, so the Firehose page calls
+`vlpds.admin.listFirehoseSubscribers` on the node you opened and that node asks its peers over the
+peer listener. It lists up to 500 connections, oldest first, and the counts cover all of them. A peer
+that doesn't answer is named at the top. The relay column is a hint. vlpds resolves the hostnames of
+the configured relays every 5 minutes in the background and names a relay when the client's address
+is one of them or its user agent contains the hostname. A relay that connects from other addresses
+and doesn't name itself shows up unnamed. The `#conn` number is the `conn` label of
+`vlpds_firehose_subscriber_events_total`, so a line on the dashboard and a row here can be matched
+(see [Per-connection firehose series](monitoring.md#per-connection-firehose-series)).
 
 ## Admin CLI
 

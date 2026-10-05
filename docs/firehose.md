@@ -182,7 +182,9 @@ edges:
 
 Watch `vlpds_firehose_subscribers`, `vlpds_firehose_bytes_sent_total` against the NIC, and
 `vlpds_firehose_disconnects_total{reason}`. A rising `too_slow` rate across many subscribers points
-at the server (`VlpdsFirehoseConsumersTooSlow`).
+at the server (`VlpdsFirehoseConsumersTooSlow`). The console's
+[Firehose page](operations/admin-console.md#pages) lists who's connected to each node, how far
+behind each one is and why recent ones left.
 
 ## Backfill from the bucket
 
