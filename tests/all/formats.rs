@@ -330,6 +330,21 @@ fn space_notify() -> Vec<u8> {
     pretty(&k)
 }
 
+/// A space blob ref (`sb`, its rev) and its CID-major twin (`sc`).
+fn space_blob_refs() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let blob = Cid::raw(b"space blob fixture");
+    let path = "com.example.post/1";
+    let k: BTreeMap<&str, String> = [
+        ("space blob sb/", hex::encode(vlpds::state::space_blob_key(DID, &sid, &blob, path))),
+        ("space blob by cid sc/", hex::encode(vlpds::state::space_blob_cid_key(DID, &blob, &sid, path))),
+        ("sb row", hex::encode(0x1234_5678_9abc_u64.to_be_bytes())),
+    ]
+    .into_iter()
+    .collect();
+    pretty(&k)
+}
+
 fn space_space() -> vlpds::space::rows::SpaceRow {
     vlpds::space::rows::SpaceRow::defaults(SPACE, TIME)
 }
@@ -477,6 +492,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/space_writer.bin", space_writer().encode().to_vec()),
         ("state/space_space.json", space_space().encode().to_vec()),
         ("state/space_notify.json", space_notify()),
+        ("state/space_blob_refs.json", space_blob_refs()),
         ("control/node_lease.json", compact(&lease())),
         ("control/assignment.json", compact(&assignment())),
         ("control/layout.json", compact(&layout())),
@@ -913,6 +929,24 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let row = hex::decode(&k["row"]).unwrap();
             let r = vlpds::space::rows::NotifyRow::decode(&row).unwrap();
             assert!(r.encode() == row);
+        }
+        "state/space_blob_refs.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let sid = vlpds::state::space_id(SPACE);
+            let sb = hex::decode(&k["space blob sb/"]).unwrap();
+            let sc = hex::decode(&k["space blob by cid sc/"]).unwrap();
+            for key in [&sb, &sc] {
+                assert_eq!(vlpds::state::key_slot(key), Some(vlpds::slots::slot_of(DID)));
+                assert!(vlpds::state::is_space_key(key));
+            }
+            let prefix = vlpds::state::space_prefix(vlpds::state::SPACE_BLOB_FAMILY, DID, &sid);
+            let (cid, path) = vlpds::space::rows::blob_ref_parts(&sb[prefix.len()..]).unwrap();
+            let blob = Cid::parse(cid).unwrap();
+            assert!(vlpds::state::space_blob_key(DID, &sid, &blob, path) == sb);
+            assert!(vlpds::state::space_blob_cid_key(DID, &blob, &sid, path) == sc);
+            let rev = vlpds::space::rows::blob_ref_rev(&hex::decode(&k["sb row"]).unwrap());
+            assert_eq!(rev.0, 0x1234_5678_9abc);
         }
         "state/space_space.json" => {
             let r = vlpds::space::rows::SpaceRow::decode(b).unwrap();
