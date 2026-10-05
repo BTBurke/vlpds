@@ -3,7 +3,7 @@ title: OAuth and 2FA
 section: vlPDS
 order: 9
 status: ready
-summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, and how auth state stays correct under concurrency."
+summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, the account page, and how auth state stays correct under concurrency."
 ---
 
 ```hero
@@ -247,6 +247,20 @@ message that isn't "Authentication Required" or "Invalid identifier or password"
 messages say what to do instead. This server's account page signs in with `createSession` too, so
 same-origin requests from it still go through, and they still need the second factor (or a trusted
 browser).
+
+## The account page
+
+| Tab | What a user can do | Details |
+|---|---|---|
+| Overview | see the handle, DID, status (with the date of a scheduled deletion), repo counts and the DID document | |
+| Handle and email | change the handle to a name on this server or to their own domain, with a guided check · change and confirm the email | [Changing a handle](operations/email-and-moderation.md#changing-a-handle-on-the-account-page) |
+| Security | TOTP and recovery codes · recent sign-ins · trusted browsers · sign-in alerts · OAuth only · the recovery key · app passwords, scoped or not · connected OAuth apps · the password | [Second factors](#second-factors), [Trusted browsers](#trusted-browsers), [Sign-in alerts](#sign-in-alerts-and-recent-sign-ins), [OAuth only](#oauth-only), [Scoped app passwords](#scoped-app-passwords), [Recovery keys](keys-security.md#plc-rotation-key-and-recovery-keys) |
+| Repository, Media | browse records and delete one · preview blobs | |
+| Export, Preferences | download a full backup or the repo CAR · view and edit stored app preferences | [Backups](migration.md#backups) |
+| Deactivate or delete | deactivate, reactivate (which cancels a scheduled deletion) · delete with an emailed token | [Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion) |
+
+Users manage their account at `/account` on this server. The page signs in with `createSession`, so
+the second factor applies there too, unless the browser is trusted.
 
 ## Auth state under concurrency
 
