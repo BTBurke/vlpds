@@ -1434,6 +1434,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         txt_resolver: None,
         ptr_resolver: None,
         asn_whois: (args.asn_lookup == AsnLookup::BgpTools).then(|| vlpds::asn::BGP_TOOLS.to_string()),
+        asn_debounce: vlpds::asn::DEBOUNCE,
         well_known_fetcher: None,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),

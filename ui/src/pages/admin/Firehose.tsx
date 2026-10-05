@@ -10,6 +10,12 @@ type Subscriber = {
   /** False past the per-node labelled cap: its metrics count under conn="other". */
   labelled: boolean
   ip: string | null
+  /** Reverse DNS; only `ptrVerified` names resolve back to the address. */
+  ptr: string | null
+  ptrVerified: boolean
+  asn: number | null
+  asName: string | null
+  asCountry: string | null
   userAgent: string
   relay: string | null
   connectedAt: number
@@ -81,6 +87,32 @@ function lag(s: Subscriber): string {
 function Cursor({ seq }: { seq: string }) {
   const ms = seq.length > 12 ? seqMillis(seq) : undefined
   return <span title={seq}>{ms !== undefined ? `from ${relTime(ms)}` : seq}</span>
+}
+
+/** IP · AS · verified PTR on one line; an unverified PTR is only a claim, so it stays in the tooltip. */
+function Client({ s }: { s: Subscriber }) {
+  const as = s.asn != null ? `AS${s.asn}${s.asName ? ` ${s.asName}` : ''}${s.asCountry ? ` (${s.asCountry})` : ''}` : null
+  const tip = [s.ip ?? 'unknown', as, s.ptr ? (s.ptrVerified ? s.ptr : `${s.ptr} (unverified)`) : null].filter(Boolean).join(' · ')
+  return (
+    <span className="client" title={tip}>
+      <span className="mono">{s.ip ?? 'unknown'}</span>
+      {s.asn != null && (
+        <span className="muted">
+          {' · '}
+          <a href={`https://bgp.tools/as/${s.asn}`} target="_blank" rel="noreferrer">
+            AS{s.asn}
+          </a>
+          {s.asName && <span className="trunc"> {s.asName}</span>}
+        </span>
+      )}
+      {s.ptr && s.ptrVerified && (
+        <span className="muted">
+          {' · '}
+          <span className="trunc mono">{s.ptr}</span>
+        </span>
+      )}
+    </span>
+  )
 }
 
 const key = (s: Subscriber) => `${s.node}/${s.conn}`
@@ -181,7 +213,8 @@ export function Firehose() {
         desc={
           <>
             Oldest first{d.total > d.subscribers.length ? `, the first ${fmtNum(d.subscribers.length)} of ${fmtNum(d.total)}` : ''}. <b>Relay</b> names a
-            configured relay whose hostname resolves to the client's address or appears in its user agent. <b>#conn</b> is the{' '}
+            configured relay whose hostname resolves to the client's address, appears in its user agent, or holds the client's verified
+            reverse DNS name. The client's AS and verified reverse DNS follow its address once looked up. <b>#conn</b> is the{' '}
             <span className="mono">conn</span> label on <span className="mono">vlpds_firehose_subscriber_events_total</span>.
           </>
         }
@@ -224,7 +257,7 @@ export function Firehose() {
                         {multi && <span className="muted mono small"> {s.node}</span>}
                       </td>
                       <td>
-                        <span className="mono">{s.ip ?? 'unknown'}</span>
+                        <Client s={s} />
                         {s.relay && <span className="pill accent">{s.relay}</span>}
                       </td>
                       <td>{s.state === 'live' ? <Status kind="ok">Live</Status> : <Status kind="warn">Backfilling</Status>}</td>
@@ -281,7 +314,7 @@ export function Firehose() {
                       {multi && <span className="muted mono small"> {s.node}</span>}
                     </td>
                     <td>
-                      <span className="mono">{s.ip ?? 'unknown'}</span>
+                      <Client s={s} />
                       {s.relay && <span className="pill accent">{s.relay}</span>}
                     </td>
                     <td>

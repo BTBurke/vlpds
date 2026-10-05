@@ -83,7 +83,7 @@ cluster, and account pages are routed to each account's owner.
 | Invite codes | Every code, newest first, with uses remaining, who used it, who it's for and when it was made | Create codes (count, uses, for an account) · disable selected codes. |
 | Rate limits | Each bucket's busiest key, 429s in the last minute and 15 minutes, a 429/s chart, top keys, recent 429s by route, and each node's applied config version | Change a bucket's points, window or on/off · add routes · add IP, CIDR or DID overrides (exempt or a custom limit) · a global off switch. Changes apply to every node within seconds and are kept, with your name, in the last 50 changes. See [Rate limits](rate-limits.md#changing-limits-live). |
 | Relays | The relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, and the minimum interval | Add or remove relays, reset to the flag's list, change the interval, request a crawl now. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
-| Firehose | Every subscribeRepos connection on every node, every 5 s: subscribers, live vs backfilling, this PDS's events/s and the bytes/s sent · per connection its `#conn` number and node, client address, the relay it matched, user agent (first 120 characters), how long it's been connected, start cursor and shard, state, lag, events/s against the PDS's rate, and events and bytes sent · the last 50 disconnects per node with their reason | Read only. A live connection well under the PDS's events/s is falling behind. |
+| Firehose | Every subscribeRepos connection on every node, every 5 s: subscribers, live vs backfilling, this PDS's events/s and the bytes/s sent · per connection its `#conn` number and node, client address with its AS and verified reverse DNS name, the relay it matched, user agent (first 120 characters), how long it's been connected, start cursor and shard, state, lag, events/s against the PDS's rate, and events and bytes sent · the last 50 disconnects per node with their reason | Read only. A live connection well under the PDS's events/s is falling behind. |
 
 The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
 every node reads the same one. `{}` means the built-in defaults. The relay list lives next to it in
@@ -95,7 +95,12 @@ peer listener. It lists up to 500 connections, oldest first, and the counts cove
 that doesn't answer is named at the top. The relay column is a hint. vlpds resolves the hostnames of
 the configured relays every 5 minutes in the background and names a relay when the client's address
 is one of them or its user agent contains the hostname. A relay that connects from other addresses
-and doesn't name itself shows up unnamed. The `#conn` number is the `conn` label of
+and doesn't name itself shows up unnamed, unless its reverse DNS name is under the relay's hostname
+and resolves back to its address. The client cell shows the address, its AS from bgp.tools (a link to
+the AS page; `--asn-lookup off` hides it) and that forward-confirmed reverse DNS name. A name that
+doesn't resolve back is only in the tooltip, marked unverified, because anyone can put any name in
+their reverse zone. Both are looked up in the background, so a new address shows them on a later
+refresh. The `#conn` number is the `conn` label of
 `vlpds_firehose_subscriber_events_total`, so a line on the dashboard and a row here can be matched
 (see [Per-connection firehose series](monitoring.md#per-connection-firehose-series)).
 

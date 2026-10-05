@@ -117,10 +117,6 @@ pub struct AsnCache {
 }
 
 impl AsnCache {
-    pub fn new(server: Option<String>) -> Arc<AsnCache> {
-        Self::with(server, DEBOUNCE, MAX_ENTRIES)
-    }
-
     pub fn with(server: Option<String>, debounce: Duration, max_entries: usize) -> Arc<AsnCache> {
         Arc::new(AsnCache {
             server,

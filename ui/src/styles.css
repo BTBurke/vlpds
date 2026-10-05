@@ -2825,6 +2825,13 @@ table.data.firehose-subs td.ua {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+table.data.firehose-subs .client .trunc {
+  display: inline-block;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
 table.data.firehose-subs .slow {
   color: var(--amber);
   font-weight: 600;
@@ -2835,5 +2842,8 @@ table.data.firehose-subs td .pill {
 @media (max-width: 560px) {
   table.data.firehose-subs td.ua {
     max-width: 160px;
+  }
+  table.data.firehose-subs .client .trunc {
+    max-width: 100px;
   }
 }

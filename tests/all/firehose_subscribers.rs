@@ -102,3 +102,105 @@ async fn lists_every_nodes_subscribers() {
         assert!(r.get("unreachableNodes").is_none(), "{r}");
     }
 }
+
+/// Answers each PTR and forward query from its tables.
+struct StubDns {
+    ptr: std::collections::HashMap<std::net::IpAddr, Vec<String>>,
+    a: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
+}
+
+impl vlpds::ptr::PtrResolver for StubDns {
+    fn reverse(&self, ip: std::net::IpAddr) -> futures::future::BoxFuture<'_, Result<Vec<String>, String>> {
+        Box::pin(async move { self.ptr.get(&ip).cloned().ok_or_else(|| "NXDOMAIN".into()) })
+    }
+    fn forward<'a>(&'a self, name: &'a str) -> futures::future::BoxFuture<'a, Result<Vec<std::net::IpAddr>, String>> {
+        Box::pin(async move { self.a.get(name).cloned().ok_or_else(|| "NXDOMAIN".into()) })
+    }
+}
+
+/// A bgp.tools whois stand-in answering every bulk query with `reply`.
+async fn stub_whois(reply: &'static str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let mut req = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !req.ends_with(b"end\n") {
+                match s.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = s.write_all(reply.as_bytes()).await;
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn names_subscribers_by_reverse_dns_and_as() {
+    let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+    let dns = StubDns {
+        ptr: [
+            (ip("5.6.7.8"), vec!["relay3.us-east.relay.example.com.".to_string()]),
+            (ip("5.6.7.9"), vec!["spoof.relay.example.com.".to_string()]),
+        ]
+        .into(),
+        a: [
+            ("relay3.us-east.relay.example.com".to_string(), vec![ip("5.6.7.8")]),
+            ("spoof.relay.example.com".to_string(), vec![ip("9.9.9.9")]),
+        ]
+        .into(),
+    };
+    let whois = stub_whois(
+        "16276   | 5.6.7.8          | 5.6.0.0/16          | FR | RIPE     | 2016-08-05 | OVH SAS\n\
+         0       | 5.6.7.9          | <nil>               |    | Unknown  | 0001-01-01 | ERR_AS_NAME_NOT_FOUND\n",
+    )
+    .await;
+    let s = TestServer::spawn_with(move |c| {
+        c.crawlers = vec!["relay.example.com".into()];
+        c.trusted_proxies = vec!["127.0.0.1".into()];
+        c.ptr_resolver = Some(vlpds::ptr::PtrResolverRef(Arc::new(dns)));
+        c.asn_whois = Some(whois);
+        c.asn_debounce = Duration::from_millis(50);
+    })
+    .await;
+    eventually(Duration::from_secs(10), || async {
+        s.app.crawlers.relay_hint(&s.app.store, None, "", Some("a.relay.example.com")).map(|_| ())
+    })
+    .await
+    .expect("relay hints loaded");
+
+    let ua = "indigo-relay (atproto-relay)";
+    let real = Sub::connect_with(&s.ws_url(None), &[("user-agent", ua), ("x-forwarded-for", "5.6.7.8")]).await;
+    let spoof = Sub::connect_with(&s.ws_url(None), &[("user-agent", ua), ("x-forwarded-for", "5.6.7.9")]).await;
+    // connects only start the lookups; listings answer from the caches
+    let r = eventually(Duration::from_secs(10), || async {
+        let r = list(&s).await;
+        let subs = r["subscribers"].as_array()?;
+        (subs.len() == 2 && subs.iter().all(|v| v["ptr"].is_string()) && subs.iter().any(|v| v["asn"].is_u64()))
+            .then_some(r)
+    })
+    .await
+    .expect("PTR and AS filled in");
+    let by_ip = |a: &str| r["subscribers"].as_array().unwrap().iter().find(|v| v["ip"] == a).cloned().unwrap();
+    let v = by_ip("5.6.7.8");
+    assert_eq!(v["ptr"], "relay3.us-east.relay.example.com", "{v}");
+    assert_eq!(v["ptrVerified"], true, "{v}");
+    assert_eq!(v["relay"], "relay.example.com", "a verified PTR in the relay's domain names it: {v}");
+    assert_eq!((v["asn"].as_u64(), &v["asName"], &v["asCountry"]), (Some(16276), &json!("OVH SAS"), &json!("FR")));
+    let v = by_ip("5.6.7.9");
+    assert_eq!(v["ptr"], "spoof.relay.example.com", "{v}");
+    assert_eq!(v["ptrVerified"], false, "{v}");
+    assert!(v["relay"].is_null(), "an unverified PTR names nothing: {v}");
+    assert!(v["asn"].is_null() && v["asName"].is_null(), "{v}");
+
+    drop(real);
+    drop(spoof);
+    let r = until_total(&s, 0).await;
+    let g = r["recentDisconnects"].as_array().unwrap().iter().find(|v| v["ip"] == "5.6.7.8").cloned().unwrap();
+    assert_eq!(g["ptr"], "relay3.us-east.relay.example.com", "{g}");
+    assert_eq!((g["ptrVerified"].as_bool(), g["asn"].as_u64()), (Some(true), Some(16276)), "{g}");
+}

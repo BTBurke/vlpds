@@ -115,6 +115,8 @@ pub struct Config {
     /// The whois server (`host:port`) asked for firehose subscribers' AS.
     /// None: no lookups.
     pub asn_whois: Option<String>,
+    /// How long ASN misses gather before one batched query.
+    pub asn_debounce: Duration,
     /// None: the SSRF-guarded HTTPS fetch; tests inject a stub.
     pub well_known_fetcher: Option<crate::handle_resolver::WellKnownRef>,
     /// None: node id "single", addr = public_url.
@@ -308,6 +310,7 @@ impl Default for Config {
             txt_resolver: None,
             ptr_resolver: None,
             asn_whois: None,
+            asn_debounce: crate::asn::DEBOUNCE,
             well_known_fetcher: None,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
@@ -557,7 +560,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
         crawlers: Arc::new(xrpc::crawlers::Crawlers::new(&cfg.crawlers, cfg.crawl_interval)),
         ptr: crate::ptr::PtrCache::new(cfg.ptr_resolver.as_ref()),
-        asn: crate::asn::AsnCache::new(cfg.asn_whois.clone()),
+        asn: crate::asn::AsnCache::with(cfg.asn_whois.clone(), cfg.asn_debounce, crate::asn::MAX_ENTRIES),
         secrets,
         plc,
         config: Arc::new(cfg),
