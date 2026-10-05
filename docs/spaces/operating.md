@@ -130,7 +130,7 @@ without the flag still answers `BlobNotFound` for a blob only space records name
 | `--spaces` (`VLPDS_SPACES`) | off | serves `com.atproto.space.*` and `com.atproto.simplespace.*` here |
 | `--space-repo-max-records` | 100000 | the most records one account's repo in one space may hold. A write past it gets `InvalidRequest` |
 | `--space-oplog-retention` | `7d` | how long ops stay for `listRepoOps`. `off` keeps them all |
-| `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo` |
+| `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo`. Its blocks are capped besides ([Moving a repo in](storage.md#moving-a-repo-in)), and it reserves from the same import budget |
 | `--max-exports`, `--export-stall-secs` | as for `sync.getRepo` | `space.getRepo` takes the same export slots and stall timeout |
 
 A `space.getRepo` holds every path and CID of the repo while it streams (~128 B a record), so it

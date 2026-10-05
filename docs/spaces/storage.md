@@ -109,6 +109,21 @@ rows or 4 MiB. One last entry on the repo's worker puts the head
 in at the CAR's rev with an empty oplog, and the authority is owed a notify like after any write.
 The account's writes to that space are refused while it imports.
 
+Nothing of the body is read until the import is let in, so a stranger's CAR can't cost the node
+memory first:
+
+- The grant must allow `create` in the space for some collection (a `space:` scope). Which
+  collections the records are in is checked once the index is in.
+- An account gets 100 imports an hour (`space-import`), and runs 2 at once; a node runs 8.
+- The import reserves what it can hold from the import budget, as `com.atproto.repo.importRepo`
+  does, and waits up to 30 s for room (then 503 `Overloaded`). A body that declares its length
+  reserves less.
+- Every block is refused from its length, before it's read. The commit gets 1 KiB (a real one is
+  ~200 bytes), the index `--space-repo-max-records` × 128 bytes (12.8 MB at the default, and never
+  less than 1 MiB), and each record 1 MB, as a space write does. The index's entry count is checked
+  from its head too, and it's read in place. A repo near the record limit whose paths average over
+  ~85 bytes won't fit.
+
 - A rev more than 5 min in the future gets `FutureRev`.
 - When the space's authority is hosted on the same node, the account must be allowed to write in the
   space (`NotAuthorized` otherwise). An authority elsewhere refuses a non-writer's notify as it

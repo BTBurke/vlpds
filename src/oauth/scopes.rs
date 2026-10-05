@@ -658,6 +658,9 @@ pub enum SpaceAccess<'a> {
     ReadSelf,
     /// create | update | delete, of a collection.
     Write(&'a str, &'a str),
+    /// create | update | delete, of some collection: what a request needs
+    /// before it knows which (importRepo, before its body is read).
+    WriteAny(&'a str),
     /// create | update | delete of the space itself.
     Manage(&'a str),
 }
@@ -684,6 +687,7 @@ impl SpacePermission {
             SpaceAccess::Write(action, coll) => {
                 has(action) && self.collection.as_ref().is_some_and(|c| c.iter().any(|x| x == "*" || x == coll))
             }
+            SpaceAccess::WriteAny(action) => has(action) && self.collection.as_ref().is_some_and(|c| !c.is_empty()),
         }
     }
 
@@ -723,6 +727,7 @@ impl SpacePermission {
             SpaceAccess::Read => (None, one("read"), None),
             SpaceAccess::ReadSelf => (None, one("read_self"), None),
             SpaceAccess::Write(action, coll) => (one(coll), one(action), None),
+            SpaceAccess::WriteAny(action) => (one("*"), one(action), None),
         };
         SPACE.format(&vec![
             ("type", one(t.space_type)),

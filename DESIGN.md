@@ -5572,6 +5572,18 @@ the space row, and counts a mismatch in
   A failed import clears what it staged, and rows a crashed one left with
   no head over them are cleared by the next import or the repo's first
   write before it lands.
+  Everything that costs memory is decided before the body is read: a
+  grant with `create` in the space (for some collection; the index's
+  collections are checked once it's in), the `space-import` bucket, 2
+  imports per account and 8 per node, and a reservation from the import
+  budget sized by the block caps (and the Content-Length, when there is
+  one). Each block is refused from its length before it's buffered: the
+  commit over 1 KiB, the index over max(records cap × 128 B, 1 MiB), a
+  record over 1 MB. The index is read in place with its count checked
+  from the map's head, and a record's blob refs are found by a scan that
+  holds only the refs (`cbor::scan_blob_refs`): a generic decode holds
+  ~40 bytes per byte of a block of tiny items, so a 32 MiB root used to
+  cost ~1.3 GB before any scope or signature check.
 - Revocations and registrations are bounded (see above). The reference
   bounds neither, but its revocations are per host rows where vlpds's are
   one object every node reads.

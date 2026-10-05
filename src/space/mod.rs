@@ -100,6 +100,9 @@ pub struct Spaces {
     /// (account, space) -> the importRepo staging it on this node. Not
     /// with the worker's state, which can be evicted mid-import.
     imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
+    /// importRepo calls running on this node, per account, from before the
+    /// body is read ([`Spaces::import_slot`]).
+    importing: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
     /// registerNotify's count-and-write, per space (striped).
     registering: [tokio::sync::Mutex<()>; 64],
     /// Authorities whose shard's owner (another node) said the cluster
@@ -112,6 +115,31 @@ pub struct Spaces {
     /// [`export_budget_bytes`] in KiB, which space exports reserve from.
     exports: Arc<tokio::sync::Semaphore>,
     export_kib: u32,
+}
+
+/// importRepo calls one account runs at once on a node: a move brings its
+/// spaces in one after another.
+pub const IMPORTS_PER_ACCOUNT: usize = 2;
+/// importRepo calls a node runs at once. Each also reserves its working set
+/// from the import budget; this bounds the PLC and DID lookups besides.
+pub const IMPORTS_RUNNING: usize = 8;
+
+/// An importRepo's slot ([`Spaces::import_slot`]), given back on drop.
+pub struct ImportSlot<'a> {
+    sp: &'a Spaces,
+    did: String,
+}
+
+impl Drop for ImportSlot<'_> {
+    fn drop(&mut self) {
+        let mut m = self.sp.importing.lock();
+        if let Some(n) = m.get_mut(&self.did) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.did);
+            }
+        }
+    }
 }
 
 /// An authority that moves into the cluster within this is still told
@@ -146,6 +174,7 @@ impl Spaces {
             peer_notifies: Default::default(),
             cache_fills: Default::default(),
             imports: Default::default(),
+            importing: Default::default(),
             registering: std::array::from_fn(|_| Default::default()),
             not_hosted: Default::default(),
             same_rev: Default::default(),
@@ -155,6 +184,21 @@ impl Spaces {
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
+    }
+
+    /// One of the node's [`IMPORTS_RUNNING`] importRepo slots, and one of
+    /// `did`'s [`IMPORTS_PER_ACCOUNT`]; Err(true) when the account's are
+    /// taken, Err(false) when the node's are.
+    pub fn import_slot(&self, did: &str) -> Result<ImportSlot<'_>, bool> {
+        let mut m = self.importing.lock();
+        if m.get(did).is_some_and(|n| *n >= IMPORTS_PER_ACCOUNT) {
+            return Err(true);
+        }
+        if m.values().sum::<usize>() >= IMPORTS_RUNNING {
+            return Err(false);
+        }
+        *m.entry(did.to_string()).or_default() += 1;
+        Ok(ImportSlot { sp: self, did: did.to_string() })
     }
 
     /// Room for `bytes` of a space export, waited for up to 10 s.
@@ -501,6 +545,24 @@ pub(crate) mod vectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two importRepo slots per account and eight per node, given back on
+    /// drop.
+    #[test]
+    fn import_slots_cap_accounts_and_the_node() {
+        let sp = Spaces::new(Limits::default());
+        let a1 = sp.import_slot("did:a").unwrap();
+        let _a2 = sp.import_slot("did:a").unwrap();
+        assert!(matches!(sp.import_slot("did:a"), Err(true)));
+        drop(a1);
+        let a3 = sp.import_slot("did:a").unwrap();
+        let others: Vec<_> = (0..6).map(|i| sp.import_slot(&format!("did:o{i}")).unwrap()).collect();
+        assert!(matches!(sp.import_slot("did:new"), Err(false)));
+        drop(a3);
+        let _n = sp.import_slot("did:new").unwrap();
+        drop(others);
+        assert_eq!(sp.importing.lock().len(), 2);
+    }
 
     #[test]
     fn space_nsids() {

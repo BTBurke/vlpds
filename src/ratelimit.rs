@@ -389,9 +389,11 @@ limit!(
     1000
 );
 
+limit!(SPACE_IMPORT, 42, "space-import", Did, "vlpds.space.importRepo per account, before its body is read", HOUR, 100);
+
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 42] = [
+pub const BUILTIN: [&Limit; 43] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -434,6 +436,7 @@ pub const BUILTIN: [&Limit; 42] = [
     &SPACE_CREDENTIAL,
     &SPACE_NOTIFY_IN,
     &SPACE_REVOKE,
+    &SPACE_IMPORT,
 ];
 
 /// A confidential client's backend calls these for all of its users from

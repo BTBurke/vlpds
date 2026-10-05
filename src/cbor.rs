@@ -1017,12 +1017,102 @@ impl<'a> Cursor<'a> {
         Some(c)
     }
 
+    /// A map key, in canonical order after `prev`.
+    pub(crate) fn map_key(&mut self, prev: Option<&str>) -> Option<&'a str> {
+        self.d.map_key(1, prev).ok()
+    }
+
     #[inline(always)]
     pub(crate) fn opt_link(&mut self) -> Option<Option<Cid>> {
         if self.lit(&[0xf6]) {
             return Some(None);
         }
         self.link().map(Some)
+    }
+}
+
+/// The blob refs [`crate::xrpc::blob_refs`] finds in `Value::decode(data)`,
+/// in the same order, accepting exactly what it accepts but holding only the
+/// refs: a record of a million one-byte items would be ~40 MB as a `Value`.
+pub fn scan_blob_refs(data: &[u8]) -> Result<Vec<Cid>, CborError> {
+    let mut d = Decoder { data, pos: 0 };
+    let mut out = Vec::new();
+    d.scan(0, &mut out)?;
+    if d.pos != data.len() {
+        return Err(CborError::Invalid("trailing bytes"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(out.len());
+    out.retain(|c| seen.insert(*c));
+    Ok(out)
+}
+
+#[derive(Clone, Copy)]
+enum Scanned<'a> {
+    Text(&'a str),
+    Link(Cid),
+    Other,
+}
+
+// `scan` mirrors `owned` check for check.
+impl<'a> Decoder<'a> {
+    fn scan(&mut self, depth: usize, out: &mut Vec<Cid>) -> Result<Scanned<'a>, CborError> {
+        if depth > 128 {
+            return Err(CborError::Invalid("nesting too deep"));
+        }
+        let (major, n) = self.head()?;
+        Ok(match major {
+            0 | 1 => {
+                int(major, n)?;
+                Scanned::Other
+            }
+            2 => {
+                self.take(n)?;
+                Scanned::Other
+            }
+            3 => Scanned::Text(utf8(self.take(n)?)?),
+            4 => {
+                for _ in 0..n {
+                    self.scan(depth + 1, out)?;
+                }
+                Scanned::Other
+            }
+            5 => {
+                // a map's own ref goes before its children's, as `blob_refs` walks
+                let at = out.len();
+                let (mut ty, mut rf, mut cid, mut mime) = (None, None, None, None);
+                let mut prev: Option<&str> = None;
+                for _ in 0..n {
+                    let k = self.map_key(depth + 1, prev)?;
+                    let v = self.scan(depth + 1, out)?;
+                    match k {
+                        "$type" => ty = Some(v),
+                        "ref" => rf = Some(v),
+                        "cid" => cid = Some(v),
+                        "mimeType" => mime = Some(v),
+                        _ => {}
+                    }
+                    prev = Some(k);
+                }
+                let found = match (ty, rf, cid, mime) {
+                    (Some(Scanned::Text("blob")), Some(Scanned::Link(c)), ..) => Some(c),
+                    (None, _, Some(Scanned::Text(c)), Some(Scanned::Text(m))) if n == 2 && !m.is_empty() => {
+                        Cid::parse(c).ok()
+                    }
+                    _ => None,
+                };
+                if let Some(c) = found {
+                    out.insert(at, c);
+                }
+                Scanned::Other
+            }
+            6 => {
+                if n != 42 {
+                    return Err(CborError::Invalid("unsupported tag"));
+                }
+                Scanned::Link(self.json_link(depth + 1)?)
+            }
+            _ => Scanned::Other,
+        })
     }
 }
 
@@ -1125,6 +1215,69 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `scan_blob_refs` finds what `Value::decode` and `blob_refs` find, and
+    /// refuses what they refuse.
+    #[test]
+    fn scan_blob_refs_matches_decode() {
+        let blob = |i: u8| Cid::raw(&[i]);
+        let m = |pairs: Vec<(&str, Value)>| {
+            let mut v: Vec<(String, Value)> = pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+            v.sort_by(|a, b| key_cmp(&a.0, &b.0));
+            Value::Map(v)
+        };
+        let t = |s: &str| Value::Text(s.into());
+        let b = |i: u8| {
+            m(vec![
+                ("$type", t("blob")),
+                ("ref", Value::Link(blob(i))),
+                ("mimeType", t("image/png")),
+                ("size", Value::Int(3)),
+            ])
+        };
+        let legacy = |i: u8| m(vec![("cid", t(&blob(i).to_string())), ("mimeType", t("image/png"))]);
+        let records = [
+            m(vec![("text", t("none"))]),
+            m(vec![
+                ("a", b(1)),
+                ("b", Value::Array(vec![b(2), m(vec![("x", b(1))]), legacy(3)])),
+                ("c", m(vec![("d", b(4))])),
+            ]),
+            // a blob map holding another blob: the outer one first
+            m(vec![("$type", t("blob")), ("ref", Value::Link(blob(5))), ("mimeType", t("x/y")), ("z", b(6))]),
+            m(vec![("$type", t("blob")), ("ref", t("not a link")), ("mimeType", t("x/y"))]),
+            m(vec![("$type", Value::Int(1)), ("ref", Value::Link(blob(5)))]),
+            m(vec![("cid", t(&blob(7).to_string())), ("mimeType", t(""))]),
+            m(vec![("cid", t(&blob(7).to_string())), ("mimeType", t("a/b")), ("extra", Value::Int(1))]),
+            m(vec![("cid", t("nope")), ("mimeType", t("a/b"))]),
+            Value::Array(vec![b(8), Value::Array(vec![Value::Array(vec![b(9)])]), b(8)]),
+        ];
+        for r in &records {
+            let bytes = r.to_cbor();
+            let mut want = Vec::new();
+            crate::xrpc::blob_refs(&Value::decode(&bytes).unwrap(), &mut want);
+            assert_eq!(scan_blob_refs(&bytes).unwrap(), want, "{r:?}");
+        }
+        assert_eq!(scan_blob_refs(&records[1].to_cbor()).unwrap(), vec![blob(1), blob(2), blob(3), blob(4)]);
+        let ok = records[1].to_cbor();
+        let mut bad: Vec<Vec<u8>> = vec![
+            vec![],
+            vec![0xa2, 0x61, 0x62, 0x01, 0x61, 0x61, 0x01], // keys out of order
+            vec![0xf9, 0, 0],                               // a float
+            vec![0xc5, 0x01],                               // tag 5
+            vec![0x18, 0x01],                               // non-minimal
+            vec![0x9f, 0xff],                               // indefinite
+            [&ok[..], &[0x01]].concat(),                    // trailing
+            ok[..ok.len() - 1].to_vec(),                    // truncated
+        ];
+        let mut deep = vec![0x81; 200];
+        deep.push(0x01);
+        bad.push(deep);
+        for b in &bad {
+            assert!(Value::decode(b).is_err(), "{b:02x?}");
+            assert!(scan_blob_refs(b).is_err(), "{b:02x?}");
+        }
+    }
 
     #[test]
     fn json_roundtrip_sorted() {
