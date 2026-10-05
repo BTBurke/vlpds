@@ -130,11 +130,18 @@ pub(super) async fn submit_space(app: &App, did: &str, space: &Space, op: SpaceO
     // taken down, what it serves (and so listRepos) is the set without them
     if matches!(ack, SpaceAck::Write { rev: Some(_), .. })
         && did == space.authority
-        && !hidden_paths(app, did, &space.sid).await?.is_empty()
+        && !hidden_paths(app, did, &space.sid).await.map_err(after_applied)?.is_empty()
     {
-        push_served_hash(app, did, space.sid).await?;
+        push_served_hash(app, did, space.sid).await.map_err(after_applied)?;
     }
     Ok(ack)
+}
+
+/// A failure once the write is applied: neither a refusal nor a "nothing
+/// done" answer (ShardMoved, which the entry node resends), but a 500 whose
+/// outcome the client must treat as unknown.
+fn after_applied(e: XrpcError) -> XrpcError {
+    XrpcError::internal(format!("the write was applied, then failed: {}", e.message))
 }
 
 pub(super) async fn submit_space_once(

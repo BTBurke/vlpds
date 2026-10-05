@@ -40,8 +40,11 @@ pub type AckFn = Box<dyn FnOnce(Result<(), Arc<anyhow::Error>>) + Send>;
 
 /// The error an entry is acked with when its shard isn't held here or is
 /// closing: nothing of it is applied or replayed, so the write can be resent
-/// to the shard's owner.
+/// to the shard's owner. Only ever for an entry no segment carries.
 pub const NOT_HELD: &str = "partition not owned by this node (moved)";
+/// An entry already in a durable segment whose shard is gone: a successor
+/// may replay it, so it is not [`NOT_HELD`] (never resent).
+pub const NOT_HELD_LOGGED: &str = "partition left this node after the write was logged: outcome unknown";
 /// False once this node may no longer act as an owner (lease lapsed).
 pub type LeaseCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 
@@ -1260,7 +1263,7 @@ async fn run_finalizer(
             }
             if let Some(ack) = ack {
                 if unheld.contains(&shard) {
-                    ack(Err(Arc::new(anyhow::anyhow!(NOT_HELD))));
+                    ack(Err(Arc::new(anyhow::anyhow!(NOT_HELD_LOGGED))));
                 } else {
                     ack(Ok(()));
                 }

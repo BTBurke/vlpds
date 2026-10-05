@@ -10,6 +10,7 @@
 //! (`operator_reads`), with their shared pieces in `phase3`.
 
 mod accept;
+mod applied_writes;
 mod backup;
 mod bench;
 mod check;
