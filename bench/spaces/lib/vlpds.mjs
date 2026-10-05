@@ -222,7 +222,17 @@ export class Vlpds {
           res.writeHead(up.status, h)
           res.end(Buffer.from(await up.arrayBuffer()))
           return
-        } catch {}
+        } catch (e) {
+          // Resend only when the node refused the connection, so nothing
+          // reached it. Anything later (a reset mid-request, a cut answer)
+          // may have applied it, and resending a DPoP request would replay
+          // its proof: answer 502 and let the client treat it as uncertain.
+          const code = e?.cause?.code ?? e?.code
+          if (code === 'ECONNREFUSED') continue
+          res.writeHead(502, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ error: 'BadGateway', message: `upstream failed mid-request: ${code ?? e?.message}` }))
+          return
+        }
       }
       res.writeHead(503, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ error: 'Unavailable', message: 'no live vlpds node' }))
