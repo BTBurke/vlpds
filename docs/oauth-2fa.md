@@ -101,7 +101,7 @@ because the scope syntax can't tell a query from a procedure.
 - title: Sign in on this server
   body: "The browser opens `/oauth/authorize`. A device cookie remembers accounts that signed in on that browser within 7 days, so the user can pick one without a password unless the client sends `prompt=login`. Otherwise the user enters a handle and password, then the second factor if one is on. Sign-up (`prompt=create`) goes through the same checks as `createAccount`."
 - title: Consent
-  body: "Public clients always show the consent screen. It lists each requested scope in plain words with a checkbox, so the user can untick what they don't want (the page needs no script). `atproto` can't be unticked, and the server refuses a post without it. The token's scope is exactly what was left ticked, and `transition:chat.bsky` goes with `transition:generic` since the spec says it doesn't work without it. A confidential client's consent is remembered per account, and the user is asked again only for scopes it hasn't been granted."
+  body: "Public clients always show the consent screen. It lists each requested scope in plain words with a checkbox, so the user can untick what they don't want (the page needs no script). Scopes are grouped by NSID authority, so `app.bsky.feed.post` and `app.bsky.feed.like` sit together (see [The consent screen](#the-consent-screen)). `atproto` can't be unticked, and the server refuses a post without it. The token's scope is exactly what was left ticked, and `transition:chat.bsky` goes with `transition:generic` since the spec says it doesn't work without it. A confidential client's consent is remembered per account, and the user is asked again only for scopes it hasn't been granted."
 - title: Code exchange
   body: "The client posts the code, its PKCE verifier and a DPoP proof to `/oauth/token`. A code lives 5 min and works once, and reusing it revokes the session it created. A PKCE challenge seen in the last 24 h is refused."
 - title: Use and refresh
@@ -125,6 +125,28 @@ within its short window, and only together with the access token it's bound to.
 
 Users see and revoke their OAuth sessions on the account page and at `/oauth/account`. The API is
 `vlpds.oauth.listSessions` and `vlpds.oauth.revokeSession`.
+
+### The consent screen
+
+A big grant can ask for 20 or more scopes, and a flat list of 20 checkboxes is hard to read. So the
+consent screen groups every permission it lists by NSID authority, which is the NSID minus its last
+segment. `app.bsky.feed.post` and `app.bsky.feed.like` both sit under `app.bsky.feed`. A
+`repo:` scope groups by its collections, an `rpc:` scope by its methods, a `space:` scope by its
+space type, and an `include:` permission set groups the permissions inside it. Permissions without
+an NSID get groups of their own (uploads, account settings, full access, every space).
+
+The top level is the first two segments (`app.bsky`), with one more level inside it (feed, graph,
+actor). A group whose scopes all share one authority takes that authority's name instead, so a grant
+that only touches `app.bsky.feed` doesn't nest under `app.bsky`. A group of one is just its row.
+Each group has one summary line with a label from a small built-in map ("Bluesky posts and feeds",
+"Bluesky chat", and so on) or else the prefix, plus the combined verbs and a count, like "Create and
+delete in 4 collections · call 2 methods". Its warnings show in the summary too.
+
+Opening a group shows each scope's checkbox, its plain-words description and the NSIDs it covers
+with their actions. Groups are native `<details>`, so the page still runs no script under its CSP.
+They start closed, except a group with a warning (full access, private messages, a read or write on
+every space), which starts open. A permission set keeps one checkbox, since it's granted or refused
+whole. "Show requested scopes" at the bottom shows the raw scope string.
 
 ## Second factors
 

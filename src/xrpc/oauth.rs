@@ -999,7 +999,7 @@ async fn consent_step(app: &App, mut flow: Flow, did: &str) -> Response {
     let rows = ui::describe_scopes(&flow.req.params.scope, &sets, names.as_ref());
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &rows);
+    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &flow.req.params.scope, &rows);
     flow.page(app, body)
 }
 
