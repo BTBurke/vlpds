@@ -311,6 +311,8 @@ reactivation that lands mid-sweep wins. A deletion that stops partway (a crash, 
 finished by the next pass. `getSession` and the console's account page show
 `deletionScheduledAt`, and `vlpds_account_deletions_total{reason="delete_after"}` counts the
 deletions (`user` and `admin` count the others).
+To cancel a deletion that was scheduled by mistake, see `ops/RUNBOOK.md` "Cancelling a scheduled
+deletion".
 
 ## Handle policy
 

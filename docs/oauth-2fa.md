@@ -234,7 +234,7 @@ with `alerts: {password, appPassword}`.
 
 Some apps still take a handle and password and call `createSession`. The OAuth-only switch on the
 Security tab makes `createSession` refuse the account's main password with 401 `OAuthRequired`, so
-the password only works on this server's sign-in page. App passwords keep working unless the user
+the password only works on this server's own pages. App passwords keep working unless the user
 also blocks them (401 `AppPasswordsBlocked`). The switch is only offered with a second factor on,
 and it only applies while one is. Without a factor there's no second step to get around.
 Blocking app passwords doesn't depend on a factor. It only refuses new sign-ins, so an app that's
@@ -247,6 +247,8 @@ message that isn't "Authentication Required" or "Invalid identifier or password"
 messages say what to do instead. This server's account page signs in with `createSession` too, so
 same-origin requests from it still go through, and they still need the second factor (or a trusted
 browser).
+
+`ops/RUNBOOK.md` "A user locked out by OAuth only" covers a user an app refuses.
 
 ## The account page
 
