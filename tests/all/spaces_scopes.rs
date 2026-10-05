@@ -234,6 +234,42 @@ async fn refresh_never_widens_a_bare_grant() {
     }
 }
 
+/// A session approved before `--spaces` was enabled has a bare writing
+/// grant but no approved collections: its refresh is refused with
+/// invalid_grant (not server_error, which clients retry) and the session
+/// ends, so the client signs in again and the account approves the writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refresh_without_approved_collections_needs_a_new_grant() {
+    let s = spawn().await;
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6pre").await;
+    let ty = "com.c6pre.forum";
+    publish(&s, ty, json!({"type": "space", "name": "Forum", "collections": ["com.c6pre.thread"]})).await;
+    let scope = format!("atproto space:{ty}?manage=create");
+    let key = DpopKey::new();
+    let f = Flow::loopback(&scope, &key);
+    let t = oauth::grant(&srv, &mut Browser::default(), &f, &acct).await;
+    let sid = jwt_claims(&t.access)["sid"].as_str().unwrap().to_string();
+
+    // what a session from before `--spaces` looks like
+    let (mut row, raw) = vlpds::oauth::store::get_session_raw(&s.app, &acct.did, &sid).await.unwrap().expect("session");
+    assert!(row.space_collections.is_some());
+    row.space_collections = None;
+    assert!(vlpds::oauth::store::put_session_if(&s.app, &row, vlpds::oauth::store::SessionGuard::Row(raw))
+        .await
+        .unwrap());
+
+    let rt = t.refresh.expect("refresh token");
+    let r = oauth::refresh(&srv, &f, &rt, &[]).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert_eq!(r.body["error"], "invalid_grant", "{}", r.body);
+    assert!(r.body["error_description"].as_str().unwrap().contains(ty), "{}", r.body);
+    assert!(vlpds::oauth::store::get_session(&s.app, &acct.did, &sid).await.unwrap().is_none());
+
+    let again = oauth::grant(&srv, &mut Browser::default(), &Flow::loopback(&scope, &key), &acct).await;
+    assert!(again.scope.contains("collection=com.c6pre.thread"), "{}", again.scope);
+}
+
 /// `authority=self` is resolved to the account when the token is issued, so
 /// the grant covers only the account's own spaces; a type or an authority
 /// not granted is refused, and so is an action.

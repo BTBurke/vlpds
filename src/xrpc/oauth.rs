@@ -1906,7 +1906,7 @@ async fn code_grant(
     }
     let token_scope = lexicon::build_token_scope_cached(app, &params.scope, &did, req.space_collections.as_ref())
         .await
-        .map_err(|e| OAuthError::invalid_request(&e))?;
+        .map_err(|e| OAuthError::invalid_request(&e.to_string()))?;
     let now = now_secs();
     let mut s = Session {
         id: ou::random_id("ses-", 16),
@@ -2038,9 +2038,15 @@ async fn refresh_grant(
         return Err(OAuthError::invalid_grant("Refresh token expired"));
     }
     ensure_active_any(app, &s.did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
-    s.token_scope = lexicon::build_token_scope_cached(app, &s.scope, &s.did, s.space_collections.as_ref())
-        .await
-        .map_err(|e| OAuthError::server_error(&e))?;
+    s.token_scope = match lexicon::build_token_scope_cached(app, &s.scope, &s.did, s.space_collections.as_ref()).await {
+        Ok(t) => t,
+        Err(lexicon::TokenScopeError::Lookup(m)) => return Err(OAuthError::server_error(&m)),
+        // retrying can't help, and a client only re-authenticates on invalid_grant
+        Err(lexicon::TokenScopeError::NotApproved(m)) => {
+            store::delete_session(app, &s.did, &s.id).await?;
+            return Err(OAuthError::invalid_grant(&m));
+        }
+    };
     s.refresh_gen += 1;
     super::cas::pause_point("oauth_refresh", &s.did).await;
     // only if the row is still the one read: a revocation since is not undone
