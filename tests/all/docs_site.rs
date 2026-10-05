@@ -63,7 +63,9 @@ async fn docs_pages_are_served_with_the_spa_csp() {
     let app = body(&app);
     for slug in ["overview", "architecture", "operations/deploy", "operations/runbook"] {
         assert!(
-            app.contains(&format!("slug:\"{slug}\"")) || app.contains(&format!("\"slug\":\"{slug}\"")),
+            app.contains(&format!("slug:\"{slug}\""))
+                || app.contains(&format!("slug:`{slug}`"))
+                || app.contains(&format!("\"slug\":\"{slug}\"")),
             "nav lists {slug}"
         );
     }
