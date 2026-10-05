@@ -84,6 +84,18 @@ Each write's `sH` row carries the whole 2,048 B LtHash state. It's random, so it
 That's fine for the alpha. Logging only the element deltas and deriving the state at apply would cut
 it, and isn't built.
 
+## Moving a repo in
+
+`vlpds.space.importRepo` takes the 2-root CAR that `space.getRepo` serves on the old host, for an
+account moving in (it may still be deactivated). Before anything is written, the commit's signature
+and MAC must verify against the DID's current `#atproto` key, and the set hash recomputed from the
+index must be the commit's. The records then stream in, each block checked against its CID, in
+frameless entries of at most 1,000 rows or 4 MiB. One last entry on the repo's worker puts the head
+in at the CAR's rev with an empty oplog, and the authority is owed a notify like after any write.
+The account's writes to that space are refused while it imports. An import that stops part way
+leaves rows no head names, which nothing serves, and the next import of the space deletes them
+first.
+
 ## Revocations
 
 The one piece of cluster-wide Spaces state is `{prefix}/spaces/revocations.json`, since a credential

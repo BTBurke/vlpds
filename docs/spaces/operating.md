@@ -8,7 +8,7 @@ summary: "Turning Spaces on, its limits, what to watch and what it costs: flags,
 
 ```hero
 diagram:
-  caption: "Three things to watch and the alert on each. Every vlpds_space_* series is registered on first use, so a node without --spaces exports none and these alerts stay silent."
+  caption: "Three things to watch and the alert on each. A node without --spaces exports no vlpds_space_* series, and one with it exports what these alerts read at 0 from the start."
   nodes:
     - { id: cr, label: Credential reads, sub: "`…_credential_checks_total`", at: [0, 0], size: [13, 3], tone: blue }
     - { id: ob, label: notifyWrite outbox, sub: "`…_outbox_oldest_seconds`", at: [16, 0], size: [13, 3], tone: accent }
@@ -72,6 +72,11 @@ it. With no space traffic, a node with it on makes one conditional GET of the re
 | `vlpds_space_credentials_issued_total{result}`, `vlpds_space_delegations_total` | credentials issued as an authority, delegation tokens minted |
 | `vlpds_space_revocations` | revoked credentials in force |
 | `vlpds_space_export_bytes`, `vlpds_space_oplog_pruned_total` | `getRepo` memory, oplog ops pruned |
+| `vlpds_space_sign_seconds` | signing one commit for a reader (every `getLatestCommit`, `listRepoOps` and `getRepo` signs its own) |
+| `vlpds_space_digest_mismatch_total` | space repos whose head disagreed with the set hash recomputed from their records. Should stay 0 |
+| `vlpds_space_repos` | space repos in this node's shards, counted by the oplog retention sweep every ~6 h |
+| `vlpds_space_imports_total{result}` | `vlpds.space.importRepo` calls: `ok`, `refused` (a bad CAR, signature or hash), `error` |
+| `vlpds_space_operator_reads_total{method}` | audited operator reads of space data |
 
 The internals dashboard has a Spaces row built from these: writes, write → notify ack, outbox rows and
 oldest row per node, notifies by hop and their failure ratio, `listRepoOps` noop vs scan and its
@@ -92,8 +97,9 @@ readable at its 200 whatever these say. For an outbox backlog, one failing autho
 from you (the next retry, at most ~1 h away, delivers the newest rev). Many failing at once points at
 this node's DNS or egress.
 
-`vlpds_space_digest_mismatch_total` isn't exported yet, so `VlpdsSpaceDigestMismatch` can't fire
-until it is. `vlpds admin check-space` needs `vlpds.admin.checkSpace`, which still answers 501.
+`VlpdsSpaceDigestMismatch` counts what `vlpds.admin.checkSpace` finds, so it fires only once that
+check runs (`vlpds admin check-space`). A refused `importRepo` with a bad set hash is the
+uploader's problem and counts in `vlpds_space_imports_total{result="refused"}` instead.
 
 ## What it costs
 

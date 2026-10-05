@@ -76,9 +76,9 @@ from it. vlpds has no back-compat for Spaces data yet, so a format change replac
 | The credential chain, revocations, the credential cache | built |
 | simplespace host: policies, members, `getSpaceCredential`, `notifyWrite`, `listRepos`, fan-out | built |
 | The notifyWrite outbox, oplog retention, the 100k record cap | built |
-| Space blobs (`space.getBlob`, `listBlobs`, the `sync.getBlob` rule) | not built yet |
-| The full OAuth consent screen for `space:` scopes | not built yet |
-| Operator access to space records, `vlpds.space.importRepo`, space takedowns | not built yet |
+| Space blobs (`space.getBlob`, `listBlobs`, the `sync.getBlob` rule) | built |
+| The OAuth consent screen for `space:` scopes | built |
+| Audited operator access to space records, `vlpds.space.importRepo`, space takedowns | built |
 | Concurrent space writes to one repo sharing log segments | not built yet |
 
 ## Pages

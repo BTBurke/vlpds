@@ -244,6 +244,12 @@ account itself. Each action is also logged on the node (`target=vlpds::audit`).
 | Record | Hidden from this PDS's record reads (`getRecord`, `listRecords`), as in the reference PDS | The record stays in the signed repo. `sync.getRepo`, `sync.getRecord` and the firehose still carry it, so relays and AppViews keep showing it until the user deletes it |
 | Blob | `getBlob` answers BlobNotFound at once. The blob can't be uploaded again or referenced by a new record, and its bytes move to `blob-quarantine/{did}/{cid}` | Only the quarantined copy, until it's purged. The operator can still preview it from the console |
 
+With `--spaces`, Look up also takes space URIs. A space record shows its takedown state and CID,
+and its value only through "Read record", which asks for a reason and writes a `space.read` entry
+to the audit log before it reads. A space URI at its authority can be taken down as a whole: no
+credentials are issued for it, syncers can't list its writers or register, and members' notifies
+are dropped. [Privacy guardrails](../spaces/privacy.md#operator-access) has the details.
+
 A taken-down blob's bytes are deleted `--blob-quarantine-days` (30) after the takedown unless the
 blob is restored first. Until then, a restore moves the bytes back and the blob is served again.
 After the purge, a restore only lifts the takedown, and the user can upload the blob again. The

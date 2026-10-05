@@ -3,7 +3,7 @@ title: Privacy guardrails
 section: Spaces
 order: 204
 status: draft
-summary: "What keeps space data private on vlpds: no firehose path, no proxy escape, the blob rule, audited operator access and takedowns. Each guardrail has a test, and the parts not built yet say so."
+summary: "What keeps space data private on vlpds: no firehose path, no proxy escape, the blob rule, audited operator access and takedowns. Each guardrail has a test."
 ---
 
 ```hero
@@ -26,7 +26,7 @@ facts:
   - { value: "0", unit: sentinels, label: found on any public path, note: "single node and three nodes", tone: ok }
   - { value: "501", label: for an unhandled space method, note: "answered locally · never proxied", tone: rust }
   - { value: "3,610 s", label: a revocation is held, note: "longer than any credential can live", tone: violet }
-  - { value: audited, label: operator reads, note: "decided · not built yet", tone: muted }
+  - { value: audited, label: operator reads, note: "admin or moderator · reason in the log", tone: muted }
 ```
 
 A space controls who can read its data, but there's no encryption, so the guardrails are in how
@@ -60,12 +60,8 @@ this node. One that isn't built yet answers 501 `MethodNotImplemented`. It never
 
 ## Blobs
 
-> [!NOTE]
-> Not built yet. Space blobs land in a later slice. Until then `com.atproto.space.getBlob` and
-> `listBlobs` answer 501, and `sync.getBlob` keeps today's rule.
-
 ```diagram
-caption: "The rule as decided, for when space blobs land. With `--spaces` on, `sync.getBlob` serves a blob only once a public record references it. A blob that only space records reference is served by `space.getBlob`, to a credential for that same space."
+caption: "With `--spaces` on, `sync.getBlob` serves a blob only once a public record references it. A blob that only space records reference is served by `space.getBlob`, to a credential for that same space."
 nodes:
   - { id: up, label: uploadBlob, sub: "stored · no refs yet", at: [0, 4.2], size: [9, 3], tone: ink }
   - { id: pubr, label: Public record refs it, sub: "`b/`", at: [13, 0], size: [10, 2.8], tone: accent }
@@ -83,20 +79,34 @@ edges:
   - none -> s3
 ```
 
-The last row is a change. vlpds serves a blob as soon as it's uploaded today, which would leave a
-window where a blob meant for a space can be fetched by CID before the space write. With `--spaces`
-on, that window closes. The blob GC will count both `b/` and `sb/` refs, `sync.listBlobs` will list
-only `b/`, and quotas stay bytes per account with space blobs included.
+The last row is a change. Without `--spaces`, vlpds serves a blob as soon as it's uploaded, which
+would leave a window where a blob meant for a space can be fetched by CID before the space write.
+With `--spaces` on, that window closes. The blob GC counts both `b/` and `sc/` refs, `sync.listBlobs`
+lists only `b/`, and quotas stay bytes per account with space blobs included. A blob that only
+taken-down records name is hidden from `space.getBlob` and `listBlobs` too.
 
 ## Operator access
 
-> [!NOTE]
-> Not built yet. Today the admin console has no view of space records.
+Nothing is encrypted, so whoever runs a PDS can read the space data on it. vlpds makes that an
+explicit path with an audit trail. Moderators and admins can read space records for
+terms-of-service work, and nobody else can use these methods (an account's own OAuth token, its
+password session and its app passwords are all refused).
 
-The decision is that moderators and admins can read space records, for terms-of-service work, from
-the console and the admin API. Only moderator and admin auth gets in, and every read goes into the
-audit log next to takedowns. Nothing is encrypted, so an operator can read space data on any PDS.
-This makes it an explicit path with an audit trail.
+| Method | Returns |
+|---|---|
+| `vlpds.admin.getSpaceRecord` | one record as `space.getRecord` answers it (`uri`, `cid`, `value`), plus `takendown` |
+| `vlpds.admin.listSpaceRecords` | an account's records in one space, values included, 100 a page |
+| `vlpds.admin.getSpaceRepo` | the repo's rev, record count, creation time and taken-down records |
+
+Each call writes a `space.read` entry to the moderation audit log (`vlpds.admin.getAuditLog`) before
+it reads anything. The entry names who asked, from which IP, the space, the account and the record,
+and the reason when one is given. A read that fails auth writes nothing. Taken-down records are
+shown to the operator, flagged.
+
+The console's Look up takes space URIs. A space record shows what it is (its author, whether it
+exists, its CID, its takedown state) but never what it says. Reading the value is a separate
+"Read record" step that asks for a reason and goes through `getSpaceRecord`, so every value an
+operator sees has its own audit entry.
 
 ## Takedowns
 
@@ -104,15 +114,18 @@ This makes it an explicit path with an audit trail.
 |---|---|
 | Account | Credential reads of its space repos get `RepoTakendown`. Its space writes are refused. Its outbox rows wait and resume if the takedown is reversed. Its OAuth sessions are revoked and stay revoked after a reversal, so apps have to sign in again. |
 | Record | Taken down by its space URI, through the same admin and moderation paths as a public record (`sec/td/space/{sid}/{collection}/{rkey}`). It's hidden from `getRecord`, `listRecords`, `listRepoOps` values and `getRepo`'s blocks. |
-| Space | A takedown of a whole space this cluster governs. Not built yet. |
+| Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `getSpaceCredential` answers `NotAuthorized`, `listRepos` and `registerNotify` answer `SpaceNotFound`, and members' notifies are acknowledged and dropped. The records stay on their authors' hosts. A vlpds extension. |
 
-Today a taken-down space record stays in its repo's LtHash and `getRepo` index, the way a taken-down
-public record stays in the signed repo. A syncer that compares hashes can then see a mismatch and
-fall back to `getRepo`. The reference has no record takedown for space data at all, so record
-takedowns are a vlpds extension.
+No credential names a taken-down account either. A taken-down account mints no delegation tokens,
+and `getSpaceCredential` refuses a taken-down member (`AccountTakedown`) and a space whose authority
+is taken down (`RepoTakendown`). The reference admits both.
+
+The reference has no record takedown for space data at all, so record takedowns are a vlpds
+extension. The record stays in sR, and the LtHash stored with the head keeps it, the way a
+taken-down public record stays in the signed repo.
 
 ```timeline
-caption: "Decided, not built yet: the takedown-adjusted view. While a takedown lasts, every read signs a commit over the repo without the record, so a syncer that held it sees a mismatch at the same rev, refetches and converges. A reversal flips it back the same way."
+caption: "The takedown-adjusted view. While a takedown lasts, every read signs a commit over the repo without the record, so a syncer that held it sees a mismatch at the same rev, refetches and converges. A reversal flips it back the same way."
 scale: 46
 lanes:
   - { id: op, label: Operator, tone: muted }

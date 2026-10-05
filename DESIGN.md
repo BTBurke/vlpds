@@ -5286,6 +5286,37 @@ Deliberate divergences from the reference:
   `prevSpaceRev` vlpds sends is the last spaceRev that service was sent,
   so a replaced forward leaves no gap. A lost one does, and the service
   catches up with listRepos as it would with the reference.
+- Space data is OAuth-only. App passwords (scoped or not) and password
+  sessions are refused on every space and simplespace method, delegation
+  tokens included. The reference lets them read and write the account's
+  own space records.
+- The notifyWrite outbox is the `sP` row written in the write's own entry,
+  so there's no lease retry worker and no extra PUT. A delivered row's
+  delete rides the shard's next entry instead of its own, so after a
+  takeover an idle row costs one resend the authority ignores as not
+  newer. Fan-out lanes are in memory. When a shard opens, each of its
+  spaces with a live registration sends one forward of its newest writer,
+  naming the spaceRev before it, so a syncer that missed a forward lost
+  with the old owner sees the gap and pulls listRepos.
+- With `--spaces` on, `sync.getBlob` serves a blob only once a public
+  record names it (the reference rule). Without the flag an upload is
+  served before any record names it, as before. A blob that only
+  taken-down space records name is hidden from space.getBlob and
+  listBlobs.
+- Space takedowns (`sec/td/space/{sid}` on the authority) are a vlpds
+  extension: getSpaceCredential answers NotAuthorized, listRepos and
+  registerNotify SpaceNotFound, and members' notifies are acknowledged and
+  dropped. getSpaceCredential also refuses a taken-down member
+  (AccountTakedown) and a taken-down authority (RepoTakendown), which the
+  reference admits.
+- Operators can read space records (Q6): `vlpds.admin.getSpaceRepo`,
+  `listSpaceRecords` and `getSpaceRecord`, admin or the moderation service
+  only, each call audited (`space.read`) before it reads.
+- `vlpds.space.importRepo` (Q8) has no upstream counterpart. It takes
+  space.getRepo's 2-root CAR, checks the signature and MAC against the
+  DID's current key and the set hash against the index, stages the records
+  in bounded frameless entries and switches the head in at the CAR's rev
+  with an empty oplog. It follows the upstream contract once there is one.
 
 ## Reference test divergences (`tests/REFERENCE_COVERAGE.md`)
 

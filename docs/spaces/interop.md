@@ -64,7 +64,9 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Oplog | keeps every op | keeps 7 days. A `since` past that gets the window's start, and the syncer falls back to `getRepo` |
 | Space repo size | no cap | 100k records |
 | Backlinks | a like of a space URI is recorded as a backlink | public URIs only |
-| `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same, once space blobs are built. Today vlpds keeps serving unreferenced uploads |
+| `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same. Without `--spaces`, vlpds still serves an upload before any record names it |
+| Space takedown | none | a vlpds extension: no credentials, no `listRepos` or registrations, notifies dropped |
+| Credentials for taken-down accounts | issued | refused for a taken-down member or authority |
 
 ## Upstream gaps
 
@@ -72,9 +74,9 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 - title: HTTP signatures cover two headers
   body: "A request signature covers only `authorization` and `atproto-space-audience`, with no method or URL. So a captured request can be replayed against any read of the same repo while its credential lives. vlpds requires the audience to be a DID and the target repo, checks the credential's space against the request, and checks revocation on every request."
 - title: Takedowns and the LtHash (Q11)
-  body: "The spec has no record takedown for space data, and a hidden record still counts in the repo's hash. vlpds matches public-repo semantics for now. The decided answer, a takedown-adjusted view signed at serve time, isn't built yet. It keeps every view verifiable, so upstream could adopt it as is."
+  body: "The spec has no record takedown for space data, and a hidden record still counts in the repo's hash. vlpds serves a takedown-adjusted view: every read signs a commit over the set without the hidden records. It keeps every view verifiable, so upstream could adopt it as is."
 - title: The getRepo format
   body: "The 2-root CAR has one index block (~6 MB at 100k records) and needs its record blocks in canonical key order, which is why vlpds caps repos at 100k records and exports in two passes. STAR (#114) would remove both problems."
 - title: No import endpoint
-  body: "Nothing upstream moves a space repo into a new host. vlpds plans `vlpds.space.importRepo`, which isn't built yet, and will follow the upstream contract once there is one."
+  body: "Nothing upstream moves a space repo into a new host. vlpds has `vlpds.space.importRepo`, which takes the 2-root CAR that `space.getRepo` serves and checks it against the DID's current key, and it'll follow the upstream contract once there is one."
 ```

@@ -64,9 +64,9 @@ failover.
 
 Space data is OAuth-only on vlpds. The reference lets legacy app passwords read and write the
 account's own space records, so this is a deliberate divergence
-([Interop](interop.md#where-vlpds-differs)). The consent screen lists a `space:` scope in plain
-words today. The fuller screen (the type declaration's name, a verified handle for the authority and
-a warning for `space:*?authority=*`) isn't built yet.
+([Interop](interop.md#where-vlpds-differs)). The consent screen names a space type by its
+declaration, an authority by its handle when the handle resolves back to it (else the DID), and
+warns on `space:*?authority=*`.
 
 ## What a member host checks
 
