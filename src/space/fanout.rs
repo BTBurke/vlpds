@@ -24,11 +24,15 @@
 //! shard lease that sequenced the forward: a lease's first forward per
 //! registration, and anything after a lost one, names the true predecessor.
 //!
-//! Bounds: the dispatchers' queues, each lane, and each service host's
-//! queued forwards across its lanes (all drop the oldest and count it), a
-//! host's sends in flight and all sends in flight. Registrations per space
-//! are capped where they're made. Sends go over their own pooled guarded
-//! client.
+//! Bounds: the dispatchers' queues, each lane, each service host's queued
+//! forwards across its lanes, and all queued forwards (all drop the oldest
+//! and count it, marking the gap), the lanes in all (a new one past that
+//! isn't made: the forward is dropped and nothing is remembered, so the
+//! next one names its true predecessor), a host's sends in flight and all
+//! sends in flight. Hosts are many (one per /64 a did:web names), so only
+//! the global bounds keep tarpits from growing memory without end.
+//! Registrations are capped per space and per authority where they're
+//! made. Sends go over their own pooled guarded client.
 
 use super::host::Forward;
 use super::repo::Sequenced;
@@ -49,6 +53,10 @@ pub const LANE: usize = 256;
 pub const HOST_QUEUE: usize = 4096;
 /// Sends in flight to one service host.
 pub const HOST_SENDS: usize = 16;
+/// Forwards waiting across every lane (~0.5 KB each).
+pub const TOTAL_QUEUE: usize = 65_536;
+/// Lanes in all, each a (space, service) with a sender task.
+pub const MAX_LANES: usize = 16_384;
 pub const RETRY_BASE: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(60);
 const ATTEMPTS: u32 = 6;
@@ -125,6 +133,8 @@ struct Host {
 struct State {
     lanes: HashMap<LaneKey, Lane>,
     hosts: HashMap<String, Host>,
+    /// Forwards waiting in every lane.
+    queued: usize,
 }
 
 impl State {
@@ -143,6 +153,7 @@ impl State {
 
     fn unqueued(&mut self, host: &str) {
         crate::metrics::space_fanout_depth(-1);
+        self.queued -= 1;
         if let Some(h) = self.hosts.get_mut(host) {
             h.queued -= 1;
             if h.queued == 0 && Arc::strong_count(&h.sends) == 1 {
@@ -169,6 +180,8 @@ pub struct Fanout {
     pruning: parking_lot::Mutex<HashSet<(Arc<str>, String)>>,
     /// The first retry's pause.
     retry_base: Duration,
+    /// [`TOTAL_QUEUE`] and [`MAX_LANES`]; tests lower them.
+    caps: parking_lot::Mutex<(usize, usize)>,
 }
 
 /// Second-level labels under a country code that are sold like TLDs
@@ -255,7 +268,13 @@ impl Fanout {
             state: Default::default(),
             pruning: Default::default(),
             retry_base,
+            caps: parking_lot::Mutex::new((TOTAL_QUEUE, MAX_LANES)),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_caps(&self, total_queue: usize, lanes: usize) {
+        *self.caps.lock() = (total_queue, lanes);
     }
 
     /// Called from the worker's ack: never waits. A job dropped here shows
@@ -343,7 +362,14 @@ impl Fanout {
     fn push(self: &Arc<Self>, app: &Weak<crate::xrpc::App>, sid: SpaceId, f: Forward, epoch: u64) {
         let key: LaneKey = (f.authority.clone(), sid, f.service.clone());
         let host = host_of(&f.endpoint);
+        let (total_cap, lanes_cap) = *self.caps.lock();
         let mut st = self.state.lock();
+        if st.lanes.len() >= lanes_cap && !st.lanes.contains_key(&key) {
+            // no lane, no memory of what it sent: the next forward to this
+            // service names its true predecessor, a gap and never a fork
+            crate::metrics::space_fanout_dropped("lanes_full");
+            return;
+        }
         let lane = st.lanes.entry(key.clone()).or_default();
         if lane.epoch != epoch {
             (lane.epoch, lane.pushed, lane.gap_next) = (epoch, None, false);
@@ -372,9 +398,14 @@ impl Fanout {
             st.unqueued(&old.host);
         }
         let host_full = st.host(&host).queued >= HOST_QUEUE;
+        let all_full = st.queued >= total_cap;
         let lane = st.lanes.get_mut(&key).expect("present");
-        if lane.queue.len() >= LANE || host_full {
-            crate::metrics::space_fanout_dropped(if host_full { "host_full" } else { "lane_full" });
+        if lane.queue.len() >= LANE || host_full || all_full {
+            crate::metrics::space_fanout_dropped(match () {
+                _ if all_full => "all_full",
+                _ if host_full => "host_full",
+                _ => "lane_full",
+            });
             let Some(old) = lane.queue.pop_front() else {
                 // an idle lane keeps nothing worth holding: its next push
                 // starts from the forward's own prevSpaceRev anyway
@@ -394,6 +425,7 @@ impl Fanout {
         lane.queue.push_back(Queued { f, epoch, host: host.clone(), gap });
         let start = !std::mem::replace(&mut lane.running, true);
         st.host(&host).queued += 1;
+        st.queued += 1;
         crate::metrics::space_fanout_depth(1);
         drop(st);
         if start {
@@ -464,6 +496,11 @@ impl Fanout {
     /// Forwards waiting in lanes.
     pub fn pending(&self) -> usize {
         self.state.lock().lanes.values().map(|l| l.queue.len()).sum()
+    }
+
+    /// Lanes held now (each a (space, service)).
+    pub fn lanes(&self) -> usize {
+        self.state.lock().lanes.len()
     }
 }
 
@@ -600,6 +637,43 @@ mod tests {
             assert_eq!(q[0].1, 6, "the oldest went");
             assert!(q[0].2, "after a gap");
             assert_eq!(f.state.lock().hosts["syncer.example"].queued, LANE);
+        });
+    }
+
+    /// Many hosts (a did:web's fragments on distinct /64s, in many spaces)
+    /// can't grow the queues past the global caps: past them the oldest of
+    /// a lane goes (its successor marked as after a gap), and no new lane
+    /// is made.
+    #[test]
+    fn many_hosts_stay_within_the_global_caps() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let f = fanout();
+            f.set_caps(100, 30);
+            let app = Weak::new();
+            for h in 0..50u64 {
+                for w in 0..10u64 {
+                    let mut x = fwd(&format!("svc{h}"), &format!("w{w}"), h * 10 + w + 1, None);
+                    x.endpoint = format!("http://[2001:db8:{h:x}::1]");
+                    f.push(&app, [0; 16], x, 1);
+                }
+            }
+            // a full lane's newest writer: its oldest goes, marked as a gap
+            let mut x = fwd("svc0", "w99", 1000, Some(10));
+            x.endpoint = "http://[2001:db8::1]".into();
+            f.push(&app, [0; 16], x, 1);
+            let st = f.state.lock();
+            assert!(st.lanes.len() <= 30, "{}", st.lanes.len());
+            assert!(st.queued <= 100, "{}", st.queued);
+            assert_eq!(st.queued, st.lanes.values().map(|l| l.queue.len()).sum::<usize>());
+            assert_eq!(st.queued, st.hosts.values().map(|h| h.queued).sum::<usize>());
+            assert!(st.lanes.values().any(|l| l.queue.front().is_some_and(|q| q.gap)), "a drop marks the gap");
+            drop(st);
+            f.set_caps(1000, 10);
+            let mut x = fwd("svc-new", "w", 2000, Some(1000));
+            x.endpoint = "http://[2001:db8:ffff::1]".into();
+            f.push(&app, [0; 16], x, 1);
+            assert!(f.lanes() <= 10, "no lane past the cap");
         });
     }
 

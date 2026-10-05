@@ -1712,7 +1712,8 @@ hour (`vlpds_space_outbox_oldest_seconds`). Every space write is durable and
 readable at its 200. The outbox only tells the authority that the repo moved,
 so syncers find the write later than they should. Each (repo, space) has one
 row that always carries the newest rev. Sends retry from 1 min, doubling to
-1 h, and a row is dropped 24 h after its write. The row's `sP` key survives a
+1 h, and a row is dropped 24 h after its rev was owed (written, renotified,
+or found when its shard opened). The row's `sP` key survives a
 restart or a takeover, and the next owner sends it again.
 
 **Causes:** the authority's PDS is down or answering 5xx, its DID doesn't
@@ -1803,6 +1804,35 @@ which.
 - A single client stuck on `bad_sig`, `audience` or `space`: it's that app's
   bug. Reads stay refused, so there's no data exposure. Contact the app if it
   keeps up.
+
+### VlpdsSpaceRevocationsSaturated
+
+**Means:** the revocation blocks are saturated
+(`vlpds_space_revocations_saturated` is 1), so every space credential whose
+authority isn't hosted here is refused with a 503. Local authorities' spaces
+keep working. A revocation that can't be stored (its caps are full) blocks
+its space; over 100 blocked spaces of one authority become one block of the
+authority; over 1,000 blocked authorities, every remote one is refused.
+Blocks never fail open, so this is what's left when they're full.
+
+**Causes:** someone flooding `notifyCredentialRevoked` from many authorities
+with stakes here (accounts here holding repos in their spaces), or caps far
+too low for real traffic.
+
+**Confirm:** `vlpds_space_revocation_blocks{kind}` on the Spaces row, and
+the `space revocation not stored` warnings in the logs (their `space` and
+`refused` fields). `{prefix}/spaces/revocations.json` lists the blocks
+(`blocked`, `blocked_authorities`, `remote_blocked_until`).
+
+**Do:**
+- It clears on its own: each block ends 3,610 s after it was made, once
+  every credential it stood for has expired. Nothing carries over.
+- A flood: find the accounts here giving the stake (each stored entry's
+  `aud`) and take them down if they're abusive. Their spaces' revocations
+  then need no stake here.
+- Don't delete blocks from the object by hand: a block stands for a
+  revocation that wasn't stored, and removing it lets a revoked credential
+  read again.
 
 ---
 

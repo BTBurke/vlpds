@@ -51,7 +51,7 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 
 | | Reference PDS | vlpds |
 |---|---|---|
-| Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes, delegation tokens or `getServiceAuth` tokens for space methods, and `vlpds.space.importRepo` is OAuth too |
+| Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes or delegation tokens, `getServiceAuth` tokens for space methods go only to OAuth apps whose `space:` grant covers the action (the reference checks only `rpc:`), and `vlpds.space.importRepo` is OAuth too |
 | Fan-out to syncers | each forward goes out as it's sequenced, unordered | one lane per (space, service), in spaceRev order, a writer's waiting forward replaced by its newer one |
 | notifyWrite delivery | a retry row written only after a send fails, so an acked write's notify can be lost in a crash | the `sP` row is in the write's own log entry |
 | Delegation tokens and client attestations | any lifetime (it mints 60 s) | refused past 300 s, since their `jti`s are held until `exp` |
@@ -62,6 +62,7 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Account takedown | the app's session works again after a reversal (what the harness expects) | revokes the account's OAuth sessions, and they stay revoked after a reversal. The app has to sign in again |
 | Record takedown | none for space records | hidden from every space read (a vlpds extension, see [Takedowns](privacy.md#takedowns)) |
 | Oplog | keeps every op | keeps 7 days. A `since` past that gets the window's start, and the syncer falls back to `getRepo` |
+| Revocations | stored for any audience the host has, unbounded, one row each | stored only when the audience account holds a repo in the space or its authority is here (else 200, dropped), capped per authority, space and account, and one past a cap blocks the space's credentials ([Revocation](reading.md#revocation)) |
 | Space repo size | no cap | 100k records |
 | Backlinks | a like of a space URI is recorded as a backlink | public URIs only |
 | `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same. Without `--spaces`, vlpds still serves an upload before any record names it |

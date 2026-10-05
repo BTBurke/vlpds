@@ -3004,20 +3004,25 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
             )));
         }
     }
+    // A space-method token carries authority (a notifyWrite as a writer, a
+    // revocation as an authority) to another host: OAuth apps get one only
+    // with a space: grant covering it, never from transition:generic or rpc:
+    // alone, and other credentials never (space data is OAuth-only).
+    if let Some(l) = lxm.filter(|l| crate::space::is_space_nsid(l)) {
+        let ok = match &creds {
+            Credentials::OAuth { scopes, .. } => scopes.allows_space_service_auth(l, &did),
+            _ => false,
+        };
+        if !ok {
+            return Err(invalid_request(format!(
+                "insufficient access to request a service auth token for the following method: {l} (needs an OAuth space: grant covering it)"
+            )));
+        }
+    }
     // a scoped app password is held to its scopes here as OAuth is: else a
     // service token would carry what the scopes withhold
     if matches!(creds, Credentials::OAuth { .. }) || creds.app_pass_scopes().is_some() {
         creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?;
-    }
-    // space data is OAuth-only: a service token for a space method (a
-    // notifyWrite, a revocation) would carry it to app passwords and
-    // password sessions
-    if app.config.spaces && !matches!(creds, Credentials::OAuth { .. }) {
-        if let Some(l) = lxm.filter(|l| crate::space::is_space_nsid(l)) {
-            return Err(invalid_request(format!(
-                "insufficient access to request a service auth token for the following method: {l} (space methods take OAuth)"
-            )));
-        }
     }
     let acct = app.account(&did).await?;
     if is_takendown_account(&acct) && lxm != Some("com.atproto.server.createAccount") {

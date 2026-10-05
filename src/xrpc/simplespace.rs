@@ -110,6 +110,23 @@ pub(super) async fn space_row_opt(app: &App, space: &Space) -> XResult<Option<Sp
     Ok(Some(row))
 }
 
+/// Live spaces `did` governs, counted up to `stop_at`.
+async fn live_spaces(app: &App, did: &str, stop_at: usize) -> XResult<usize> {
+    let p = app.partition(did)?;
+    let prefix = state::space_did_prefix(state::SPACE_FAMILY, did);
+    let mut it = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+    let mut n = 0;
+    while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
+        if SpaceRow::decode(&kv.value).map_err(XrpcError::from_err)?.live() {
+            n += 1;
+            if n >= stop_at {
+                break;
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// [`space_row_opt`], a space never created being SpaceNotFound.
 pub(super) async fn space_row(app: &App, space: &Space) -> XResult<SpaceRow> {
     space_row_opt(app, space).await?.ok_or_else(space_not_found)
@@ -216,7 +233,18 @@ async fn create_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
         created_at: crate::events::now_rfc3339(),
         deleted_at: None,
     };
-    if space_row_opt(&app, &space).await?.is_some_and(|r| !r.live()) {
+    let existing = space_row_opt(&app, &space).await?;
+    if existing.as_ref().is_none_or(|r| !r.live()) {
+        crate::ratelimit::check(&[&crate::ratelimit::SPACE_CREATE], &did, 1)?;
+        let (cap, _) = spaces(&app)?.account_caps();
+        if live_spaces(&app, &did, cap).await? >= cap {
+            return Err(XrpcError::bad(
+                "InvalidRequest",
+                format!("this account governs {cap} spaces; delete one first"),
+            ));
+        }
+    }
+    if existing.is_some_and(|r| !r.live()) {
         // a deletion's sweep may have stopped part way: nothing of the old
         // space (members above all) may carry over
         delete_space_rows(&app, &space).await?;

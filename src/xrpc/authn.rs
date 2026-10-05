@@ -725,7 +725,7 @@ async fn verify_space_token(app: &App, t: &token::SpaceToken) -> XResult<()> {
 /// A rate-limit key the console can show without naming who talks to which
 /// space authority: keyed by the server secret, so it can't be matched
 /// against a list of DIDs.
-fn private_limit_key(app: &App, key: &str) -> String {
+pub(super) fn private_limit_key(app: &App, key: &str) -> String {
     let k = crate::oauth::util::derive_secret(&app.config.jwt_secret, "space-rate-limit-key");
     hex::encode(&crate::prims::hmac_sha256(&k, &[key.as_bytes()])[..16])
 }
@@ -803,8 +803,16 @@ async fn check_space_credential(app: &App, headers: &HeaderMap) -> XResult<Crede
     if sp.revocations.is_revoked(&v.space, &v.jti, now) {
         return Err(space_auth_err("CredentialRevoked", "space credential has been revoked"));
     }
-    if sp.revocations.is_blocked(&v.space, now) {
-        return Err(XrpcError::unavailable("Unavailable", "this space's credentials are refused for now; retry later"));
+    let blocked = || XrpcError::unavailable("Unavailable", "this space's credentials are refused for now; retry later");
+    match sp.revocations.blocked(&v.space, now) {
+        crate::space::revocations::Blocked::No => {}
+        crate::space::revocations::Blocked::Yes => return Err(blocked()),
+        crate::space::revocations::Blocked::IfRemote => {
+            let authority = crate::space::revocations::authority_of(&v.space).unwrap_or_default();
+            if !super::space::authority_hosted(app, authority).await? {
+                return Err(blocked());
+            }
+        }
     }
     Ok(Credentials::SpaceCredential {
         space: v.space.clone(),

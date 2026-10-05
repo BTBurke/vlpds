@@ -100,6 +100,12 @@ pub struct Spaces {
     /// (account, space) -> the importRepo staging it on this node. Not
     /// with the worker's state, which can be evicted mid-import.
     imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
+    /// importRepo calls running on this node, per account, from before the
+    /// body is read ([`Spaces::import_slot`]).
+    importing: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+    /// (live spaces per authority account, live notify registrations per
+    /// authority account); tests lower them.
+    account_caps: parking_lot::Mutex<(usize, usize)>,
     /// registerNotify's count-and-write, per space (striped).
     registering: [tokio::sync::Mutex<()>; 64],
     /// Authorities whose shard's owner (another node) said the cluster
@@ -112,6 +118,35 @@ pub struct Spaces {
     /// [`export_budget_bytes`] in KiB, which space exports reserve from.
     exports: Arc<tokio::sync::Semaphore>,
     export_kib: u32,
+}
+
+/// Live spaces one account governs. Each fans out to its own registrations,
+/// so their number bounds what one account's writes send.
+pub const MAX_SPACES_PER_ACCOUNT: usize = 1000;
+
+/// importRepo calls one account runs at once on a node: a move brings its
+/// spaces in one after another.
+pub const IMPORTS_PER_ACCOUNT: usize = 2;
+/// importRepo calls a node runs at once. Each also reserves its working set
+/// from the import budget; this bounds the PLC and DID lookups besides.
+pub const IMPORTS_RUNNING: usize = 8;
+
+/// An importRepo's slot ([`Spaces::import_slot`]), given back on drop.
+pub struct ImportSlot<'a> {
+    sp: &'a Spaces,
+    did: String,
+}
+
+impl Drop for ImportSlot<'_> {
+    fn drop(&mut self) {
+        let mut m = self.sp.importing.lock();
+        if let Some(n) = m.get_mut(&self.did) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.did);
+            }
+        }
+    }
 }
 
 /// An authority that moves into the cluster within this is still told
@@ -146,6 +181,8 @@ impl Spaces {
             peer_notifies: Default::default(),
             cache_fills: Default::default(),
             imports: Default::default(),
+            importing: Default::default(),
+            account_caps: parking_lot::Mutex::new((MAX_SPACES_PER_ACCOUNT, host::MAX_REGISTRATIONS_PER_AUTHORITY)),
             registering: std::array::from_fn(|_| Default::default()),
             not_hosted: Default::default(),
             same_rev: Default::default(),
@@ -155,6 +192,33 @@ impl Spaces {
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
+    }
+
+    /// One of the node's `node_cap` importRepo slots (at most
+    /// [`IMPORTS_RUNNING`]), and one of `did`'s [`IMPORTS_PER_ACCOUNT`];
+    /// Err(true) when the account's are taken, Err(false) when the node's
+    /// are.
+    pub fn import_slot(&self, did: &str, node_cap: usize) -> Result<ImportSlot<'_>, bool> {
+        let mut m = self.importing.lock();
+        if m.get(did).is_some_and(|n| *n >= IMPORTS_PER_ACCOUNT) {
+            return Err(true);
+        }
+        if m.values().sum::<usize>() >= node_cap.clamp(1, IMPORTS_RUNNING) {
+            return Err(false);
+        }
+        *m.entry(did.to_string()).or_default() += 1;
+        Ok(ImportSlot { sp: self, did: did.to_string() })
+    }
+
+    /// (live spaces per authority account, live notify registrations per
+    /// authority account).
+    pub fn account_caps(&self) -> (usize, usize) {
+        *self.account_caps.lock()
+    }
+
+    #[doc(hidden)]
+    pub fn set_account_caps(&self, spaces: usize, registrations: usize) {
+        *self.account_caps.lock() = (spaces, registrations);
     }
 
     /// Room for `bytes` of a space export, waited for up to 10 s.
@@ -216,25 +280,36 @@ impl Spaces {
     }
 
     /// Revokes `jtis` of `space` cluster-wide (durable on Ok(Ok); peers
-    /// learn of it by a nudge or their next re-read). One that can't be
-    /// stored blocks the space here instead. Ok(Ok(true)): the object was
-    /// written.
+    /// learn of it by a nudge or their next re-read), on the stake of `aud`,
+    /// an account here. One that can't be stored blocks the space in the
+    /// object, or here alone when it wasn't written (Err((refused, false)):
+    /// peers need telling). On Err (the store failed, or CAS ran out) the
+    /// space is blocked here too, and the caller tells the peers.
+    /// Ok(Ok(true)): the object was written.
     pub async fn revoke(
         &self,
         store: &crate::store::Store,
         space: &str,
+        aud: &str,
         jtis: &[String],
-        staked: bool,
-    ) -> anyhow::Result<Result<bool, revocations::Refused>> {
+        local_authority: bool,
+    ) -> anyhow::Result<Result<bool, (revocations::Refused, bool)>> {
         let now = now_secs();
-        match self.revocations.revoke(store, space, jtis, staked, now).await? {
-            Ok(r) => {
-                self.credentials.invalidate(&r.added);
-                Ok(Ok(r.wrote))
+        let r = match self.revocations.revoke(store, space, aud, jtis, local_authority, now).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.revocations.block(space, local_authority, now);
+                return Err(e);
             }
-            Err(refused) => {
-                self.revocations.block(space, now);
-                Ok(Err(refused))
+        };
+        self.credentials.invalidate(&r.added);
+        match r.refused {
+            None => Ok(Ok(r.wrote)),
+            Some(refused) => {
+                if !r.wrote {
+                    self.revocations.block(space, local_authority, now);
+                }
+                Ok(Err((refused, r.wrote)))
             }
         }
     }
@@ -501,6 +576,45 @@ pub(crate) mod vectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A revoke the store can't take (here an unreadable object) blocks the
+    /// space here rather than leaving its credentials readable.
+    #[tokio::test]
+    async fn a_failed_revoke_blocks_the_space() {
+        let store = crate::store::Store {
+            raw: Arc::new(object_store::memory::InMemory::new()),
+            prefix: "t".into(),
+            latency: None,
+        };
+        let bad = object_store::PutPayload::from(b"not json".to_vec());
+        store.raw.put_opts(&revocations::path(&store), bad, Default::default()).await.unwrap();
+        let sp = Spaces::new(Limits::default());
+        let space = "at://did:web:a.example/space/t.t/k";
+        assert!(sp.revoke(&store, space, "did:aud", &["j".into()], false).await.is_err());
+        assert!(sp.revocations.is_blocked(space, now_secs()));
+        assert!(!sp.revocations.is_blocked("at://did:web:a.example/space/t.t/other", now_secs()));
+    }
+
+    /// Two importRepo slots per account and eight per node, given back on
+    /// drop.
+    #[test]
+    fn import_slots_cap_accounts_and_the_node() {
+        let sp = Spaces::new(Limits::default());
+        let a1 = sp.import_slot("did:a", 8).unwrap();
+        let _a2 = sp.import_slot("did:a", 8).unwrap();
+        assert!(matches!(sp.import_slot("did:a", 8), Err(true)));
+        drop(a1);
+        let a3 = sp.import_slot("did:a", 8).unwrap();
+        let others: Vec<_> = (0..6).map(|i| sp.import_slot(&format!("did:o{i}"), 8).unwrap()).collect();
+        assert!(matches!(sp.import_slot("did:new", 8), Err(false)));
+        drop(a3);
+        let _n = sp.import_slot("did:new", 8).unwrap();
+        drop(others);
+        assert_eq!(sp.importing.lock().len(), 2);
+        // a smaller node cap (a small import budget)
+        assert!(matches!(sp.import_slot("did:x", 2), Err(false)));
+        assert!(sp.import_slot("did:x", 3).is_ok());
+    }
 
     #[test]
     fn space_nsids() {

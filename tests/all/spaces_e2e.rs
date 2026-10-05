@@ -273,11 +273,52 @@ async fn legacy_auth_and_missing_scopes() {
             s.xrpc.get("com.atproto.server.getServiceAuth", &q, auth).await.err(400, "InvalidRequest");
         }
     }
-    // with --spaces off, getServiceAuth is as it was
+    // an OAuth app gets a space-method token only with a space: grant that
+    // covers it (an authority's app revoking at member hosts, a writer's
+    // notifying): transition:generic or rpc: alone never
+    let lxms = [
+        "com.atproto.space.notifyWrite",
+        "com.atproto.space.notifyCredentialRevoked",
+        "com.atproto.space.getRecord",
+        "com.atproto.simplespace.getSpace",
+        "COM.ATPROTO.SPACE.notifyWrite",
+    ];
+    async fn mint(sc: &SpaceClient, lxm: &str) -> Resp {
+        sc.get("com.atproto.server.getServiceAuth", &[("aud", "did:web:space.example#svc"), ("lxm", lxm)]).await
+    }
+    let generic = SpaceClient::new(&s, "spgs", "transition:generic").await;
+    let rpc = SpaceClient::new(&s, "spgr", "rpc:*?aud=did:web:space.example%23svc").await;
+    for sc in [&generic, &rpc] {
+        for lxm in lxms {
+            mint(sc, lxm).await.err(400, "InvalidRequest");
+        }
+        // other methods still get one where the grant allows it
+        mint(sc, "app.bsky.feed.getTimeline").await.ok();
+    }
+    let g = |scope: &str| format!("transition:generic space:{TYPE}?authority=*&{scope}");
+    let manager = SpaceClient::new(&s, "spgm", &g("action=read&manage=update")).await;
+    mint(&manager, "com.atproto.space.notifyCredentialRevoked").await.ok();
+    mint(&manager, "com.atproto.space.notifyWrite").await.err(400, "InvalidRequest");
+    let writer = SpaceClient::new(&s, "spgw", &g(&format!("collection={COLL}&action=create"))).await;
+    mint(&writer, "com.atproto.space.notifyWrite").await.ok();
+    mint(&writer, "COM.ATPROTO.SPACE.notifyWrite").await.ok();
+    mint(&writer, "com.atproto.space.notifyCredentialRevoked").await.err(400, "InvalidRequest");
+    let reader = SpaceClient::new(&s, "spgd", &g("action=read")).await;
+    mint(&reader, "com.atproto.space.notifyWrite").await.err(400, "InvalidRequest");
+    mint(&reader, "com.atproto.space.getRecord").await.ok();
+    // the user's own spaces (authority=self) carry authority powers
+    let own = SpaceClient::new(&s, "spgo", &format!("transition:generic space:{TYPE}?action=read")).await;
+    mint(&own, "com.atproto.space.notifyCredentialRevoked").await.ok();
+    // other credentials never, with the flag off too
     let off = TestServer::spawn().await;
     let acct = off.create_account("splo").await;
-    let q = [("aud", "did:web:space.example"), ("lxm", "com.atproto.space.notifyWrite")];
-    off.xrpc.get("com.atproto.server.getServiceAuth", &q, &Auth::Bearer(acct.access)).await.ok();
+    for lxm in lxms {
+        let q = [("aud", "did:web:space.example#svc"), ("lxm", lxm)];
+        off.xrpc
+            .get("com.atproto.server.getServiceAuth", &q, &Auth::Bearer(acct.access.clone()))
+            .await
+            .err(400, "InvalidRequest");
+    }
     // OAuth without the space scope
     let g = SpaceClient::new(&s, "spg", "transition:generic").await;
     let mine = format!("at://{}/space/{TYPE}/main", g.did);

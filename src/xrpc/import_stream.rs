@@ -23,6 +23,7 @@ use crate::mst::{self, Node};
 use crate::mst_lazy::StreamBuilder;
 use futures::StreamExt;
 use std::io::{Read, Write as _};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Chunks queued for the parser: hyper's are up to a few hundred KB.
@@ -61,24 +62,52 @@ enum Chunk {
     Fail(XrpcError),
 }
 
+/// An import body that sends nothing for this long fails: it holds an
+/// import slot and its reservation, which other imports wait for.
+pub const BODY_IDLE: Duration = Duration::from_secs(30);
+/// And one that takes longer than this in all (a 1 GiB CAR at ~0.3 MB/s).
+pub const BODY_DEADLINE: Duration = Duration::from_secs(3600);
+
+/// A body's chunks, each within `idle` of the last and all by `deadline`;
+/// past either, an error.
+pub struct TimedBody {
+    stream: axum::body::BodyDataStream,
+    idle: Duration,
+    deadline: tokio::time::Instant,
+}
+
+impl TimedBody {
+    pub(super) fn new(body: Body, idle: Duration, total: Duration) -> TimedBody {
+        TimedBody { stream: body.into_data_stream(), idle, deadline: tokio::time::Instant::now() + total }
+    }
+
+    pub(super) async fn next(&mut self) -> Option<XResult<Bytes>> {
+        let by = (tokio::time::Instant::now() + self.idle).min(self.deadline);
+        match tokio::time::timeout_at(by, self.stream.next()).await {
+            Ok(Some(Ok(c))) => Some(Ok(c)),
+            Ok(Some(Err(e))) => Some(Err(XrpcError::bad("InvalidRequest", format!("error reading body: {e}")))),
+            Ok(None) => None,
+            Err(_) => Some(Err(XrpcError::bad("InvalidRequest", "the request body stalled or took too long"))),
+        }
+    }
+}
+
 /// Reads the body (at most `max` bytes) and parses it on the blocking pool;
 /// the items arrive on the receiver, at most [`ITEMS_AHEAD`] ahead. The
 /// reservation grows as the body passes what it covers.
-pub(super) fn start(body: Body, max: usize, res: Arc<Reservation>) -> mpsc::Receiver<XResult<Item>> {
+pub(super) fn start(body: TimedBody, max: usize, res: Arc<Reservation>) -> mpsc::Receiver<XResult<Item>> {
     let (tx, rx) = mpsc::channel::<Chunk>(QUEUE);
     let (items_tx, items_rx) = mpsc::channel(ITEMS_AHEAD);
     let parse_res = res.clone();
     tokio::task::spawn_blocking(move || parse(rx, items_tx, &parse_res));
     tokio::spawn(async move {
-        let mut stream = body.into_data_stream();
+        let mut stream = body;
         let mut total = 0usize;
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx
-                        .send(Chunk::Fail(XrpcError::bad("InvalidRequest", format!("error reading body: {e}"))))
-                        .await;
+                    let _ = tx.send(Chunk::Fail(e)).await;
                     return;
                 }
             };
@@ -659,7 +688,7 @@ mod tests {
         let budget = ImportBudget::new(64 << 20, std::time::Duration::from_millis(100));
         let res = budget.admit(Some(100)).await.ok().expect("room");
         let before = res.held();
-        let mut items = start(chunked(car.clone()), usize::MAX, res.clone());
+        let mut items = start(TimedBody::new(chunked(car.clone()), BODY_IDLE, BODY_DEADLINE), usize::MAX, res.clone());
         loop {
             match items.recv().await.expect("an item") {
                 Ok(Item::Batch { .. }) => {}
@@ -681,7 +710,7 @@ mod tests {
         let budget = ImportBudget::new(2 << 20, std::time::Duration::from_millis(100));
         let other = budget.admit(Some(100)).await.ok().expect("room");
         let res = budget.admit(Some(100)).await.ok().expect("room");
-        let mut items = start(chunked(car), usize::MAX, res);
+        let mut items = start(TimedBody::new(chunked(car), BODY_IDLE, BODY_DEADLINE), usize::MAX, res);
         let e = loop {
             match items.recv().await.expect("an item") {
                 Err(e) => break e,

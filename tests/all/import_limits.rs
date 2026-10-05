@@ -126,3 +126,47 @@ async fn unsafe_integers_are_refused_on_write() {
         assert_eq!(r.is_ok(), ok, "{n}: {}", r.text());
     }
 }
+
+/// A body that sends part of a CAR and then nothing fails once it's been
+/// idle too long, giving back its import slot and reservation, as one that
+/// takes too long in all does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_import_body_fails() {
+    use futures::StreamExt;
+    for (idle, total) in
+        [(Duration::from_millis(500), Duration::from_secs(60)), (Duration::from_secs(60), Duration::from_secs(1))]
+    {
+        let s = TestServer::spawn_with(move |c| {
+            c.import_body_idle = idle;
+            c.import_body_deadline = total;
+        })
+        .await;
+        let a = s.create_account("stall").await;
+        let car = bytes::Bytes::from(import_car(&a.did, &[]));
+        let head = car.slice(..car.len() / 2);
+        // trickles a byte a quarter second, never ending
+        let trickle = futures::stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Some((Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"\x00")), ()))
+        });
+        let stalled = futures::stream::once(async move { Ok::<_, std::io::Error>(head) });
+        let body = match total < Duration::from_secs(5) {
+            true => reqwest::Body::wrap_stream(stalled.chain(trickle)),
+            false => reqwest::Body::wrap_stream(stalled.chain(futures::stream::pending())),
+        };
+        let rb = s
+            .xrpc
+            .http
+            .post(format!("{}/xrpc/com.atproto.repo.importRepo", s.url))
+            .header("content-type", "application/vnd.ipld.car")
+            .header("authorization", format!("Bearer {}", a.access))
+            .body(body);
+        let t = std::time::Instant::now();
+        let r =
+            tokio::time::timeout(Duration::from_secs(20), s.xrpc.send(rb)).await.expect("the import waited forever");
+        assert_eq!(r.status, 400, "{}", r.text());
+        assert!(r.text().contains("stalled"), "{}", r.text());
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        assert_eq!(s.app.imports.reserved(), 0);
+    }
+}

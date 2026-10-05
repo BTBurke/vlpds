@@ -183,6 +183,17 @@ impl ImportBudget {
         self.total
     }
 
+    /// How many imports of `working_set` bytes the budget holds at once,
+    /// the large share included.
+    pub fn holds(&self, working_set: u64) -> u64 {
+        let (need, need_large) = self.split(working_set);
+        let by_total = self.total / need.max(1);
+        match need_large {
+            0 => by_total,
+            n => by_total.min(self.large / n),
+        }
+    }
+
     /// Bytes reserved by imports now.
     pub fn reserved(&self) -> u64 {
         self.total - self.st.lock().free
@@ -264,7 +275,17 @@ impl ImportBudget {
     /// its turn (30 s by default); then a retryable 503.
     pub async fn admit(self: &Arc<Self>, declared: Option<u64>) -> XResult<Arc<Reservation>> {
         let car = declared.unwrap_or(UNKNOWN_LENGTH);
-        let (need, need_large) = self.split(sizing(car).working_set);
+        self.admit_sized(car, sizing(car).working_set).await
+    }
+
+    /// Admits an import that holds at most `working_set` bytes whatever its
+    /// body brings (vlpds.space.importRepo, whose blocks are capped).
+    pub async fn admit_working_set(self: &Arc<Self>, working_set: u64) -> XResult<Arc<Reservation>> {
+        self.admit_sized(0, working_set).await
+    }
+
+    async fn admit_sized(self: &Arc<Self>, car: u64, working_set: u64) -> XResult<Arc<Reservation>> {
+        let (need, need_large) = self.split(working_set);
         let t = Instant::now();
         let waiting = metrics::IMPORTS.with_label_values(&["waiting"]);
         waiting.inc();

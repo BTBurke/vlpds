@@ -56,7 +56,9 @@ every configuration, and it passes too.
 
 With `--spaces` on, every `com.atproto.space.*` and `com.atproto.simplespace.*` method is answered on
 this node. One that isn't built yet answers 501 `MethodNotImplemented`. It never reaches the
-`atproto-proxy` fallback, where vlpds would mint service auth for it and send it to another host.
+`atproto-proxy` fallback, where vlpds would mint service auth for it and send it to another host. With
+`--spaces` off they answer 501 too and are never proxied either, so an app can't get the node to
+sign a `notifyWrite` as one of its users and send it somewhere.
 
 ## Blobs
 
@@ -122,9 +124,19 @@ paths, so it writes an audit entry as well.
 
 Logs and the console's rate-limit pages are the other places an operator could pick up space
 metadata, since skeys and rkeys are often meaningful names. So vlpds logs a space by its 32-character
-hex id and leaves member DIDs and record paths out of its log lines. The two rate limits keyed by who
+hex id and leaves member DIDs and record paths out of its log lines. That includes the errors of
+its own outbound calls, whose URLs can name a space and a member in their query: they're logged
+without the URL. The two rate limits keyed by who
 talks to which authority (`space-credential` and `space-read-credential`) show a keyed hash of the
 pair in the console.
+
+## Revoked credentials
+
+A revoked credential never reads again. When a revocation can't be stored (its caps are full), the
+space's credentials are refused instead, on every node and across restarts, until the credentials
+it named have expired. Past 100 blocked spaces of one authority the whole authority is refused,
+and past 1,000 such authorities every remote authority is, but never one hosted here. Nothing about
+a block fails open ([Revocation](reading.md#revocation)).
 
 ## Takedowns
 

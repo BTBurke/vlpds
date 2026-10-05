@@ -68,6 +68,18 @@ impl DocMap {
     }
 }
 
+impl DocMap {
+    /// Moves every operation in `did`'s audit log `by` into the past, as if
+    /// its key rotations happened that much earlier.
+    pub fn backdate(&mut self, did: &str, by: Duration) {
+        for op in self.history.get_mut(did).into_iter().flatten() {
+            let at = chrono::DateTime::parse_from_rfc3339(op["createdAt"].as_str().unwrap()).unwrap();
+            let at = at - chrono::Duration::from_std(by).unwrap();
+            op["createdAt"] = json!(at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true));
+        }
+    }
+}
+
 /// A PLC directory stand-in serving whatever documents a test puts in it
 /// (tests/all/migration.rs's): a DID moves between hosts by a test
 /// replacing its document, and `/log/audit` lists each one it had.
@@ -610,7 +622,7 @@ async fn nothing_written(sc: &SpaceClient, space: &str, what: &str) {
 async fn imports_a_restored_repo_and_takes_writes_after() {
     let o = one().await;
     let s = &o.net.pds[0];
-    let rev = rev_ago(Duration::from_secs(3600));
+    let rev = rev_ago(Duration::from_secs(90));
     let b = records(RepoBuilder::new(&o.space, &o.bob.did, &rev), 7);
     let built = b.build(&*account_key(s, &o.bob.did).await);
     let out = import_repo(&o.bob, &o.space, &built.car()).await.ok();
@@ -940,4 +952,60 @@ async fn settled_ordinal(s: &TestServer) -> u64 {
         last = now;
     }
     panic!("the node log never settled");
+}
+
+/// A key the DID rotated away from signs only commits from before the
+/// rotation (with its 5 min of slack): a former host can't keep minting
+/// importable commits after the account left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_past_key_signs_only_revs_before_it_was_rotated_away() {
+    let h = two_hosts().await;
+    let old_key = account_key(&h.a, &h.bob.did).await;
+    let b_did = h.b.pds_did().await;
+    let sa = service_jwt(&h.bob, &b_did, "com.atproto.server.createAccount").await;
+    let arrived = arrive(&h.b, &h.bob.did, sa).await;
+    complete_move(&h.docs, &h.b, &arrived).await;
+    // the move's rotation, 30 min ago
+    h.docs.lock().unwrap().backdate(&h.bob.did, Duration::from_secs(1800));
+    let moved = arrived.oauth(&h.b).await;
+    let built = |ago: u64| {
+        records(RepoBuilder::new(&h.space, &h.bob.did, &rev_ago(Duration::from_secs(ago))), 2).build(&old_key)
+    };
+    // 20 min ago: after the rotation and its slack
+    let r = import_repo(&moved, &h.space, &built(1200).car()).await;
+    assert_eq!((r.status, r.json["error"].as_str()), (400, Some("InvalidCommit")), "{}", r.text());
+    nothing_written(&moved, &h.space, "a past key after its rotation").await;
+    // 27 min ago: within the slack
+    let r = import_repo(&moved, &h.space, &built(1620).car()).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // and long before it, but older than what's there now
+    let r = import_repo(&moved, &h.space, &built(2400).car()).await;
+    assert_eq!(r.status, 400, "{}", r.text());
+}
+
+/// A space deleted and made again is a new space: a repo from before
+/// (signed by any key the account held then) doesn't come back into it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repo_from_before_the_space_was_made_again_is_refused() {
+    let o = one().await;
+    let s = &o.net.pds[0];
+    let key = account_key(s, &o.alice.did).await;
+    let old = records(RepoBuilder::new(&o.space, &o.alice.did, &rev_ago(Duration::from_secs(600))), 2).build(&key);
+    write(&o.alice, &o.space, W::new().rkey("live").text("before the delete")).await.ok();
+    o.alice.post("com.atproto.simplespace.deleteSpace", json!({"space": o.space})).await.ok();
+    let skey = last_segment(&o.space).to_string();
+    let again = o
+        .alice
+        .post(
+            "com.atproto.simplespace.createSpace",
+            json!({"spaceType": TEST_SPACE_TYPE, "skey": skey, "readPolicy": member_list(), "writePolicy": member_list(), "appAccess": open()}),
+        )
+        .await;
+    assert_eq!(again.ok()["uri"], json!(o.space));
+    let r = import_repo(&o.alice, &o.space, &old.car()).await;
+    refused_mentioning(&r, &["predates the space"]);
+    nothing_written(&o.alice, &o.space, "a repo from before").await;
+    // a repo of the space as it is now goes in
+    let now = records(RepoBuilder::new(&o.space, &o.alice.did, &rev_ago(Duration::from_secs(1))), 2).build(&key);
+    import_repo(&o.alice, &o.space, &now.car()).await.ok();
 }

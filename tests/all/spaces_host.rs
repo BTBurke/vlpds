@@ -982,3 +982,62 @@ async fn shard_open_sends_registrations_a_catch_up() {
     assert_eq!(catch_up["prevSpaceRev"], first["spaceRev"], "{catch_up}");
     assert_ne!(catch_up["prevSpaceRev"], before["spaceRev"], "{catch_up}");
 }
+
+/// What one authority account can make its writes fan out to is bounded:
+/// its live spaces, its registrations across them, and how fast it makes
+/// spaces and a credential registers (each over its own bucket).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spaces_and_registrations_are_capped_per_authority() {
+    let s = TestServer::spawn_with(|c| {
+        c.spaces = true;
+        c.rate_limits_enabled = true;
+    })
+    .await;
+    s.app.spaces.as_deref().unwrap().set_account_caps(2, 3);
+    let limits = json!({"config": {"limiters": {"space-create": {"points": 4}, "space-register": {"points": 3}}}, "ifVersion": 0, "actor": "it-test"});
+    s.xrpc.post("vlpds.admin.updateRateLimits", &limits, &Auth::Admin).await.ok();
+    let owner = SpaceClient::new(&s, "shc1", OWNER).await;
+    let ml = || policy("memberListPolicy");
+    let mut spaces = vec![];
+    for k in ["a", "b"] {
+        spaces.push(create(&owner, k, ml(), ml(), policy("open")).await.ok()["uri"].as_str().unwrap().to_string());
+    }
+    let r = create(&owner, "c", ml(), ml(), policy("open")).await;
+    assert!(r.status == 400 && r.text().contains("governs 2 spaces"), "{r:?}");
+    // updating one isn't creating one
+    owner
+        .post("com.atproto.simplespace.updateSpace", json!({"space": spaces[0], "readPolicy": policy("publicPolicy")}))
+        .await
+        .ok();
+
+    let mut syncers = vec![];
+    for _ in 0..4 {
+        syncers.push(stub("atproto_space_syncer").await);
+    }
+    let register = |space: String, service: String, cred: String| {
+        let owner = &owner;
+        let url = s.url.clone();
+        async move {
+            let body = json!({"space": space, "service": service});
+            owner.signed_post(&url, "com.atproto.space.registerNotify", body, &cred, &owner.did).await
+        }
+    };
+    let (c0, c1) = (owner.credential(&spaces[0]).await, owner.credential(&spaces[1]).await);
+    let svc = |i: usize| syncers[i].service("atproto_space_syncer");
+    register(spaces[0].clone(), svc(0), c0.clone()).await.ok();
+    register(spaces[0].clone(), svc(1), c0.clone()).await.ok();
+    register(spaces[1].clone(), svc(2), c1.clone()).await.ok();
+    let r = register(spaces[1].clone(), svc(3), c1.clone()).await;
+    assert!(r.status == 400 && r.text().contains("3 notify registrations across its spaces"), "{r:?}");
+    // a renewal isn't a new registration
+    register(spaces[1].clone(), svc(2), c1.clone()).await.ok();
+    // space-register: 3 a credential; c0's third
+    register(spaces[0].clone(), svc(0), c0.clone()).await.ok();
+    register(spaces[0].clone(), svc(0), c0.clone()).await.err(429, "RateLimitExceeded");
+
+    // space-create: 4 a day; 3 spent (2 made, 1 refused at the cap)
+    owner.post("com.atproto.simplespace.deleteSpace", json!({"space": spaces[1]})).await.ok();
+    create(&owner, "d", ml(), ml(), policy("open")).await.ok();
+    owner.post("com.atproto.simplespace.deleteSpace", json!({"space": spaces[0]})).await.ok();
+    create(&owner, "e", ml(), ml(), policy("open")).await.err(429, "RateLimitExceeded");
+}

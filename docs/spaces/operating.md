@@ -57,8 +57,8 @@ guard this. Spaces shipped inside level 1 (vlpds hadn't been released), so no cl
 A few rules decide what your users and their apps can do:
 
 - Space data is OAuth only. An app needs a `space:` scope, and app passwords and password sessions
-  get no space reads, writes or delegation tokens. `getServiceAuth` won't mint them a token for a
-  space method either ([Reading a space](reading.md#oauth-only)).
+  get no space reads, writes or delegation tokens. `getServiceAuth` mints a token for a space
+  method only to an OAuth app whose `space:` grant covers it ([Reading a space](reading.md#oauth-only)).
 - That includes `vlpds.space.importRepo`, so an account moving in imports its space repos after it's
   activated here, with OAuth. Syncers see none of its space data for that short gap
   ([Moving a repo in](storage.md#moving-a-repo-in)).
@@ -90,10 +90,11 @@ cluster is the same, once every node runs a build that knows Spaces (see above).
 3. Open the Spaces row on the `vlpds internals` dashboard. Every panel should show 0 or a note like "no space writes" right
    away, since a node with the flag exports the `vlpds_space_*` series at 0 from the start. If the
    row stays empty, the flag didn't take.
-4. Check that vmalert has the four `VlpdsSpace*` rules from `ops/alerts.yml` loaded. The one that
+4. Check that vmalert has the five `VlpdsSpace*` rules from `ops/alerts.yml` loaded. The one that
    catches most problems is `VlpdsSpaceOutboxBacklog` (the oldest outbox row over 1 h for 10 min).
    `VlpdsSpaceNotifyFanoutFailing`, `VlpdsSpaceCredentialRejectsHigh` and
-   `VlpdsSpaceDigestMismatch` cover the rest ([Alerts](#alerts)). All four are tickets.
+   `VlpdsSpaceDigestMismatch` cover the rest ([Alerts](#alerts)). Those four are tickets;
+   `VlpdsSpaceRevocationsSaturated` pages, since remote authorities' credentials stop working.
 
 An app that was approved for a bare `space:` grant that writes before the flag was on has no
 collections recorded for it. Its next refresh gets `invalid_grant`, so the user signs in again and
@@ -130,7 +131,7 @@ without the flag still answers `BlobNotFound` for a blob only space records name
 | `--spaces` (`VLPDS_SPACES`) | off | serves `com.atproto.space.*` and `com.atproto.simplespace.*` here |
 | `--space-repo-max-records` | 100000 | the most records one account's repo in one space may hold. A write past it gets `InvalidRequest` |
 | `--space-oplog-retention` | `7d` | how long ops stay for `listRepoOps`. `off` keeps them all |
-| `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo` |
+| `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo`. Its blocks are capped besides ([Moving a repo in](storage.md#moving-a-repo-in)), and it reserves from the same import budget |
 | `--max-exports`, `--export-stall-secs` | as for `sync.getRepo` | `space.getRepo` takes the same export slots and stall timeout |
 
 A `space.getRepo` holds every path and CID of the repo while it streams (~128 B a record), so it
@@ -145,12 +146,13 @@ also takes that much room from the memory plan's space exports. The room fits 4 
 | Space credential lifetime | 10 min minted by vlpds, 3,600 s accepted at most, 5 s of clock skew |
 | Delegation token and client attestation | 60 s minted, 300 s accepted at most, single use |
 | `Signature-Input` and `Signature` headers | 8 KiB each |
-| Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · 2,000 live per authority · 10,000 in all for spaces with no account here, 50,000 for the rest · credential reads 503 after 6 min without a good read |
+| Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · only ones with a stake here are stored · 2,000 live per authority, 1,000 per space, 5,000 per account here, 50,000 in all · one past a cap blocks its space, past 100 of an authority's the authority, past 1,000 authorities every remote one (`VlpdsSpaceRevocationsSaturated`; local authorities never), each for 3,610 s · 8 waiting per node · credential reads 503 after 6 min without a good read |
 | `applyWrites` | 200 ops |
 | `notifyWrite` with a future `repoRev` | refused past 5 min |
 | Outbox | 262,144 rows in memory, 256 sends in flight, 8 per authority and 32 in all to authorities whose last send failed, retries for 24 h |
-| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 512 sends in flight in all |
-| Notify registrations | 24 h · 256 per space · service ids up to 512 bytes |
+| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 65,536 queued and 16,384 lanes in all (past those, drops marked as gaps: syncers catch up with `listRepos`), 512 sends in flight in all |
+| Notify registrations | 24 h · 256 per space, 1,024 across one authority's spaces · 60 an hour per credential (`space-register`) · service ids up to 512 bytes |
+| Spaces | 1,000 live per account · 100 created a day per account (`space-create`) |
 | `listRecords` and `listRepoOps` pages | end early with a cursor past 4 MiB of values |
 | Memory | space heads cache 64 MiB, credential cache 50,000 entries |
 
@@ -189,6 +191,7 @@ the fan-out queue and drops, and revocations held.
 | `VlpdsSpaceOutboxBacklog` | a node's oldest outbox row is over 1 h old for 10 min | `notifyWrite by hop and result`: `out retry` means the authority is failing. Inactive writers' rows wait without aging the outbox |
 | `VlpdsSpaceNotifyFanoutFailing` | over 50% of fan-out sends fail, at over 0.1/s, for 30 min | one syncer down (nothing to do) or this node's egress |
 | `VlpdsSpaceCredentialRejectsHigh` | over 25% of credential reads are refused, at over 0.5/s, for 15 min (expired ones left out) | which `result` dominates. One client stuck on `bad_sig` is that app's bug |
+| `VlpdsSpaceRevocationsSaturated` (page) | the revocation blocks are saturated: every remote authority's credentials are refused | `vlpds_space_revocation_blocks{kind}` and the `space revocation not stored` warnings; it clears 3,610 s after the last block ([runbook](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacerevocationssaturated)) |
 | `VlpdsSpaceDigestMismatch` | a space repo's head disagrees with its records | run `vlpds admin check-space DID SPACE` |
 
 Each has a section in `ops/RUNBOOK.md`. All four are tickets, since a space write is durable and

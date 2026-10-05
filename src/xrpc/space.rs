@@ -1242,9 +1242,9 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
         // notifySpaceDeleted
         return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
     }
-    if space_takendown(app, &space).await? {
-        return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
-    }
+    // told only to those it would otherwise admit: a non-member learns
+    // nothing about the space from it
+    let taken_down = space_takendown(app, &space).await?;
     // vlpds: no credential names a taken-down authority or member (the
     // reference admits both)
     let (key, status) = super::proxy::account_key_status(app, &space.authority).await?;
@@ -1271,6 +1271,9 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
     }
     if !super::simplespace::authorize_user(app, &space, &row, &d.user, "read", client_id.as_deref()).await? {
         return Err(XrpcError::bad("UserNotAuthorized", "User not authorized for this space"));
+    }
+    if taken_down {
+        return Err(XrpcError::bad("NotAuthorized", "Space has been taken down"));
     }
     let mint = token::Mint { iss: &space.authority, sub: &space.uri, key_id: Some(&d.key_id), ..Default::default() };
     let now = crate::tid::now_micros() as i64 / 1_000_000;
@@ -1407,8 +1410,9 @@ const REVOKE_NUDGE_RETRIES: u32 = 6;
 /// (each given a second to answer; one that misses it is asked again in the
 /// background, and refuses credentials once its set is stale).
 ///
-/// The object is read whole by every node, so it's bounded
-/// ([`revocations::SOFT_CAP`] and the rest), and the rate limit counts only
+/// The object is read whole by every node, so only revocations with a
+/// stake here go in, bounded per authority, space and audience
+/// ([`revocations::PER_AUD`] and the rest), and the rate limits count only
 /// jtis new here. A revocation that can't be stored blocks the space's
 /// credentials instead, on every node: it fails closed.
 async fn notify_credential_revoked(
@@ -1452,37 +1456,64 @@ async fn notify_credential_revoked(
     if new.is_empty() {
         return Ok(StatusCode::OK);
     }
+    // Neither the audience's repo in the space nor its authority is here,
+    // so no credential for it reads anything through this audience: there
+    // is nothing to enforce, and nothing is written. An authority tells
+    // each member's host, addressed to that member.
+    let local_authority = authority_hosted(&app, &space.authority).await?;
+    if !local_authority && !aud_holds_repo(&app, &sp, &space, &auth.aud).await? {
+        return Ok(StatusCode::OK);
+    }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
-    let staked = revocation_staked(&app, &sp, &space, &auth.aud).await?;
-    match sp.revoke(&app.store, &space.uri, &new, staked).await {
+    // anyone with a DID can spend an account's bucket, so an exhausted one
+    // is a revocation not stored: the space is blocked, never left open
+    if let Err(e) = crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE_AUD], &auth.aud, new.len() as u32) {
+        let now = crate::tid::now_micros() as i64 / 1_000_000;
+        sp.revocations.block(&space.uri, local_authority, now);
+        nudge_revocation_peers(&app, Some(&space.uri)).await;
+        tracing::warn!(
+            space = hex::encode(space.sid),
+            refused = "aud_rate",
+            "space revocation not stored: the space is blocked"
+        );
+        return Err(e);
+    }
+    match sp.revoke(&app.store, &space.uri, &auth.aud, &new, local_authority).await {
         Ok(Ok(wrote)) => {
             if wrote {
                 nudge_revocation_peers(&app, None).await;
             }
             Ok(StatusCode::OK)
         }
-        Ok(Err(refused)) => {
-            nudge_revocation_peers(&app, Some(&space.uri)).await;
+        Ok(Err((refused, in_object))) => {
+            nudge_revocation_peers(&app, (!in_object).then_some(space.uri.as_str())).await;
             tracing::warn!(
                 space = hex::encode(space.sid),
-                ?refused,
+                refused = refused.as_str(),
                 "space revocation not stored: the space is blocked"
             );
             Err(XrpcError::unavailable("Unavailable", "revocation not stored: too many revocations held; retry later"))
         }
-        Err(e) => Err(XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}"))),
+        Err(e) => {
+            // blocked here by Spaces::revoke; the peers too
+            nudge_revocation_peers(&app, Some(&space.uri)).await;
+            Err(XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}")))
+        }
     }
 }
 
-/// Whether an account here has a stake in `space`: it governs it, or the
-/// revocation's audience holds a repo in it.
-async fn revocation_staked(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
-    if let Ok(p) = app.partition(aud) {
-        if load_head(sp, &p, aud, space).await?.is_some() {
-            return Ok(true);
-        }
+/// Whether the revocation's audience holds a repo in `space` here.
+async fn aud_holds_repo(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
+    match app.partition(aud) {
+        Ok(p) => Ok(load_head(sp, &p, aud, space).await?.is_some()),
+        Err(_) => Ok(false),
     }
-    match super::internal::account_anywhere(app, &space.authority).await {
+}
+
+/// Whether the cluster hosts `authority` (a revocation of its space has a
+/// stake here, and its blocks never escalate to every remote authority).
+pub(super) async fn authority_hosted(app: &App, authority: &str) -> XResult<bool> {
+    match super::internal::account_anywhere(app, authority).await {
         Ok(_) => Ok(true),
         Err(e) if e.error == "AccountNotFound" => Ok(false),
         Err(e) => Err(e),
@@ -1500,7 +1531,7 @@ async fn nudge_revocation_peers(app: &Arc<App>, block: Option<&str>) {
         let (app, block) = (app.clone(), block.clone());
         async move {
             if let Err(e) = nudge_revocation_peer(&app, &l.addr, block.as_deref()).await {
-                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (retrying): {e}");
+                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (retrying): {}", e.without_url());
                 tokio::spawn(async move {
                     let mut wait = std::time::Duration::from_secs(1);
                     for _ in 0..REVOKE_NUDGE_RETRIES {
@@ -1543,7 +1574,11 @@ async fn internal_reload_revocations(
     super::internal::check(&app, &headers)?;
     let sp = spaces(&app)?;
     if let Some(space) = &q.block {
-        sp.revocations.block(space, crate::tid::now_micros() as i64 / 1_000_000);
+        let local = match crate::space::revocations::authority_of(space) {
+            Some(a) => authority_hosted(&app, a).await.unwrap_or(false),
+            None => false,
+        };
+        sp.revocations.block(space, local, crate::tid::now_micros() as i64 / 1_000_000);
     }
     sp.refresh_revocations(&app.store)
         .await
@@ -1667,7 +1702,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         Ok(r) if r.status().is_success() => Outcome::Delivered,
         Ok(r) if retryable_status(r.status().as_u16()) => Outcome::Retry(format!("{} from {url}", r.status())),
         Ok(r) => Outcome::Refused(format!("{} from {url}", r.status())),
-        Err(e) => Outcome::Retry(format!("{url}: {e}")),
+        Err(e) => Outcome::Retry(crate::space::host::http_error(&url, e)),
     }
 }
 
@@ -2081,10 +2116,12 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
 
 /// A request the space host answers for a credential holder only: the
 /// credential is this space's and addressed to the authority.
-async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<()> {
-    match super::authn::verify_space_credential(app, headers).await? {
+/// The verified credential.
+async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<Credentials> {
+    let cred = super::authn::verify_space_credential(app, headers).await?;
+    match &cred {
         Credentials::SpaceCredential { audience, space: s, .. } => {
-            assert_credential_space(&audience, &s, space, &space.authority)?
+            assert_credential_space(audience, s, space, &space.authority)?
         }
         _ => return Err(XrpcError::internal("not a space credential")),
     }
@@ -2096,7 +2133,7 @@ async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResu
             return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
         }
     }
-    Ok(())
+    Ok(cred)
 }
 
 #[derive(Deserialize)]
@@ -2195,7 +2232,7 @@ struct RegisterIn {
 async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Json<RegisterIn>) -> XResult<Json<J>> {
     let sp = spaces(&app)?.clone();
     let space = Space::parse(&inp.space)?;
-    host_credential(&app, &headers, &space).await?;
+    let cred = host_credential(&app, &headers, &space).await?;
     super::simplespace::assert_space_host(&app, &space).await?;
     if space_takendown(&app, &space).await? {
         return Err(super::simplespace::space_not_found());
@@ -2203,6 +2240,10 @@ async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Js
     use crate::space::host::{MAX_REGISTRATIONS, MAX_SERVICE_LEN};
     if inp.service.len() > MAX_SERVICE_LEN {
         return Err(XrpcError::bad("InvalidRequest", format!("service must be at most {MAX_SERVICE_LEN} bytes")));
+    }
+    if let Credentials::SpaceCredential { iss, jti, .. } = &cred {
+        let key = super::authn::private_limit_key(&app, &format!("{iss} {jti}"));
+        crate::ratelimit::check(&[&crate::ratelimit::SPACE_REGISTER], &key, 1)?;
     }
     // every write of the space is forwarded to each registration: one
     // member mustn't make that unbounded. Counted and made under the
@@ -2213,11 +2254,24 @@ async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Js
     for service in expired {
         sp.fanout.prune(&app, &space.uri.as_str().into(), service);
     }
+    let renewal = live.iter().any(|(s, _)| *s == inp.service);
     if live.iter().filter(|(s, _)| *s != inp.service).count() >= MAX_REGISTRATIONS {
         return Err(XrpcError::bad(
             "InvalidRequest",
             format!("this space has {MAX_REGISTRATIONS} notify registrations; unregister one first"),
         ));
+    }
+    if !renewal {
+        let (_, cap) = sp.account_caps();
+        let n = crate::space::host::authority_registrations(&app, &space.authority, cap)
+            .await
+            .map_err(XrpcError::from_err)?;
+        if n >= cap {
+            return Err(XrpcError::bad(
+                "InvalidRequest",
+                format!("this space's authority has {cap} notify registrations across its spaces"),
+            ));
+        }
     }
     let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
         return Err(XrpcError::bad(

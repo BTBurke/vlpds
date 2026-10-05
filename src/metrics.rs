@@ -641,8 +641,10 @@ lazy!(SPACE_DELEGATIONS: IntCounter = register_int_counter!("vlpds_space_delegat
 lazy!(SPACE_CREDENTIAL_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_cache_total", "Space credential verifications by cache result (hit: a verified credential, only the request signature checked; miss: the whole chain)", &["result"]));
 lazy!(SPACE_CREDENTIAL_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_checks_total", "Space credential checks by result (ok, bad_sig, expired, revoked, audience, space)", &["result"]));
 lazy!(SPACE_REVOCATIONS: IntGauge = register_int_gauge!("vlpds_space_revocations", "Revoked space credentials this node enforces (until they would have expired)"));
+lazy!(SPACE_REVOCATIONS_SATURATED: IntGauge = register_int_gauge!("vlpds_space_revocations_saturated", "1 while the revocation blocks are saturated: every remote space authority's credentials are refused (local ones keep working)"));
+lazy!(SPACE_REVOCATION_BLOCKS: IntGaugeVec = register_int_gauge_vec!("vlpds_space_revocation_blocks", "Spaces and authorities whose credentials are refused because a revocation of theirs couldn't be stored, by kind (space, authority)", &["kind"]));
 lazy!(SPACE_FANOUT_DEPTH: IntGauge = register_int_gauge!("vlpds_space_fanout_queue_depth", "Write notifications waiting to be forwarded to registered services, across lanes"));
-lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a (space, service) lane; host_full: the service host's queue; gave_up: retries ran out; expired: the registration expired while failing). The service sees a prevSpaceRev gap and catches up with listRepos", &["reason"]));
+lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a (space, service) lane; host_full: the service host's queue; all_full: every lane's queues together; lanes_full: no room for another lane; gave_up: retries ran out; expired: the registration expired while failing; takendown: the space is taken down). The service sees a prevSpaceRev gap and catches up with listRepos", &["reason"]));
 lazy!(SPACE_FANOUT_COALESCED: IntCounter = register_int_counter!("vlpds_space_fanout_coalesced_total", "Write notifications replaced before they were sent by a newer one of the same writer to the same service"));
 lazy!(SPACE_OUTBOX_OVERFLOW: IntCounter = register_int_counter!("vlpds_space_outbox_overflow_total", "notifyWrite outbox rows left in the bucket because the in-memory outbox was full (picked up by a rescan once it drains)"));
 lazy!(SPACE_EXPORT_BYTES: Histogram = register_histogram!("vlpds_space_export_bytes", "Memory a space getRepo export holds: its paths and CIDs (pass 1) and the chunk it fills", exponential_buckets(65536.0, 2.0, 16).unwrap()));
@@ -689,6 +691,12 @@ pub fn space_credential_check(result: &str) {
 
 pub fn space_revocations(n: usize) {
     SPACE_REVOCATIONS.set(n as i64);
+}
+
+pub fn space_revocation_blocks(saturated: bool, spaces: usize, authorities: usize) {
+    SPACE_REVOCATIONS_SATURATED.set(saturated as i64);
+    SPACE_REVOCATION_BLOCKS.with_label_values(&["space"]).set(spaces as i64);
+    SPACE_REVOCATION_BLOCKS.with_label_values(&["authority"]).set(authorities as i64);
 }
 
 pub fn space_fanout_depth(delta: i64) {
@@ -768,7 +776,7 @@ pub fn init_space_counters() {
         SPACE_LIST_REPO_OPS.with_label_values(&[path]);
         SPACE_LIST_REPO_OPS_SECONDS.with_label_values(&[path]);
     }
-    for r in ["queue_full", "lane_full", "host_full", "gave_up", "expired"] {
+    for r in ["queue_full", "lane_full", "host_full", "all_full", "lanes_full", "gave_up", "expired", "takendown"] {
         SPACE_FANOUT_DROPPED.with_label_values(&[r]);
     }
     for r in ["ok", "bad_token", "refused", "error"] {
@@ -786,8 +794,11 @@ pub fn init_space_counters() {
     ] {
         LazyLock::force(c);
     }
-    for g in [&SPACE_OUTBOX_ROWS, &SPACE_FANOUT_DEPTH, &SPACE_REVOCATIONS] {
+    for g in [&SPACE_OUTBOX_ROWS, &SPACE_FANOUT_DEPTH, &SPACE_REVOCATIONS, &SPACE_REVOCATIONS_SATURATED] {
         LazyLock::force(g);
+    }
+    for k in ["space", "authority"] {
+        SPACE_REVOCATION_BLOCKS.with_label_values(&[k]);
     }
     LazyLock::force(&SPACE_OUTBOX_OLDEST);
     LazyLock::force(&SPACE_NOTIFY_ACK);

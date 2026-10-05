@@ -389,9 +389,22 @@ limit!(
     1000
 );
 
+limit!(SPACE_IMPORT, 42, "space-import", Did, "vlpds.space.importRepo per account, before its body is read", HOUR, 100);
+limit!(
+    SPACE_REVOKE_AUD,
+    43,
+    "space-revoke-aud",
+    Did,
+    "credentials newly revoked by space.notifyCredentialRevoked, per account here giving the stake",
+    HOUR,
+    2000
+);
+limit!(SPACE_CREATE, 44, "space-create", Did, "simplespace.createSpace per account", DAY, 100);
+limit!(SPACE_REGISTER, 45, "space-register", Credential, "space.registerNotify with one space credential", HOUR, 60);
+
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 42] = [
+pub const BUILTIN: [&Limit; 46] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -434,6 +447,10 @@ pub const BUILTIN: [&Limit; 42] = [
     &SPACE_CREDENTIAL,
     &SPACE_NOTIFY_IN,
     &SPACE_REVOKE,
+    &SPACE_IMPORT,
+    &SPACE_REVOKE_AUD,
+    &SPACE_CREATE,
+    &SPACE_REGISTER,
 ];
 
 /// A confidential client's backend calls these for all of its users from

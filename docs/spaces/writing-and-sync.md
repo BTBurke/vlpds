@@ -123,7 +123,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 |---|---|
 | When it sends | as soon as nothing is in flight for that (repo, space), with no linger |
 | Where it sends | a local authority is told on its own worker with no HTTP. One on another cluster node gets `/internal/v1/space/notify`. When that node says the cluster doesn't host the authority, the sender remembers it for 5 min and goes straight to HTTP. Anything else gets `notifyWrite` at its `#atproto_space_host` (or `#atproto_pds`) with the writer's service auth, a 10 s timeout and the SSRF-guarded client |
-| Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was written. A permanent refusal drops the row |
+| Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was owed (written, renotified after a takedown, or found when its shard opened), not 24 h after the rev's own time, so an old rev (an import, a writer back from deactivation) gets its retries too. A permanent refusal drops the row |
 | Inactive writers | a taken-down or deactivated account's rows wait and resume on reactivation |
 | Cleanup | a delivered row's `sP` delete rides the author's next space write, so delivery costs no PUT |
 | Bounds | 262,144 rows held in memory (the rest are rescanned once it drains to half) and 256 sends in flight. One authority gets 8 at most, and authorities whose last send failed share 32, so a slow one can't hold up the rest |
@@ -144,7 +144,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 ## Fan-out
 
 ```diagram
-caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each) and 512 sends in flight in all."
+caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each), 65,536 queued and 16,384 lanes in all, and 512 sends in flight in all."
 nodes:
   - { id: hw, label: Authority's worker, sub: acks in spaceRev order, at: [0, 4], size: [9, 3], tone: violet }
   - { id: d, label: Dispatcher, sub: reads `sN` registrations, at: [12.5, 4], size: [9, 3], tone: violet }
@@ -175,7 +175,7 @@ edges:
   memory from before a takeover could do that. The takeover tests check no syncer ever sees one.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
-- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
+- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most, one authority's spaces 1,024 together, and one credential makes 60 an hour. An account governs 1,000 live spaces at most and creates 100 a day. A did:web can point each of its fragments at its own address, so only these and the global queue and lane caps keep slow endpoints from growing the fan-out's memory: past them a lane's oldest forward goes, marked as a gap, and a syncer catches up with `listRepos`. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
 - Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
   registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
   syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.

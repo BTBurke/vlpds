@@ -3260,6 +3260,11 @@ plan), but real repos are mostly tiny, so a migration wave queued behind 4
 slots while the budget sat unused. Now each import reserves its *estimated
 working set* from one byte budget, and as many run as fit.
 
+A reservation is only as good as the body that holds it, so every
+importRepo body (public and space) fails after 30 s without a byte or an
+hour in all (`import_stream::TimedBody`): a slowloris can't hold a slot and
+its room while migrations queue behind it.
+
 **The distribution** (`real_dist.rs`: ClickHouse crawl, 39.0 M repos; CAR
 bytes at the 326 B/record `tests/all/import_burst.rs` measures for
 real-shaped records):
@@ -5365,8 +5370,10 @@ authority is told on its own worker, one on another node over
 `/internal/v1/space/notify`, anything else with `notifyWrite` and the
 writer's service auth. An authority hosted elsewhere whose DID lands in
 another node's shard would cost an internal call per send to learn that,
-so the answer is kept for 5 min (4,096 authorities at most). Retries run from 1 min to 1 h with jitter for 24 h,
-and a permanent refusal drops the row. A delivered row's delete rides the
+so the answer is kept for 5 min (4,096 authorities at most). Retries run from 1 min to 1 h with jitter for 24 h
+from when the rev was owed (as the reference's `expiresAt = now + DAY`;
+the rev's own time would give an imported or renotified old rev one
+try), and a permanent refusal drops the row. A delivered row's delete rides the
 author's next space write. When a shard opens, its `sP` rows are rescanned
 (retried with backoff until it scans or the shard moves, bad rows skipped)
 and the newest rev is sent. Rows of a taken-down or deactivated account
@@ -5418,8 +5425,15 @@ before a takeover could name a `prevSpaceRev` the old owner already sent
 with another successor, a fork. A failed
 send is retried with jittered backoff from 1 s only while nothing newer
 from its writer waits. Bounds: 256 per lane, 4,096 queued and 16 in flight
-per service host, 4,096 per dispatcher, 512 sends in flight in all, and
-256 registrations per space. A "host" is the endpoint's registrable domain
+per service host, 4,096 per dispatcher, 512 sends in flight in all,
+65,536 queued and 16,384 lanes in all, 256 registrations per space and
+1,024 per authority account, 1,000 live spaces per account, and the
+`space-create` and `space-register` buckets. Hosts are many (one did:web
+can name a /64 per fragment, in many spaces), so the per-host bounds alone
+let tarpit endpoints grow lanes without end; past the global ones a lane's
+oldest forward goes with its successor marked as after a gap, and no new
+lane is made (a dropped forward leaves no lane memory, so the next one
+names its true predecessor: a gap, never a fork). A "host" is the endpoint's registrable domain
 (the last two labels, three under a `co.uk`-style suffix), IPv4 address
 or IPv6 /64, ports ignored, so a DID document listing many hostnames under
 one domain can't multiply what a write sends one machine. Sends go through the pooled, SSRF-guarded
@@ -5435,10 +5449,32 @@ live peers and answers 200 once it's durable. Peers re-read it every 5 min
 and at startup. It's written only when something is revoked. Each entry is
 held 3,610 s, and the object is bounded: `jti`s of 1-128 printable ASCII
 characters (a credential with a longer one is refused, so every accepted
-credential can be revoked), 2,000 live entries per authority, 10,000 in
-all for spaces nobody here has a stake in and 50,000 (~7 MB) for the rest.
-A revocation that can't be stored gets a 503 and blocks that space's
-credentials on every node for 3,610 s, so it fails closed.
+credential can be revoked). Only a revocation with a stake here is
+stored: the audience account holds a repo in the space, or its authority
+is hosted here. Any other is answered 200 and dropped, since no credential
+for the space reads anything through that audience (an authority tells
+each member's host, addressed to that member). Stored ones are capped at
+2,000 live entries per authority, 1,000 per space, 5,000 per audience
+account (so one account here and many authorities can't fill it) and
+50,000 (~7 MB) in all, and rate-limited per authority and per audience
+account. A revocation that can't be stored gets a 503 and blocks that
+space's credentials for 3,610 s, as a block in the object itself, so it
+reaches every node and outlives a restart. Blocks never fail open, and
+widen only over the party behind them: past 100 blocked spaces of one
+authority (or 10,000 in all) the authority is blocked and its space
+blocks fold into it; past 1,000 blocked authorities every remote
+authority is (a local authority is always blocked alone, so local users'
+spaces keep working), and `vlpds_space_revocations_saturated` pages.
+Only a store outage, where the object can't be written or read, refuses
+every credential (the 6 min staleness cutoff). A block ends 3,610 s after
+it was made, an authority's after the latest block it folded in: it
+stands for revocations of credentials that existed then, all expired by
+that time, and a credential issued after it isn't one of them.
+Appends on a node go one at a time, with at most 8 waiting (more are
+refused, the space blocked), and re-reads take their own lock, so a queue
+of appends can't hold the re-read past the 6 min staleness cutoff and turn
+every credential read into a 503. A generation number in the object keeps
+a slow read from installing an older object over a newer one.
 
 Each node sweeps the oplogs of its shards about every 6 h in frameless
 entries, never per write. Operator reads (Q6) are
@@ -5494,6 +5530,9 @@ the space row, and counts a mismatch in
   doesn't resolve at consent, the screen says so and the token request
   fails, which is what the reference does. A grant that only reads or
   manages skips the lookup, since collections only name write targets.
+  A declaration whose collections aren't all NSIDs (a `*` would widen
+  the grant to every collection) or whose `key` isn't a record-key type
+  doesn't resolve, as the reference refuses it at token time.
 - `space:` scopes also take indigo's `spaceType` parameter for the type
   (`space?spaceType=…`). The reference only knows `type`.
 - The oplog keeps 7 days of ops (`--space-oplog-retention`). The reference
@@ -5516,8 +5555,16 @@ the space row, and counts a mismatch in
   catches up with listRepos as it would with the reference.
 - Space data is OAuth-only. App passwords (scoped or not) and password
   sessions are refused on every space and simplespace method, delegation
-  tokens included, and `getServiceAuth` mints them no token for a
-  `com.atproto.space.*` or `com.atproto.simplespace.*` method. The
+  tokens included. `getServiceAuth` mints a token for a
+  `com.atproto.space.*` or `com.atproto.simplespace.*` method (with
+  `--spaces` on or off) only to an OAuth app whose `space:` grant covers
+  the action: `manage` or the account's own spaces for
+  notifyCredentialRevoked (an authority's app revoking at member hosts),
+  a write action for notifyWrite, some space grant for the rest.
+  `transition:generic` or `rpc:` alone never does, where the reference
+  checks only `rpc:`; otherwise an app could forge the account's writer
+  state or revoke credentials in its spaces. The `atproto-proxy`
+  pipethrough never carries a space method. The
   reference lets them read and write the account's own space records.
   `vlpds.space.importRepo` is no exception, so an account moving in
   imports after it's activated (see below).
@@ -5560,7 +5607,11 @@ the space row, and counts a mismatch in
   with an empty oplog. The CAR's layout is verifyRepoCarFull's (commit,
   index, one block per entry in index order, nothing else), and an
   authority on the same node must let the account write. It follows the upstream contract once there is one.
-  A rev more than 5 min ahead gets FutureRev. An import over a repo that's
+  A rev more than 5 min ahead gets FutureRev. A past key verifies only a
+  rev from before the DID rotated away from it (5 min of slack), and with
+  the authority here a rev from before the space's `createdAt` (2 min of
+  slack) is refused, so a space deleted and made again never gets an old
+  incarnation's repo back. An import over a repo that's
   there replaces it at a newer rev, as the public importRepo does: the old
   head goes in the first entry, the old rows in bounded batches, and the
   new head in the last, so reads see no repo in between. The same rev
@@ -5572,6 +5623,20 @@ the space row, and counts a mismatch in
   A failed import clears what it staged, and rows a crashed one left with
   no head over them are cleared by the next import or the repo's first
   write before it lands.
+  Everything that costs memory is decided before the body is read: a
+  grant with `create` in the space (for some collection; the index's
+  collections are checked once it's in), the `space-import` bucket, 2
+  imports per account and 8 per node (fewer when the import budget, large
+  share included, can't hold 8 at their largest, so chunked bodies are
+  refused at once rather than overdraw or queue on it), and a reservation from the import
+  budget sized by the block caps (and the Content-Length, when there is
+  one). Each block is refused from its length before it's buffered: the
+  commit over 1 KiB, the index over max(records cap × 128 B, 1 MiB), a
+  record over 1 MB. The index is read in place with its count checked
+  from the map's head, and a record's blob refs are found by a scan that
+  holds only the refs (`cbor::scan_blob_refs`): a generic decode holds
+  ~40 bytes per byte of a block of tiny items, so a 32 MiB root used to
+  cost ~1.3 GB before any scope or signature check.
 - Revocations and registrations are bounded (see above). The reference
   bounds neither, but its revocations are per host rows where vlpds's are
   one object every node reads.

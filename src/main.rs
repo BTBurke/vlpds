@@ -1471,6 +1471,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
         max_import_bytes: args.max_import_mb << 20,
         import_memory_bytes: args.import_memory_mb.map(|m| m << 20),
         import_wait: vlpds::xrpc::import_budget::ADMIT_WAIT,
+        import_body_idle: vlpds::xrpc::import_stream::BODY_IDLE,
+        import_body_deadline: vlpds::xrpc::import_stream::BODY_DEADLINE,
         trusted_proxies: args.trusted_proxies.clone(),
         peer_connections: args.peer_connections,
         peer_tls,

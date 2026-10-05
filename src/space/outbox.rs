@@ -87,6 +87,11 @@ struct Row {
     waiting: bool,
     /// Sent again once the send in flight returns, at the same rev.
     again: bool,
+    /// When its current rev was owed (enqueued, renotified, or found on
+    /// open): [`DEADLINE`] counts from here, as the reference's `expiresAt`
+    /// does, not from the rev's time, so an old rev (imported, a writer
+    /// back from deactivation, a takedown's renotify) gets its retries too.
+    owed: Instant,
 }
 
 #[derive(Default)]
@@ -246,6 +251,7 @@ impl Outbox {
             Some(r) if r.repo_rev > repo_rev || (r.repo_rev == repo_rev && !again) => return,
             Some(r) if r.repo_rev == repo_rev => {
                 r.attempts = 0;
+                r.owed = now;
                 r.again |= r.in_flight;
                 let idle = !r.in_flight && !r.queued;
                 st.set_waiting(&key, false);
@@ -257,6 +263,7 @@ impl Outbox {
                 r.repo_rev = repo_rev;
                 r.hash = hash;
                 r.attempts = 0;
+                r.owed = now;
                 r.acked = acked.then_some(now);
                 let idle = !r.in_flight && !r.queued;
                 st.set_waiting(&key, false);
@@ -289,6 +296,7 @@ impl Outbox {
                     acked: acked.then_some(now),
                     waiting: false,
                     again: false,
+                    owed: now,
                 };
                 st.rows.insert(key.clone(), row);
                 st.oldest.insert((now, id));
@@ -455,7 +463,7 @@ impl Outbox {
         };
         r.in_flight = false;
         let newer = r.repo_rev > s.repo_rev || std::mem::take(&mut r.again);
-        let expired = Duration::from_micros(crate::tid::now_micros().saturating_sub(r.repo_rev.micros())) > DEADLINE;
+        let expired = now.saturating_duration_since(r.owed) > DEADLINE;
         let (result, drop_row) = match outcome {
             Outcome::Delivered => {
                 if let Some(t) = r.acked.filter(|_| !newer) {
@@ -712,11 +720,20 @@ mod tests {
         assert_eq!(s.len(), 1);
         o.finish(&s[0], &Outcome::Refused("400".into()));
         assert!(o.is_empty());
-        // past the deadline a retryable failure drops the row
+        // an old rev (imported, renotified after a takedown) gets its
+        // retries: the deadline counts from when it was owed
+        o.set_retry_base(Duration::ZERO);
         o.enqueue("did:b", sid, "at://s", Tid::from_parts(1_000_000, 0), [0; 32], false);
         let s = send(&o);
         o.finish(&s[0], &Outcome::Retry("503".into()));
+        assert_eq!(o.len(), 1, "one 5xx doesn't drop an old rev");
+        // past the deadline a retryable failure drops the row
+        let past = Instant::now().checked_sub(DEADLINE + Duration::from_secs(1)).unwrap();
+        o.state.lock().rows.values_mut().for_each(|r| r.owed = past);
+        let s = send(&o);
+        o.finish(&s[0], &Outcome::Retry("503".into()));
         assert!(o.is_empty());
+        o.set_retry_base(RETRY_BASE);
         for a in 1..10 {
             let d = backoff(RETRY_BASE, a);
             assert!(d >= RETRY_BASE / 2 && d <= RETRY_MAX, "{a}: {d:?}");

@@ -109,7 +109,31 @@ rows or 4 MiB. One last entry on the repo's worker puts the head
 in at the CAR's rev with an empty oplog, and the authority is owed a notify like after any write.
 The account's writes to that space are refused while it imports.
 
+Nothing of the body is read until the import is let in, so a stranger's CAR can't cost the node
+memory first:
+
+- The grant must allow `create` in the space for some collection (a `space:` scope). Which
+  collections the records are in is checked once the index is in.
+- An account gets 100 imports an hour (`space-import`), and runs 2 at once. A node runs 8, or as
+  many as its import budget holds at their largest if that's fewer (one on the smallest budget,
+  192 MiB; two on a 7 GB VPS). Past that they get 503 `Overloaded` at once.
+- The import reserves what it can hold from the import budget, as `com.atproto.repo.importRepo`
+  does, and waits up to 30 s for room (then 503 `Overloaded`). That's ~75 MB at the default record
+  limit for a chunked body; a body that declares its length reserves less.
+- A body that sends nothing for 30 s, or takes over an hour, fails and gives its slot and room
+  back (as `com.atproto.repo.importRepo`'s does).
+- Every block is refused from its length, before it's read. The commit gets 1 KiB (a real one is
+  ~200 bytes), the index `--space-repo-max-records` × 128 bytes (12.8 MB at the default, and never
+  less than 1 MiB), and each record 1 MB, as a space write does. The index's entry count is checked
+  from its head too, and it's read in place. A repo near the record limit whose paths average over
+  ~85 bytes won't fit.
+
 - A rev more than 5 min in the future gets `FutureRev`.
+- A key the DID has rotated away from verifies only a commit whose rev is from before the rotation
+  (5 min of slack), so a former host can't keep signing importable commits for the account.
+- When the space's authority is hosted here, the rev can't be from before the space was created
+  (2 min of slack for clocks). A space deleted and made again is a new space, and a repo from the
+  old one doesn't come back into it.
 - When the space's authority is hosted on the same node, the account must be allowed to write in the
   space (`NotAuthorized` otherwise). An authority elsewhere refuses a non-writer's notify as it
   would any write's.
@@ -152,8 +176,11 @@ can read any repo the cluster hosts.
 
 - It's appended with a CAS on its ETag, and pruned of entries past `until` whenever it's rewritten.
 - It's written only when something is revoked, so it costs nothing when idle.
-- It's capped at 2,000 live entries per authority and 50,000 in all (see
-  [Revocation](reading.md#revocation)), so a read stays under ~7 MB.
+- It holds only revocations with a stake here, capped per authority, space and account and at
+  50,000 in all (see [Revocation](reading.md#revocation)), so a read stays under ~7 MB.
+- Spaces whose revocation couldn't be stored are listed in it too (`blocked`), so their
+  credentials stay refused across restarts and on every node. Each write bumps `gen`, and a node
+  never installs an older object over a newer one.
 - Every node loads it before serving a credential read, then re-reads it every 5 min with a
   conditional GET, and at once when nudged.
 

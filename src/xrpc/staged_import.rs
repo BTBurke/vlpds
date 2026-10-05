@@ -150,6 +150,7 @@ pub(super) async fn import(app: &Arc<App>, did: &str, body: Body, headers: &Head
     }
     let res = app.imports.admit(declared).await?;
     let driver = Driver::start(did)?;
+    let body = import_stream::TimedBody::new(body, app.config.import_body_idle, app.config.import_body_deadline);
     let mut items = import_stream::start(body, max, res.clone());
     let mut st = Stage { did: did.to_string(), nonce: driver.nonce, ..Default::default() };
     let r = st.run(app, &mut items, &res).await;

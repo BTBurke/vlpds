@@ -658,6 +658,9 @@ pub enum SpaceAccess<'a> {
     ReadSelf,
     /// create | update | delete, of a collection.
     Write(&'a str, &'a str),
+    /// create | update | delete, of some collection: what a request needs
+    /// before it knows which (importRepo, before its body is read).
+    WriteAny(&'a str),
     /// create | update | delete of the space itself.
     Manage(&'a str),
 }
@@ -684,6 +687,7 @@ impl SpacePermission {
             SpaceAccess::Write(action, coll) => {
                 has(action) && self.collection.as_ref().is_some_and(|c| c.iter().any(|x| x == "*" || x == coll))
             }
+            SpaceAccess::WriteAny(action) => has(action) && self.collection.as_ref().is_some_and(|c| !c.is_empty()),
         }
     }
 
@@ -723,6 +727,7 @@ impl SpacePermission {
             SpaceAccess::Read => (None, one("read"), None),
             SpaceAccess::ReadSelf => (None, one("read_self"), None),
             SpaceAccess::Write(action, coll) => (one(coll), one(action), None),
+            SpaceAccess::WriteAny(action) => (one("*"), one(action), None),
         };
         SPACE.format(&vec![
             ("type", one(t.space_type)),
@@ -1006,6 +1011,25 @@ impl ScopeSet {
     /// No transition scope grants space access.
     pub fn allows_space(&self, t: &SpaceTarget, access: SpaceAccess) -> bool {
         self.perms.iter().any(|p| matches!(p, Permission::Space(s) if s.matches(t, access)))
+    }
+
+    /// Whether a `space:` grant covers a service token for space method
+    /// `lxm`, which an app sends to another host as `user`: a revocation
+    /// needs authority powers (`manage`, or the user's own spaces), a
+    /// notifyWrite a write action, anything else some space grant.
+    /// `transition:generic` and `rpc:` alone never do.
+    pub fn allows_space_service_auth(&self, lxm: &str, user: &str) -> bool {
+        let lxm = lxm.to_ascii_lowercase();
+        self.perms.iter().any(|p| match p {
+            Permission::Space(s) => match lxm.as_str() {
+                "com.atproto.space.notifycredentialrevoked" => {
+                    s.manage.as_ref().is_some_and(|m| !m.is_empty()) || s.authority == user
+                }
+                "com.atproto.space.notifywrite" => s.writes(),
+                _ => true,
+            },
+            _ => false,
+        })
     }
 }
 
