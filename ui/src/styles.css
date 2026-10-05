@@ -2816,3 +2816,20 @@ dialog.modal.mod-dialog {
 .mod-dialog textarea {
   width: 100%;
 }
+table.data.firehose-subs td.ua {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.data.firehose-subs .slow {
+  color: var(--amber);
+  font-weight: 600;
+}
+table.data.firehose-subs td > .pill {
+  margin-left: 6px;
+}
+@media (max-width: 560px) {
+  table.data.firehose-subs td.ua {
+    max-width: 160px;
+  }
+}
