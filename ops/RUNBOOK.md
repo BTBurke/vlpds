@@ -2263,7 +2263,84 @@ vlpds TOTP. With both on, only TOTP is asked for.
 - Lost the authenticator (TOTP). A recovery code works in place of a code.
   There's no admin reset of TOTP.
 - App passwords bypass both factors (reference behaviour), so a user with one
-  can still use apps while sorting out the factor.
+  can still use apps while sorting out the factor, unless they blocked app
+  passwords (see the next section).
+
+### A user locked out by OAuth only
+
+The Security tab's OAuth-only switch makes `createSession` refuse the main
+password, and "Block app passwords too" refuses app passwords (docs
+`oauth-2fa.md` "OAuth only").
+- The app shows 401 `OAuthRequired` (main password) or `AppPasswordsBlocked`
+  (app password). Both count as `vlpds_logins_total{result="blocked"}`, which
+  takedowns also use.
+- Not an outage. Sign in through the app's OAuth option (this server's sign-in
+  page, with the second factor), or with an app password if they aren't
+  blocked.
+- To turn it off, the user signs in on the account page (`/account`, it still
+  takes the password and the second factor) and unticks it under Security,
+  "Sign-in protection". There's no admin switch.
+- Lost the second factor too: fix that first ("A user locked out by a second
+  factor"). OAuth only stops applying while the account has no factor. Blocked
+  app passwords stay blocked.
+- Blocking app passwords only refuses new sign-ins. Apps already signed in with
+  one keep working until the password is revoked.
+
+### A sign-in alert that didn't arrive
+
+Alerts go out for a sign-in from a device the account hasn't used in 180 days
+(docs `oauth-2fa.md` "Sign-in alerts and recent sign-ins"). None is sent when:
+- the device was seen before. A browser is its device cookie. An app is its user
+  agent plus its address (a v6 address as its /64), so the same app on the same
+  network doesn't alert twice.
+- the user turned that kind off (Security, "Sign-in protection"), or the account
+  has no email.
+- the sign-in used an emailed code, or it's the first sign-in vlpds recorded for
+  the account.
+- the account already got 3 that UTC day.
+- a mail budget is spent: `vlpds_mail_suppressed_total{purpose="sign_in_alert"}`.
+  Delivery failures: `vlpds_mail_messages_total{purpose="sign_in_alert",result="failed"}`.
+
+Ask the user to check Recent sign-ins on the Security tab. A sign-in marked
+"New" was a new device. Mail problems in general: "Email (SMTP, moderation
+mail, branding)".
+
+### Cancelling a scheduled deletion
+
+A deactivated account with a `deleteAfter` is deleted once that date and
+`--delete-after-min-hold-days` (3) since deactivation have both passed (docs
+`operations/email-and-moderation.md` "Scheduled deletion"). The deletion
+can't be undone, so act before the date.
+- Confirm: the console's account page shows "Scheduled for deletion on …", and
+  `vlpds admin account info DID` shows `deletionScheduledAt`.
+- The user reactivates on the account page ("Deactivate or delete", Reactivate
+  account). That clears `deleteAfter`.
+- Or as admin, reactivate:
+  `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"subject": {"$type": "com.atproto.admin.defs#repoRef", "did": "DID"}, "deactivated": {"applied": false}}' $NODE/xrpc/com.atproto.admin.updateSubjectStatus`.
+  With `"applied": true` instead, the account stays deactivated and the
+  deletion is cancelled.
+- The sweep skips a taken-down or suspended account until the takedown is
+  reversed.
+- To stop every scheduled deletion, set `--delete-after false` on every node
+  (rolling restart). Each node sweeps its own shards every 10 min.
+
+### A handle check that fails
+
+The account page checks a new handle with `vlpds.identity.checkHandle` before
+switching (docs `operations/email-and-moderation.md` "Changing a handle on the
+account page"). It shows the DNS and HTTPS results separately.
+- "That domain points at a private address": the domain resolves to a private
+  or other non-public address, so the guarded client won't fetch
+  `/.well-known/atproto-did`. Use the DNS TXT record
+  (`_atproto.<handle>` = `did=<DID>`), or point the domain at a public address.
+- DNS found another DID: DNS wins over the file, so fix or remove that TXT record
+  even if the file is right. Several `did=` records count as none.
+- "Taken" means another account on this server holds the handle.
+- DNS not found but the user says it's set: see "External handles" in
+  "Moderation service, earned invites, external handles".
+- 429: 60 checks per 5 min and 1,000 a day per account
+  (`vlpds.identity.checkHandle-*`). Lift with a DID override in the console's
+  Rate limits tab.
 
 ---
 

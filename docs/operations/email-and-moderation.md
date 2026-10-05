@@ -88,9 +88,8 @@ edges:
 ### What is mailed
 
 vlpds sends the reference's six account mails with its subjects and wording, each as plain text
-plus HTML (`multipart/alternative`), its own new-sign-in alert in the same layout, and admin
-`sendEmail` from a moderator. `purpose` is the
-metrics label.
+plus HTML (`multipart/alternative`), its own sign-in alert in the same layout, and admin
+`sendEmail` from a moderator. `purpose` is the metrics label.
 
 | Mail | Subject | `purpose` | Sent by |
 |---|---|---|---|
@@ -100,7 +99,7 @@ metrics label.
 | Sign-in code | Sign-in Confirmation | `auth_factor` | signing in to an account with email 2FA on |
 | Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
 | PLC operation | PLC Update Operation Requested | `plc_operation` | `requestPlcOperationSignature` |
-| New sign-in alert | New Sign-in to Your Account | `sign_in_alert` | a sign-in from a new device (vlpds's own, see [Sign-in alerts](../oauth-2fa.md#sign-in-alerts-and-recent-sign-ins)) |
+| Sign-in alert | New Sign-in to Your Account | `sign_in_alert` | a sign-in from a new device (vlpds's own, see [Sign-in alerts](../oauth-2fa.md#sign-in-alerts-and-recent-sign-ins)) |
 | Moderation | the moderator's subject | `admin` | admin `sendEmail` |
 
 ### Mail budgets
@@ -120,7 +119,7 @@ everything else. Admin `sendEmail` is exempt from all three.
 | `password-reset-account-hour` / `-day` | 5 / hour, 15 / day | the account, from any IP | answered OK but not mailed (no account probing) · `reason="account_limit"` |
 | `requestPlcOperationSignature` | 5 / hour, 15 / day | DID | 429 (the reference has no limit here) |
 | sign-in code de-dup | one new code per 60 s | DID | no new mail (the live code still works) · `reason="dedup"` |
-| new-sign-in alerts | 3 / UTC day, once per device | the account, in its private state | not mailed, the sign-in still works. The alerts also spend the three budgets above, and a spent one drops the alert |
+| sign-in alerts | 3 / UTC day, only for a device unseen in 180 days | the account, in its private state | not mailed, the sign-in still works. The alerts also spend the three budgets above, and a spent one drops the alert |
 
 The other mailing endpoints keep the reference's limits. `requestEmailConfirmation`,
 `requestEmailUpdate` and `requestAccountDelete` allow 5 / hour and 15 / day per DID, and
@@ -287,10 +286,10 @@ account once that date has passed and the account has been deactivated for at le
 `--delete-after-min-hold-days` (3), whichever is later. `--delete-after false` keeps every account
 until it's deleted by hand.
 
-The hold is there since an OAuth app with the account-status scope can deactivate an account, but
-deleting one takes the password and an emailed token. With a `deleteAfter` in the past, the app
+The hold is there since an OAuth app with `account:status?action=manage` can deactivate an account,
+but deleting one takes the password and an emailed token. With a `deleteAfter` in the past, the app
 could otherwise delete the account on the next sweep. Within the hold, the user can sign in with
-their password and reactivate, and that clears `deleteAfter`. So does an admin reactivation, and
+their password and reactivate (the account page's "Deactivate or delete"), and that clears `deleteAfter`. So does an admin reactivation, and
 an admin deactivation (`updateSubjectStatus`) replaces it with none.
 
 The deletion is the same as `deleteAccount`: the repo, blobs, a `#account` event with status
@@ -306,12 +305,14 @@ PLC entry. That's what an account that moved away needs, since the DID now point
 
 Each node sweeps the shards it owns every 10 minutes and deletes at most 100 accounts a pass. It
 finds them through a `D/{did}` row the account's worker writes with the account, so a pass reads
-only the scheduled accounts, never every account. A shard move carries the rows along, and the new
+only the scheduled accounts. A shard move carries the rows along, and the new
 owner's sweep takes over. The worker refuses the delete unless the account is still due, so a
 reactivation that lands mid-sweep wins. A deletion that stops partway (a crash, a shard move) is
 finished by the next pass. `getSession` and the console's account page show
 `deletionScheduledAt`, and `vlpds_account_deletions_total{reason="delete_after"}` counts the
 deletions (`user` and `admin` count the others).
+To cancel a deletion that was scheduled by mistake, see `ops/RUNBOOK.md` "Cancelling a scheduled
+deletion".
 
 ## Handle policy
 
@@ -352,10 +353,12 @@ See [Deploy](deploy.md#first-deploy).
 
 Both paths ask `vlpds.identity.checkHandle?name=<handle>`, a read-only call for the signed-in account
 (the parameter isn't called `handle` because forwarding would route by it). For a name under
-`--handle-domain` it answers `available`, `taken`, `reserved` or `invalid`, with a message for the
-user. For a domain it looks up the TXT record and fetches the file, with the same 3 s deadlines and
+`--handle-domain` it answers `available`, `taken` (by another account on this server), `reserved`,
+`invalid` or `current`, with a message for the user. For a domain it looks up the TXT record and fetches the file, with the same 3 s deadlines and
 the same SSRF-guarded client as updateHandle (guarded in `--dev-mode` too). It reports each one
-separately: found with this DID, found with another DID, several `did=` records, or nothing. It
+separately: found with this DID, found with another DID, several `did=` records, or nothing. The
+file check says `refused` when the domain resolves to a private address, since the guarded client
+won't fetch from one. It
 only answers `verified` when updateHandle would accept the domain. So a TXT record naming another
 DID fails the check even when the file is right, since DNS's answer is the one that counts.
 
