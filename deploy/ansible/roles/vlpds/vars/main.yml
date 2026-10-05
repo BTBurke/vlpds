@@ -93,6 +93,10 @@ _vlpds_env_base:
   VLPDS_INVITE_INTERVAL_MS: "{{ vlpds_invite_interval_ms }}"
   VLPDS_INVITE_EPOCH_MS: "{{ vlpds_invite_epoch_ms }}"
   VLPDS_MAX_BLOB_MB: "{{ vlpds_max_blob_mb }}"
+  VLPDS_MAX_IMPORT_MB: "{{ vlpds_max_import_mb }}"
+  VLPDS_SPACES: "{{ 'true' if vlpds_spaces | bool else '' }}"
+  VLPDS_SPACE_REPO_MAX_RECORDS: "{{ vlpds_space_repo_max_records }}"
+  VLPDS_SPACE_OPLOG_RETENTION: "{{ vlpds_space_oplog_retention }}"
   VLPDS_NO_RATE_LIMITS: "{{ '' if vlpds_rate_limits | bool else 'true' }}"
   VLPDS_TRUSTED_PROXIES: "{{ vlpds_trusted_proxies | join(',') }}"
   VLPDS_PYROSCOPE_URL: "{{ vlpds_pyroscope_url }}"
@@ -119,9 +123,14 @@ _vlpds_env_secret_file_env: >-
   {{ dict(_vlpds_env_secrets_set | map(attribute='env') | map('regex_replace', '$', '_FILE')
           | zip(_vlpds_env_secret_files | map('regex_replace', '^', _vlpds_secrets_dir_in_container ~ '/'))) }}
 
+# The role deploys production nodes, which never run in dev mode, so the
+# dev-only lexicon authority override (pins whose repo a lexicon is read
+# from) can't come through vlpds_extra_env either. tasks/assert.yml refuses
+# both, and dropping them here still holds with that assert skipped.
+_vlpds_dev_only_env: [VLPDS_DEV_MODE, VLPDS_LEXICON_AUTHORITY_OVERRIDE]
 _vlpds_env: >-
   {{ (_vlpds_env_base | combine(_vlpds_env_secret_file_env, vlpds_extra_env))
-     | dict2items | rejectattr('value', 'equalto', '') | items2dict }}
+     | dict2items | rejectattr('value', 'equalto', '') | rejectattr('key', 'in', _vlpds_dev_only_env) | items2dict }}
 
 # Flags without an env var.
 _vlpds_args: >-

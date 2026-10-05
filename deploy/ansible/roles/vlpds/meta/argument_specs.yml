@@ -340,6 +340,18 @@ argument_specs:
       vlpds_max_blob_mb:
         description: See defaults/main.yml (vlpds_max_blob_mb).
         type: int
+      vlpds_max_import_mb:
+        description: Largest CAR importRepo accepts, in MiB (--max-import-mb). Empty = vlpds' default (1024). Caddy's importRepo cap follows it.
+        type: str
+      vlpds_spaces:
+        description: Serve Spaces (--spaces). Off by default. See docs/spaces/operating.md before turning it on.
+        type: bool
+      vlpds_space_repo_max_records:
+        description: Most records one account's repo in one space may hold (--space-repo-max-records). Empty = vlpds' default (100000).
+        type: str
+      vlpds_space_oplog_retention:
+        description: How long space oplog entries are kept (--space-oplog-retention, e.g. 7d; off keeps them all). Empty = vlpds' default (7d).
+        type: str
       vlpds_rate_limits:
         description: "Rate limits (reference limits, keyed on the client IP from X-Forwarded-For when the peer is a trusted proxy: Caddy)."
         type: bool

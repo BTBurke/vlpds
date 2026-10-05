@@ -692,6 +692,12 @@ impl SpacePermission {
         self.action.iter().any(|a| REPO_ACTIONS.contains(&a.as_str()))
     }
 
+    /// A bare grant that writes: its collections come from its type's
+    /// declaration. One that writes nothing needs none.
+    pub fn needs_declaration(&self) -> bool {
+        self.collection.is_none() && self.space_type != "*" && self.writes()
+    }
+
     /// `withDefaultCollections`: a bare grant takes its type declaration's
     /// collections.
     pub fn with_default_collections(mut self, collections: &[String]) -> SpacePermission {

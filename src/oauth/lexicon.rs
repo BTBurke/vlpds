@@ -82,6 +82,12 @@ pub fn forget_cached(nsid: &str) {
     CACHE.lock().remove(nsid);
 }
 
+/// Tests: whether `nsid` has an in-memory copy, i.e. whether it was looked
+/// up since [`forget_cached`].
+pub fn is_cached(nsid: &str) -> bool {
+    CACHE.lock().contains_key(nsid)
+}
+
 /// All segments but the name, reversed.
 pub fn nsid_authority(nsid: &str) -> String {
     let segs: Vec<&str> = nsid.split('.').collect();
@@ -384,6 +390,23 @@ pub async fn space_declaration(app: &App, nsid: &str) -> Result<SpaceDecl, Strin
         .map_err(|_| format!("Timed out resolving space type {nsid}"))?
 }
 
+pub enum TokenScopeError {
+    /// A permission set didn't resolve now; a retry may work.
+    Lookup(String),
+    /// A bare writing grant has no collections from its approval: it was
+    /// approved before `--spaces`, or its type didn't resolve then. Only a
+    /// new approval fixes it.
+    NotApproved(String),
+}
+
+impl std::fmt::Display for TokenScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokenScopeError::Lookup(m) | TokenScopeError::NotApproved(m) => f.write_str(m),
+        }
+    }
+}
+
 /// `include:` scopes replaced by the permissions their sets grant, then
 /// with `--spaces` each `space:` grant made concrete
 /// (`LexiconManager.buildTokenScope`), in bounded time: a bare grant that
@@ -397,7 +420,7 @@ pub async fn build_token_scope_cached(
     scope: &str,
     did: &str,
     consented: Option<&BTreeMap<String, Vec<String>>>,
-) -> Result<String, String> {
+) -> Result<String, TokenScopeError> {
     let spaces = app.config.spaces;
     let has_space = spaces && scope.split(' ').any(super::scopes::is_space_scope);
     if !has_space && !scope.split(' ').any(|s| IncludeScope::parse(s).is_some()) {
@@ -408,7 +431,7 @@ pub async fn build_token_scope_cached(
     for s in scope.split(' ') {
         match IncludeScope::parse(s) {
             Some(inc) => {
-                let set = permission_set_cached(app, &inc.nsid).await?;
+                let set = permission_set_cached(app, &inc.nsid).await.map_err(TokenScopeError::Lookup)?;
                 out.extend(inc.to_permissions(&set, spaces).iter().map(|p| p.to_scope_string()));
             }
             None => others.push(s.to_string()),
@@ -424,13 +447,14 @@ pub async fn build_token_scope_cached(
             concrete.push(s);
             continue;
         };
-        // collections only name write targets, so a grant that writes
-        // nothing needs no declaration
-        let p = if p.collection.is_none() && p.space_type != "*" && p.writes() {
+        let p = if p.needs_declaration() {
             match consented.and_then(|c| c.get(&p.space_type)) {
                 Some(c) => p.with_default_collections(c),
                 None => {
-                    return Err(format!("Space type {} could not be resolved when access was approved", p.space_type))
+                    return Err(TokenScopeError::NotApproved(format!(
+                        "Space type {} could not be resolved when access was approved",
+                        p.space_type
+                    )))
                 }
             }
         } else {
