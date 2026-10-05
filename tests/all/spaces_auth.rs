@@ -453,8 +453,20 @@ async fn delete_account_sweeps_every_space_family() {
     }
     a.create_record(&stub.space("x"), COLL, Some("r"), rec("x")).await.ok();
     b.create_record(&mine, COLL, Some("b"), rec("b")).await.ok();
+    let session = TestAccount {
+        did: a.did.clone(),
+        handle: a.handle.clone(),
+        password: String::new(),
+        email: String::new(),
+        access: a.session_jwt.clone(),
+        refresh: String::new(),
+    };
+    let blob = s.upload_blob(&session, &random_png(1), "image/png").await;
+    let with_blob = json!({"$type": COLL, "text": "img", "img": blob, "createdAt": "2026-10-01T00:00:00.000Z"});
+    a.create_record(&mine, COLL, Some("img"), with_blob.clone()).await.ok();
+    a.create_record(&stub.space("x"), COLL, Some("img"), with_blob).await.ok();
     let keys = space_keys(&s, &a.did).await;
-    for fam in ["sH/", "sR/", "sO/", "sS/", "sW/", "sQ/", "sP/"] {
+    for fam in ["sH/", "sR/", "sO/", "sS/", "sW/", "sQ/", "sP/", "sb/", "sc/"] {
         assert!(keys.iter().any(|k| k.starts_with(fam)), "no {fam} row before: {keys:?}");
     }
     let b_keys = space_keys(&s, &b.did).await;

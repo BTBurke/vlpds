@@ -10,6 +10,9 @@
 //! pruned (applied entries dropped) while `fetched` is empty, so a value
 //! read before an entry applied is never used once that entry's overlay is
 //! gone.
+//!
+//! Blob refs: each path's held state carries the blobs its record names, so
+//! a write's `sb`/`sc` deletes come from the same read as its prev CID.
 
 use super::heads::DurableSpaceHead;
 use super::lthash::LtHash;
@@ -32,6 +35,7 @@ pub enum SpaceWrite {
         rkey: String,
         cid: Cid,
         bytes: Bytes,
+        blobs: Vec<Cid>,
     },
     /// applyWrites#update (`must_exist`), or putRecord, which is a create
     /// or an update by what the path holds: `put` names the scope each would
@@ -41,6 +45,7 @@ pub enum SpaceWrite {
         rkey: String,
         cid: Cid,
         bytes: Bytes,
+        blobs: Vec<Cid>,
         must_exist: bool,
         put: Option<PutScopes>,
     },
@@ -191,6 +196,27 @@ fn internal(m: impl Into<String>) -> SpaceError {
     SpaceError::Write(WriteError::Internal(m.into()))
 }
 
+/// A record a path holds: its CID and the distinct blobs it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathRec {
+    pub cid: Cid,
+    pub blobs: Vec<Cid>,
+}
+
+impl PathRec {
+    /// From an `sR` value.
+    pub fn from_value(v: &[u8]) -> anyhow::Result<PathRec> {
+        let (cid, bytes) = state::record_value_parts(v)?;
+        let mut blobs = Vec::new();
+        crate::xrpc::blob_refs(&crate::cbor::Value::decode(bytes)?, &mut blobs);
+        Ok(PathRec { cid, blobs })
+    }
+
+    fn heap_bytes(&self) -> usize {
+        self.blobs.len() * std::mem::size_of::<Cid>()
+    }
+}
+
 /// One account's repo in one space, as the worker builds on it: the head
 /// after every entry it sent, applied or not.
 pub struct SpaceHead {
@@ -199,11 +225,11 @@ pub struct SpaceHead {
     pub hash: LtHash,
     pub records: u64,
     pub created: u64,
-    /// path -> CID (None: deleted) written by an entry, and whether that
+    /// path -> record (None: deleted) written by an entry, and whether that
     /// entry has applied.
-    overlay: HashMap<String, (Option<Cid>, Arc<AtomicBool>)>,
+    overlay: HashMap<String, (Option<PathRec>, Arc<AtomicBool>)>,
     /// Read from `sR` for the requests about to run.
-    fetched: HashMap<String, Option<Cid>>,
+    fetched: HashMap<String, Option<PathRec>>,
 }
 
 impl SpaceHead {
@@ -215,12 +241,17 @@ impl SpaceHead {
         SpaceHead { uri, rev, hash, records, created, overlay: HashMap::new(), fetched: HashMap::new() }
     }
 
-    fn known(&self, path: &str) -> Option<Option<Cid>> {
-        self.overlay.get(path).map(|(c, _)| *c).or_else(|| self.fetched.get(path).copied())
+    fn known(&self, path: &str) -> Option<&Option<PathRec>> {
+        self.overlay.get(path).map(|(c, _)| c).or_else(|| self.fetched.get(path))
     }
 
     fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.uri.len() + (self.overlay.len() + self.fetched.len()) * 128
+        let blobs = |r: &Option<PathRec>| r.as_ref().map_or(0, PathRec::heap_bytes);
+        std::mem::size_of::<Self>()
+            + self.uri.len()
+            + (self.overlay.len() + self.fetched.len()) * 128
+            + self.overlay.values().map(|(r, _)| blobs(r)).sum::<usize>()
+            + self.fetched.values().map(blobs).sum::<usize>()
     }
 }
 
@@ -367,7 +398,7 @@ fn authority(uri: &str) -> Option<&str> {
 #[derive(Default)]
 pub struct Fetched {
     heads: Vec<(SpaceId, Arc<str>, Option<HeadRow>)>,
-    paths: Vec<(SpaceId, String, Option<Cid>)>,
+    paths: Vec<(SpaceId, String, Option<PathRec>)>,
     hosts: Vec<(SpaceId, Arc<str>, Option<SpaceRow>, Option<Tid>)>,
     writers: Vec<(SpaceId, String, Option<WriterRow>)>,
     members: Vec<(SpaceId, String, Option<MemberRow>)>,
@@ -387,8 +418,8 @@ pub async fn fetch(db: &slatedb::Db, did: &str, need: SpaceNeed) -> anyhow::Resu
     }
     let paths = futures::future::try_join_all(need.paths.into_iter().map(|(sid, path)| async move {
         let v = db.get(state::space_record_key(did, &sid, &path)).await?;
-        let cid = v.map(|v| state::record_value_parts(&v).map(|(c, _)| c)).transpose()?;
-        anyhow::Ok((sid, path, cid))
+        let rec = v.map(|v| PathRec::from_value(&v)).transpose()?;
+        anyhow::Ok((sid, path, rec))
     }))
     .await?;
     f.paths = paths;
@@ -419,9 +450,9 @@ pub fn install(st: &mut SpaceStates, f: Fetched) {
     for (sid, uri, row) in f.heads {
         st.repos.entry(sid).or_insert_with(|| SpaceHead::new(uri, row));
     }
-    for (sid, path, cid) in f.paths {
+    for (sid, path, rec) in f.paths {
         if let Some(h) = st.repos.get_mut(&sid) {
-            h.fetched.insert(path, cid);
+            h.fetched.insert(path, rec);
         }
     }
     for (sid, uri, space, max) in f.hosts {
@@ -491,23 +522,29 @@ pub fn write(
     if *head.uri != **uri {
         return Err(internal(format!("space id collision: {} and {uri}", head.uri)));
     }
-    let mut batch: HashMap<String, Option<Cid>> = HashMap::new();
+    let mut batch: HashMap<String, Option<PathRec>> = HashMap::new();
+    // the blobs each path named before the batch
+    let mut before: HashMap<String, Vec<Cid>> = HashMap::new();
     let mut ops: Vec<(OpRow, Option<Bytes>)> = Vec::with_capacity(writes.len());
     let mut results = Vec::with_capacity(writes.len());
     for w in writes {
         let path = w.path();
         let prev = match batch.get(&path) {
-            Some(c) => *c,
-            None => head.known(&path).ok_or_else(|| internal(format!("space record {path} not loaded")))?,
+            Some(c) => c.clone(),
+            None => {
+                let p = head.known(&path).ok_or_else(|| internal(format!("space record {path} not loaded")))?.clone();
+                before.entry(path.clone()).or_insert_with(|| p.as_ref().map(|r| r.blobs.clone()).unwrap_or_default());
+                p
+            }
         };
         let (action, new, bytes) = match w {
-            SpaceWrite::Create { cid, bytes, .. } => {
+            SpaceWrite::Create { cid, bytes, blobs, .. } => {
                 if prev.is_some() {
                     return Err(SpaceError::RecordAlreadyExists(format!("Record already exists: {path}")));
                 }
-                (OpAction::Create, Some(cid), Some(bytes))
+                (OpAction::Create, Some(PathRec { cid, blobs }), Some(bytes))
             }
-            SpaceWrite::Update { cid, bytes, must_exist, put, .. } => {
+            SpaceWrite::Update { cid, bytes, blobs, must_exist, put, .. } => {
                 if prev.is_none() && must_exist {
                     return Err(SpaceError::RecordNotFound(format!("Record not found: {path}")));
                 }
@@ -516,7 +553,7 @@ pub fn write(
                     return Err(SpaceError::ScopeMissing(scope));
                 }
                 let action = if prev.is_some() { OpAction::Update } else { OpAction::Create };
-                (action, Some(cid), Some(bytes))
+                (action, Some(PathRec { cid, blobs }), Some(bytes))
             }
             SpaceWrite::Delete { must_exist, .. } => {
                 if prev.is_none() {
@@ -529,14 +566,15 @@ pub fn write(
                 (OpAction::Delete, None, None)
             }
         };
-        results.push(match (action, new) {
+        let (cid, prev) = (new.as_ref().map(|r| r.cid), prev.map(|r| r.cid));
+        results.push(match (action, cid) {
             (OpAction::Create, Some(cid)) => SpaceOutcome::Create { path: path.clone(), cid },
             (OpAction::Update, Some(cid)) => SpaceOutcome::Update { path: path.clone(), cid },
             _ => SpaceOutcome::Delete,
         });
         batch.insert(path.clone(), new);
         let (collection, rkey) = path.split_once('/').map(|(c, r)| (c.to_string(), r.to_string())).unwrap_or_default();
-        ops.push((OpRow { action, collection, rkey, cid: new, prev }, bytes));
+        ops.push((OpRow { action, collection, rkey, cid, prev }, bytes));
     }
     if ops.is_empty() {
         return Ok(Err(results));
@@ -567,12 +605,13 @@ pub fn write(
         }
         muts.push(put(state::space_oplog_key(did, &sid, rev.0, idx as u16), op.encode()));
     }
+    blob_ref_mutations(did, sid, rev, &batch, &before, &mut muts);
     if head.rev.is_none() {
         head.created = tid::now_micros();
     }
     head.rev = Some(rev);
-    for (path, cid) in batch {
-        head.overlay.insert(path, (cid, applied.clone()));
+    for (path, rec) in batch {
+        head.overlay.insert(path, (rec, applied.clone()));
     }
     let row =
         HeadRow { uri: uri.to_string(), rev, hash: head.hash.clone(), records: head.records, created: head.created };
@@ -605,6 +644,30 @@ pub fn write(
         (Some(o), None)
     };
     Ok(Ok(BuiltWrite { muts, rev, head: durable, notify, sequenced, results }))
+}
+
+/// The `sb`/`sc` rows of a batch's net change per path: refs the record no
+/// longer names go, and every ref it names is (re)written with the batch's
+/// rev, so listBlobs `since` sees a blob kept across an update, as `b/`.
+fn blob_ref_mutations(
+    did: &str,
+    sid: SpaceId,
+    rev: Tid,
+    batch: &HashMap<String, Option<PathRec>>,
+    before: &HashMap<String, Vec<Cid>>,
+    muts: &mut Vec<Mutation>,
+) {
+    for (path, rec) in batch {
+        let new = rec.as_ref().map_or(&[][..], |r| &r.blobs[..]);
+        for b in before.get(path).into_iter().flatten().filter(|b| !new.contains(b)) {
+            muts.push(del(state::space_blob_key(did, &sid, b, path)));
+            muts.push(del(state::space_blob_cid_key(did, b, &sid, path)));
+        }
+        for b in new {
+            muts.push(put(state::space_blob_key(did, &sid, b, path), Bytes::copy_from_slice(&rev.0.to_be_bytes())));
+            muts.push(put(state::space_blob_cid_key(did, b, &sid, path), Bytes::new()));
+        }
+    }
 }
 
 /// The author is the authority: the space host's writer state moves in the
@@ -826,7 +889,7 @@ mod tests {
         let mut f = Fetched::default();
         f.heads.push((sid, uri.clone(), None));
         for (p, c) in paths {
-            f.paths.push((sid, p.to_string(), *c));
+            f.paths.push((sid, p.to_string(), c.map(|cid| PathRec { cid, blobs: Vec::new() })));
         }
         install(&mut st, f);
         (st, sid, uri)
@@ -839,6 +902,7 @@ mod tests {
             rkey: rkey.into(),
             cid: Cid::dag_cbor(&bytes),
             bytes,
+            blobs: Vec::new(),
         }
     }
 
@@ -849,6 +913,7 @@ mod tests {
             rkey: rkey.into(),
             cid: Cid::dag_cbor(&bytes),
             bytes,
+            blobs: Vec::new(),
             must_exist,
             put: None,
         }
@@ -909,6 +974,92 @@ mod tests {
         assert!(w(&mut st, vec![update("b", 2, true)], 1).unwrap(), "over a lowered cap, no growth");
         assert!(w(&mut st, vec![del("b")], 1).unwrap());
         assert_eq!(st.repos[&sid].records, 1);
+    }
+
+    /// `sb`/`sc` rows follow each path's net change: a ref a record stops
+    /// naming goes, the ones it names are rewritten with the new rev, and a
+    /// path created and deleted in one batch leaves none.
+    #[test]
+    fn blob_refs_follow_the_batch() {
+        let blob = |i: u8| Cid::raw(&[i]);
+        let with = |w: SpaceWrite, blobs: Vec<Cid>| match w {
+            SpaceWrite::Create { collection, rkey, cid, bytes, .. } => {
+                SpaceWrite::Create { collection, rkey, cid, bytes, blobs }
+            }
+            SpaceWrite::Update { collection, rkey, cid, bytes, must_exist, put, .. } => {
+                SpaceWrite::Update { collection, rkey, cid, bytes, blobs, must_exist, put }
+            }
+            d => d,
+        };
+        let del =
+            |r: &str| SpaceWrite::Delete { collection: "com.example.post".into(), rkey: r.into(), must_exist: true };
+        let (mut st, sid, uri) = states_with(&[("com.example.post/a", None), ("com.example.post/t", None)]);
+        // `o` was written before and names blob 9, as read from `sR`
+        let mut f = Fetched::default();
+        let old = PathRec { cid: Cid::dag_cbor(b"old"), blobs: vec![blob(9)] };
+        f.paths.push((sid, "com.example.post/o".into(), Some(old)));
+        install(&mut st, f);
+        let did = "did:plc:writer";
+        let refs = |b: &BuiltWrite| {
+            let mut v: Vec<(Vec<u8>, bool)> = b
+                .muts
+                .iter()
+                .filter(|m| {
+                    let body = state::key_body(&m.key);
+                    body.starts_with(state::SPACE_BLOB_FAMILY) || body.starts_with(state::SPACE_BLOB_CID_FAMILY)
+                })
+                .map(|m| (m.key.to_vec(), m.val.is_some()))
+                .collect();
+            v.sort();
+            v
+        };
+        let row = |b: u8, path: &str, put: bool| {
+            let mut v = vec![
+                (state::space_blob_key(did, &sid, &blob(b), path), put),
+                (state::space_blob_cid_key(did, &blob(b), &sid, path), put),
+            ];
+            v.sort();
+            v
+        };
+        let b = go(&mut st, sid, &uri, vec![with(create("a", 1), vec![blob(1), blob(2)])]).unwrap();
+        let mut want = [row(1, "com.example.post/a", true), row(2, "com.example.post/a", true)].concat();
+        want.sort();
+        assert_eq!(refs(&b), want);
+        let sb = b.muts.iter().find(|m| m.key[..] == state::space_blob_key(did, &sid, &blob(1), "com.example.post/a"));
+        assert_eq!(sb.unwrap().val.as_deref(), Some(&b.rev.0.to_be_bytes()[..]));
+        // from the overlay: 1 goes, 2 is rewritten, 3 comes
+        let b = go(&mut st, sid, &uri, vec![with(update("a", 2, true), vec![blob(2), blob(3)])]).unwrap();
+        let mut want = [
+            row(1, "com.example.post/a", false),
+            row(2, "com.example.post/a", true),
+            row(3, "com.example.post/a", true),
+        ]
+        .concat();
+        want.sort();
+        assert_eq!(refs(&b), want);
+        // from `sR`: deleting `o` drops its ref
+        let b = go(&mut st, sid, &uri, vec![del("o")]).unwrap();
+        assert_eq!(refs(&b), row(9, "com.example.post/o", false));
+        // created and deleted in one batch: no rows at all
+        let b = go(&mut st, sid, &uri, vec![with(create("t", 1), vec![blob(4)]), del("t")]).unwrap();
+        assert_eq!(refs(&b), Vec::new());
+        // the overlay remembers the update's blobs for the next write
+        let b = go(&mut st, sid, &uri, vec![del("a")]).unwrap();
+        let mut want = [row(2, "com.example.post/a", false), row(3, "com.example.post/a", false)].concat();
+        want.sort();
+        assert_eq!(refs(&b), want);
+    }
+
+    #[test]
+    fn path_rec_reads_blob_refs_from_the_stored_value() {
+        let blob = Cid::raw(b"img");
+        let rec = serde_json::json!({"$type": "com.example.post", "img": {"$type": "blob", "ref": {"$link": blob.to_string()}, "mimeType": "image/png", "size": 3}});
+        let v = crate::cbor::Value::from_json(&rec).unwrap();
+        let mut bytes = Vec::new();
+        v.encode(&mut bytes);
+        let cid = Cid::dag_cbor(&bytes);
+        let r = PathRec::from_value(&state::record_value(&cid, 7, &bytes)).unwrap();
+        assert_eq!(r, PathRec { cid, blobs: vec![blob] });
     }
 
     /// A value read from `sR` before an entry applied is never used once

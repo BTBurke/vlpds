@@ -154,6 +154,16 @@ pub fn seq_rev(key: &[u8]) -> Option<Tid> {
     Some(Tid(u64::from_be_bytes(tail.try_into().ok()?)))
 }
 
+/// (CID, path) of an `sb` key after its `{did}\0{sid}` prefix.
+pub fn blob_ref_parts(rest: &[u8]) -> Option<(&str, &str)> {
+    std::str::from_utf8(rest).ok()?.split_once('\0')
+}
+
+/// The rev of the write that last named an `sb` ref's blob.
+pub fn blob_ref_rev(v: &[u8]) -> Tid {
+    Tid(v.get(..8).map_or(0, |b| u64::from_be_bytes(b.try_into().unwrap())))
+}
+
 /// `sP`: the newest write of a (repo, space) its authority hasn't
 /// acknowledged yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -381,6 +391,14 @@ mod tests {
         let k = crate::state::space_oplog_key("did:plc:abc", &sid, 42, 7);
         assert_eq!(oplog_position(&k), Some((Tid(42), 7)));
         assert_eq!(seq_rev(&crate::state::space_seq_key("did:plc:abc", &sid, 99)), Some(Tid(99)));
+        let blob = Cid::raw(b"blob");
+        let k = crate::state::space_blob_key("did:plc:abc", &sid, &blob, "com.example.post/1");
+        let prefix = crate::state::space_prefix(crate::state::SPACE_BLOB_FAMILY, "did:plc:abc", &sid);
+        assert_eq!(blob_ref_parts(&k[prefix.len()..]), Some((blob.to_string().as_str(), "com.example.post/1")));
+        assert!(k.starts_with(&crate::state::space_blob_prefix("did:plc:abc", &sid, &blob)));
+        let c = crate::state::space_blob_cid_key("did:plc:abc", &blob, &sid, "com.example.post/1");
+        assert!(c.starts_with(&crate::state::space_blob_cid_prefix("did:plc:abc", &blob.to_string())));
+        assert!(crate::state::is_space_key(&k) && crate::state::is_space_key(&c));
         assert!(crate::state::is_space_key(&k));
         assert!(!crate::state::is_space_key(&crate::state::repo_stats_key("did:plc:abc")));
     }

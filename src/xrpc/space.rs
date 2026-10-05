@@ -29,6 +29,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.space.applyWrites", post(apply_writes))
         .route("/xrpc/com.atproto.space.getRecord", get(get_record))
         .route("/xrpc/com.atproto.space.listRecords", get(list_records))
+        .route("/xrpc/com.atproto.space.getBlob", get(get_blob))
+        .route("/xrpc/com.atproto.space.listBlobs", get(list_blobs))
         .route("/xrpc/com.atproto.space.getLatestCommit", get(get_latest_commit))
         .route("/xrpc/com.atproto.space.listRepoOps", get(list_repo_ops))
         .route("/xrpc/com.atproto.space.getDelegationToken", get(get_delegation_token))
@@ -137,24 +139,18 @@ fn writer(creds: &Credentials, repo: &str) -> XResult<String> {
     Ok(did.to_string())
 }
 
-/// Until space blobs are referenced (`sb`), a space record naming a blob
-/// is refused, so no space-only upload becomes servable.
-fn no_blobs(blobs: &[Cid]) -> XResult<()> {
-    match blobs.is_empty() {
-        true => Ok(()),
-        false => Err(XrpcError::bad("InvalidRequest", "blobs in space records are not supported yet")),
-    }
-}
-
 struct Prepared {
     collection: String,
     rkey: String,
     cid: Cid,
     bytes: Bytes,
+    blobs: Vec<Cid>,
+    decls: Vec<super::repo::BlobDecl>,
     status: crate::lexicon::ValidationStatus,
 }
 
-/// Reference prepareCreate/prepareUpdate of a space record.
+/// Reference prepareCreate/prepareUpdate of a space record. Its blobs are
+/// checked as a repo write's are (`check_blobs`), by the caller.
 async fn prepare(
     app: &Arc<App>,
     collection: String,
@@ -165,9 +161,9 @@ async fn prepare(
     check_path(&collection, Some(&rkey))?;
     check_rkey_slur(Some(&rkey))?;
     let schema = crate::lexicon::resolve_record_schema(app, &collection, validate).await;
-    let (cid, bytes, blobs, status, _) = encode_record(&mut record, &collection, &rkey, validate, schema.as_deref())?;
-    no_blobs(&blobs)?;
-    Ok(Prepared { collection, rkey, cid, bytes, status })
+    let (cid, bytes, blobs, status, decls) =
+        encode_record(&mut record, &collection, &rkey, validate, schema.as_deref())?;
+    Ok(Prepared { collection, rkey, cid, bytes, blobs, decls, status })
 }
 
 fn write_result(op: &str, r: &XResult<impl Sized>) {
@@ -198,8 +194,9 @@ async fn create_record_inner(app: &Arc<App>, creds: &Credentials, body: RecordBo
     check_path(&collection, rkey.as_deref())?;
     let rkey = rkey.unwrap_or_else(|| app.tids.next().to_string());
     let p = prepare(app, collection, rkey, record, validate).await?;
+    let _held = super::repo::check_blobs(app, &did, &p.decls).await?;
     let path = format!("{}/{}", p.collection, p.rkey);
-    let w = SpaceWrite::Create { collection: p.collection, rkey: p.rkey, cid: p.cid, bytes: p.bytes };
+    let w = SpaceWrite::Create { collection: p.collection, rkey: p.rkey, cid: p.cid, bytes: p.bytes, blobs: p.blobs };
     submit_space(app, &did, &space, SpaceOp::Write { writes: vec![w] }).await?;
     Ok(Json(with_status(json!({"uri": space.record_uri(&did, &path), "cid": p.cid.to_string()}), p.status)))
 }
@@ -232,12 +229,14 @@ async fn put_record_inner(app: &Arc<App>, creds: &Credentials, body: RecordBody)
         creds.need_space(&t, SpaceAccess::Write("create", &collection))?;
     }
     let p = prepare(app, collection, rkey, record, validate).await?;
+    let _held = super::repo::check_blobs(app, &did, &p.decls).await?;
     let path = format!("{}/{}", p.collection, p.rkey);
     let w = SpaceWrite::Update {
         collection: p.collection,
         rkey: p.rkey,
         cid: p.cid,
         bytes: p.bytes,
+        blobs: p.blobs,
         must_exist: false,
         put: Some(put).filter(|p| p.create.is_some() || p.update.is_some()),
     };
@@ -310,6 +309,7 @@ async fn apply_writes_inner(app: &Arc<App>, creds: &Credentials, body: RecordBod
     }
     let mut ops = Vec::with_capacity(writes.len());
     let mut statuses = Vec::with_capacity(writes.len());
+    let mut decls = Vec::new();
     for w in writes.iter_mut() {
         let t = w.get("$type").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let collection = w.get("collection").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -336,18 +336,27 @@ async fn apply_writes_inner(app: &Arc<App>, creds: &Credentials, body: RecordBod
         let value = w.get_mut("value").map(|x| std::mem::replace(x, JsonValue::Null)).unwrap_or(JsonValue::Null);
         let p = prepare(app, collection, rkey, value, validate).await?;
         statuses.push(p.status);
+        decls.extend(p.decls);
         ops.push(match action {
-            "create" => SpaceWrite::Create { collection: p.collection, rkey: p.rkey, cid: p.cid, bytes: p.bytes },
+            "create" => SpaceWrite::Create {
+                collection: p.collection,
+                rkey: p.rkey,
+                cid: p.cid,
+                bytes: p.bytes,
+                blobs: p.blobs,
+            },
             _ => SpaceWrite::Update {
                 collection: p.collection,
                 rkey: p.rkey,
                 cid: p.cid,
                 bytes: p.bytes,
+                blobs: p.blobs,
                 must_exist: true,
                 put: None,
             },
         });
     }
+    let _held = super::repo::check_blobs(app, &did, &decls).await?;
     let results = match submit_space(app, &did, &space, SpaceOp::Write { writes: ops }).await? {
         SpaceAck::Write { results, .. } => results,
         _ => return Err(XrpcError::internal("unexpected space ack")),
@@ -637,6 +646,111 @@ async fn list_records(
     }
     out.push(b'}');
     Ok(json_bytes(out))
+}
+
+#[derive(Deserialize)]
+struct BlobQ {
+    space: String,
+    repo: String,
+    cid: String,
+}
+
+/// Reference space.getBlob: only a blob a record of this repo in this space
+/// names (`sb`), so a credential for one space reads none of another's, nor
+/// an upload no record names; whether such a blob exists isn't revealed.
+async fn get_blob(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Query<BlobQ>) -> XResult<Response> {
+    let sp = spaces(&app)?;
+    let space = Space::parse(&q.space)?;
+    let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    let cid = Cid::parse(&q.cid).map_err(|_| XrpcError::bad("InvalidRequest", "Invalid cid"))?;
+    available(&app, &q.repo, self_read).await?;
+    metrics::space_read("getBlob", auth_label(&creds));
+    let not_found = || XrpcError::bad("BlobNotFound", "Blob not found");
+    let p = app.partition(&q.repo)?;
+    // the head names the space: a space id shared with another fails here
+    if load_head(sp, &p, &q.repo, &space).await?.is_none() {
+        return Err(not_found());
+    }
+    let prefix = state::space_blob_prefix(&q.repo, &space.sid, &cid);
+    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+    if iter.next().await.map_err(XrpcError::from_err)?.is_none() {
+        return Err(not_found());
+    }
+    if super::admin::is_blob_takendown(&app, &q.repo, &q.cid).await? {
+        return Err(not_found());
+    }
+    match app.store.raw.get(&super::blobs::blob_path(&app, &q.repo, cid)).await {
+        Ok(r) => Ok(super::blobs::blob_response(r, &cid)),
+        Err(object_store::Error::NotFound { .. }) => Err(not_found()),
+        Err(e) => Err(XrpcError::from_err(e)),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListBlobsQ {
+    space: String,
+    repo: String,
+    since: Option<String>,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// Reference space.listBlobs: the distinct blobs this repo's records in
+/// this space name, in CID order; with `since`, those named by a record
+/// written after that rev. Only a full page has a cursor.
+async fn list_blobs(
+    State(app): AppState,
+    SpaceAuth(creds): SpaceAuth,
+    Query(q): Query<ListBlobsQ>,
+) -> XResult<Json<J>> {
+    let sp = spaces(&app)?;
+    let space = Space::parse(&q.space)?;
+    let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    let since = match q.since.as_deref() {
+        Some(s) => Some(Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?),
+        None => None,
+    };
+    let limit = super::extract::limit_param(q.limit, 500, 1, 1000)?;
+    available(&app, &q.repo, self_read).await?;
+    metrics::space_read("listBlobs", auth_label(&creds));
+    let p = app.partition(&q.repo)?;
+    if load_head(sp, &p, &q.repo, &space).await?.is_none() {
+        return Ok(Json(json!({"cids": []})));
+    }
+    let prefix = state::space_prefix(state::SPACE_BLOB_FAMILY, &q.repo, &space.sid);
+    let lo = match &q.cursor {
+        // past every key of the cursor's CID
+        Some(c) => state::prefix_end(&[&prefix[..], c.as_bytes(), b"\0"].concat()),
+        None => prefix.clone(),
+    };
+    let opts = slatedb::config::ScanOptions::default();
+    let mut iter = p.db.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
+    let mut cids: Vec<String> = Vec::new();
+    'scan: loop {
+        let rows = iter.next_batch(limit.max(64)).await.map_err(XrpcError::from_err)?;
+        if rows.is_empty() {
+            break;
+        }
+        for kv in rows {
+            let (cid, _) = crate::space::rows::blob_ref_parts(&kv.key[prefix.len()..])
+                .ok_or_else(|| XrpcError::internal("bad space blob ref key"))?;
+            if cids.last().is_some_and(|c| c == cid) {
+                continue;
+            }
+            if since.is_some_and(|s| crate::space::rows::blob_ref_rev(&kv.value) <= s) {
+                continue;
+            }
+            if cids.len() == limit {
+                break 'scan;
+            }
+            cids.push(cid.to_string());
+        }
+    }
+    let mut out = json!({"cids": cids});
+    if cids.len() == limit {
+        out["cursor"] = json!(cids.last());
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]

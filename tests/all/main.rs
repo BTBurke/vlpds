@@ -146,6 +146,7 @@ mod signature_faults;
 mod smtp_mail;
 mod spaces;
 mod spaces_auth;
+mod spaces_blobs;
 mod spaces_e2e;
 mod spaces_host;
 mod spaces_sync;

@@ -34,6 +34,8 @@
 //! sR/{did}\0{sid}{coll}/{rkey}      -> record cid | rev | record bytes (as `R/`)
 //! sO/{did}\0{sid}{rev u64}{idx u16} -> oplog op: action, coll, rkey, cid?, prev?
 //! sP/{did}\0{sid}                   -> notifyWrite outbox: URI, repoRev, hash
+//! sb/{did}\0{sid}{cid}\0{path}       -> rev (space blob refs: space.listBlobs/getBlob)
+//! sc/{did}\0{cid}\0{sid}{path}       -> empty (the same refs by CID: blob GC)
 //!
 //! Space-host rows are in the authority's slot:
 //!
@@ -232,9 +234,11 @@ pub const SPACE_MEMBER_FAMILY: &[u8] = b"sM/";
 pub const SPACE_WRITER_FAMILY: &[u8] = b"sW/";
 pub const SPACE_SEQ_FAMILY: &[u8] = b"sQ/";
 pub const SPACE_NOTIFY_FAMILY: &[u8] = b"sN/";
+pub const SPACE_BLOB_FAMILY: &[u8] = b"sb/";
+pub const SPACE_BLOB_CID_FAMILY: &[u8] = b"sc/";
 
 /// Every Spaces family: rows that must never reach a firehose frame.
-pub const SPACE_FAMILIES: [&[u8]; 9] = [
+pub const SPACE_FAMILIES: [&[u8]; 11] = [
     SPACE_HEAD_FAMILY,
     SPACE_RECORD_FAMILY,
     SPACE_OPLOG_FAMILY,
@@ -244,6 +248,8 @@ pub const SPACE_FAMILIES: [&[u8]; 9] = [
     SPACE_WRITER_FAMILY,
     SPACE_SEQ_FAMILY,
     SPACE_NOTIFY_FAMILY,
+    SPACE_BLOB_FAMILY,
+    SPACE_BLOB_CID_FAMILY,
 ];
 
 pub const SPACE_ID_LEN: usize = 16;
@@ -301,6 +307,26 @@ pub fn space_seq_key(authority: &str, sid: &SpaceId, space_rev: u64) -> Vec<u8> 
 
 pub fn space_notify_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
     keyed(authority, SPACE_NOTIFY_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
+}
+
+/// The CID is in its string form, as in `b/`, so listBlobs pages in the
+/// reference's (string) CID order.
+pub fn space_blob_key(did: &str, sid: &SpaceId, blob: &Cid, path: &str) -> Vec<u8> {
+    [&space_blob_prefix(did, sid, blob)[..], path.as_bytes()].concat()
+}
+
+/// `sb/{did}\0{sid}{cid}\0`: the paths in one space naming one blob.
+pub fn space_blob_prefix(did: &str, sid: &SpaceId, blob: &Cid) -> Vec<u8> {
+    keyed(did, SPACE_BLOB_FAMILY, &[did.as_bytes(), b"\0", sid, blob.to_string().as_bytes(), b"\0"])
+}
+
+pub fn space_blob_cid_key(did: &str, blob: &Cid, sid: &SpaceId, path: &str) -> Vec<u8> {
+    [&space_blob_cid_prefix(did, &blob.to_string())[..], sid, path.as_bytes()].concat()
+}
+
+/// `sc/{did}\0{cid}\0`: every space ref of one blob of the account.
+pub fn space_blob_cid_prefix(did: &str, blob: &str) -> Vec<u8> {
+    keyed(did, SPACE_BLOB_CID_FAMILY, &[did.as_bytes(), b"\0", blob.as_bytes(), b"\0"])
 }
 
 /// A repo generation in keys: LEB128, which is prefix-free, so no

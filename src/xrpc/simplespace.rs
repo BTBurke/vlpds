@@ -310,6 +310,7 @@ pub(super) async fn delete_space_rows(app: &App, space: &Space) -> XResult<()> {
         state::SPACE_WRITER_FAMILY,
         state::SPACE_SEQ_FAMILY,
         state::SPACE_NOTIFY_FAMILY,
+        state::SPACE_BLOB_FAMILY,
         state::SPACE_RECORD_FAMILY,
         state::SPACE_OPLOG_FAMILY,
         state::SPACE_HEAD_FAMILY,
@@ -324,7 +325,19 @@ pub(super) async fn delete_space_rows(app: &App, space: &Space) -> XResult<()> {
             if rows.is_empty() {
                 break;
             }
-            let muts = rows.into_iter().map(|kv| crate::segment::Mutation { key: kv.key, val: None }).collect();
+            let mut muts = Vec::with_capacity(rows.len());
+            for kv in rows {
+                // a blob ref's CID-major twin goes in the same entry, so the
+                // GC never keeps a blob for a ref that is gone
+                if fam == state::SPACE_BLOB_FAMILY {
+                    let (cid, path) = crate::space::rows::blob_ref_parts(&kv.key[prefix.len()..])
+                        .ok_or_else(|| XrpcError::internal("bad space blob ref key"))?;
+                    let cid = Cid::parse(cid).map_err(XrpcError::from_err)?;
+                    let key = state::space_blob_cid_key(&space.authority, &cid, &space.sid, path);
+                    muts.push(crate::segment::Mutation { key: key.into(), val: None });
+                }
+                muts.push(crate::segment::Mutation { key: kv.key, val: None });
+            }
             super::write_private_local(&p, muts).await?;
         }
     }

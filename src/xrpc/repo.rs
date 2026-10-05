@@ -137,7 +137,7 @@ pub(super) fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>>
 /// real bytes. One HEAD per distinct blob (a 1 MB record can declare ~9k
 /// refs). Keep the returned guard until the write has applied or failed; it
 /// is taken before the checks, so a quarantine that races them is covered.
-async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<super::blobs::HeldBlobs> {
+pub(super) async fn check_blobs(app: &App, did: &str, decls: &[BlobDecl]) -> XResult<super::blobs::HeldBlobs> {
     let mut seen = std::collections::HashSet::with_capacity(decls.len());
     let decls: Vec<&BlobDecl> = decls.iter().filter(|d| seen.insert(*d)).collect();
     let mut cids: Vec<Cid> = Vec::with_capacity(decls.len());

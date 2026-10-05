@@ -23,8 +23,6 @@ const METHODS: &[(&str, bool)] = &[
 /// Spaces methods without a handler yet: with the flag they answer 501
 /// locally.
 const UNIMPLEMENTED: &[(&str, bool)] = &[
-    ("com.atproto.space.getBlob?repo=did:plc:x", false),
-    ("com.atproto.space.listBlobs", false),
     ("com.atproto.space.notifySpaceDeleted", true),
     ("com.atproto.simplespace.checkUserAccess", false),
     // NSID authorities are case-insensitive

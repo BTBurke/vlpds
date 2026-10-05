@@ -312,6 +312,11 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
     if !is_admin && super::admin::is_blob_takendown(&app, &q.did, &cid.to_string()).await? {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
+    // Spaces: the reference rule (`hasRecordsForBlob`). Serving an upload
+    // before a public record names it would serve one a space record names.
+    if app.config.spaces && !publicly_referenced(&app, &q.did, &cid.to_string()).await? {
+        return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
+    }
     let r = match app.store.raw.get(&blob_path(&app, &q.did, cid)).await {
         Ok(r) => r,
         // the operator reviewing a taken-down blob reads its quarantined copy
@@ -327,6 +332,11 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
         Err(object_store::Error::NotFound { .. }) => return Err(XrpcError::bad("BlobNotFound", "Blob not found")),
         Err(e) => return Err(XrpcError::from_err(e)),
     };
+    Ok(blob_response(r, &cid))
+}
+
+/// A stored blob's bytes, streamed, with the reference's headers.
+pub(super) fn blob_response(r: object_store::GetResult, cid: &Cid) -> Response {
     let mime = stored_mime(&r.attributes);
     let size = r.meta.size;
     let mut resp = Body::from_stream(r.into_stream()).into_response();
@@ -340,7 +350,26 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
     h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
     h.insert(header::CONTENT_DISPOSITION, hv(format!("attachment; filename=\"{cid}\"")));
     h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("default-src 'none'; sandbox"));
-    Ok(resp)
+    resp
+}
+
+/// Named by a record of `did`'s public repo. The generation is re-read
+/// after a miss, as [`referenced`] does.
+async fn publicly_referenced(app: &App, did: &str, cid: &str) -> XResult<bool> {
+    let p = app.partition(did)?;
+    let mut gen = app.repo_gen(did).await?;
+    loop {
+        let prefix = [state::blob_ref_prefix(did, gen).as_slice(), cid.as_bytes(), b"\0"].concat();
+        let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+        if iter.next().await.map_err(XrpcError::from_err)?.is_some() {
+            return Ok(true);
+        }
+        let now = app.repo_gen(did).await?;
+        if now == gen {
+            return Ok(false);
+        }
+        gen = now;
+    }
 }
 
 /// Distinct (cid, one referencing record path) of `did`, in CID order after
@@ -565,10 +594,16 @@ fn quarantine_path(app: &App, did: &str, cid: &str) -> object_store::path::Path 
     object_store::path::Path::from(format!("{}/blob-gc/{}/{}", app.store.prefix, did, cid))
 }
 
-/// Referenced by the repo or by an import staged into it. The generation is
-/// re-read after a miss, as `App::record_value` does: an import's commit
-/// may have moved it, and the generation it left be swept since.
+/// Referenced by the repo, by an import staged into it, or by a record of
+/// the account in a space (`sc/`, whatever `--spaces` is now, so turning
+/// it off never collects a space's blobs). The generation is re-read after
+/// a miss, as `App::record_value` does: an import's commit may have moved
+/// it, and the generation it left be swept since.
 async fn referenced(p: &Partition, did: &str, cid: &str) -> anyhow::Result<bool> {
+    let sc = state::space_blob_cid_prefix(did, cid);
+    if p.db.scan(sc.clone()..state::prefix_end(&sc)).await?.next().await?.is_some() {
+        return Ok(true);
+    }
     let gens = || async {
         let (a, g) = tokio::try_join!(p.db.get(state::account_key(did)), p.db.get(state::import_key(did)))?;
         let current = a.map(|a| serde_json::from_slice::<state::Account>(&a)).transpose()?.map_or(0, |a| a.repo_gen);
