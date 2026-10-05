@@ -201,7 +201,7 @@ once they expire.
 
 ## Sign-in alerts and recent sign-ins
 
-| | Recent sign-ins | New-device alert |
+| | Recent sign-ins | Sign-in alert |
 |---|---|---|
 | Recorded or sent for | every successful sign-in · OAuth page, `createSession` with the password or an app password | a sign-in from a device the account hasn't used in 180 days |
 | Kept | the last 50, at most 30 days old, in `signin/log` | at most 3 a day per account (`ALERTS_PER_DAY`) |
@@ -223,11 +223,12 @@ other. The cap of 3 a day keeps them to a tenth of the recipient's 30 a day, so 
 sign-in codes. If a budget is spent the alert is dropped (`vlpds_mail_suppressed_total`) and the
 sign-in still works. The first sign-in vlpds records for an account sets the baseline without an
 alert, so a new account, or an existing one the first time it signs in after an upgrade, doesn't get
-one for the device it already uses. A sign-in that just used an emailed code doesn't alert either, since the code went to
-the same inbox.
+one for the device it already uses. A sign-in that just used an emailed code doesn't alert either,
+since the code went to the same inbox.
 
-Users turn alerts off per kind (password sign-ins and app-password sign-ins) on the Security tab.
-That's `vlpds.server.updateSignInSecurity` with `alerts: {password, appPassword}`.
+Users turn sign-in alerts off per kind on the Security tab. The two kinds are password sign-ins (the
+OAuth sign-in page included) and app-password sign-ins. That's `vlpds.server.updateSignInSecurity`
+with `alerts: {password, appPassword}`.
 
 ## OAuth only
 
@@ -236,6 +237,8 @@ Security tab makes `createSession` refuse the account's main password with 401 `
 the password only works on this server's sign-in page. App passwords keep working unless the user
 also blocks them (401 `AppPasswordsBlocked`). The switch is only offered with a second factor on,
 and it only applies while one is. Without a factor there's no second step to get around.
+Blocking app passwords doesn't depend on a factor. It only refuses new sign-ins, so an app that's
+already signed in with an app password stays signed in until the user revokes that password.
 
 The checks run after the password is verified, so they don't tell a guesser anything, and before a
 code is mailed. The error names aren't the reference's. The Bluesky app turns
