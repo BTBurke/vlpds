@@ -751,11 +751,15 @@ ts("Fan-out queue depth and drops", [t(f"sum(vlpds_space_fanout_queue_depth{{{I}
    overrides=[right_axis("queued", "short")], empty="no fan-out",
    desc="Notifies waiting for a syncer, and the ones dropped (a newer one for the same syncer superseded it, or a host's "
         "queue was full). Superseded drops are normal. The syncer pulls from its last rev either way.")
-ts("Revocations held, digest mismatches", [t(f"max(vlpds_space_revocations{{{I}}})", "revocations held"),
-                                           t(f"sum(increase(vlpds_space_digest_mismatch_total{{{I}}}[1h])) > 0", "digest mismatches (1 h)")],
+ts("Revocations held, blocks, digest mismatches",
+   [t(f"max(vlpds_space_revocations{{{I}}})", "revocations held"),
+    t(f"sum(increase(vlpds_space_digest_mismatch_total{{{I}}}[1h])) > 0", "digest mismatches (1 h)"),
+    t(f"max by (kind) (vlpds_space_revocation_blocks{{{I}}})", "blocked {{kind}}s"),
+    t(f"max(vlpds_space_revocations_saturated{{{I}}}) > 0", "saturated (remote authorities refused)")],
    "short", decimals=0, empty="none",
-   desc=f"Revoked credential ids still in force (kept until their credential could have expired). Mismatches: "
-        f"{rb('VlpdsSpaceDigestMismatch')}.")
+   desc=f"Revoked credential ids still in force (kept until their credential could have expired). Blocks: spaces and authorities "
+        f"refused because a revocation of theirs couldn't be stored; saturated: every remote authority refused "
+        f"({rb('VlpdsSpaceRevocationsSaturated')}). Mismatches: {rb('VlpdsSpaceDigestMismatch')}.")
 
 # ============================================================== cluster: leases and ownership
 row("Cluster: leases, ownership, failover")

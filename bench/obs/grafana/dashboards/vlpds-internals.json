@@ -9220,8 +9220,8 @@
     {
      "type": "timeseries",
      "id": 112,
-     "title": "Revocations held, digest mismatches",
-     "description": "Revoked credential ids still in force (kept until their credential could have expired). Mismatches: [VlpdsSpaceDigestMismatch](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacedigestmismatch).",
+     "title": "Revocations held, blocks, digest mismatches",
+     "description": "Revoked credential ids still in force (kept until their credential could have expired). Blocks: spaces and authorities refused because a revocation of theirs couldn't be stored; saturated: every remote authority refused ([VlpdsSpaceRevocationsSaturated](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacerevocationssaturated)). Mismatches: [VlpdsSpaceDigestMismatch](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacedigestmismatch).",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
@@ -9252,6 +9252,26 @@
        "legendFormat": "digest mismatches (1 h)",
        "range": true,
        "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "max by (kind) (vlpds_space_revocation_blocks{cluster=~\"$cluster\", instance=~\"$instance\"})",
+       "legendFormat": "blocked {{kind}}s",
+       "range": true,
+       "refId": "C"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "max(vlpds_space_revocations_saturated{cluster=~\"$cluster\", instance=~\"$instance\"}) > 0",
+       "legendFormat": "saturated (remote authorities refused)",
+       "range": true,
+       "refId": "D"
       }
      ],
      "fieldConfig": {
