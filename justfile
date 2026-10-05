@@ -97,6 +97,27 @@ migrate-e2e:
 passkeys-e2e:
     bench/passkeys/run.sh
 
+# Spaces e2e matrix (bench/spaces/README.md): local PLC, two reference PDSes at the Spaces alpha and MinIO in
+# docker, vlpds from the newest spaces branch; each role on vlpds or a reference PDS, pass / fail / not impl. per step
+# (configs: ref-ref vlpds-authority ref-authority vlpds-only; default all; KEEP=1 leaves it up, CLUSTER=1 for 3 nodes)
+spaces-e2e *configs:
+    bench/spaces/run.sh e2e {{configs}}
+
+# Randomized Spaces workload with invariants (no lost acked write, syncers converge, LtHash, spaceRev order);
+# scale: small | medium | large | <ops>; HOSTS=ref-a,ref-b runs it all-ref
+spaces-sim seed="1" scale="small":
+    bench/spaces/run.sh sim {{seed}} {{scale}}
+
+# The sim under faults: notify drops/delays/duplicates on both hops, vlpds kill -9 and SIGTERM mid-burst
+# (CLUSTER=1: a node dies, its shards move), syncer restarts; the same invariants after recovery
+spaces-fault seed="1" scale="small":
+    bench/spaces/run.sh fault {{seed}} {{scale}}
+
+# Spaces sync cost against the targets: no-op poll and delta pull server time, notify latency, bucket ops per
+# space write, public commit p99 under a space write load
+spaces-cost:
+    bench/spaces/run.sh cost
+
 # The WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs; its own crate, since passkey-types
 # turns on serde_json's preserve_order, which would change every vlpds test build
 passkey-differential:
