@@ -435,7 +435,11 @@ pub fn describe_permission(p: &Permission) -> String {
         Permission::Rpc { aud, lxm } => {
             let svc = if aud == "*" { "any service".to_string() } else { aud.clone() };
             if !lxm.is_empty() && lxm.iter().all(|l| l.starts_with("chat.bsky.")) {
-                format!("Read and send your Bluesky private messages (through {svc})")
+                if aud == "did:web:api.bsky.chat#bsky_chat" {
+                    "Read and send your Bluesky private messages".to_string()
+                } else {
+                    format!("Read and send your Bluesky private messages (through {svc})")
+                }
             } else if lxm.iter().any(|l| l == "*") {
                 format!("Make any request on your behalf to {svc}")
             } else {
