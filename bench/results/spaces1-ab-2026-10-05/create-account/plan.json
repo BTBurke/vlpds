@@ -1,0 +1,101 @@
+{
+ "name": "spaces1-ca-2026-10-05",
+ "profile": "bisect",
+ "scale": "benchbox",
+ "created": 1791202341.9864373,
+ "shas": [
+  "36f0be7b",
+  "3ebf852d"
+ ],
+ "fmt": {
+  "36f0be7b": "3e7aa1e0",
+  "3ebf852d": "1ae35ad8"
+ },
+ "baseline": "",
+ "steps": [
+  {
+   "id": "ca-36f0be7b-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "ca-3ebf852d-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "3ebf852d"
+  },
+  {
+   "id": "ca-3ebf852d-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "3ebf852d"
+  },
+  {
+   "id": "ca-36f0be7b-r2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "ca-36f0be7b-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "ca-3ebf852d-r3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "createAccount,describeServer"
+   ],
+   "env": {
+    "OUT": "ca.jsonl"
+   },
+   "est_s": 40,
+   "sha": "3ebf852d"
+  }
+ ]
+}

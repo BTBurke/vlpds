@@ -8,7 +8,7 @@
 //!
 //! (or `just spaces-microbench`). One node, `--spaces` on, log segment PUTs
 //! delayed like S3 (`SPACES_BENCH_PUT_MS`, default 25 ms median, lognormal
-//! sigma 0.3). Sections, picked with `SPACES_BENCH_ONLY=noop,delta,cred,bucket,load`
+//! sigma 0.3). Sections, picked with `SPACES_BENCH_ONLY=noop,delta,cred,conc,bucket,load`
 //! (default all):
 //!
 //! - `noop`: listRepoOps with `since` at the head, client p50/p99, the
@@ -19,6 +19,8 @@
 //! - `cred`: the first use of each of `SPACES_BENCH_CREDS` (200) fresh
 //!   credentials (a cache miss: the full chain verify) against one
 //!   credential reused (a hit from C2 on).
+//! - `conc`: `SPACES_BENCH_CONC` (1,4,16) concurrent writers on one
+//!   account, public and then space, and log segment PUTs per write.
 //! - `bucket`: object-store requests by op and component while public
 //!   writers run, without and then with concurrent space writes. The target
 //!   is zero added PUTs per space write.
@@ -52,6 +54,7 @@ struct Cfg {
     deltas: Vec<usize>,
     delta_reqs: usize,
     creds: usize,
+    conc: Vec<usize>,
     spaces: usize,
     members: usize,
     pollers: usize,
@@ -63,7 +66,7 @@ struct Cfg {
 
 impl Cfg {
     fn from_env() -> Cfg {
-        let only = env_or("SPACES_BENCH_ONLY", "noop,delta,cred,bucket,load".to_string());
+        let only = env_or("SPACES_BENCH_ONLY", "noop,delta,cred,conc,bucket,load".to_string());
         Cfg {
             sections: only.split(',').map(|s| s.trim().to_string()).collect(),
             put_ms: env_or("SPACES_BENCH_PUT_MS", 25.0),
@@ -75,6 +78,10 @@ impl Cfg {
                 .collect(),
             delta_reqs: env_or("SPACES_BENCH_DELTA_REQS", 2_000),
             creds: env_or("SPACES_BENCH_CREDS", 200),
+            conc: env_or("SPACES_BENCH_CONC", "1,4,16".to_string())
+                .split(',')
+                .filter_map(|v| v.trim().parse().ok())
+                .collect(),
             spaces: env_or("SPACES_BENCH_N", 20),
             members: env_or("SPACES_BENCH_M", 5),
             pollers: env_or("SPACES_BENCH_K", 3),
@@ -89,13 +96,14 @@ impl Cfg {
     /// check, not a measurement.
     fn tiny() -> Cfg {
         Cfg {
-            sections: ["noop", "delta", "cred", "bucket", "load"].map(String::from).to_vec(),
+            sections: ["noop", "delta", "cred", "conc", "bucket", "load"].map(String::from).to_vec(),
             put_ms: 2.0,
             secs: 1.0,
             noop_reqs: 50,
             deltas: vec![1, 5],
             delta_reqs: 10,
             creds: 4,
+            conc: vec![2],
             spaces: 2,
             members: 0,
             pollers: 1,
@@ -828,6 +836,70 @@ async fn bench_bucket(
     }
 }
 
+/// `c` writers on one account back to back for `window`: each write's
+/// latency and the log segment PUTs over the window.
+async fn one_repo<F, Fut>(c: usize, window: Duration, f: F) -> (Lat, f64)
+where
+    F: Fn(usize) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let seg = |t: &str| sum(t, "vlpds_object_store_requests_total", &[("component", "log_segment")]);
+    let m0 = vlpds::metrics::render();
+    let end = Instant::now() + window;
+    let lats = futures::future::join_all((0..c).map(|w| {
+        let f = &f;
+        async move {
+            let mut lat = Lat::default();
+            let mut i = 0;
+            while Instant::now() < end {
+                let t = Instant::now();
+                f(w * 1_000_000 + i).await;
+                lat.push(t.elapsed());
+                i += 1;
+            }
+            lat
+        }
+    }))
+    .await;
+    let mut all = Lat::default();
+    for l in lats {
+        all.0.extend(l.0);
+    }
+    (all, seg(&vlpds::metrics::render()) - seg(&m0))
+}
+
+/// Concurrent writes to one repo, public and then space: a space write
+/// should share segments with the others in flight as a public one does.
+async fn bench_conc(s: &TestServer, fx: &Fixture, cfg: &Cfg, out: &mut Report) {
+    let window = Duration::from_secs_f64(cfg.secs / 2.0);
+    let a = s.create_account("sbc").await;
+    for &c in &cfg.conc {
+        let (publat, pubsegs) = one_repo(c, window, |i| {
+            let (xrpc, a) = (&s.xrpc, &a);
+            async move {
+                let body =
+                    json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record(&format!("conc {i}"))});
+                let r = xrpc.post("com.atproto.repo.createRecord", &body, &a.auth()).await;
+                assert_eq!(r.status, 200, "{}", r.text());
+            }
+        })
+        .await;
+        let (splat, spsegs) = one_repo(c, window, |i| async move {
+            let r = fx.authority.create_record(&fx.space, COLLECTION, None, note(i)).await;
+            assert_eq!(r.status, 200, "space write: {}", r.text());
+        })
+        .await;
+        let n = |l: &Lat| l.0.len().max(1) as f64;
+        out.say(format!(
+            "one repo, {c} concurrent: public {:.3} PUTs/write, {}; space {:.3} PUTs/write, {}",
+            pubsegs / n(&publat),
+            publat.line(),
+            spsegs / n(&splat),
+            splat.line()
+        ));
+    }
+}
+
 async fn bench_load(
     s: &TestServer,
     fixtures: &Arc<Vec<Fixture>>,
@@ -932,6 +1004,9 @@ async fn run(cfg: Cfg) -> Report {
     if cfg.on("cred") {
         bench_cred(&fx, &cfg, &mut out).await;
     }
+    if cfg.on("conc") {
+        bench_conc(&s, &fx, &cfg, &mut out).await;
+    }
     if cfg.on("bucket") || cfg.on("load") {
         let mut fixtures = Vec::new();
         for _ in 0..cfg.spaces {
@@ -969,6 +1044,7 @@ async fn spaces_microbench_smoke() {
         "delta K=5",
         "credential reused (hit)",
         "added PUTs per space write",
+        "one repo, 2 concurrent",
         "with spaces load",
     ] {
         assert!(out.0.iter().any(|l| l.contains(want)), "no {want:?} in:\n{}", out.0.join("\n"));

@@ -1,0 +1,73 @@
+{
+ "name": "spaces1-m-2026-10-05",
+ "profile": "bisect",
+ "scale": "benchbox",
+ "created": 1791202341.9864373,
+ "shas": [
+  "36f0be7b",
+  "3ebf852d"
+ ],
+ "fmt": {
+  "36f0be7b": "3e7aa1e0",
+  "3ebf852d": "1ae35ad8"
+ },
+ "baseline": "",
+ "steps": [
+  {
+   "id": "m-3ebf852d-0",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "m.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3ebf852d"
+  },
+  {
+   "id": "m-36f0be7b-1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "m.jsonl"
+   },
+   "est_s": 70,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "m-36f0be7b-2",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "m.jsonl"
+   },
+   "est_s": 70,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "m-3ebf852d-3",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "m.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3ebf852d"
+  }
+ ]
+}

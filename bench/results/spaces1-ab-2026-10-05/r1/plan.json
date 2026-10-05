@@ -1,0 +1,97 @@
+{
+ "name": "spaces1-ab-2026-10-05",
+ "profile": "bisect",
+ "scale": "benchbox",
+ "created": 1791202341.9864373,
+ "shas": [
+  "36f0be7b",
+  "3ebf852d"
+ ],
+ "fmt": {
+  "36f0be7b": "3e7aa1e0",
+  "3ebf852d": "1ae35ad8"
+ },
+ "baseline": "",
+ "steps": [
+  {
+   "id": "ab-grid-36f0be7b-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-36f0be7b",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "ab-methods-36f0be7b-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "36f0be7b"
+  },
+  {
+   "id": "ab-grid-3ebf852d-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3ebf852d",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25.jsonl"
+   },
+   "est_s": 160,
+   "sha": "3ebf852d"
+  },
+  {
+   "id": "ab-methods-3ebf852d-r1",
+   "driver": "bench.py",
+   "args": [
+    "methods",
+    "0",
+    "describeServer,getRecord,getLatestCommit,createRecord,createAccount"
+   ],
+   "env": {
+    "OUT": "ab-methods.jsonl"
+   },
+   "est_s": 70,
+   "sha": "3ebf852d"
+  },
+  {
+   "id": "ab-grid-3ebf852d-spaces-r1",
+   "driver": "bench.py",
+   "args": [
+    "grid",
+    "ab-3ebf852d-spaces",
+    "10000",
+    "5000",
+    "25",
+    "10000,25000,50000,75000,100000"
+   ],
+   "env": {
+    "OUT": "ab-grid-10k-inj25-spaces.jsonl",
+    "VLPDS_EXTRA": "--spaces"
+   },
+   "est_s": 160,
+   "sha": "3ebf852d"
+  }
+ ]
+}

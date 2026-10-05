@@ -546,8 +546,6 @@ impl App {
         cluster.owner_of(p).filter(|(id, _)| *id != cluster.cfg.node_id).map(|(_, addr)| addr)
     }
 
-    /// A DID in a partition this node owns, so account creation never needs
-    /// forwarding.
     /// Drops `did`'s signing key from every cache that holds it, so its next
     /// use unwraps it again (the cold-key path the Spaces bench measures).
     #[doc(hidden)]
@@ -556,6 +554,8 @@ impl App {
         self.secrets.forget(did);
     }
 
+    /// A DID in a partition this node owns, so account creation never needs
+    /// forwarding.
     pub fn mint_local_did(&self) -> Result<String, XrpcError> {
         if self.cluster.is_none() {
             return Ok(crypto::random_plc_did());

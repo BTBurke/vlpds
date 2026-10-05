@@ -125,5 +125,52 @@ vlpds node on MinIO. All of these are client-side.
   one repo don't share segments yet. At a concurrency of 4 they cost 1.0 PUT per write against 0.68
   for public writes. That's the likely cause of the public p50 rise, and the fix isn't built yet.
 
-The in-tree micro-bench (`just spaces-microbench`, write-up in `bench/results/spaces-sync.md`)
-measures server CPU per sync request and bucket ops per write. It hasn't been run yet.
+### Server cost on one node
+
+The in-tree micro-bench (`just spaces-microbench`) runs one `--spaces` node in process on an
+in-memory bucket with log segment PUTs delayed like S3 (25 ms median). It measures what the
+harness can't see from outside: CPU per sync request, bucket requests by kind, and public commit
+latency with and without a spaces load. These numbers are from a 32-thread desktop (Ryzen AI Max+
+395) at `3ebf852d` on 2026-10-05, with nothing else running. The full output and every knob
+are in `bench/results/spaces-sync.md`.
+
+| | p50 | p99 | Target |
+|---|---|---|---|
+| No-op `listRepoOps`, handler | 0.05 ms (mean 0.014 ms) | 0.10 ms | well under 1 ms · met |
+| No-op `listRepoOps`, client | 0.17 ms | 0.29 ms | |
+| No-op poll, signing key unwrapped first | 0.20 ms | 0.64 ms | |
+| Delta pull of 1 / 10 / 100 ops, client | 0.18 / 0.22 / 0.52 ms | 0.40 / 0.73 / 0.93 ms | a few ms · met |
+| Credential first use (full chain) / cached | 0.30 / 0.24 ms | 0.45 / 0.52 ms | |
+| Member write ack to authority ack | 52 ms | 125 ms | |
+| Syncer notified to its pull done | 1.9 ms | 5.5 ms | |
+
+- A no-op poll costs ~143 µs of process CPU more than `/xrpc/_health` on the same client. That's
+  the P-256 signature check, a fresh secp256k1 commit signature and the JSON. 100 polls at the head
+  read nothing from the bucket (`spaces_side::accept`).
+- Notify to a local authority is one more durable entry after the member's write, so it costs what a
+  public commit does (52 ms against 54 ms here, both mostly the 25 ms segment PUT and the wait for
+  the one ahead of it).
+- Space writes add no bucket PUTs. With 16 public writers at ~286 commits/s, adding ~220 space
+  writes/s moved log segment PUTs from 35.7/s to 36.2/s, and PUTs per write of either kind went
+  from 0.143 to 0.078.
+- On one repo, space writes share segments the same way public ones do. 4 concurrent writers cost
+  0.50 PUTs per write for both, and 16 cost 0.125. That doesn't match the harness's 1.0 at a
+  concurrency of 4 above, so that number needs a second look on the harness side.
+- Public commit p99 didn't move under 20 spaces x 5 members x 3 pollers a second plus a syncer per
+  space. Four runs gave 80 / 86 / 85 / 86 ms alone and 87 / 85 / 83 / 85 ms with the load.
+
+With the flag off, the commit path matches main. An A/B on the same box (the campaigns' bisect shape,
+grid 10k accounts / 5k active at 25 ms injected PUT latency, two rounds in alternating order) put
+`3ebf852d` with and without `--spaces` next to its base `36f0be7b`:
+
+| Rate | `36f0be7b` p99 | `3ebf852d` p99 | `3ebf852d --spaces` p99 | CPU µs/commit |
+|---|---|---|---|---|
+| 10k/s | 130 / 133 ms | 123 / 131 ms | 125 / 143 ms | 215-218 for all three |
+| 25k/s | 119 / 130 ms | 121 / 135 ms | 133 / 114 ms | 206-208 |
+| 50k/s | 164 / 245 ms | 249 / 269 ms | 303 / 190 ms | 235-238 |
+| 75k/s | 437 / 392 ms | 403 / 379 ms | 426 / 424 ms | 276-282 |
+| 100k/s (saturated) | 71.1k / 72.0k achieved | 71.2k / 72.1k | 70.6k / 70.0k | 300-305 |
+
+The 50k/s step is the knee, and its p99 swings by 2x between identical runs (it ran 350 to 700 ms
+across earlier rounds). The reads (`getRecord`, `getLatestCommit`) and `createRecord` matched within
+1-2%. Results are in `bench/results/spaces1-ab-2026-10-05/`.
