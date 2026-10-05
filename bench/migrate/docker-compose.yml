@@ -75,3 +75,40 @@ services:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${REF_PDS_PORT:-2783}/xrpc/_health"]
       interval: 1s
       retries: 60
+
+  # The reference PDS at the Spaces alpha, for spaces.sh only (profile
+  # "spaces"): the same settings, its own port. The published image is
+  # amd64-only; REF_SPACES_IMAGE points at a native build elsewhere (as
+  # bench/spaces/refpds.sh makes one).
+  ref-spaces:
+    profiles: [spaces]
+    image: ${REF_SPACES_IMAGE:-ghcr.io/bluesky-social/atproto:pds-spaces-alpha}
+    depends_on:
+      plc:
+        condition: service_healthy
+    environment:
+      PDS_HOSTNAME: localhost
+      PDS_PORT: "${REF_SPACES_PORT:-2786}"
+      PDS_DEV_MODE: "true"
+      PDS_DATA_DIRECTORY: /pds
+      PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+      PDS_JWT_SECRET: e2e-jwt-secret
+      PDS_ADMIN_PASSWORD: e2e-admin
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: 4c5f4f0a6e3d2c1b0a99887766554433221100ffeeddccbbaa99887766554433
+      PDS_DID_PLC_URL: http://plc:2582
+      PDS_INVITE_REQUIRED: "false"
+      PDS_EMAIL_SMTP_URL: smtp://mail:1025
+      PDS_EMAIL_FROM_ADDRESS: noreply@ref.test
+      PDS_CRAWLERS: ""
+      PDS_BSKY_APP_VIEW_URL: http://127.0.0.1:9
+      PDS_BSKY_APP_VIEW_DID: did:web:appview.invalid
+      PDS_RATE_LIMITS_ENABLED: "false"
+      LOG_ENABLED: "true"
+    tmpfs: /pds
+    mem_limit: 1g
+    ports:
+      - "127.0.0.1:${REF_SPACES_PORT:-2786}:${REF_SPACES_PORT:-2786}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${REF_SPACES_PORT:-2786}/xrpc/_health"]
+      interval: 1s
+      retries: 90
