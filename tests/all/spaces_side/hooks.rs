@@ -239,42 +239,70 @@ impl HookedStore {
     }
 }
 
-/// A TCP forwarder on a fixed loopback address to whichever backend it
-/// points at; repointing cuts every connection to the old one.
+/// An HTTP forwarder on a fixed loopback address to whichever backend it
+/// points at, request by request: repointing never cuts a client's pooled
+/// connection, which a client could reuse before it saw the cut.
 pub struct Front {
     pub url: String,
     target: Arc<Mutex<Option<SocketAddr>>>,
-    conns: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
 }
+
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "content-length",
+];
 
 impl Front {
     pub async fn new() -> Front {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", l.local_addr().unwrap());
-        let (target, conns) =
-            (Arc::new(Mutex::new(None::<SocketAddr>)), Arc::new(Mutex::new(Vec::<tokio::task::JoinHandle<()>>::new())));
-        let (t, c) = (target.clone(), conns.clone());
-        tokio::spawn(async move {
-            while let Ok((mut down, _)) = l.accept().await {
-                let Some(to) = *t.lock() else { continue };
-                let job = tokio::spawn(async move {
-                    if let Ok(mut up) = tokio::net::TcpStream::connect(to).await {
-                        let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+        let target = Arc::new(Mutex::new(None::<SocketAddr>));
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+        let t = target.clone();
+        let forward = move |req: axum::extract::Request| {
+            let (t, client) = (t.clone(), client.clone());
+            async move {
+                use axum::response::IntoResponse;
+                let bad_gateway = |e: String| (axum::http::StatusCode::BAD_GATEWAY, e).into_response();
+                let Some(to) = *t.lock() else { return bad_gateway("the front points nowhere".into()) };
+                let (parts, body) = req.into_parts();
+                let path = parts.uri.path_and_query().map_or("/", |p| p.as_str());
+                let body = match axum::body::to_bytes(body, usize::MAX).await {
+                    Ok(b) => b,
+                    Err(e) => return bad_gateway(e.to_string()),
+                };
+                let mut headers = parts.headers;
+                for h in HOP_BY_HOP {
+                    headers.remove(*h);
+                }
+                let r =
+                    client.request(parts.method, format!("http://{to}{path}")).headers(headers).body(body).send().await;
+                let r = match r {
+                    Ok(r) => r,
+                    Err(e) => return bad_gateway(e.to_string()),
+                };
+                let mut out = axum::response::Response::builder().status(r.status());
+                for (k, v) in r.headers() {
+                    if !HOP_BY_HOP.contains(&k.as_str()) {
+                        out = out.header(k, v);
                     }
-                });
-                let mut c = c.lock();
-                c.retain(|j| !j.is_finished());
-                c.push(job);
+                }
+                out.body(axum::body::Body::from_stream(r.bytes_stream())).unwrap()
             }
-        });
-        Front { url, target, conns }
+        };
+        let router = axum::Router::new().fallback(forward);
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        Front { url, target }
     }
 
     pub fn point(&self, s: &TestServer) {
         *self.target.lock() = Some(s.addr);
-        for j in self.conns.lock().drain(..) {
-            j.abort();
-        }
     }
 
     /// `s` as clients see it: the same node, at the front's URL.

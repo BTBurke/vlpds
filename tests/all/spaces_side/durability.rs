@@ -66,11 +66,9 @@ fn tid(base: u64, n: u64) -> String {
     vlpds::tid::Tid::from_parts(base + n, 7).to_string()
 }
 
-/// `sc` after its node restarted behind the same front: a fresh connection
-/// pool (the old one points at the dead incarnation).
+/// `sc` after its node restarted behind the same front.
 fn rebind(sc: &mut SpaceClient, s: &TestServer) {
     sc.srv.app = s.app.clone();
-    sc.srv.http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
 }
 
 async fn owns_all(s: &TestServer) {

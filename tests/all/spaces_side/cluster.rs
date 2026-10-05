@@ -61,12 +61,10 @@ pub async fn client_on(front: &Front, n: &TestServer, prefix: &str, scope: &str)
     SpaceClient::new(&front.view(n), &unique_name(prefix), scope).await
 }
 
-/// Points the front at `n` for good: `clients` get fresh connection pools,
-/// since repointing cut their old connections.
+/// Points the front at `n` for good, and `clients` at its app.
 pub fn settle_front(front: &Front, n: &TestServer, clients: &mut [&mut SpaceClient]) {
     front.point(n);
     for c in clients {
         c.srv.app = n.app.clone();
-        c.srv.http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
     }
 }
