@@ -48,6 +48,12 @@ accounts govern. Nothing is proxied to another host.
 A method under `com.atproto.space.*` or `com.atproto.simplespace.*` that a PDS doesn't serve
 (`notifySpaceDeleted` and `checkUserAccess` go to syncers and managing apps) answers 501 here.
 
+Turn `--spaces` on only once every node in the cluster runs a build that knows Spaces, and don't
+roll back below that build afterwards. Space writes put private entries in the node logs and space
+rows in the shards, and a build from before Spaces doesn't know either. The feature level doesn't
+guard this. Spaces shipped inside level 1 (vlpds hadn't been released), so no cluster level can say
+"Spaces yet or not", and a node can't check it at startup ([Upgrades](../operations/upgrades.md#compatibility-contract)).
+
 A few rules decide what your users and their apps can do:
 
 - Space data is OAuth only. An app needs a `space:` scope, and app passwords and password sessions

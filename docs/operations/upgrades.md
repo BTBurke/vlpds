@@ -138,6 +138,10 @@ Every release keeps these promises, so a rolling upgrade and a rollback are alwa
 - SlateDB is a format. A SlateDB version bump, or a flag that changes stored bytes (log or SST
   compression codec), is a level. What the new version writes must open under the old one until the
   level is raised.
+- Spaces sits outside the levels. Its log entries and rows are part of level 1, so the active level
+  can't keep a pre-Spaces build away from them. Turn `--spaces` on only once every node runs a
+  Spaces-aware build, and after that never roll back to a build from before it
+  ([Spaces: operating](../spaces/operating.md#what-you-get-with-spaces)).
 - Client tokens are a format too. If the old build can't verify a session JWT or OAuth token, a
   rollback turns into a forced logout, so a change to them belongs to a level.
 
