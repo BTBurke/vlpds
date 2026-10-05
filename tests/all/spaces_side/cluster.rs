@@ -56,9 +56,9 @@ pub async fn fronted_node(
 
 /// A space client whose account lives on `n` (created through the front
 /// while it points there).
-pub async fn client_on(front: &Front, n: &TestServer, name: &str, scope: &str) -> SpaceClient {
+pub async fn client_on(front: &Front, n: &TestServer, prefix: &str, scope: &str) -> SpaceClient {
     front.point(n);
-    SpaceClient::new(&front.view(n), name, scope).await
+    SpaceClient::new(&front.view(n), &unique_name(prefix), scope).await
 }
 
 /// Points the front at `n` for good: `clients` get fresh connection pools,

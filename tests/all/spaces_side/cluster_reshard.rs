@@ -191,7 +191,7 @@ impl World {
         let mut writers = Vec::new();
         for n in &nodes {
             for _ in 0..2 {
-                writers.push(client_on(&front, n, &unique_name("rsp"), &scope(&st, &collection)).await);
+                writers.push(client_on(&front, n, "rsp", &scope(&st, &collection)).await);
             }
         }
         settle_front(&front, &nodes[0], &mut writers.iter_mut().collect::<Vec<_>>());

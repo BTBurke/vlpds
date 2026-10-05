@@ -13,6 +13,7 @@ mod cluster;
 mod cluster_leak;
 mod cluster_reshard;
 mod cluster_revocation;
+mod cluster_takeover;
 mod durability;
 mod fuzz;
 mod hooks;

@@ -16,6 +16,7 @@
 //!   each repoRev once, its spaceRevs only moving forward (C3, C4).
 //! - An inbound notifyWrite survives a kill right after its 200 (C3).
 
+use super::cluster::{client_on, settle_front, Plc};
 use super::fuzz::{bytes_field, fold, signed_commit};
 use super::hooks::*;
 use crate::common::spaces::{space_uri, SpaceClient};
@@ -477,9 +478,9 @@ pub(super) async fn burst(sc: &SpaceClient, space: &str, coll: &str, prefix: &st
 /// n2 or n1. Both write in a burst through n1 while n2 is killed. A stub
 /// syncer is registered for the space, and listRepos is polled throughout.
 async fn takeover_mid_burst(authority_on_victim: bool) {
-    let (bucket, front) = (Bucket::default(), Front::new().await);
-    let (n1, _) = hooked_node("tb-1", &bucket, SHARDS, &front).await;
-    let (n2, s2) = hooked_node("tb-2", &bucket, SHARDS, &front).await;
+    let (bucket, front, plc) = (Bucket::default(), Front::new().await, Plc::start().await);
+    let (n1, _) = hooked_node_with("tb-1", &bucket, SHARDS, &front, |c| plc.apply(c)).await;
+    let (n2, s2) = hooked_node_with("tb-2", &bucket, SHARDS, &front, |c| plc.apply(c)).await;
     balanced(&[&n1, &n2]).await;
     let (st, coll) = names();
     // a DID lands on the node that creates it

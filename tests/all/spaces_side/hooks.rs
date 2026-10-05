@@ -297,11 +297,23 @@ pub async fn hooked_node(
     shards: u32,
     front: &Front,
 ) -> (TestServer, Arc<HookedStore>) {
+    hooked_node_with(id, bucket, shards, front, |_| {}).await
+}
+
+/// [`hooked_node`], then `f` adjusts the config.
+pub async fn hooked_node_with(
+    id: &str,
+    bucket: &Arc<object_store::memory::InMemory>,
+    shards: u32,
+    front: &Front,
+    f: impl FnOnce(&mut vlpds::server::Config),
+) -> (TestServer, Arc<HookedStore>) {
     let store = HookedStore::new(bucket);
     let public = front.url.clone();
     let s = cluster_node(id, store.clone(), shards, move |c| {
         c.spaces = true;
         c.public_url = public;
+        f(c);
     })
     .await;
     (s, store)
