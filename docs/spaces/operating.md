@@ -145,7 +145,7 @@ also takes that much room from the memory plan's space exports. The room fits 4 
 | Space credential lifetime | 10 min minted by vlpds, 3,600 s accepted at most, 5 s of clock skew |
 | Delegation token and client attestation | 60 s minted, 300 s accepted at most, single use |
 | `Signature-Input` and `Signature` headers | 8 KiB each |
-| Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · 2,000 live per authority · 10,000 in all for spaces with no account here, 50,000 for the rest · credential reads 503 after 6 min without a good read |
+| Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · only ones with a stake here are stored · 2,000 live per authority, 1,000 per space, 5,000 per account here, 50,000 in all · one past a cap blocks its space (10,000 blocked, then every space) · 8 waiting per node · credential reads 503 after 6 min without a good read |
 | `applyWrites` | 200 ops |
 | `notifyWrite` with a future `repoRev` | refused past 5 min |
 | Outbox | 262,144 rows in memory, 256 sends in flight, 8 per authority and 32 in all to authorities whose last send failed, retries for 24 h |

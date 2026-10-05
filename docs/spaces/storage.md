@@ -167,8 +167,11 @@ can read any repo the cluster hosts.
 
 - It's appended with a CAS on its ETag, and pruned of entries past `until` whenever it's rewritten.
 - It's written only when something is revoked, so it costs nothing when idle.
-- It's capped at 2,000 live entries per authority and 50,000 in all (see
-  [Revocation](reading.md#revocation)), so a read stays under ~7 MB.
+- It holds only revocations with a stake here, capped per authority, space and account and at
+  50,000 in all (see [Revocation](reading.md#revocation)), so a read stays under ~7 MB.
+- Spaces whose revocation couldn't be stored are listed in it too (`blocked`), so their
+  credentials stay refused across restarts and on every node. Each write bumps `gen`, and a node
+  never installs an older object over a newer one.
 - Every node loads it before serving a credential read, then re-reads it every 5 min with a
   conditional GET, and at once when nudged.
 

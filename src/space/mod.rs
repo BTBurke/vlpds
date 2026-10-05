@@ -260,23 +260,23 @@ impl Spaces {
     }
 
     /// Revokes `jtis` of `space` cluster-wide (durable on Ok(Ok); peers
-    /// learn of it by a nudge or their next re-read). One that can't be
-    /// stored blocks the space here instead. Ok(Ok(true)): the object was
-    /// written.
+    /// learn of it by a nudge or their next re-read), on the stake of `aud`,
+    /// an account here. One that can't be stored blocks the space here and
+    /// (when the object took the block) everywhere. Ok(Ok(true)): the object
+    /// was written.
     pub async fn revoke(
         &self,
         store: &crate::store::Store,
         space: &str,
+        aud: &str,
         jtis: &[String],
-        staked: bool,
     ) -> anyhow::Result<Result<bool, revocations::Refused>> {
         let now = now_secs();
-        match self.revocations.revoke(store, space, jtis, staked, now).await? {
-            Ok(r) => {
-                self.credentials.invalidate(&r.added);
-                Ok(Ok(r.wrote))
-            }
-            Err(refused) => {
+        let r = self.revocations.revoke(store, space, aud, jtis, now).await?;
+        self.credentials.invalidate(&r.added);
+        match r.refused {
+            None => Ok(Ok(r.wrote)),
+            Some(refused) => {
                 self.revocations.block(space, now);
                 Ok(Err(refused))
             }

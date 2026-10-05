@@ -134,13 +134,22 @@ edges:
   reads until a read succeeds. So a missed nudge can't leave a revoked credential readable for long.
 - Reloading drops any cached credential the new entries revoke.
 
-Every node reads the object whole, so anyone with a DID could grow it if nothing bounded it. It
-holds at most 2,000 live entries per authority, and 10,000 in all for spaces nobody here has a
-stake in. Past that, only a space where an account here holds a repo or that it governs gets in,
-up to 50,000 entries (~7 MB). A revocation that can't be stored gets a 503, and that space's
-credentials are refused on every node for as long as the revocation would have lasted. The rate
-limit counts only `jti`s that aren't revoked yet, so an authority telling every member's host about
-the same credential pays once per host.
+Every node reads the object whole, so anyone with a DID could grow it if nothing bounded it:
+
+- Only a revocation with a stake here is stored: the account it's addressed to holds a repo in the
+  space, or the space's authority is hosted here. Any other gets a 200 and is dropped, since no
+  credential for that space reads anything here through that account. An authority should tell
+  each member's host, addressed to that member.
+- Stored ones are capped at 2,000 live entries per authority, 1,000 per space, 5,000 per account
+  here, and 50,000 in all (~7 MB). Each is rate-limited per authority (`space-revoke`) and per
+  account (`space-revoke-aud`). The limits count only `jti`s that aren't revoked yet, so an
+  authority telling every member's host about the same credential pays once per host.
+- A revocation that can't be stored gets a 503, and that space's credentials are refused on every
+  node for as long as the revocation would have lasted. The block goes in the object, so it
+  outlives a restart. Past 10,000 blocked spaces every space credential is refused until they
+  drain: it never fails open.
+- A node runs one append at a time and refuses a ninth waiting one (blocking its space). Re-reads
+  don't wait behind appends, so a flood can't make the set go stale.
 
 On a three-node cluster a revoked credential was refused on every node within 0.5–5 ms of the
 revoke's 200 (the test allows 1 s), and still after restarts, missed nudges and joins (the phase 2

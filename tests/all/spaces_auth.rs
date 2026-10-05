@@ -730,11 +730,11 @@ async fn list_records_paging() {
 }
 
 /// The revocations object stays bounded whoever notifies: jtis are checked,
-/// a space with no stake here is taken only up to the soft cap and any up
-/// to the hard cap, and one past a cap blocks its space's credentials on
-/// this node rather than leaving them readable. A jti already revoked costs
-/// no rate-limit point. A node whose set has gone stale refuses credentials
-/// until a read succeeds.
+/// a space with no stake here is answered 200 and nothing is stored, and
+/// one past a cap blocks its space's credentials rather than leaving them
+/// readable. A jti already revoked costs no rate-limit point, and the
+/// account giving the stake has its own bucket. A node whose set has gone
+/// stale refuses credentials until a read succeeds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn revocations_are_bounded_and_fail_closed() {
     let stub = Stub::new().await;
@@ -765,34 +765,107 @@ async fn revocations_are_bounded_and_fail_closed() {
     // a credential whose jti no revocation could name is refused
     read(&staked, &long).await.err(401, "BadJwt");
 
-    spaces(&s).revocations.set_caps(2, 4, 10);
-    revoke(&s, &jwt(), &loose, &["a", "b"]).await.ok();
-    revoke(&s, &jwt(), &loose, &["c"]).await.err(503, "Unavailable");
-    read(&loose, "z").await.err(503, "Unavailable");
+    spaces(&s).revocations.set_caps(2, 100, 100, 100);
+    // no stake: answered, never stored, however many
+    for i in 0..20 {
+        revoke(&s, &jwt(), &loose, &[&format!("l{i}")]).await.ok();
+    }
+    assert_eq!(spaces(&s).revocations.len(), 0);
+    assert!(!spaces(&s).revocations.is_blocked(&loose, 0));
     revoke(&s, &jwt(), &staked, &["c", "d"]).await.ok();
+    read(&staked, "c").await.err(401, "CredentialRevoked");
     read(&staked, "e").await.ok();
     revoke(&s, &jwt(), &staked, &["e"]).await.err(503, "Unavailable");
     read(&staked, "e").await.err(503, "Unavailable");
-    assert_eq!(spaces(&s).revocations.len(), 4);
+    assert_eq!(spaces(&s).revocations.len(), 2);
     read(&other, "q").await.ok();
 
     // only new jtis are charged: one point buys one, then repeats are free
     // (another authority, whose bucket nothing has spent yet)
-    let limits = json!({"config": {"limiters": {"space-revoke": {"points": 1}}}, "ifVersion": 0, "actor": "it-test"});
+    let limits = json!({"config": {"limiters": {"space-revoke": {"points": 1}, "space-revoke-aud": {"points": 7}}}, "ifVersion": 0, "actor": "it-test"});
     s.xrpc.post("vlpds.admin.updateRateLimits", &limits, &Auth::Admin).await.ok();
-    spaces(&s).revocations.set_caps(100, 100, 100);
+    spaces(&s).revocations.set_caps(100, 100, 100, 100);
     let second = Stub::new().await;
     let (sp2, jwt2) = (second.space("main"), || second.service_jwt(&m.did, REVOKE));
+    m.create_record(&sp2, COLL, Some("r"), rec("z")).await.ok();
     for _ in 0..3 {
         revoke(&s, &jwt2(), &sp2, &["n1"]).await.ok();
     }
     revoke(&s, &jwt2(), &sp2, &["n2"]).await.err(429, "RateLimitExceeded");
+    // the stake's account: 7 points, 4 spent above (c, d, the refused e,
+    // n1); other authorities, with their own buckets, spend the rest
+    for (i, name) in ["third", "fourth"].iter().enumerate() {
+        let st = Stub::new().await;
+        let sp = st.space(name);
+        m.create_record(&sp, COLL, Some("r"), rec("z")).await.ok();
+        revoke(&s, &st.service_jwt(&m.did, REVOKE), &sp, &[&format!("a{i}")]).await.ok();
+    }
+    let fifth = Stub::new().await;
+    let sp5 = fifth.space("main");
+    m.create_record(&sp5, COLL, Some("r"), rec("z")).await.ok();
+    revoke(&s, &fifth.service_jwt(&m.did, REVOKE), &sp5, &["a8", "a9"]).await.err(429, "RateLimitExceeded");
 
     // stale: refused until a read succeeds
     spaces(&s).revocations.age_last_read(vlpds::space::revocations::STALE_AFTER);
     read(&other, "q").await.err(503, "Unavailable");
     spaces(&s).refresh_revocations(&s.app.store).await.unwrap();
     read(&other, "q").await.ok();
+}
+
+/// A flood of revocations from many authorities, unstaked or staked by one
+/// account here, can't get a legitimate authority's revocation refused:
+/// unstaked ones are answered and never stored, one account's stake is
+/// capped, and the object stays bounded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_flood_never_refuses_other_authorities() {
+    let s = TestServer::spawn_with(|c| c.spaces = true).await;
+    let (victim, attacker) =
+        (SpaceClient::new(&s, "rfv", ANY_SCOPE).await, SpaceClient::new(&s, "rfa", ANY_SCOPE).await);
+    let legit = Stub::new().await;
+    let lsp = legit.space("main");
+    victim.create_record(&lsp, COLL, Some("r"), rec("x")).await.ok();
+    spaces(&s).revocations.set_caps(300, 100, 100, 150);
+    let jtis = |p: &str, n: usize| (0..n).map(|i| format!("{p}{i}")).collect::<Vec<_>>();
+    let mut stubs = Vec::new();
+    for _ in 0..12 {
+        stubs.push(Stub::new().await);
+    }
+    // unstaked: addressed to the victim, whose repo isn't in their spaces
+    let floods = stubs.iter().map(|st| {
+        let (s, sp, did) = (&s, st.space("x"), victim.did.clone());
+        async move {
+            let j = jtis("u", 100);
+            let j: Vec<&str> = j.iter().map(String::as_str).collect();
+            revoke(s, &st.service_jwt(&did, REVOKE), &sp, &j).await
+        }
+    });
+    for r in futures::future::join_all(floods).await {
+        r.ok();
+    }
+    assert_eq!(spaces(&s).revocations.len(), 0, "unstaked revocations are never stored");
+    // staked by one account here, in each flooding authority's space
+    for st in &stubs {
+        attacker.create_record(&st.space("y"), COLL, Some("r"), rec("y")).await.ok();
+    }
+    let mut refused = 0;
+    for st in &stubs {
+        let j = jtis("s", 50);
+        let j: Vec<&str> = j.iter().map(String::as_str).collect();
+        let r = revoke(&s, &st.service_jwt(&attacker.did, REVOKE), &st.space("y"), &j).await;
+        if r.status == 503 {
+            refused += 1;
+        } else {
+            r.ok();
+        }
+    }
+    assert!(refused > 0, "the account's stake is capped");
+    assert!(spaces(&s).revocations.len() <= 150, "{}", spaces(&s).revocations.len());
+    // the legitimate authority's revocation still goes in, and is enforced
+    let j = jtis("legit", 20);
+    let j: Vec<&str> = j.iter().map(String::as_str).collect();
+    revoke(&s, &legit.service_jwt(&victim.did, REVOKE), &lsp, &j).await.ok();
+    assert!(spaces(&s).revocations.is_revoked(&lsp, "legit0", 0));
+    assert!(!spaces(&s).revocations.is_blocked(&lsp, 0));
 }
 
 /// A shard's `sP` rescan (what a takeover or a restart runs) sends what's

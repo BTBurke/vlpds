@@ -1407,8 +1407,9 @@ const REVOKE_NUDGE_RETRIES: u32 = 6;
 /// (each given a second to answer; one that misses it is asked again in the
 /// background, and refuses credentials once its set is stale).
 ///
-/// The object is read whole by every node, so it's bounded
-/// ([`revocations::SOFT_CAP`] and the rest), and the rate limit counts only
+/// The object is read whole by every node, so only revocations with a
+/// stake here go in, bounded per authority, space and audience
+/// ([`revocations::PER_AUD`] and the rest), and the rate limits count only
 /// jtis new here. A revocation that can't be stored blocks the space's
 /// credentials instead, on every node: it fails closed.
 async fn notify_credential_revoked(
@@ -1452,9 +1453,16 @@ async fn notify_credential_revoked(
     if new.is_empty() {
         return Ok(StatusCode::OK);
     }
+    // Neither the audience's repo in the space nor its authority is here,
+    // so no credential for it reads anything through this audience: there
+    // is nothing to enforce, and nothing is written. An authority tells
+    // each member's host, addressed to that member.
+    if !revocation_staked(&app, &sp, &space, &auth.aud).await? {
+        return Ok(StatusCode::OK);
+    }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
-    let staked = revocation_staked(&app, &sp, &space, &auth.aud).await?;
-    match sp.revoke(&app.store, &space.uri, &new, staked).await {
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE_AUD], &auth.aud, new.len() as u32)?;
+    match sp.revoke(&app.store, &space.uri, &auth.aud, &new).await {
         Ok(Ok(wrote)) => {
             if wrote {
                 nudge_revocation_peers(&app, None).await;

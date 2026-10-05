@@ -62,6 +62,7 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 | Account takedown | the app's session works again after a reversal (what the harness expects) | revokes the account's OAuth sessions, and they stay revoked after a reversal. The app has to sign in again |
 | Record takedown | none for space records | hidden from every space read (a vlpds extension, see [Takedowns](privacy.md#takedowns)) |
 | Oplog | keeps every op | keeps 7 days. A `since` past that gets the window's start, and the syncer falls back to `getRepo` |
+| Revocations | stored for any audience the host has, unbounded, one row each | stored only when the audience account holds a repo in the space or its authority is here (else 200, dropped), capped per authority, space and account, and one past a cap blocks the space's credentials ([Revocation](reading.md#revocation)) |
 | Space repo size | no cap | 100k records |
 | Backlinks | a like of a space URI is recorded as a backlink | public URIs only |
 | `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same. Without `--spaces`, vlpds still serves an upload before any record names it |

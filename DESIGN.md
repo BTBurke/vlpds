@@ -5435,10 +5435,23 @@ live peers and answers 200 once it's durable. Peers re-read it every 5 min
 and at startup. It's written only when something is revoked. Each entry is
 held 3,610 s, and the object is bounded: `jti`s of 1-128 printable ASCII
 characters (a credential with a longer one is refused, so every accepted
-credential can be revoked), 2,000 live entries per authority, 10,000 in
-all for spaces nobody here has a stake in and 50,000 (~7 MB) for the rest.
-A revocation that can't be stored gets a 503 and blocks that space's
-credentials on every node for 3,610 s, so it fails closed.
+credential can be revoked). Only a revocation with a stake here is
+stored: the audience account holds a repo in the space, or its authority
+is hosted here. Any other is answered 200 and dropped, since no credential
+for the space reads anything through that audience (an authority tells
+each member's host, addressed to that member). Stored ones are capped at
+2,000 live entries per authority, 1,000 per space, 5,000 per audience
+account (so one account here and many authorities can't fill it) and
+50,000 (~7 MB) in all, and rate-limited per authority and per audience
+account. A revocation that can't be stored gets a 503 and blocks that
+space's credentials for 3,610 s, as a block in the object itself, so it
+reaches every node and outlives a restart. Past 10,000 blocked spaces,
+every space credential is refused until they drain: it never fails open.
+Appends on a node go one at a time, with at most 8 waiting (more are
+refused, the space blocked), and re-reads take their own lock, so a queue
+of appends can't hold the re-read past the 6 min staleness cutoff and turn
+every credential read into a 503. A generation number in the object keeps
+a slow read from installing an older object over a newer one.
 
 Each node sweeps the oplogs of its shards about every 6 h in frameless
 entries, never per write. Operator reads (Q6) are

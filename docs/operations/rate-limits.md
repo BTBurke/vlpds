@@ -52,13 +52,13 @@ let a stranger use up its password sign-ins. Asking for the password again to ch
 signs in (adding or removing a passkey, turning TOTP off, new recovery codes) does spend
 `sign-in-account`, so a stolen session can't guess the password any faster than a sign-in could.
 
-With `--spaces` on there are six more. The reference only limits space writes, and those share the
+With `--spaces` on there are seven more. The reference only limits space writes, and those share the
 repo-write buckets here too. Space reads get a budget per credential and per account
 (`space-read-*`), counted on the repo's owner. Each `getSpaceCredential` claims its delegation
 token durably, so it's capped per account and authority (`space-credential`). An inbound
 `notifyWrite` is a durable entry on the authority's owner and a revocation is a write to a
-cluster-wide object, so they're capped per writer and per authority (`space-notify-in`,
-`space-revoke`). `vlpds.space.importRepo` is capped per account before its body is read
+cluster-wide object, so they're capped per writer, per authority and per account here
+(`space-notify-in`, `space-revoke`, `space-revoke-aud`). `vlpds.space.importRepo` is capped per account before its body is read
 (`space-import`).
 
 ## The buckets
@@ -113,6 +113,7 @@ the start of the next. The names are what the console, the config and the metric
 | `space-notify-in` | DID | 5 min | 1,000 | `space.notifyWrite` arriving from another host, per writer (each is a durable entry) · with `--spaces` | 429 · the writer's outbox retries |
 | `space-revoke` | DID | 1 h | 1000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per space authority (one point per jti not already revoked, each a write to the cluster-wide revocations object · a call naming only revoked ones costs nothing) · with `--spaces` | 429 |
 | `space-import` | DID | 1 h | 100 | `vlpds.space.importRepo` per account, spent before the body is read (an account also runs 2 at once and a node 8: `InvalidRequest` and 503 `Overloaded` past those) · with `--spaces` | 429 |
+| `space-revoke-aud` | DID | 1 h | 2,000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per account here whose stake let them in (only those are stored), so one account and many authorities can't fill the revocations object · with `--spaces` | 429 |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
 

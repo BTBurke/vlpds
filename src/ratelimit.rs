@@ -390,10 +390,19 @@ limit!(
 );
 
 limit!(SPACE_IMPORT, 42, "space-import", Did, "vlpds.space.importRepo per account, before its body is read", HOUR, 100);
+limit!(
+    SPACE_REVOKE_AUD,
+    43,
+    "space-revoke-aud",
+    Did,
+    "credentials newly revoked by space.notifyCredentialRevoked, per account here giving the stake",
+    HOUR,
+    2000
+);
 
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 43] = [
+pub const BUILTIN: [&Limit; 44] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -437,6 +446,7 @@ pub const BUILTIN: [&Limit; 43] = [
     &SPACE_NOTIFY_IN,
     &SPACE_REVOKE,
     &SPACE_IMPORT,
+    &SPACE_REVOKE_AUD,
 ];
 
 /// A confidential client's backend calls these for all of its users from

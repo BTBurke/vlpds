@@ -433,9 +433,10 @@ fn space_revocations() -> vlpds::space::revocations::Doc {
     let space = "at://did:plc:fixture0000000000000000/space/com.example.group/main".to_string();
     Doc {
         revoked: vec![
-            Entry { space: space.clone(), jti: "3k2a7bq5zzc2a".into(), until: 1_790_003_610 },
-            Entry { space, jti: "3k2a7bq5zzc2b".into(), until: 1_790_003_611 },
+            Entry { space: space.clone(), jti: "3k2a7bq5zzc2a".into(), until: 1_790_003_610, aud: String::new() },
+            Entry { space, jti: "3k2a7bq5zzc2b".into(), until: 1_790_003_611, aud: String::new() },
         ],
+        ..Default::default()
     }
 }
 
