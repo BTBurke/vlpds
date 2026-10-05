@@ -24,6 +24,10 @@ const POLL: Duration = Duration::from_secs(60);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const STORE_TIMEOUT: Duration = Duration::from_secs(5);
 const CAS_RETRIES: usize = 5;
+/// How long the relay list and its addresses are trusted for subscriber
+/// hints before they're read and resolved again (in the background).
+const HINTS_TTL: Duration = Duration::from_secs(300);
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new()
@@ -68,6 +72,15 @@ pub struct Crawlers {
     flag_interval: Duration,
     wake: tokio::sync::Notify,
     started: AtomicBool,
+    hints: parking_lot::Mutex<Hints>,
+}
+
+/// The configured relays as (name, lowercase hostname, addresses).
+#[derive(Default)]
+struct Hints {
+    relays: Vec<(String, String, Vec<std::net::IpAddr>)>,
+    refreshed: Option<std::time::Instant>,
+    refreshing: bool,
 }
 
 impl Crawlers {
@@ -83,7 +96,13 @@ impl Crawlers {
             }
         }
         metrics::init_request_crawl(&relays);
-        Crawlers { flag_relays: relays, flag_interval, wake: Default::default(), started: AtomicBool::new(false) }
+        Crawlers {
+            flag_relays: relays,
+            flag_interval,
+            wake: Default::default(),
+            started: AtomicBool::new(false),
+            hints: Default::default(),
+        }
     }
 
     fn relays<'a>(&'a self, doc: &'a Doc) -> &'a [String] {
@@ -92,6 +111,59 @@ impl Crawlers {
 
     fn interval(&self, doc: &Doc) -> Duration {
         doc.interval_secs.map(Duration::from_secs).unwrap_or(self.flag_interval)
+    }
+
+    /// The configured relay a firehose subscriber looks like: its address is
+    /// one the relay's hostname resolves to, or its user agent names the
+    /// hostname. Answers from a cache and never waits on DNS or the bucket
+    /// (a stale cache is refreshed in the background, so a relay connecting
+    /// right after startup may go unnamed).
+    pub fn relay_hint(self: &Arc<Self>, store: &Store, ip: Option<std::net::IpAddr>, ua: &str) -> Option<String> {
+        self.refresh_hints(store);
+        let ip = ip.map(|i| i.to_canonical());
+        let ua = ua.to_ascii_lowercase();
+        let h = self.hints.lock();
+        h.relays
+            .iter()
+            .find(|(_, host, ips)| {
+                ip.is_some_and(|i| ips.contains(&i)) || (!host.is_empty() && ua.contains(host.as_str()))
+            })
+            .map(|(r, ..)| r.clone())
+    }
+
+    fn refresh_hints(self: &Arc<Self>, store: &Store) {
+        {
+            let mut h = self.hints.lock();
+            if h.refreshing || h.refreshed.is_some_and(|t| t.elapsed() < HINTS_TTL) {
+                return;
+            }
+            h.refreshing = true;
+        }
+        let (c, store) = (self.clone(), store.clone());
+        tokio::spawn(async move {
+            let relays = match load(&store).await {
+                Ok((doc, _)) => c.relays(&doc).to_vec(),
+                Err(_) => c.flag_relays.clone(),
+            };
+            let resolved = futures::future::join_all(relays.into_iter().map(|r| async move {
+                let base = if r.contains("://") { r.clone() } else { format!("https://{r}") };
+                let host = reqwest::Url::parse(&base)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_ascii_lowercase()))
+                    .unwrap_or_default();
+                let ips =
+                    match tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host((host.as_str(), 443))).await {
+                        Ok(Ok(addrs)) => addrs.map(|a| a.ip().to_canonical()).collect(),
+                        _ => Vec::new(),
+                    };
+                (r, host, ips)
+            }))
+            .await;
+            let mut h = c.hints.lock();
+            h.relays = resolved;
+            h.refreshed = Some(std::time::Instant::now());
+            h.refreshing = false;
+        });
     }
 }
 
@@ -507,6 +579,7 @@ async fn set_crawlers(State(app): AppState, Auth(creds): Auth, Json(inp): Json<S
     tracing::info!(target: "vlpds::audit", action = "crawlers.update", relays = ?c.relays(&doc), interval_secs = c.interval(&doc).as_secs(), "relay crawl config updated");
     // a relay added here is due at once; peers' loops see it within POLL
     c.wake.notify_one();
+    c.hints.lock().refreshed = None;
     Ok(Json(view(&app, &doc)))
 }
 

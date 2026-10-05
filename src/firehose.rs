@@ -392,6 +392,9 @@ pub struct Options {
     pub write_idle: Duration,
     /// None = the caller's runtime.
     pub runtime: Option<tokio::runtime::Handle>,
+    /// Connections with their own `vlpds_firehose_subscriber_*` series; the
+    /// rest share `conn="other"`.
+    pub max_labelled: usize,
 }
 
 impl Default for Options {
@@ -405,6 +408,7 @@ impl Default for Options {
             max_per_ip: DEFAULT_MAX_PER_IP,
             write_idle: DEFAULT_WRITE_IDLE,
             runtime: None,
+            max_labelled: DEFAULT_MAX_LABELLED,
         }
     }
 }
@@ -414,6 +418,9 @@ pub const DEFAULT_MAX_BACKFILLS: usize = 16;
 pub const DEFAULT_MAX_PER_IP: usize = 256;
 pub const DEFAULT_WRITE_IDLE: Duration = Duration::from_secs(30);
 pub const DEFAULT_MAX_LAG_BYTES: usize = 128 << 20;
+/// Bounds the `/metrics` exposition if someone opens thousands of
+/// connections.
+pub const DEFAULT_MAX_LABELLED: usize = 1000;
 
 /// The process-wide runtime for subscriber connections (subscribeRepos
 /// fan-out, cursor backfills): their socket writes and frame copies stay off
@@ -474,6 +481,15 @@ pub struct Firehose {
     write_idle: Duration,
     /// `settled`, for backfills waiting on it.
     settled_tx: watch::Sender<i64>,
+    /// Connected subscribers, for the operator's list. Locked on connect,
+    /// disconnect and listing only: progress goes through each entry's
+    /// atomics.
+    subs: parking_lot::Mutex<HashMap<u64, Arc<SubscriberEntry>>>,
+    gone: parking_lot::Mutex<VecDeque<GoneSubscriber>>,
+    /// Connections with their own per-connection series, at most
+    /// `max_labelled`.
+    labelled: AtomicUsize,
+    max_labelled: usize,
 }
 
 impl Firehose {
@@ -506,6 +522,10 @@ impl Firehose {
             per_ip: Default::default(),
             write_idle: opts.write_idle,
             settled_tx: watch::channel(i64::MIN).0,
+            subs: Default::default(),
+            gone: Default::default(),
+            labelled: AtomicUsize::new(0),
+            max_labelled: opts.max_labelled,
         })
     }
 
@@ -839,28 +859,15 @@ impl Firehose {
     ///
     /// `client` (the trusted-proxy-resolved client address): at most
     /// `Options::max_per_ip` connections per address (IPv6: per /64), 429
-    /// past it.
+    /// past it. `relay`: the configured relay the client matched, if any.
     pub fn upgrade(
-        self: &Arc<Self>,
-        req: axum::extract::Request,
-        cursor: Option<i64>,
-        shard: Option<SlotRange>,
-        client: Option<std::net::IpAddr>,
-    ) -> Response {
-        self.upgrade_tracked(req, cursor, shard, client, None)
-    }
-
-    /// [`upgrade`](Self::upgrade), reporting the connection through `conn`
-    /// (which can also kick it).
-    pub fn upgrade_tracked(
         self: &Arc<Self>,
         mut req: axum::extract::Request,
         cursor: Option<i64>,
         shard: Option<SlotRange>,
         client: Option<std::net::IpAddr>,
-        conn: Option<Arc<ConnStats>>,
+        relay: Option<String>,
     ) -> Response {
-        let closed = conn.map(ClosedOnDrop);
         let accept = match handshake(req.headers()) {
             Ok(a) => a,
             Err(e) => return e.into_response(),
@@ -874,23 +881,41 @@ impl Firehose {
             Some(Some(s)) => Some(s),
             None => None,
         };
+        let id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        let series = Series::new(self, id, client, relay.as_deref());
+        let conn = Arc::new(ConnStats::default());
+        let _ = conn.series.set((series.events.clone(), series.bytes.clone()));
+        let entry = SubscriberEntry {
+            id,
+            labelled: series.labels.is_some(),
+            ip: client,
+            user_agent: user_agent(req.headers()),
+            relay,
+            connected_at_ms: now_ms(),
+            cursor,
+            shard: shard.map(|s| format!("{}/{}", s.k, s.n)),
+            stats: conn.clone(),
+        };
+        let closed = ClosedOnDrop(conn);
         let on_upgrade = hyper::upgrade::on(&mut req);
         let fh = self.clone();
         self.runtime.spawn(async move {
-            let _slot = slot;
+            let (_slot, _series) = (slot, series);
+            let listed = Listed::new(&fh, entry);
             let up = match on_upgrade.await {
                 Ok(up) => up,
                 Err(e) => return tracing::debug!("subscribeRepos upgrade failed: {e}"),
             };
-            match closed.as_ref().map(|c| c.0.clone()) {
-                // dropping `serve` closes the socket wherever it was waiting
-                Some(c) => {
-                    tokio::select! {
-                        _ = fh.serve(up, cursor, shard, Some(c.clone())) => {}
-                        _ = c.kick.notified() => {}
-                    }
-                }
-                None => fh.serve(up, cursor, shard, None).await,
+            metrics::FIREHOSE_CONNECTIONS
+                .with_label_values(&[if cursor.is_some() { "backfill" } else { "live" }])
+                .inc();
+            // a kick (or a runtime shutdown) drops `serve` unfinished
+            let mut sub = Subscribed::new("kicked", Some(listed));
+            let c = closed.0.clone();
+            // dropping `serve` closes the socket wherever it was waiting
+            tokio::select! {
+                r = fh.serve(up, cursor, shard, c.clone()) => sub.reason = r,
+                _ = c.kick.notified() => {}
             }
         });
         (
@@ -923,24 +948,23 @@ impl Firehose {
         self.per_ip.lock().get(&ip_key(ip)).copied().unwrap_or(0)
     }
 
+    /// Returns the disconnect reason.
     async fn serve(
         self: Arc<Self>,
         up: hyper::upgrade::Upgraded,
         cursor: Option<i64>,
         shard: Option<SlotRange>,
-        conn: Option<Arc<ConnStats>>,
-    ) {
+        conn: Arc<ConnStats>,
+    ) -> &'static str {
         use hyper_util::rt::TokioIo;
         use tokio::net::TcpStream;
-        // this future is only dropped unfinished by a kick (or a runtime shutdown)
-        let mut sub = Subscribed::new("kicked");
         // Move the socket onto this runtime's reactor (it was accepted on
         // the request runtime), so its readiness events are ours too.
-        let reason = match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(up) {
+        match hyper_util::server::conn::auto::upgrade::downcast::<TokioIo<TcpStream>>(up) {
             Ok(parts) => match parts.io.into_inner().into_std().and_then(TcpStream::from_std) {
                 Ok(tcp) => {
                     let (r, w) = tcp.into_split();
-                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard, conn).await
+                    self.serve_conn(std::io::Cursor::new(parts.read_buf).chain(r), w, cursor, shard, Some(conn)).await
                 }
                 Err(e) => {
                     tracing::debug!("subscribeRepos socket: {e}");
@@ -952,10 +976,9 @@ impl Firehose {
                     "subscribeRepos: upgraded connection isn't a plain TCP stream; serving it through hyper's IO"
                 );
                 let (r, w) = tokio::io::split(TokioIo::new(up));
-                self.serve_conn(r, w, cursor, shard, conn).await
+                self.serve_conn(r, w, cursor, shard, Some(conn)).await
             }
-        };
-        sub.reason = reason;
+        }
     }
 
     async fn serve_conn<R, W>(
@@ -999,6 +1022,7 @@ impl Firehose {
             // the ring holds everything above its floor
             None => self.last_emitted.load(Ordering::Acquire).max(self.ring_floor.load(Ordering::Acquire)),
         };
+        out.sent(0, 0, last);
         if let Some(c) = cursor {
             // seqs are time-based: a cursor beyond both the stream head and the
             // current clock can't have been issued by us. Renumbered seqs
@@ -1090,6 +1114,7 @@ impl Firehose {
                 };
                 metrics::FIREHOSE_SENT.inc_by(sent as u64);
                 out.sent(sent, bytes, b.last);
+                out.sent_to(b.end);
                 last = b.last;
                 sent_to = Some(b.end);
                 while let Ok(c) = out.ctl.try_recv() {
@@ -1325,9 +1350,15 @@ pub struct ConnStats {
     pub last_seq: AtomicI64,
     /// Streaming from the bucket rather than the ring.
     pub backfilling: AtomicBool,
+    /// The stream offset the subscriber was sent the ring up to (0: none
+    /// since it last went live), for its lag in bytes.
+    pub sent_to: AtomicU64,
     /// The connection ended (or never started), however it ended.
     pub closed: AtomicBool,
     kick: tokio::sync::Notify,
+    /// Its `vlpds_firehose_subscriber_{events,bytes}_total` series, resolved
+    /// at connect.
+    series: OnceLock<(prometheus::IntCounter, prometheus::IntCounter)>,
 }
 
 impl ConnStats {
@@ -1354,12 +1385,13 @@ impl Drop for ClosedOnDrop {
 /// serve future ends or is dropped.
 struct Subscribed {
     reason: &'static str,
+    listed: Option<Listed>,
 }
 
 impl Subscribed {
-    fn new(reason: &'static str) -> Subscribed {
+    fn new(reason: &'static str, listed: Option<Listed>) -> Subscribed {
         metrics::FIREHOSE_SUBSCRIBERS.inc();
-        Subscribed { reason }
+        Subscribed { reason, listed }
     }
 }
 
@@ -1367,6 +1399,201 @@ impl Drop for Subscribed {
     fn drop(&mut self) {
         metrics::FIREHOSE_SUBSCRIBERS.dec();
         metrics::FIREHOSE_DISCONNECTS.with_label_values(&[self.reason]).inc();
+        if let Some(l) = &mut self.listed {
+            l.reason = Some(self.reason);
+        }
+    }
+}
+
+/// Process-wide, so two firehoses in one process (tests, memory clusters)
+/// never share a series.
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+const USER_AGENT_CHARS: usize = 120;
+/// Disconnected subscribers kept for the operator's list.
+const GONE_KEPT: usize = 50;
+pub const OTHER: &str = "other";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn user_agent(h: &HeaderMap) -> String {
+    let ua = h.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("");
+    ua.chars().take(USER_AGENT_CHARS).collect()
+}
+
+/// A connection's `vlpds_firehose_subscriber_*` series: its own
+/// `{ip, conn, relay}` while fewer than `max_labelled` connections have one
+/// (the earliest keep theirs, so a series never changes labels midway), else
+/// the shared `other`. Its own series go when it does.
+struct Series {
+    fh: Arc<Firehose>,
+    labels: Option<[String; 3]>,
+    events: prometheus::IntCounter,
+    bytes: prometheus::IntCounter,
+}
+
+impl Series {
+    fn new(fh: &Arc<Firehose>, id: u64, ip: Option<std::net::IpAddr>, relay: Option<&str>) -> Series {
+        let own = fh
+            .labelled
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < fh.max_labelled).then_some(n + 1))
+            .is_ok();
+        let labels = if own {
+            [
+                ip.map_or_else(|| "unknown".into(), |ip| ip_key(ip).to_string()),
+                id.to_string(),
+                relay.unwrap_or("").into(),
+            ]
+        } else {
+            [OTHER.into(), OTHER.into(), String::new()]
+        };
+        let l = [labels[0].as_str(), labels[1].as_str(), labels[2].as_str()];
+        Series {
+            fh: fh.clone(),
+            events: metrics::FIREHOSE_SUBSCRIBER_EVENTS.with_label_values(&l),
+            bytes: metrics::FIREHOSE_SUBSCRIBER_BYTES.with_label_values(&l),
+            labels: own.then_some(labels),
+        }
+    }
+}
+
+impl Drop for Series {
+    fn drop(&mut self) {
+        let Some(labels) = &self.labels else { return };
+        let l = [labels[0].as_str(), labels[1].as_str(), labels[2].as_str()];
+        let _ = metrics::FIREHOSE_SUBSCRIBER_EVENTS.remove_label_values(&l);
+        let _ = metrics::FIREHOSE_SUBSCRIBER_BYTES.remove_label_values(&l);
+        self.fh.labelled.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// A connected subscriber as the operator sees it.
+struct SubscriberEntry {
+    id: u64,
+    labelled: bool,
+    ip: Option<std::net::IpAddr>,
+    user_agent: String,
+    relay: Option<String>,
+    connected_at_ms: u64,
+    cursor: Option<i64>,
+    shard: Option<String>,
+    stats: Arc<ConnStats>,
+}
+
+struct GoneSubscriber {
+    entry: Arc<SubscriberEntry>,
+    at_ms: u64,
+    reason: &'static str,
+}
+
+/// An entry in [`Firehose::subscribers`] while it's connected, then kept
+/// among the recently gone with its reason if it was served.
+struct Listed {
+    fh: Arc<Firehose>,
+    entry: Arc<SubscriberEntry>,
+    reason: Option<&'static str>,
+}
+
+impl Listed {
+    fn new(fh: &Arc<Firehose>, e: SubscriberEntry) -> Listed {
+        let entry = Arc::new(e);
+        fh.subs.lock().insert(entry.id, entry.clone());
+        Listed { fh: fh.clone(), entry, reason: None }
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        self.fh.subs.lock().remove(&self.entry.id);
+        if let Some(reason) = self.reason {
+            let mut g = self.fh.gone.lock();
+            if g.len() >= GONE_KEPT {
+                g.pop_back();
+            }
+            g.push_front(GoneSubscriber { entry: self.entry.clone(), at_ms: now_ms(), reason });
+        }
+    }
+}
+
+/// One subscriber in `vlpds.admin.listFirehoseSubscribers`.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriberView {
+    /// Its `conn` label, when `labelled` (else it counts under `other`).
+    pub conn: String,
+    pub labelled: bool,
+    pub ip: Option<String>,
+    pub user_agent: String,
+    pub relay: Option<String>,
+    pub connected_at: u64,
+    pub cursor: Option<i64>,
+    pub shard: Option<String>,
+    /// backfilling | live
+    pub state: String,
+    pub last_seq: i64,
+    pub events: u64,
+    pub bytes: u64,
+    /// Live only: bytes of the stream it hasn't been sent yet.
+    pub lag_bytes: Option<u64>,
+    /// Time-based seqs: how far its position trails the stream head.
+    pub lag_ms: Option<u64>,
+    /// Renumbered seqs: events between its position and the head.
+    pub lag_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnected_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl Firehose {
+    /// The connected subscribers (oldest first) and the recently gone ones
+    /// (newest first).
+    pub fn subscribers(&self) -> (Vec<SubscriberView>, Vec<SubscriberView>) {
+        let head = *self.head.borrow();
+        let emitted = self.last_emitted.load(Ordering::Acquire);
+        let renumbered = self.renumbered();
+        let view = |e: &SubscriberEntry| {
+            let s = &e.stats;
+            let backfilling = s.backfilling.load(Ordering::Relaxed);
+            let last_seq = s.last_seq.load(Ordering::Relaxed);
+            let sent_to = s.sent_to.load(Ordering::Relaxed);
+            let behind = emitted.saturating_sub(last_seq).max(0) as u64;
+            SubscriberView {
+                conn: e.id.to_string(),
+                labelled: e.labelled,
+                ip: e.ip.map(|ip| ip.to_canonical().to_string()),
+                user_agent: e.user_agent.clone(),
+                relay: e.relay.clone(),
+                connected_at: e.connected_at_ms,
+                cursor: e.cursor,
+                shard: e.shard.clone(),
+                state: if backfilling { "backfilling" } else { "live" }.into(),
+                last_seq,
+                events: s.events.load(Ordering::Relaxed),
+                bytes: s.bytes.load(Ordering::Relaxed),
+                lag_bytes: (!backfilling && sent_to > 0).then(|| head.saturating_sub(sent_to)),
+                lag_ms: (!renumbered && last_seq > 0).then_some((behind >> 8) / 1000),
+                lag_events: (renumbered && last_seq > 0).then_some(behind),
+                disconnected_at: None,
+                reason: None,
+            }
+        };
+        let mut live: Vec<SubscriberView> = Vec::new();
+        let mut ids: Vec<(u64, SubscriberView)> = self.subs.lock().values().map(|e| (e.id, view(e))).collect();
+        ids.sort_by_key(|(id, _)| *id);
+        live.extend(ids.into_iter().map(|(_, v)| v));
+        let gone = self
+            .gone
+            .lock()
+            .iter()
+            .map(|g| SubscriberView {
+                disconnected_at: Some(g.at_ms),
+                reason: Some(g.reason.to_string()),
+                ..view(&g.entry)
+            })
+            .collect();
+        (live, gone)
     }
 }
 
@@ -1690,12 +1917,23 @@ impl<W: AsyncWrite + Unpin> Out<W> {
             c.events.fetch_add(events as u64, Ordering::Relaxed);
             c.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             c.last_seq.store(last_seq, Ordering::Relaxed);
+            if let Some((e, b)) = c.series.get() {
+                e.inc_by(events as u64);
+                b.inc_by(bytes as u64);
+            }
         }
     }
 
     fn set_backfilling(&self, on: bool) {
         if let Some(c) = &self.conn {
             c.backfilling.store(on, Ordering::Relaxed);
+            c.sent_to.store(0, Ordering::Relaxed);
+        }
+    }
+
+    fn sent_to(&self, pos: u64) {
+        if let Some(c) = &self.conn {
+            c.sent_to.store(pos, Ordering::Relaxed);
         }
     }
 
@@ -2440,9 +2678,10 @@ mod tests {
                     let (w, mut r) = tokio::io::duplex(1 << 20);
                     let (ctl_tx, ctl) = mpsc::channel(1);
                     let fh = fh.clone();
+                    let (conn, series) = tracked(&fh, "192.0.2.1", None);
                     let s = tokio::spawn(async move {
-                        let mut out = Out { w, ctl, idle: Duration::from_secs(30), conn: None };
-                        let _ctl = ctl_tx;
+                        let mut out = Out { w, ctl, idle: Duration::from_secs(30), conn: Some(conn) };
+                        let _ctl = (ctl_tx, series);
                         let _ = fh.stream(&mut out, Some(base), None).await;
                     });
                     tasks.push(tokio::spawn(async move {
@@ -2523,6 +2762,111 @@ mod tests {
         let open = Firehose::new(Options { max_per_ip: 0, ..Options::default() });
         let all: Vec<_> = (0..10).map(|_| open.ip_slot(v4).unwrap()).collect();
         assert_eq!((all.len(), open.connections_from(v4)), (10, 0), "0 = no cap");
+    }
+
+    /// A connection's stats with its per-connection series, as `upgrade`
+    /// makes them.
+    fn tracked(fh: &Arc<Firehose>, ip: &str, relay: Option<&str>) -> (Arc<ConnStats>, Series) {
+        let series = Series::new(fh, NEXT_CONN.fetch_add(1, Ordering::Relaxed), Some(ip.parse().unwrap()), relay);
+        let conn = Arc::new(ConnStats::default());
+        let _ = conn.series.set((series.events.clone(), series.bytes.clone()));
+        (conn, series)
+    }
+
+    /// The subscriber series' label sets, as /metrics shows them.
+    fn series_labels() -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for mf in prometheus::gather() {
+            if mf.name() != "vlpds_firehose_subscriber_events_total" {
+                continue;
+            }
+            for m in mf.get_metric() {
+                let get = |n: &str| m.get_label().iter().find(|l| l.name() == n).unwrap().value().to_string();
+                out.push((get("ip"), get("conn"), get("relay")));
+            }
+        }
+        out
+    }
+
+    /// Each connection gets its own series (IPv6 by /64) until the cap, the
+    /// rest share `other`, and a connection's series go when it does.
+    #[test]
+    fn subscriber_series_are_capped_and_removed() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _g = rt.enter();
+        let fh = Firehose::new(Options { max_labelled: 2, ..Options::default() });
+        let (a, sa) = tracked(&fh, "2001:db8:5:6:1:2:3:4", Some("relay.example.com"));
+        let (_b, sb) = tracked(&fh, "198.51.100.9", None);
+        let (c, sc) = tracked(&fh, "198.51.100.10", None);
+        let (ida, idb) = (sa.labels.as_ref().unwrap()[1].clone(), sb.labels.as_ref().unwrap()[1].clone());
+        assert!(sc.labels.is_none(), "past the cap");
+        let out = |o: &Out<tokio::io::DuplexStream>, n| o.sent(n, n * 10, 1);
+        let (w, _r) = tokio::io::duplex(64);
+        let (_t, ctl) = mpsc::channel(1);
+        let oa = Out { w, ctl, idle: Duration::from_secs(1), conn: Some(a) };
+        out(&oa, 3);
+        let (w, _r2) = tokio::io::duplex(64);
+        let (_t2, ctl) = mpsc::channel(1);
+        let oc = Out { w, ctl, idle: Duration::from_secs(1), conn: Some(c) };
+        out(&oc, 4);
+        let labels = series_labels();
+        let mine = |id: &str| labels.iter().find(|l| l.1 == id).cloned();
+        assert_eq!(
+            mine(&ida),
+            Some(("2001:db8:5:6::".to_string(), ida.clone(), "relay.example.com".to_string())),
+            "IPv6 by /64, with the relay"
+        );
+        assert_eq!(mine(&idb), Some(("198.51.100.9".to_string(), idb.clone(), String::new())));
+        let ev = |l: &[&str]| metrics::FIREHOSE_SUBSCRIBER_EVENTS.with_label_values(l).get();
+        assert_eq!(ev(&["2001:db8:5:6::", &ida, "relay.example.com"]), 3);
+        assert!(ev(&[OTHER, OTHER, ""]) >= 4, "the third counts under other");
+        drop(sa);
+        assert!(series_labels().iter().all(|l| l.1 != ida), "removed on disconnect");
+        // its slot is free again
+        let (_d, sd) = tracked(&fh, "198.51.100.11", None);
+        assert!(sd.labels.is_some());
+        drop((sb, sc, sd));
+        assert!(series_labels().iter().all(|l| l.1 != idb));
+    }
+
+    /// The operator's list: an entry from connect to disconnect, its state
+    /// following the stream, then among the recently gone with its reason.
+    #[test]
+    fn subscribers_are_listed_while_connected() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let _g = rt.enter();
+        let fh = Firehose::new(Options::default());
+        let (conn, _series) = tracked(&fh, "192.0.2.44", None);
+        let entry = SubscriberEntry {
+            id: 7,
+            labelled: true,
+            ip: Some("192.0.2.44".parse().unwrap()),
+            user_agent: "relay-test/1".into(),
+            relay: None,
+            connected_at_ms: now_ms(),
+            cursor: Some(5),
+            shard: Some("1/4".into()),
+            stats: conn.clone(),
+        };
+        let sub = Subscribed::new("client_gone", Some(Listed::new(&fh, entry)));
+        conn.backfilling.store(true, Ordering::Relaxed);
+        let (live, gone) = fh.subscribers();
+        assert_eq!((live.len(), gone.len()), (1, 0));
+        let v = &live[0];
+        assert_eq!(
+            (v.conn.as_str(), v.ip.as_deref(), v.state.as_str(), v.cursor, v.shard.as_deref()),
+            ("7", Some("192.0.2.44"), "backfilling", Some(5), Some("1/4"))
+        );
+        assert_eq!(v.lag_bytes, None, "no byte lag while backfilling");
+        conn.backfilling.store(false, Ordering::Relaxed);
+        conn.events.store(12, Ordering::Relaxed);
+        assert_eq!(fh.subscribers().0[0].state, "live");
+        assert_eq!(fh.subscribers().0[0].events, 12);
+        drop(sub);
+        let (live, gone) = fh.subscribers();
+        assert!(live.is_empty());
+        assert_eq!((gone[0].conn.as_str(), gone[0].reason.as_deref()), ("7", Some("client_gone")));
+        assert!(gone[0].disconnected_at.is_some());
     }
 
     /// A stalled log holds the min watermark back while another keeps
