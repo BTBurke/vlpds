@@ -390,6 +390,17 @@ fn ratelimits() -> Vec<u8> {
     compact(&d)
 }
 
+fn space_revocations() -> vlpds::space::revocations::Doc {
+    use vlpds::space::revocations::{Doc, Entry};
+    let space = "at://did:plc:fixture0000000000000000/space/com.example.group/main".to_string();
+    Doc {
+        revoked: vec![
+            Entry { space: space.clone(), jti: "3k2a7bq5zzc2a".into(), until: 1_790_003_610 },
+            Entry { space, jti: "3k2a7bq5zzc2b".into(), until: 1_790_003_611 },
+        ],
+    }
+}
+
 fn cluster_version() -> version::ClusterVersion {
     version::ClusterVersion {
         active: 1,
@@ -461,6 +472,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("control/retain_report.json", compact(&report())),
         ("control/ratelimits.json", ratelimits()),
         ("control/cluster_version.json", compact(&cluster_version())),
+        ("control/space_revocations.json", space_revocations().encode()),
         ("stream/batch.bin", vlpds::remote::encode_batch(&batch).to_vec()),
         ("stream/watermark.bin", vlpds::remote::encode_watermark(1003 << 8).to_vec()),
         ("private/rows.json", private_rows()),
@@ -909,6 +921,10 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         }
         "control/cluster_version.json" => {
             json_reencode::<version::ClusterVersion>(name, b);
+        }
+        "control/space_revocations.json" => {
+            let d = vlpds::space::revocations::Doc::decode(b).unwrap();
+            assert!(d.encode() == b, "{name}");
         }
         "stream/batch.bin" => {
             let vlpds::remote::StreamMsg::Batch(batch) =
