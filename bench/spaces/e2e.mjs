@@ -894,10 +894,23 @@ export async function runConfig(rep, cfg, env) {
         contentType: 'application/vnd.ipld.car',
       })
       if (r.status === 404 || r.status === 501) throw new NotImplemented('vlpds.space.importRepo', `(${r.status})`)
-      check(r.ok, 'vlpds.space.importRepo accepts the exported space repo', `${r.status} ${r.error} ${r.message}`)
+      check(r.ok, 'importRepo of the identical snapshot is an idempotent success', `${r.status} ${r.error} ${r.message}`)
       const after = await listAll(w.client, S.space, w.did)
       const d = mapDiff(truth.repo(S.space, w.did), after)
       check(!d.length, 'and the repo is unchanged', d.join(', '))
+      // a space repo's rev only moves forward (syncers rely on it), so an
+      // older snapshot is refused once the repo has moved on
+      const extra = await w.client.com.atproto.space.createRecord({ space: S.space, repo: w.did, collection: COLL, record: record('after the export') })
+      truth.set(S.space, w.did, `${COLL}/${extra.data.uri.split('/').pop()}`, extra.data.cid)
+      const old = await dpopXrpc(w, 'vlpds.space.importRepo', {
+        method: 'POST',
+        params: { space: S.space },
+        body: Buffer.from(car.data),
+        contentType: 'application/vnd.ipld.car',
+      })
+      check(!old.ok && old.status === 400, 'an older snapshot is refused', `${old.status} ${old.error} ${old.message}`)
+      const d2 = mapDiff(truth.repo(S.space, w.did), await listAll(w.client, S.space, w.did))
+      check(!d2.length, 'and the newer repo stays', d2.join(', '))
     },
     { needs: ['records.write'], skip: vl('W1') ? undefined : 'vlpds-only endpoint; W1 is not on vlpds' },
   )
