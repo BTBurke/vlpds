@@ -48,6 +48,26 @@ use std::sync::Arc;
 /// `--space-repo-max-records`: a 100k-record repo's index block is ~6 MB.
 pub const DEFAULT_MAX_RECORDS: u64 = 100_000;
 
+/// A space getRepo's pass 1 per record: its path (most are well under 64
+/// bytes), end offset and CID, with room for the vectors' growth.
+pub const EXPORT_RECORD_BYTES: u64 = 128;
+/// Full-size space exports the memory plan holds room for at once. A
+/// smaller export takes room in proportion, so only a pile-up of the
+/// biggest repos waits for it.
+pub const EXPORTS_PLANNED: u64 = 4;
+const EXPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a space getRepo of `records` records holds: pass 1 and the chunk
+/// being filled.
+pub fn export_bytes(records: u64) -> u64 {
+    records * EXPORT_RECORD_BYTES + crate::xrpc::EXPORT_CHUNK as u64
+}
+
+/// The memory plan's room for space exports (`memory.rs` "space_exports").
+pub fn export_budget_bytes(max_records: u64) -> u64 {
+    EXPORTS_PLANNED * export_bytes(max_records)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     /// Records an account's repo in one space may hold.
@@ -86,6 +106,9 @@ pub struct Spaces {
     /// doesn't host them, and when: their notifies go out over HTTP without
     /// asking it again on every send.
     not_hosted: parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// [`export_budget_bytes`] in KiB, which space exports reserve from.
+    exports: Arc<tokio::sync::Semaphore>,
+    export_kib: u32,
 }
 
 /// An authority that moves into the cluster within this is still told
@@ -103,7 +126,10 @@ fn now_secs() -> i64 {
 
 impl Spaces {
     pub fn new(limits: Limits) -> Spaces {
+        let export_kib = export_budget_bytes(limits.max_records).div_ceil(1024).min(u32::MAX as u64) as u32;
         Spaces {
+            exports: Arc::new(tokio::sync::Semaphore::new(export_kib as usize)),
+            export_kib,
             limits,
             peer_notifies: Default::default(),
             cache_fills: Default::default(),
@@ -116,6 +142,18 @@ impl Spaces {
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
+    }
+
+    /// Room for `bytes` of a space export, waited for up to 10 s.
+    pub async fn reserve_export(&self, bytes: u64) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        let kib = bytes.div_ceil(1024).clamp(1, self.export_kib as u64) as u32;
+        let wait = self.exports.clone().acquire_many_owned(kib);
+        tokio::time::timeout(EXPORT_WAIT, wait).await.ok()?.ok()
+    }
+
+    /// Tests: KiB of the export room free now.
+    pub fn export_room_free(&self) -> (usize, usize) {
+        (self.exports.available_permits(), self.export_kib as usize)
     }
 
     /// Whether a peer said lately that the cluster doesn't host `authority`.

@@ -1690,6 +1690,14 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     let head = head_of(HeadRow::decode(&v.ok_or_else(not_found)?).map_err(XrpcError::from_err)?, &space, &p)?;
     let values = !q.exclude_values.unwrap_or(false);
     let hidden = hidden_paths(&app, &q.repo, &space.sid).await?;
+    let overloaded = || XrpcError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        error: "Overloaded".into(),
+        message: "too many space repo exports in progress; retry shortly".into(),
+    };
+    let sp = spaces(&app)?;
+    let planned = crate::space::export_bytes(head.records);
+    let mut room = sp.reserve_export(planned).await.ok_or_else(overloaded)?;
     let mut set = head.hash.clone();
     let prefix = state::space_prefix(state::SPACE_RECORD_FAMILY, &q.repo, &space.sid);
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, cache_blocks: true, ..Default::default() };
@@ -1708,6 +1716,11 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
         entries.push(path, cid);
     }
     drop(iter);
+    // long paths: what pass 1 holds past its estimate is reserved too
+    let held = entries.heap_bytes() as u64 + super::sync::EXPORT_CHUNK as u64;
+    if held > planned {
+        room.merge(sp.reserve_export(held - planned).await.ok_or_else(overloaded)?);
+    }
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author: &q.repo, rev: &rev };
     let t = Instant::now();
@@ -1717,6 +1730,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     metrics::space_sign(t.elapsed());
     let stall = app.config.export_stall;
     Ok(super::sync::export_body(slot, "application/vnd.ipld.car", move |tx| async move {
+        let _room = room;
         const CHUNK: usize = super::sync::EXPORT_CHUNK;
         let mut car = Car::new(commit_block(&commit));
         let order = car.order(&entries);

@@ -360,6 +360,38 @@ async fn a_full_repo_streams_under_a_memory_bound() {
     let bucket = |t: &str, le: &str| scraped(t, &format!("vlpds_space_export_bytes_bucket{{le=\"{le}\"}}"));
     assert_eq!(scraped(&after, count), bucket(&after, BOUND), "an export held more than 32 MiB");
     assert!(bucket(&after, "4194304") < scraped(&after, count), "the big export was measured");
+    // it fit the memory plan's estimate for a full repo, and gave its room back
+    let planned = vlpds::space::export_bytes(max as u64);
+    assert!(planned < 32 << 20 && planned > 8 << 20, "{planned}");
+    let sp = s.app.spaces.as_ref().unwrap();
+    assert!(eventually(Duration::from_secs(5), || async { sp.export_room_free().0 == sp.export_room_free().1 }).await);
+}
+
+/// A space getRepo takes its room from the memory plan's space exports,
+/// gives it back when its body is done, and is shed when there's none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_space_export_holds_its_memory_room() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "ssroom", OWNER).await;
+    let space = owner.create_space(TYPE, "room").await;
+    owner.create_record(&space, COLL, Some("a"), rec("a")).await.ok();
+    let sp = s.app.spaces.as_ref().unwrap();
+    let (free, total) = sp.export_room_free();
+    assert_eq!(free, total);
+    assert_eq!(total as u64, vlpds::space::export_budget_bytes(vlpds::space::DEFAULT_MAX_RECORDS).div_ceil(1024));
+    // a 1-record export, and a few KiB for its vectors' first growth
+    let held = vlpds::space::export_bytes(1).div_ceil(1024) as usize + 8;
+    let room = sp.reserve_export((total - held) as u64 * 1024).await.expect("the rest of the room");
+    let r = owner.get_raw("com.atproto.space.getRepo", &[("space", &space), ("repo", &owner.did)]).await;
+    assert_eq!(r.0, 200, "an export that fits the room left");
+    assert!(eventually(Duration::from_secs(5), || async { sp.export_room_free().0 == held }).await);
+    drop(room);
+    assert_eq!(sp.export_room_free().0, total);
+    // with no room at all, the export is shed after a short wait
+    let all = sp.reserve_export(total as u64 * 1024).await.unwrap();
+    let r = owner.get("com.atproto.space.getRepo", &[("space", &space), ("repo", &owner.did)]).await;
+    r.err(503, "Overloaded");
+    drop(all);
 }
 
 /// listRepoOps pages one big rev without losing an op, holds the commit

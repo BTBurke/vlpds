@@ -73,6 +73,11 @@ A few rules decide what your users and their apps can do:
 | `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo` |
 | `--max-exports`, `--export-stall-secs` | as for `sync.getRepo` | `space.getRepo` takes the same export slots and stall timeout |
 
+A `space.getRepo` holds every path and CID of the repo while it streams (~128 B a record), so it
+also takes that much room from the memory plan's space exports. The room fits 4 exports of a full
+100,000-record repo (~53 MiB). Smaller repos take less, so only a pile-up of the biggest ones waits
+(10 s, then 503 `Overloaded`).
+
 ## Fixed limits
 
 | Limit | Value |

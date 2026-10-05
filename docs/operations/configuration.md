@@ -99,6 +99,7 @@ as a percentage (`80%`). Set the container limit and leave the cache flags alone
 | Backfill | cache + read-ahead × backfills: 256 + 64 × 16 MiB (tiny: 32 + 16 × 4) | `--backfill-cache-mb`, `--backfill-readahead-mb`, `--firehose-max-backfills` |
 | Exports | ~8 MiB per getRepo stream + their read-ahead pool: 32 streams (tiny: 4) | `--max-exports` |
 | Imports | 1/16 of the budget, 192 MiB to 1 GiB | `--import-memory-mb` |
+| Space exports | with `--spaces`, room for 4 full-size `space.getRepo` streams: 4 × (128 B per record × 100,000 + 1 MiB), ~53 MiB | `--space-repo-max-records` |
 | Headroom | 15% of the budget, at least 512 MiB | memtables, request bodies, allocator slack |
 
 What's left is the **cache pool**, and it's split in this order:

@@ -198,7 +198,7 @@ const EXPORT_BATCH: usize = 512;
 const EXPORT_BATCH_BYTES: usize = 256 << 10;
 const EXPORT_FEED: usize = 16;
 
-pub(super) const EXPORT_CHUNK: usize = 1 << 20;
+pub(crate) const EXPORT_CHUNK: usize = 1 << 20;
 
 /// Feeds every record to the MST walk (`tx`) in key order: its key and CID
 /// (the walk rebuilds the leaves from them) and, unless `since` excludes
