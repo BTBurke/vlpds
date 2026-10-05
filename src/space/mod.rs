@@ -186,15 +186,16 @@ impl Spaces {
         }
     }
 
-    /// One of the node's [`IMPORTS_RUNNING`] importRepo slots, and one of
-    /// `did`'s [`IMPORTS_PER_ACCOUNT`]; Err(true) when the account's are
-    /// taken, Err(false) when the node's are.
-    pub fn import_slot(&self, did: &str) -> Result<ImportSlot<'_>, bool> {
+    /// One of the node's `node_cap` importRepo slots (at most
+    /// [`IMPORTS_RUNNING`]), and one of `did`'s [`IMPORTS_PER_ACCOUNT`];
+    /// Err(true) when the account's are taken, Err(false) when the node's
+    /// are.
+    pub fn import_slot(&self, did: &str, node_cap: usize) -> Result<ImportSlot<'_>, bool> {
         let mut m = self.importing.lock();
         if m.get(did).is_some_and(|n| *n >= IMPORTS_PER_ACCOUNT) {
             return Err(true);
         }
-        if m.values().sum::<usize>() >= IMPORTS_RUNNING {
+        if m.values().sum::<usize>() >= node_cap.clamp(1, IMPORTS_RUNNING) {
             return Err(false);
         }
         *m.entry(did.to_string()).or_default() += 1;
@@ -551,17 +552,20 @@ mod tests {
     #[test]
     fn import_slots_cap_accounts_and_the_node() {
         let sp = Spaces::new(Limits::default());
-        let a1 = sp.import_slot("did:a").unwrap();
-        let _a2 = sp.import_slot("did:a").unwrap();
-        assert!(matches!(sp.import_slot("did:a"), Err(true)));
+        let a1 = sp.import_slot("did:a", 8).unwrap();
+        let _a2 = sp.import_slot("did:a", 8).unwrap();
+        assert!(matches!(sp.import_slot("did:a", 8), Err(true)));
         drop(a1);
-        let a3 = sp.import_slot("did:a").unwrap();
-        let others: Vec<_> = (0..6).map(|i| sp.import_slot(&format!("did:o{i}")).unwrap()).collect();
-        assert!(matches!(sp.import_slot("did:new"), Err(false)));
+        let a3 = sp.import_slot("did:a", 8).unwrap();
+        let others: Vec<_> = (0..6).map(|i| sp.import_slot(&format!("did:o{i}"), 8).unwrap()).collect();
+        assert!(matches!(sp.import_slot("did:new", 8), Err(false)));
         drop(a3);
-        let _n = sp.import_slot("did:new").unwrap();
+        let _n = sp.import_slot("did:new", 8).unwrap();
         drop(others);
         assert_eq!(sp.importing.lock().len(), 2);
+        // a smaller node cap (a small import budget)
+        assert!(matches!(sp.import_slot("did:x", 2), Err(false)));
+        assert!(sp.import_slot("did:x", 3).is_ok());
     }
 
     #[test]

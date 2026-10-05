@@ -332,7 +332,11 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, headers: &Head
     if let Some(st) = app.account(&did).await?.status {
         return Err(inactive_account_error(&st));
     }
-    let _slot = sp.import_slot(&did).map_err(|account| match account {
+    // no more at once than the budget holds at their largest (what a
+    // chunked body reserves): past that they're refused at once, and the
+    // ones let in never wait on each other for room
+    let node_cap = app.imports.holds(working_set(sp.limits.max_records, None)) as usize;
+    let _slot = sp.import_slot(&did, node_cap).map_err(|account| match account {
         true => invalid("too many space imports in progress for this account; retry once one is done"),
         false => XrpcError::unavailable("Overloaded", "too many space imports in progress; retry shortly"),
     })?;

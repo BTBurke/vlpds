@@ -183,6 +183,17 @@ impl ImportBudget {
         self.total
     }
 
+    /// How many imports of `working_set` bytes the budget holds at once,
+    /// the large share included.
+    pub fn holds(&self, working_set: u64) -> u64 {
+        let (need, need_large) = self.split(working_set);
+        let by_total = self.total / need.max(1);
+        match need_large {
+            0 => by_total,
+            n => by_total.min(self.large / n),
+        }
+    }
+
     /// Bytes reserved by imports now.
     pub fn reserved(&self) -> u64 {
         self.total - self.st.lock().free

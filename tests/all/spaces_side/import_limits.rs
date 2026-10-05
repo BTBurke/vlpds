@@ -285,3 +285,77 @@ async fn imports_are_rate_limited_and_capped_per_account() {
     let r = import_repo(&o.alice, space, &built.car()).await;
     assert_ne!(r.status, 429, "{}", r.text());
 }
+
+/// Chunked bodies (no Content-Length) reserve an import's largest working
+/// set, and a node runs no more of them than its import budget holds: on a
+/// small budget several at once are each let in or refused at once with a
+/// retryable 503, the budget is never overdrawn, and it's all given back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_chunked_imports_fit_the_budget() {
+    let o = one_with(|_, c| {
+        c.import_memory_bytes = Some(200 << 20);
+        c.import_wait = Duration::from_secs(2);
+    })
+    .await;
+    let s = &o.net.pds[0];
+    let budget = s.app.imports.clone();
+    let mut actors = vec![];
+    for i in 0..6 {
+        let sc = o.net.actor(&format!("chk{i}"), 0).await;
+        put_member(&o.alice, &o.space, &sc, true, true).await.ok();
+        actors.push(sc);
+    }
+    let mut cars = vec![];
+    for sc in &actors {
+        let built = records(RepoBuilder::new(&o.space, &sc.did, &rev_ago(Duration::from_secs(60))), 3)
+            .build(&*account_key(s, &sc.did).await);
+        cars.push(bytes::Bytes::from(built.car()));
+    }
+    let peak = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sampling = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let (peak, sampling, budget) = (peak.clone(), sampling.clone(), budget.clone());
+        tokio::spawn(async move {
+            while sampling.load(Ordering::Relaxed) {
+                peak.fetch_max(budget.reserved(), Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+    };
+    // each body trickles in: the header, a pause, the rest
+    let runs = actors.iter().zip(&cars).map(|(sc, car)| {
+        let space = &o.space;
+        async move {
+            import_body(sc, space, || {
+                let (head, rest) = (car.slice(..64), car.slice(64..));
+                let s = futures::stream::once(async move { Ok::<_, std::io::Error>(head) }).chain(
+                    futures::stream::once(async move {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        Ok(rest)
+                    }),
+                );
+                reqwest::Body::wrap_stream(s)
+            })
+            .await
+        }
+    });
+    let rs = futures::future::join_all(runs).await;
+    sampling.store(false, Ordering::Relaxed);
+    sampler.await.unwrap();
+    let ok = rs.iter().filter(|r| r.status == 200).count();
+    for r in &rs {
+        assert!(r.status == 200 || (r.status == 503 && r.error_name() == Some("Overloaded")), "{}", r.text());
+    }
+    println!("{ok} of 6 let in; peak reserved {} of {} MiB", peak.load(Ordering::Relaxed) >> 20, budget.total() >> 20);
+    assert!(ok >= 1, "none let in");
+    assert!(ok < 6, "a 200 MiB budget let in 6 chunked imports at their largest");
+    assert!(peak.load(Ordering::Relaxed) <= budget.total());
+    assert_eq!(budget.reserved(), 0);
+    // one at a time, they all go in
+    for (sc, car) in actors.iter().zip(&cars) {
+        if rs.iter().any(|r| r.status == 503) {
+            let r = import_repo(sc, &o.space, car).await;
+            assert!(r.status == 200, "{}", r.text());
+        }
+    }
+}

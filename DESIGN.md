@@ -5591,7 +5591,9 @@ the space row, and counts a mismatch in
   Everything that costs memory is decided before the body is read: a
   grant with `create` in the space (for some collection; the index's
   collections are checked once it's in), the `space-import` bucket, 2
-  imports per account and 8 per node, and a reservation from the import
+  imports per account and 8 per node (fewer when the import budget, large
+  share included, can't hold 8 at their largest, so chunked bodies are
+  refused at once rather than overdraw or queue on it), and a reservation from the import
   budget sized by the block caps (and the Content-Length, when there is
   one). Each block is refused from its length before it's buffered: the
   commit over 1 KiB, the index over max(records cap × 128 B, 1 MiB), a

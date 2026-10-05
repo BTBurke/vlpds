@@ -112,7 +112,7 @@ the start of the next. The names are what the console, the config and the metric
 | `space-credential` | DID + authority | 1 h | 300 | `space.getSpaceCredential` per account and space authority, counted on the authority's owner before the delegation token is claimed, keyed by a hash of the pair so the console doesn't show them · with `--spaces` | 429 · the token stays unused |
 | `space-notify-in` | DID | 5 min | 1,000 | `space.notifyWrite` arriving from another host, per writer (each is a durable entry) · with `--spaces` | 429 · the writer's outbox retries |
 | `space-revoke` | DID | 1 h | 1000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per space authority (one point per jti not already revoked, each a write to the cluster-wide revocations object · a call naming only revoked ones costs nothing) · with `--spaces` | 429 |
-| `space-import` | DID | 1 h | 100 | `vlpds.space.importRepo` per account, spent before the body is read (an account also runs 2 at once and a node 8: `InvalidRequest` and 503 `Overloaded` past those) · with `--spaces` | 429 |
+| `space-import` | DID | 1 h | 100 | `vlpds.space.importRepo` per account, spent before the body is read (an account also runs 2 at once and a node up to 8, as its import budget allows: `InvalidRequest` and 503 `Overloaded` past those) · with `--spaces` | 429 |
 | `space-revoke-aud` | DID | 1 h | 2,000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per account here whose stake let them in (only those are stored), so one account and many authorities can't fill the revocations object · with `--spaces` | 429 |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
