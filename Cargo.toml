@@ -72,6 +72,8 @@ parking_lot = "0.12"
 lru = "0.18"
 base64 = "0.23"
 hmac = "0.13"
+# Spaces LtHash (src/space/lthash.rs): BLAKE3 in XOF mode, as the reference
+blake3 = "1"
 sha1 = "0.11"
 futures = "0.3"
 hdrhistogram = "7"

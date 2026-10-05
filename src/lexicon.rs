@@ -285,6 +285,64 @@ fn record_lexicon(nsid: &str, doc: J) -> Result<Lexicons, String> {
     Ok(Lexicons::resolved(&doc))
 }
 
+/// A space type declaration: a lexicon whose main def is `"type": "space"`,
+/// the consent unit of `space:` OAuth scopes (@atproto/lexicon `lexSpace`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpaceDecl {
+    pub name: String,
+    /// (language tag, name)
+    pub name_lang: Vec<(String, String)>,
+    pub description: Option<String>,
+    pub key: Option<String>,
+    pub collections: Vec<String>,
+}
+
+pub fn space_declaration(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
+    if doc["lexicon"].as_i64() != Some(1) || doc["id"] != nsid {
+        return Err(format!("Invalid Lexicon document for {nsid}"));
+    }
+    let defs = doc["defs"].as_object().ok_or_else(|| format!("Invalid Lexicon document for {nsid}"))?;
+    const MAIN_ONLY: &[&str] = &["record", "permission-set", "space", "procedure", "query", "subscription"];
+    if defs.iter().any(|(k, d)| k != "main" && d["type"].as_str().is_some_and(|t| MAIN_ONLY.contains(&t))) {
+        return Err(
+            "Records, permission sets, spaces, procedures, queries, and subscriptions must be the main definition."
+                .into(),
+        );
+    }
+    let main = defs
+        .get("main")
+        .filter(|m| m["type"] == "space")
+        .ok_or_else(|| format!("Lexicon {nsid} is not a space type"))?;
+    let bad = |field: &str| format!("Invalid space type {nsid}: {field}");
+    let opt_str = |k: &str| match main.get(k) {
+        None => Ok(None),
+        Some(J::String(v)) => Ok(Some(v.clone())),
+        Some(_) => Err(bad(k)),
+    };
+    // zod's string length: UTF-16 code units
+    let name = main["name"]
+        .as_str()
+        .filter(|n| (1..=64).contains(&n.encode_utf16().count()))
+        .ok_or_else(|| bad("name"))?
+        .to_string();
+    let name_lang = match main.get("name:lang") {
+        None => Vec::new(),
+        Some(J::Object(m)) => m
+            .iter()
+            .map(|(lang, v)| match v.as_str() {
+                Some(v) if valid_language(lang) => Ok((lang.clone(), v.to_string())),
+                _ => Err(bad("name:lang")),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err(bad("name:lang")),
+    };
+    let collections = main["collections"]
+        .as_array()
+        .and_then(|c| c.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>())
+        .ok_or_else(|| bad("collections"))?;
+    Ok(SpaceDecl { name, name_lang, description: opt_str("description")?, key: opt_str("key")?, collections })
+}
+
 /// Lexicon documents compiled into an arena of defs with refs resolved to
 /// indexes and message fragments precomputed, so validation never touches
 /// the JSON. A resolved document is a set of its own whose refs to other
@@ -390,6 +448,7 @@ enum Format {
     Language,
     Tid,
     RecordKey,
+    SpaceRef,
 }
 
 struct Int {
@@ -534,6 +593,7 @@ impl Lexicons {
                     Some("language") => Some(Format::Language),
                     Some("tid") => Some(Format::Tid),
                     Some("record-key") => Some(Format::RecordKey),
+                    Some("space-ref") => Some(Format::SpaceRef),
                     _ => None,
                 };
                 Schema::String(Box::new(Str {
@@ -925,7 +985,7 @@ impl<'a> Validator<'a> {
                     (valid_datetime(s), "must be an valid atproto datetime (both RFC-3339 and ISO-8601)")
                 }
                 Format::Uri => (valid_uri(s), "must be a uri"),
-                Format::AtUri => (valid_at_uri(s), "must be a valid at-uri"),
+                Format::AtUri => (valid_at_uri(s) || space_at_uri(s).is_some(), "must be a valid at-uri"),
                 Format::Did => (syntax::valid_did(s), "must be a valid did"),
                 Format::Handle => (syntax::valid_handle(s), "must be a valid handle"),
                 Format::AtIdentifier => {
@@ -940,6 +1000,7 @@ impl<'a> Validator<'a> {
                 Format::Language => (valid_language(s), "must be a well-formed BCP 47 language tag"),
                 Format::Tid => (valid_tid(s), "must be a valid TID"),
                 Format::RecordKey => (syntax::valid_rkey(s), "must be a valid Record Key"),
+                Format::SpaceRef => (space_at_uri(s).is_some_and(|u| u.record.is_none()), "must be a valid space ref"),
             };
             if !ok {
                 return Err(self.err(msg));
@@ -1068,7 +1129,9 @@ pub fn valid_uri(s: &str) -> bool {
 
 /// Strict AT URI: `at://AUTHORITY[/NSID[/RKEY]][#/JSON-POINTER]`, as
 /// @atproto/syntax `isAtUriString` checks it (the fragment is a `/`-rooted
-/// JSON pointer in its URI charset, with valid percent-encoding).
+/// JSON pointer in its URI charset, with valid percent-encoding). Public
+/// URIs only: backlink derivation's verdicts are frozen (segment.rs), so
+/// the lexicon `at-uri` format adds [`space_at_uri`] next to it.
 pub fn valid_at_uri(s: &str) -> bool {
     if s.len() > 8192 || !s.is_ascii() {
         return false;
@@ -1092,6 +1155,20 @@ pub fn valid_at_uri(s: &str) -> bool {
         (Some(c), Some(r), None) => syntax::valid_nsid(c) && syntax::valid_rkey(r),
         _ => false,
     }
+}
+
+/// A strict space AT URI, fragment allowed (@atproto/syntax
+/// `isSpaceAtUriString`). No string is both this and a [`valid_at_uri`]:
+/// `space` isn't an NSID.
+pub fn space_at_uri(s: &str) -> Option<syntax::SpaceUri<'_>> {
+    if s.len() > 8192 || !s.is_ascii() {
+        return None;
+    }
+    let uri = match s.split_once('#') {
+        Some((uri, frag)) => valid_at_uri_fragment(frag).then_some(uri)?,
+        None => s,
+    };
+    syntax::parse_space_uri(uri)
 }
 
 fn valid_at_uri_fragment(f: &str) -> bool {
@@ -1395,5 +1472,169 @@ mod tests {
             validate_output("com.atproto.repo.getRecord", &serde_json::json!({"value": {}})),
             Err("Output must have the property \"uri\"".into())
         );
+    }
+
+    /// The "space URIs" cases of @atproto/syntax tests/aturi-string.test.ts
+    /// (atproto 5b95b2f2). Its lenient-only cases (`testLoose`) are invalid
+    /// here: lexicon formats are strict.
+    #[test]
+    fn space_at_uris() {
+        let long_skey = format!("at://did:plc:asdf123/space/com.example.group/{}", "x".repeat(513));
+        for ok in [
+            "at://did:plc:asdf123/space/com.example.group/default",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post/abc123",
+            "at://did:plc:asdf123/space/com.example.group/self",
+            "at://did:plc:asdf123/space/com.example.group/3jui7kd54zh2y",
+            "at://did:plc:asdf123/space/com.example.group/a.b-c_d~e:f",
+            "at://did:plc:asdf123/space/com.example.group/default#/frag",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post/abc#/frag",
+            "at://did:web:example.com/space/com.example.group/default",
+        ] {
+            assert!(space_at_uri(ok).is_some(), "{ok}");
+            assert!(!valid_at_uri(ok), "{ok}");
+        }
+        for bad in [
+            "at://did:plc:asdf123/space/short/default",
+            "at://not a did/space/com.example.group/default",
+            "at://user.bsky.social/space/com.example.group/default",
+            "at://did:plc:asdf123/space/com.example.group/default/user.bsky.social/com.atproto.feed.post/abc123",
+            "at://did:plc:asdf123/space/com.example.group/.",
+            "at://did:plc:asdf123/space/com.example.group/..",
+            &long_skey,
+            "at://did:plc:asdf123/space/com.example.group",
+            "at://did:plc:asdf123/space",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/short/abc123",
+            "at://did:plc:asdf123/space/com.example.group/default#",
+            "at://did:plc:asdf123/space/com.example.group/default#/a#/b",
+            // testLoose: strict rejects these
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post/%%%",
+            "at://did:plc:asdf123/space/com.example.group/default?foo=bar",
+            "at://did:plc:asdf123/space/com.example.group/default/",
+            // the marker is case-sensitive, and the tail is all or nothing
+            "at://did:plc:asdf123/SPACE/com.example.group/default",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post",
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post/abc/x",
+            "at://did:plc:asdf123/spacey/com.example.group/default",
+            "at://did:plc:asdf123/space//default",
+            "AT://did:plc:asdf123/space/com.example.group/default",
+            "at://did:plc:asdf123/space/com.example.group/défault",
+        ] {
+            assert!(space_at_uri(bad).is_none(), "{bad}");
+            assert!(!valid_at_uri(bad), "{bad}");
+        }
+        let u = space_at_uri(
+            "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/com.atproto.feed.post/abc123#/x",
+        )
+        .unwrap();
+        assert_eq!(
+            u,
+            syntax::SpaceUri {
+                authority: "did:plc:asdf123",
+                space_type: "com.example.group",
+                skey: "default",
+                record: Some(("did:plc:user1", "com.atproto.feed.post", "abc123")),
+            }
+        );
+        // public URIs are unchanged
+        assert!(space_at_uri("at://did:plc:asdf123/com.atproto.feed.post/abc").is_none());
+        assert!(valid_at_uri("at://did:plc:asdf123/com.atproto.feed.post/abc"));
+    }
+
+    /// @atproto/lexicon tests/general.test.ts "Applies space-ref formatting
+    /// constraint", plus the `at-uri` format taking both kinds of URI.
+    #[test]
+    fn space_formats() {
+        let doc = Lexicons::resolved(&serde_json::json!({
+            "lexicon": 1, "id": "com.example.spaceRef",
+            "defs": {"main": {"type": "record", "key": "any", "record": {"type": "object", "properties": {
+                "space": {"type": "string", "format": "space-ref"},
+                "uri": {"type": "string", "format": "at-uri"}
+            }}}}
+        }));
+        let check = |field: &str, v: &str| {
+            let rec = Value::from_json(&serde_json::json!({"$type": "com.example.spaceRef", field: v})).unwrap();
+            validate_record("com.example.spaceRef", "self", &rec, None, Some(&doc))
+        };
+        let space = "at://did:plc:12345678abcdefghijklmnop/space/com.example.group/default";
+        let in_space = "at://did:plc:12345678abcdefghijklmnop/space/com.example.group/default/did:plc:12345678abcdefghijklmnoq/com.example.test/self";
+        assert_eq!(check("space", space), Ok(Some("valid")));
+        assert_eq!(check("space", &format!("{space}#/frag")), Ok(Some("valid")));
+        for bad in [
+            in_space,
+            "at://did:plc:12345678abcdefghijklmnop/com.example.test/self",
+            "at://test.bsky.social/space/com.example.group/default",
+            "not a space ref",
+        ] {
+            assert_eq!(
+                check("space", bad),
+                Err("Invalid com.example.spaceRef record: record/space must be a valid space ref".into()),
+                "{bad}"
+            );
+        }
+        for ok in [space, in_space, "at://did:plc:12345678abcdefghijklmnop/com.example.test/self"] {
+            assert_eq!(check("uri", ok), Ok(Some("valid")), "{ok}");
+        }
+        assert!(check("uri", "at://did:plc:x/space/com.example.group").is_err());
+    }
+
+    /// A public record pointing into a space validates (a like's strongRef
+    /// is an `at-uri`), while backlink derivation still ignores it: its
+    /// verdicts are frozen (segment.rs).
+    #[test]
+    fn public_record_referencing_a_space() {
+        let uri = "at://did:plc:asdf123/space/com.example.group/default/did:plc:user1/app.bsky.feed.post/3jui7kd54zh2y";
+        let like = serde_json::json!({
+            "$type": "app.bsky.feed.like", "createdAt": "2026-10-01T00:00:00Z",
+            "subject": {"uri": uri, "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm"}
+        });
+        let rec = Value::from_json(&like).unwrap();
+        assert_eq!(validate_record("app.bsky.feed.like", "3jui7kd54zh2y", &rec, None, None), Ok(Some("valid")));
+        assert_eq!(crate::backlinks::link("app.bsky.feed.like", &rec.to_cbor()), None);
+    }
+
+    #[test]
+    fn space_declarations() {
+        let decl = serde_json::json!({
+            "lexicon": 1, "id": "com.example.group",
+            "defs": {"main": {"type": "space", "name": "Group", "name:lang": {"pt-BR": "Grupo"},
+                "key": "any", "description": "a group", "collections": ["com.example.post", "com.example.like"]}}
+        });
+        assert_eq!(
+            space_declaration("com.example.group", &decl),
+            Ok(SpaceDecl {
+                name: "Group".into(),
+                name_lang: vec![("pt-BR".into(), "Grupo".into())],
+                description: Some("a group".into()),
+                key: Some("any".into()),
+                collections: vec!["com.example.post".into(), "com.example.like".into()],
+            })
+        );
+        let with = |f: &dyn Fn(&mut J)| {
+            let mut d = decl.clone();
+            f(&mut d);
+            space_declaration("com.example.group", &d)
+        };
+        assert!(with(&|_| {}).is_ok());
+        assert!(with(&|d| d["defs"]["main"]["name"] = "".into()).is_err());
+        assert!(with(&|d| d["defs"]["main"]["name"] = "x".repeat(65).into()).is_err());
+        assert!(with(&|d| d["defs"]["main"]["name"] = "\u{1F600}".repeat(32).into()).is_ok());
+        assert!(with(&|d| d["defs"]["main"]["name"] = "\u{1F600}".repeat(33).into()).is_err());
+        assert!(with(&|d| d["defs"]["main"]["collections"] = serde_json::json!([1])).is_err());
+        assert!(with(&|d| d["defs"]["main"].as_object_mut().unwrap().remove("collections").map(drop).unwrap()).is_err());
+        assert!(with(&|d| d["defs"]["main"]["name:lang"] = serde_json::json!({"not a tag": "x"})).is_err());
+        assert!(with(&|d| d["defs"]["main"]["key"] = 1.into()).is_err());
+        assert!(with(&|d| d["defs"]["main"]["type"] = "record".into()).is_err());
+        assert!(with(&|d| d["id"] = "com.example.other".into()).is_err());
+        assert_eq!(
+            with(&|d| d["defs"]["other"] = serde_json::json!({"type": "space", "name": "x", "collections": []})),
+            Err(
+                "Records, permission sets, spaces, procedures, queries, and subscriptions must be the main definition."
+                    .into()
+            )
+        );
+        // a declaration is no data schema
+        let doc = Lexicons::resolved(&decl);
+        assert!(doc.records.is_empty() && doc.methods.is_empty());
     }
 }

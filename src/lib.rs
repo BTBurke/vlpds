@@ -54,6 +54,7 @@ pub mod secrets;
 pub mod segment;
 pub mod server;
 pub mod slots;
+pub mod space;
 pub mod state;
 pub mod stats;
 pub mod store;

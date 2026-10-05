@@ -653,6 +653,12 @@ struct Args {
     /// validate those records too, instead of reporting them "unknown".
     #[arg(long, env = "VLPDS_RESOLVE_LEXICONS")]
     resolve_lexicons: bool,
+    /// AT Protocol Spaces (permissioned data; the reference's alpha, which
+    /// changes weekly). No methods are served yet: com.atproto.space.* and
+    /// com.atproto.simplespace.* answer 501 MethodNotImplemented here
+    /// rather than being proxied.
+    #[arg(long, env = "VLPDS_SPACES")]
+    spaces: bool,
     /// Largest CAR importRepo accepts, in MiB.
     #[arg(long, env = "VLPDS_MAX_IMPORT_MB", default_value_t = 1024)]
     max_import_mb: usize,
@@ -1438,6 +1444,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         well_known_fetcher: None,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
+        spaces: args.spaces,
         max_import_bytes: args.max_import_mb << 20,
         import_memory_bytes: args.import_memory_mb.map(|m| m << 20),
         import_wait: vlpds::xrpc::import_budget::ADMIT_WAIT,
