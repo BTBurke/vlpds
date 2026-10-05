@@ -123,6 +123,7 @@ mod ref_sync;
 mod reshard;
 mod revocation_gc;
 mod revocation_races;
+mod scheduled_deletion;
 mod secrets_at_rest;
 mod segment_bytes;
 mod segment_compression;

@@ -47,7 +47,9 @@ export function Danger() {
             desc={
               d.active
                 ? 'Your profile and posts disappear from apps until you reactivate. Nothing is deleted.'
-                : 'Your account is offline. Reactivating publishes it to the network again.'
+                : d.deletionScheduledAt
+                  ? 'Your account is offline and will be deleted on the date below. Reactivating cancels the deletion and publishes it to the network again.'
+                  : 'Your account is offline. Reactivating publishes it to the network again.'
             }
           >
             <div className="row" style={{ marginBottom: 12 }}>

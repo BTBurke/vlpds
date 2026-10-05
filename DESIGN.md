@@ -243,6 +243,10 @@ swappable.
   - `G/{did}` → `ImportState`: a staged import (generation, driver nonce,
     reserved rev) and the generations left to sweep; absent otherwise (see
     "Staged imports").
+  - `D/{did}` → the account's `deleteAfter`, put or deleted with every
+    account row its worker writes and left by the repo delete, so the
+    owner's scheduled-deletion sweep finds due accounts (and unfinished
+    deletions) with one family scan (`src/xrpc/scheduled_deletion.rs`).
   - `T/` → the slot's account totals (keyed by slot alone; see "Account
     totals"); `T/{seq}` → a delta row written while the shard's totals
     were loading.

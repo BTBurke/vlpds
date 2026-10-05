@@ -187,6 +187,9 @@ pub struct AccountReq {
 /// snapshots; preconditions belong inside it. `Ok(false)` = nothing to do.
 pub type AccountMutation = Box<dyn FnOnce(&mut state::Account) -> Result<bool, WriteError> + Send>;
 
+/// Checked against the account as the op applies: Err refuses the op.
+pub type AccountCheck = Box<dyn FnOnce(&state::Account) -> Result<(), WriteError> + Send>;
+
 pub enum AccountOp {
     /// A changed handle moves the handle index. `account_event` emits
     /// #account with the account's status (None = active).
@@ -209,7 +212,11 @@ pub enum AccountOp {
         stale_keys: Vec<Bytes>,
         tree: Option<Tree>,
     },
-    Delete,
+    /// `only_if`: refused unless the account still passes it (the
+    /// scheduled-deletion sweep, racing a reactivation).
+    Delete {
+        only_if: Option<AccountCheck>,
+    },
     /// Emits #account, #identity and #sync of the current commit, as the
     /// reference's sequenceAccountActivation.
     Activate {
@@ -1368,7 +1375,9 @@ impl Need {
                         n.keys.push(p.into_bytes());
                     }
                 }
-                Queued::Account(AccountReq { op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete, .. }) => {
+                Queued::Account(AccountReq {
+                    op: AccountOp::ReplaceRepo { .. } | AccountOp::Delete { .. }, ..
+                }) => {
                     n.all = true;
                     n.blobs = true;
                     n.bl_all = true;
@@ -2869,12 +2878,21 @@ fn account_mutation(did: &str, account: &state::Account) -> anyhow::Result<Mutat
     Ok(put(state::account_key(did), Bytes::from(serde_json::to_vec(account)?)))
 }
 
+/// `D/{did}` as the account says. A deletion leaves the row: the sweep
+/// finds the deletion's leftovers through it.
+fn delete_after_mutation(did: &str, account: &state::Account) -> Mutation {
+    match account.extra.get("deleteAfter").and_then(|v| v.as_str()) {
+        Some(t) => put(state::delete_after_key(did), Bytes::copy_from_slice(t.as_bytes())),
+        None => del(state::delete_after_key(did)),
+    }
+}
+
 fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn Source) -> anyhow::Result<()> {
     let time = events::now_rfc3339();
     let mut frames = Vec::new();
     let mut muts = Vec::new();
     let before = crate::totals::RepoKey::of(&st.account, &st.head);
-    let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete);
+    let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete { .. });
     let new_repo = whole_tree || matches!(req.op, AccountOp::Import(ImportStep::Commit { .. }));
     let gen = st.gen();
     // a re-signed head (KeyStep::Finish) extends read-after-write's log at the ack
@@ -3003,7 +3021,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             }
             muts.push(put(state::head_key(&st.did), st.head.encode()));
         }
-        AccountOp::Delete => {
+        AccountOp::Delete { only_if } => {
+            if let Some(Err(e)) = only_if.map(|check| check(&st.account)) {
+                return refuse(req.reply, e);
+            }
             let old_nodes = clear_repo_mutations(st, &mut muts, src)?;
             clear_backlinks(st, &mut muts, &done)?;
             for c in old_nodes.keys() {
@@ -3027,6 +3048,10 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
             KeyOutcome::Refused(e) => return refuse(req.reply, e),
             KeyOutcome::Written(c) => resigned = c,
         },
+    }
+    let account_key = state::account_key(&st.did);
+    if muts.iter().any(|m| m.key == account_key && m.val.is_some()) {
+        muts.push(delete_after_mutation(&st.did, &st.account));
     }
     let applied = whole_tree.then(|| track_inflight(st, None, done));
     let inner = head_ack(req.reply, st.head.clone());
@@ -3701,7 +3726,8 @@ mod tests {
         noop.await.unwrap().unwrap();
         // deleted: no snapshot of the old head over an empty tree
         let (reply, deleted) = oneshot::channel();
-        w.send(WorkerMsg::Account(AccountReq { did: did.clone(), op: AccountOp::Delete, reply })).unwrap();
+        w.send(WorkerMsg::Account(AccountReq { did: did.clone(), op: AccountOp::Delete { only_if: None }, reply }))
+            .unwrap();
         apply(&db, rx.recv().await.unwrap()).await;
         deleted.await.unwrap().unwrap();
         let (reply, snap) = oneshot::channel();

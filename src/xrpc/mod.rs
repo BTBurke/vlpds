@@ -25,6 +25,7 @@ pub mod private_rows;
 pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
+pub mod scheduled_deletion;
 mod server;
 pub mod staged_import;
 mod sync;

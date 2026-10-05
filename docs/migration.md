@@ -199,6 +199,11 @@ account page. Details: [Keys and security](keys-security.md#plc-rotation-key-and
   body: "In `checkAccountStatus` here, `activated` and `validDid` should be true, `indexedRecords` should be the record count, and `importedBlobs` should equal `expectedBlobs`. `vlpds admin check-repo <did>` should come back clean. The relay's `getRepoStatus?did=` should be active with this server's rev, the profile should load in the app, and the handle should resolve."
 ```
 
+The page deactivates the old account without a `deleteAfter`, so the old server keeps its copy
+until someone deletes it. When this server is the old one and a client does pass `deleteAfter`,
+vlpds deletes its copy once that date and a 3-day minimum hold have passed ([Scheduled
+deletion](operations/email-and-moderation.md#scheduled-deletion)).
+
 Moving back, or onward, is just another migration from this server. The account is a normal
 atproto account here, so `/migrate` on any server or `goat account migrate` can take it. Posts made
 here after the move aren't on the old server.

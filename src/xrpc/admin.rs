@@ -401,7 +401,10 @@ async fn account_view(app: &App, a: &Account) -> XResult<J> {
     if let Some(e) = &a.email {
         v["email"] = json!(e);
     }
-    for k in ["emailConfirmedAt", "deactivatedAt"] {
+    if let Some(t) = super::scheduled_deletion::scheduled_at(app, a) {
+        v["deletionScheduledAt"] = json!(t);
+    }
+    for k in ["emailConfirmedAt", "deactivatedAt", "deleteAfter"] {
         if let Some(s) = a.extra.get(k).and_then(|v| v.as_str()) {
             v[k] = json!(s);
         }

@@ -1,5 +1,5 @@
 import { CopyText, ErrorNotice, JsonView, Loading, PageHead, Panel, Status } from '../../components/ui'
-import { fmtNum } from '../../lib/format'
+import { fmtNum, fmtTime } from '../../lib/format'
 import { useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, getSession, setSession } from '../../lib/xrpc'
@@ -11,6 +11,7 @@ export type SessionInfo = {
   emailConfirmed?: boolean
   active: boolean
   status?: string
+  deletionScheduledAt?: string
   didDoc?: any
 }
 
@@ -23,9 +24,14 @@ export async function loadSession(): Promise<SessionInfo> {
   return info
 }
 
-export function accountStatus(info: { active: boolean; status?: string }) {
+export function accountStatus(info: { active: boolean; status?: string; deletionScheduledAt?: string }) {
   if (info.active) return <Status kind="ok">Active</Status>
-  if (info.status === 'deactivated') return <Status kind="warn">Deactivated</Status>
+  if (info.status === 'deactivated')
+    return info.deletionScheduledAt ? (
+      <Status kind="bad">Deactivated, scheduled for deletion on {fmtTime(info.deletionScheduledAt)}</Status>
+    ) : (
+      <Status kind="warn">Deactivated</Status>
+    )
   return <Status kind="bad">{info.status ? info.status[0].toUpperCase() + info.status.slice(1) : 'Inactive'}</Status>
 }
 

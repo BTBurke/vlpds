@@ -515,7 +515,7 @@ async fn deleted_account_generations_are_swept() {
     };
     wait_until("paused", Duration::from_secs(20), || paused.load(Ordering::SeqCst)).await;
     let staged = import_state(&s, &a.did).await.unwrap().staging.unwrap().gen;
-    s.app.account_op(&a.did, vlpds::worker::AccountOp::Delete).await.ok().unwrap();
+    s.app.account_op(&a.did, vlpds::worker::AccountOp::Delete { only_if: None }).await.ok().unwrap();
     go.store(true, Ordering::SeqCst);
     assert!(!imp.await.unwrap().is_ok());
     si::set_crash_hook(&a.did, None);

@@ -94,6 +94,9 @@ pub struct Config {
     pub blob_uploads_per_day: u32,
     /// How long a taken-down blob's bytes stay in quarantine.
     pub blob_quarantine: Duration,
+    /// Deactivated accounts with a `deleteAfter` are deleted once it has
+    /// passed and they have been deactivated at least this long. None: kept.
+    pub delete_after_min_hold: Option<Duration>,
     pub plc_url: String,
     /// Default: registration off, which only dev mode accepts.
     pub plc: crate::plc::PlcConfig,
@@ -156,6 +159,7 @@ pub const DEV_S3_CREDENTIAL: &str = "minioadmin";
 pub const DEFAULT_BLOB_QUOTA_GB: u64 = 25;
 pub const DEFAULT_BLOB_UPLOADS_PER_DAY: u32 = 500;
 pub const DEFAULT_BLOB_QUARANTINE_DAYS: u64 = 30;
+pub const DEFAULT_DELETE_AFTER_MIN_HOLD_DAYS: u64 = 3;
 pub const DEV_JWT_SECRET: &str = "dev-secret-change-me";
 pub const DEV_ADMIN_TOKEN: &str = "dev-admin-token";
 pub const DEV_INTERNAL_TOKEN: &str = "dev-internal-token";
@@ -284,6 +288,7 @@ impl Default for Config {
             blob_quota_bytes: DEFAULT_BLOB_QUOTA_GB * 1_000_000_000,
             blob_uploads_per_day: DEFAULT_BLOB_UPLOADS_PER_DAY,
             blob_quarantine: Duration::from_secs(DEFAULT_BLOB_QUARANTINE_DAYS * 86_400),
+            delete_after_min_hold: Some(Duration::from_secs(DEFAULT_DELETE_AFTER_MIN_HOLD_DAYS * 86_400)),
             plc_url: crate::plc::DEFAULT_PLC_URL.into(),
             plc: Default::default(),
             invite_required: false,
