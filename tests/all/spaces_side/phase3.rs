@@ -101,10 +101,6 @@ pub struct VerifiedRepo {
 }
 
 impl VerifiedRepo {
-    pub fn paths(&self) -> Vec<String> {
-        self.index.iter().map(|(p, _)| p.clone()).collect()
-    }
-
     pub fn set(&self) -> BTreeMap<String, String> {
         self.index.iter().map(|(p, c)| (p.clone(), c.to_string())).collect()
     }
@@ -503,9 +499,4 @@ pub async fn listed(base: &str, cred: &Cred, space: &str, repo: &str) -> BTreeMa
 
 pub fn set_hash(set: &BTreeMap<String, String>) -> Vec<u8> {
     digest(set).to_vec()
-}
-
-/// A JSON $bytes field.
-pub fn json_bytes_field(v: &J) -> Vec<u8> {
-    super::fuzz::bytes_field(v)
 }

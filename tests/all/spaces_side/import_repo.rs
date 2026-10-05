@@ -101,7 +101,6 @@ pub(super) async fn oauth_client(s: &TestServer, did: &str, handle: &str, jwt: &
 /// DID moves), given the old host's service auth for it.
 pub(super) struct Arrived {
     pub did: String,
-    pub handle: String,
     /// The createAccount session (legacy auth: public methods only).
     pub session: Auth,
     /// The account's OAuth grant on the new host.
@@ -117,7 +116,7 @@ pub(super) async fn arrive(new: &TestServer, did: &str, service_auth: String) ->
     let st = new.xrpc.get("com.atproto.server.checkAccountStatus", &[], &Auth::Bearer(jwt.clone())).await.ok();
     assert_eq!(st["activated"], json!(false), "{st}");
     let oauth = oauth_client(new, did, &handle, &jwt, FULL_SCOPE).await;
-    Arrived { did: did.into(), handle, session: Auth::Bearer(jwt), oauth }
+    Arrived { did: did.into(), session: Auth::Bearer(jwt), oauth }
 }
 
 /// Points the DID at `new` with the key it recommends, and activates there.
@@ -412,7 +411,7 @@ async fn vlpds_export_imports_on_another_vlpds() {
     let before = head(&h.bob, &h.space).await.unwrap();
     let cred_a = h.carol_cred().await;
     let records_a = listed(&h.a.url, &cred_a, &h.space, &h.bob.did).await;
-    assert_eq!(records_a.len(), 5);
+    assert_eq!(records_a.len(), 6);
 
     let (arrived, exported) = move_bob(&h, &blob).await;
     let moved = &arrived.oauth;
