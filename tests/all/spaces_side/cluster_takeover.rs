@@ -292,6 +292,10 @@ async fn takeover_sends_each_registration_one_catch_up_forward() {
         let b = &late[0].body;
         assert_eq!(b["space"], json!(local), "syncer {i}: {b}");
         assert_eq!(b["spaceRev"], json!(head), "syncer {i}: the current spaceRev: {b}");
-        assert_eq!((b["repo"].clone(), b["repoRev"].clone()), (row["did"].clone(), row["repoRev"].clone()), "syncer {i}: the head's repo and rev: {b}");
+        assert_eq!(
+            (b["repo"].clone(), b["repoRev"].clone()),
+            (row["did"].clone(), row["repoRev"].clone()),
+            "syncer {i}: the head's repo and rev: {b}"
+        );
     }
 }

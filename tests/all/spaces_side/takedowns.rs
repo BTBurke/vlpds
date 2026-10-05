@@ -71,7 +71,8 @@ async fn record_takedown_hides_it_from_records_and_op_values() {
     t.bob_writes("kept", "still here").await;
     let cred = t.net.credential_for(&t.carol, &t.space).await;
     let base = t.net.pds[1].url.clone();
-    let q = [("space", t.space.as_str()), ("repo", t.bob.did.as_str()), ("collection", TEST_COLLECTION), ("rkey", "gone")];
+    let q =
+        [("space", t.space.as_str()), ("repo", t.bob.did.as_str()), ("collection", TEST_COLLECTION), ("rkey", "gone")];
     cred.get(&base, "com.atproto.space.getRecord", &q).await.ok();
 
     t.takedown_bobs("gone", &cid, true).await;
@@ -108,11 +109,14 @@ async fn record_takedown_hides_blobs_only_it_names() {
     let base = t.net.pds[1].url.clone();
     let get = |cid: String| {
         let (cred, base, space, did) = (&cred, base.clone(), t.space.clone(), t.bob.did.clone());
-        async move { cred.get(&base, "com.atproto.space.getBlob", &[("space", &space), ("repo", &did), ("cid", &cid)]).await }
+        async move {
+            cred.get(&base, "com.atproto.space.getBlob", &[("space", &space), ("repo", &did), ("cid", &cid)]).await
+        }
     };
     let list = || async {
         let r = cred.get(&base, "com.atproto.space.listBlobs", &[("space", &t.space), ("repo", &t.bob.did)]).await;
-        let mut v: Vec<String> = r.ok()["cids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().into()).collect();
+        let mut v: Vec<String> =
+            r.ok()["cids"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().into()).collect();
         v.sort();
         v
     };
@@ -183,7 +187,10 @@ async fn record_takedown_serves_a_consistent_signed_view() {
     assert!(!String::from_utf8_lossy(&r.body).contains("zqoptiontext"), "the record's value is in the CAR");
 
     let ops = cred.get(&base, "com.atproto.space.listRepoOps", &[q[0], q[1], ("limit", "100")]).await.ok();
-    assert!(commit_matches(&replay(ops["ops"].as_array().unwrap()), &ops["commit"]), "listRepoOps from the start: {ops}");
+    assert!(
+        commit_matches(&replay(ops["ops"].as_array().unwrap()), &ops["commit"]),
+        "listRepoOps from the start: {ops}"
+    );
     assert!(!ops.to_string().contains("zqoptiontext"));
     let noop = cred.get(&base, "com.atproto.space.listRepoOps", &[q[0], q[1], ("since", &head_rev)]).await.ok();
     assert_eq!(noop["ops"], json!([]));
@@ -221,9 +228,13 @@ async fn account_takedown_refuses_every_read_path() {
     let t = td().await;
     let blob = upload_blob(&t.bob, b"\x89PNG account takedown").await;
     let (cid, bc) = (
-        write(&t.bob, &t.space, W::new().rkey("r").record(json!({"$type": TEST_COLLECTION, "text": "x", "image": blob})))
-            .await
-            .ok()["cid"]
+        write(
+            &t.bob,
+            &t.space,
+            W::new().rkey("r").record(json!({"$type": TEST_COLLECTION, "text": "x", "image": blob})),
+        )
+        .await
+        .ok()["cid"]
             .clone(),
         blob_cid(&blob),
     );
@@ -232,7 +243,10 @@ async fn account_takedown_refuses_every_read_path() {
     let base = t.net.pds[1].url.clone();
     let (sp, did) = (t.space.as_str(), t.bob.did.as_str());
     let reads: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        ("com.atproto.space.getRecord", vec![("space", sp), ("repo", did), ("collection", TEST_COLLECTION), ("rkey", "r")]),
+        (
+            "com.atproto.space.getRecord",
+            vec![("space", sp), ("repo", did), ("collection", TEST_COLLECTION), ("rkey", "r")],
+        ),
         ("com.atproto.space.listRecords", vec![("space", sp), ("repo", did)]),
         ("com.atproto.space.listRepoOps", vec![("space", sp), ("repo", did)]),
         ("com.atproto.space.getLatestCommit", vec![("space", sp), ("repo", did)]),

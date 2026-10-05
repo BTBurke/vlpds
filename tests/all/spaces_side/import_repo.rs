@@ -251,8 +251,8 @@ async fn reference_export_imports_mid_migration() {
             "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": "http://127.0.0.1:9"}],
         }),
     );
-    let sa = vlpds::auth::service_auth_jwt(&f.key, &f.did, &new_did, Some("com.atproto.server.createAccount"), 60)
-        .unwrap();
+    let sa =
+        vlpds::auth::service_auth_jwt(&f.key, &f.did, &new_did, Some("com.atproto.server.createAccount"), 60).unwrap();
     let a = arrive(&new, &f.did, sa).await;
 
     let r = import_repo(&a.oauth, &f.space, EXPORT_CAR).await;
@@ -279,7 +279,10 @@ async fn reference_export_imports_mid_migration() {
     let mine = verify_repo_car(&r.body, &f.space, &f.did, &did_key(&new, &f.did).await, true)
         .unwrap_or_else(|e| panic!("vlpds's getRepo after the import doesn't verify: {e}"));
     let theirs = verify_repo_car(EXPORT_CAR, &f.space, &f.did, &f.key.did_key(), true).unwrap();
-    assert_eq!((mine.commit.rev.clone(), mine.commit.hash.clone()), (theirs.commit.rev.clone(), theirs.commit.hash.clone()));
+    assert_eq!(
+        (mine.commit.rev.clone(), mine.commit.hash.clone()),
+        (theirs.commit.rev.clone(), theirs.commit.hash.clone())
+    );
     assert_eq!(mine.index_cid, theirs.index_cid, "the same index block");
     assert_eq!(mine.records, theirs.records, "the same record blocks, in the same order");
     let b = dpop_raw(
@@ -301,7 +304,8 @@ async fn reference_export_imports_mid_migration() {
     let (rev, _) = head(&a.oauth, &f.space).await.unwrap();
     assert!(rev > f.rev, "a write after the import moves past its rev: {rev} vs {}", f.rev);
     assert!(w["uri"].as_str().unwrap().ends_with("/after-import"), "{w}");
-    let ops = a.oauth
+    let ops = a
+        .oauth
         .get("com.atproto.space.listRepoOps", &[("space", &f.space), ("repo", &f.did), ("since", &f.rev)])
         .await
         .ok();
@@ -391,7 +395,8 @@ pub(super) async fn move_bob(h: &TwoHosts, blob: &(String, Vec<u8>)) -> (Arrived
     assert_eq!(out["records"], json!(exported.index.len()), "{out}");
     assert_eq!(missing_blobs(&h.b, &arrived.session).await, vec![blob.0.clone()]);
     // the blob from the old host's space.getBlob, as the migrate page copies it
-    let got = h.bob.get("com.atproto.space.getBlob", &[("space", &h.space), ("repo", &h.bob.did), ("cid", &blob.0)]).await;
+    let got =
+        h.bob.get("com.atproto.space.getBlob", &[("space", &h.space), ("repo", &h.bob.did), ("cid", &blob.0)]).await;
     assert_eq!((got.status, got.body.to_vec()), (200, blob.1.clone()));
     h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", got.body.to_vec(), "image/png", &arrived.session).await.ok();
     assert!(missing_blobs(&h.b, &arrived.session).await.is_empty());
@@ -425,7 +430,10 @@ async fn vlpds_export_imports_on_another_vlpds() {
     assert_eq!(lb["cids"], json!([blob.0]), "{lb}");
 
     complete_move(&h.docs, &h.b, &arrived).await;
-    h.a.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &Auth::Bearer(h.bob.session_jwt.clone())).await.ok();
+    h.a.xrpc
+        .post("com.atproto.server.deactivateAccount", &json!({}), &Auth::Bearer(h.bob.session_jwt.clone()))
+        .await
+        .ok();
     let r = get_repo_self(moved, &h.space).await;
     let served = verify_repo_car(&r.body, &h.space, &h.bob.did, &did_key(&h.b, &h.bob.did).await, true)
         .unwrap_or_else(|e| panic!("the new host's getRepo doesn't verify: {e}"));
@@ -436,7 +444,8 @@ async fn vlpds_export_imports_on_another_vlpds() {
     // carol's credential (from the authority on a) reads bob at b
     let cred = h.carol_cred().await;
     assert_eq!(listed(&h.b.url, &cred, &h.space, &h.bob.did).await, records_a);
-    let latest = cred.get(&h.b.url, "com.atproto.space.getLatestCommit", &[("space", &h.space), ("repo", &h.bob.did)]).await;
+    let latest =
+        cred.get(&h.b.url, "com.atproto.space.getLatestCommit", &[("space", &h.space), ("repo", &h.bob.did)]).await;
     assert_eq!(latest.ok()["commit"]["rev"], json!(before.0));
 
     // bob writes on b: the authority on a hears the newer rev
@@ -489,7 +498,9 @@ async fn one() -> One {
 }
 
 fn records(b: RepoBuilder, n: usize) -> RepoBuilder {
-    (0..n).fold(b, |b, i| b.record(TEST_COLLECTION, &format!("imp{i:04}"), record(TEST_COLLECTION, &format!("imported {i}"))))
+    (0..n).fold(b, |b, i| {
+        b.record(TEST_COLLECTION, &format!("imp{i:04}"), record(TEST_COLLECTION, &format!("imported {i}")))
+    })
 }
 
 async fn nothing_written(sc: &SpaceClient, space: &str, what: &str) {
@@ -541,7 +552,10 @@ async fn refuses_a_tampered_car() {
     assert!(verify_repo_car(&built.car(), &o.space, &o.bob.did, &dk, true).is_ok());
 
     let mut cases: Vec<(&str, Vec<u8>)> = vec![
-        ("a record's bytes changed", built.car_with(|bl| bl[3].1 = record_block(&record(TEST_COLLECTION, "tampered")).1)),
+        (
+            "a record's bytes changed",
+            built.car_with(|bl| bl[3].1 = record_block(&record(TEST_COLLECTION, "tampered")).1),
+        ),
         ("a record block missing", built.car_with(|bl| drop(bl.remove(4)))),
         ("an extra block", built.car_with(|bl| bl.push(record_block(&record(TEST_COLLECTION, "extra"))))),
         ("records out of index order", built.car_with(|bl| bl.swap(2, 3))),
@@ -565,7 +579,10 @@ async fn refuses_a_tampered_car() {
     }));
 
     for (what, car) in &cases {
-        assert!(verify_repo_car(car, &o.space, &o.bob.did, &dk, true).is_err(), "{what}: the reference would accept it");
+        assert!(
+            verify_repo_car(car, &o.space, &o.bob.did, &dk, true).is_err(),
+            "{what}: the reference would accept it"
+        );
         let r = import_repo(&o.bob, &o.space, car).await;
         assert_eq!(r.status, 400, "{what}: {}", r.text());
         nothing_written(&o.bob, &o.space, what).await;
@@ -604,7 +621,9 @@ async fn refuses_a_bad_signature_or_mac() {
     rebound.commit_cid = Cid::dag_cbor(&rebound.commit_block);
 
     let dk = key.did_key();
-    for (what, built) in [("another key's signature", wrong_key), ("a broken MAC", bad_mac), ("a rebound hash", rebound)] {
+    for (what, built) in
+        [("another key's signature", wrong_key), ("a broken MAC", bad_mac), ("a rebound hash", rebound)]
+    {
         let car = built.car();
         assert!(verify_repo_car(&car, &o.space, &o.bob.did, &dk, true).is_err(), "{what}");
         let r = import_repo(&o.bob, &o.space, &car).await;
@@ -646,7 +665,8 @@ async fn refuses_a_repo_over_the_record_cap() {
     let rev = rev_ago(Duration::from_secs(60));
     let mut b = RepoBuilder::new(&o.space, &o.bob.did, &rev);
     for i in 0..100_001u32 {
-        b.records.insert(format!("{TEST_COLLECTION}/c{i:06}"), record_block(&json!({"$type": TEST_COLLECTION, "i": i})));
+        b.records
+            .insert(format!("{TEST_COLLECTION}/c{i:06}"), record_block(&json!({"$type": TEST_COLLECTION, "i": i})));
     }
     let car = b.build(&key).car();
     let r = import_repo(&o.bob, &o.space, &car).await;
@@ -712,8 +732,7 @@ async fn import_is_oauth_only() {
         assert!(r.status == 401 || r.status == 403, "{what}: {}", r.text());
         nothing_written(&o.bob, &o.space, what).await;
     }
-    let read_only =
-        regrant(&o.bob, &format!("space:{TEST_SPACE_TYPE}?authority=*&collection=*&action=read")).await;
+    let read_only = regrant(&o.bob, &format!("space:{TEST_SPACE_TYPE}?authority=*&collection=*&action=read")).await;
     let r = import_repo(&read_only, &o.space, &car).await;
     assert!((400..500).contains(&r.status), "a read-only grant: {}", r.text());
     nothing_written(&o.bob, &o.space, "a read-only grant").await;

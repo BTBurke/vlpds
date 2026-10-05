@@ -301,7 +301,14 @@ impl RepoBuilder {
         entries.sort_by(|a, b| vlpds::cbor::key_cmp(&a.0, &b.0));
         let ib = index_block(&entries);
         let records = entries.iter().map(|(p, c)| (p.clone(), *c, self.records[p].1.clone())).collect();
-        BuiltCar { commit_cid: Cid::dag_cbor(&cb), commit_block: cb, commit, index_cid: Cid::dag_cbor(&ib), index_block: ib, records }
+        BuiltCar {
+            commit_cid: Cid::dag_cbor(&cb),
+            commit_block: cb,
+            commit,
+            index_cid: Cid::dag_cbor(&ib),
+            index_block: ib,
+            records,
+        }
     }
 
     pub fn build(&self, key: &vlpds::crypto::Keypair) -> BuiltCar {

@@ -164,7 +164,8 @@ async fn non_operators_are_refused_and_unaudited() {
         .post("com.atproto.server.createAppPassword", &json!({"name": "ops", "privileged": true}), &session)
         .await
         .ok();
-    let app_pw = s.create_session(did, ap["password"].as_str().unwrap()).await.ok()["accessJwt"].as_str().unwrap().to_string();
+    let app_pw =
+        s.create_session(did, ap["password"].as_str().unwrap()).await.ok()["accessJwt"].as_str().unwrap().to_string();
     let other = vlpds::crypto::Keypair::generate();
     let not_mod = Auth::Bearer(
         vlpds::auth::service_auth_jwt(&other, &o.alice.did, &o.pds_did, Some(GET_SPACE_RECORD), 60).unwrap(),
@@ -213,7 +214,8 @@ async fn operator_reads_never_reach_public_surfaces() {
     s.sync_subs(&public, std::slice::from_mut(&mut live)).await;
 
     let mut read = 0;
-    for coll in p.sc.get("com.atproto.space.listRecords", &[("space", &p.space), ("repo", &a.did)]).await.ok()["records"]
+    for coll in p.sc.get("com.atproto.space.listRecords", &[("space", &p.space), ("repo", &a.did)]).await.ok()
+        ["records"]
         .as_array()
         .unwrap()
     {
@@ -225,7 +227,8 @@ async fn operator_reads_never_reach_public_surfaces() {
     }
     assert!(read >= 4, "{read} records read");
 
-    let marker = Cid::parse(s.post(&a, "public after the operator reads").await.commit_cid.as_deref().unwrap()).unwrap();
+    let marker =
+        Cid::parse(s.post(&a, "public after the operator reads").await.commit_cid.as_deref().unwrap()).unwrap();
     p.sentinels.assert_frames_clean("live subscribeRepos", &read_to_commit(&mut live, &marker).await);
     let mut replay = s.subscribe(Some(0)).await;
     p.sentinels.assert_frames_clean("cursor-0 backfill", &read_to_commit(&mut replay, &marker).await);

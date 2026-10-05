@@ -52,7 +52,8 @@ pub(super) async fn space_backup(sc: &SpaceClient) -> BTreeMap<String, Vec<u8>> 
         }
         assert_eq!(r.status, 200, "getRepo {space}: {}", r.text());
         files.insert(format!("{dir}/repo.car"), r.body.to_vec());
-        let lb = sc.get("com.atproto.space.listBlobs", &[("space", &space), ("repo", &sc.did), ("limit", "1000")]).await;
+        let lb =
+            sc.get("com.atproto.space.listBlobs", &[("space", &space), ("repo", &sc.did), ("limit", "1000")]).await;
         for cid in lb.ok()["cids"].as_array().cloned().unwrap_or_default() {
             let cid = cid.as_str().unwrap();
             let q = [("space", space.as_str()), ("repo", sc.did.as_str()), ("cid", cid)];
@@ -124,7 +125,10 @@ async fn backup_holds_each_space_repo_and_no_other_members_data() {
             .await
             .iter()
             .map(|r| {
-                (format!("{}/{}", r["collection"].as_str().unwrap(), r["rkey"].as_str().unwrap()), r["cid"].as_str().unwrap().to_string())
+                (
+                    format!("{}/{}", r["collection"].as_str().unwrap(), r["rkey"].as_str().unwrap()),
+                    r["cid"].as_str().unwrap().to_string(),
+                )
             })
             .collect();
         assert_eq!(v.set(), own, "{space}: exactly bob's records");
@@ -152,9 +156,13 @@ async fn backup_reads_only_the_accounts_own_repos() {
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 0).await);
     let space = net.create_space(&alice, SpaceOpts { members: &[&bob], ..Default::default() }).await;
     let blob = upload_blob(&alice, b"\x89PNG alice's").await;
-    let r = write(&alice, &space, W::new().rkey("a").record(json!({"$type": TEST_COLLECTION, "text": "zqalicesown", "image": blob})))
-        .await
-        .ok();
+    let r = write(
+        &alice,
+        &space,
+        W::new().rkey("a").record(json!({"$type": TEST_COLLECTION, "text": "zqalicesown", "image": blob})),
+    )
+    .await
+    .ok();
     assert!(r["cid"].is_string());
     let bc = blob_cid(&blob);
     let (sp, did) = (space.as_str(), alice.did.as_str());
@@ -162,7 +170,10 @@ async fn backup_reads_only_the_accounts_own_repos() {
     for (nsid, q) in [
         ("com.atproto.space.getRepo", vec![("space", sp), ("repo", did)]),
         ("com.atproto.space.listRecords", vec![("space", sp), ("repo", did)]),
-        ("com.atproto.space.getRecord", vec![("space", sp), ("repo", did), ("collection", TEST_COLLECTION), ("rkey", "a")]),
+        (
+            "com.atproto.space.getRecord",
+            vec![("space", sp), ("repo", did), ("collection", TEST_COLLECTION), ("rkey", "a")],
+        ),
         ("com.atproto.space.listRepoOps", vec![("space", sp), ("repo", did)]),
         ("com.atproto.space.getLatestCommit", vec![("space", sp), ("repo", did)]),
         ("com.atproto.space.listBlobs", vec![("space", sp), ("repo", did)]),
@@ -239,5 +250,9 @@ async fn backup_restores_on_a_new_host() {
         assert!(r.is_ok(), "{out}");
     }
     let restored = space_backup(&arrived.oauth).await;
-    assert_eq!(restored.keys().collect::<Vec<_>>(), files.keys().collect::<Vec<_>>(), "the same backup from the new host");
+    assert_eq!(
+        restored.keys().collect::<Vec<_>>(),
+        files.keys().collect::<Vec<_>>(),
+        "the same backup from the new host"
+    );
 }
