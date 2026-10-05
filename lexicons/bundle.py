@@ -1,16 +1,19 @@
-# Usage: python3 lexicons/bundle.py <atproto>/lexicons lexicons/bundle.json
-# Bundles every record lexicon from the atproto lexicons dir, every
-# com.atproto.* query/procedure (their params, inputs and outputs are
-# validated: src/lexicon.rs), plus the lexicons they reference
-# (transitively), into one JSON object {nsid: doc}.
+# Usage: python3 lexicons/bundle.py <atproto>/lexicons lexicons/spaces-alpha lexicons/bundle.json
+# Bundles every record lexicon from the lexicon dirs, every com.atproto.*
+# query/procedure (their params, inputs and outputs are validated:
+# src/lexicon.rs), plus the lexicons they reference (transitively), into
+# one JSON object {nsid: doc}. A later dir's document replaces an earlier
+# one's: lexicons/spaces-alpha holds the Spaces lexicons, vendored from
+# the reference's permissioned-data branch (lexicons/spaces-alpha/SOURCE).
 import json, os, sys
-root = sys.argv[1]; out = sys.argv[2]
+roots = sys.argv[1:-1]; out = sys.argv[-1]
 docs = {}
-for dp, _, fs in os.walk(root):
-    for f in fs:
-        if f.endswith('.json'):
-            d = json.load(open(os.path.join(dp, f)))
-            docs[d['id']] = d
+for root in roots:
+    for dp, _, fs in os.walk(root):
+        for f in fs:
+            if f.endswith('.json'):
+                d = json.load(open(os.path.join(dp, f)))
+                docs[d['id']] = d
 def refs(node, base, acc):
     if isinstance(node, dict):
         t = node.get('type')
