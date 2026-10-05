@@ -69,6 +69,60 @@ A few rules decide what your users and their apps can do:
 - Moderators and admins can read space records for terms-of-service work, and every read is
   audited ([Operator access](privacy.md#operator-access)).
 
+## Enabling on a single node
+
+This is the order for turning Spaces on for one production node deployed with the Ansible role. A
+cluster is the same, once every node runs a build that knows Spaces (see above).
+
+1. Set `vlpds_spaces: true` in the node's inventory. It maps to `--spaces`. The knobs below keep
+   vlpds' defaults while they're empty, and those defaults are fine for an alpha:
+
+   | Variable | Flag | Default |
+   |---|---|---|
+   | `vlpds_spaces` | `--spaces` | `false` |
+   | `vlpds_space_repo_max_records` | `--space-repo-max-records` | 100000 |
+   | `vlpds_space_oplog_retention` | `--space-oplog-retention` | `7d` |
+   | `vlpds_max_import_mb` | `--max-import-mb` | 1024 (Caddy's `importRepo` cap follows it, +64 MiB) |
+
+2. Deploy with `--tags vlpds-deploy,vlpds-verify`. The compose file changes, so it's one graceful
+   restart. The role refuses `--dev-mode` and `--lexicon-authority-override`, so lexicons resolve
+   through DNS as they would for anyone else.
+3. Open the Spaces row on the `vlpds internals` dashboard. Every panel should show 0 or a note like "no space writes" right
+   away, since a node with the flag exports the `vlpds_space_*` series at 0 from the start. If the
+   row stays empty, the flag didn't take.
+4. Check that vmalert has the four `VlpdsSpace*` rules from `ops/alerts.yml` loaded. The one that
+   catches most problems is `VlpdsSpaceOutboxBacklog` (the oldest outbox row over 1 h for 10 min).
+   `VlpdsSpaceNotifyFanoutFailing`, `VlpdsSpaceCredentialRejectsHigh` and
+   `VlpdsSpaceDigestMismatch` cover the rest ([Alerts](#alerts)). All four are tickets.
+
+An app that was approved for a bare `space:` grant that writes before the flag was on has no
+collections recorded for it. Its next refresh gets `invalid_grant`, so the user signs in again and
+approves the writes on the consent screen.
+
+### The first day
+
+| Watch | Where | Healthy |
+|---|---|---|
+| Outbox depth and age | `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | a few rows, oldest under a few minutes |
+| Notify failures | `notifyWrite failure ratio by hop` | ~0 for `out` and `in`. `fanout` fails while a syncer is down |
+| Unconfirmed same-rev notifies | `vlpds_space_notify_total{hop="in",result=~"same_rev_unverified\|same_rev_capped"}` | 0. These only come with record takedowns |
+| Credential cache hit rate | `Credential cache hit ratio` | high under steady polling |
+| Digest mismatches | `vlpds_space_digest_mismatch_total` | 0, always |
+| Throttling | `vlpds_object_store_throttled_total{kind}` | 0. R2 answers the odd 429 on lease writes, and the client retries it |
+| Segment PUTs per write | `sum(rate(vlpds_segments_total[5m])) / (sum(rate(vlpds_commits_total[5m])) + sum(rate(vlpds_space_writes_total{result="ok"}[5m])))` | at most 1. Space writes add no PUTs of their own ([cost](#server-cost-on-one-node)) |
+
+A digest mismatch only counts once `vlpds admin check-space` runs, so run it on a space or two at the
+end of the day.
+
+### Turning it back off
+
+Set `vlpds_spaces: false` and deploy again. That's another graceful restart, and it's safe on the
+same build. What isn't safe is rolling the image back below the build that knows Spaces, for the
+reasons above. With the flag off, the space methods stop being served here, new tokens carry no space
+permissions, and the space data stays in the bucket. Space-only blobs stay private, since a node
+without the flag still answers `BlobNotFound` for a blob only space records name
+([Blobs](privacy.md#blobs)).
+
 ## Flags
 
 | Flag | Default | What it does |
