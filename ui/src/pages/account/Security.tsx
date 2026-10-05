@@ -8,12 +8,14 @@ import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
 import { RecoveryKeys } from './RecoveryKeys'
 import { SignInSecurity } from './SignIns'
+import { Passkeys } from './Passkeys'
 
 export function Security() {
   const [ver, setVer] = useState(0)
   return (
     <>
-      <PageHead title="Security" desc="Two-factor sign-in, where you've signed in, your recovery key, passwords for apps, and the apps you've connected." />
+      <PageHead title="Security" desc="Passkeys and two-factor sign-in, where you've signed in, your recovery key, passwords for apps, and the apps you've connected." />
+      <Passkeys onChange={() => setVer((v) => v + 1)} />
       <Totp onChange={() => setVer((v) => v + 1)} />
       <SignInSecurity ver={ver} />
       <RecoveryKeys />

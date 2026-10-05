@@ -895,6 +895,10 @@ async fn device_accounts(app: &App, d: &Device) -> Vec<(String, String)> {
         if crate::xrpc::auth_epoch(app, &a.did).await.ok().as_deref() != Some(a.auth_epoch.as_str()) {
             continue;
         }
+        // signed in with a passkey that has since been removed
+        if !super::passkeys::still_registered(app, &a.did, a.auth_cred.as_deref()).await.unwrap_or(false) {
+            continue;
+        }
         if let Ok(acct) = account_any(app, &a.did).await {
             if acct.status.is_none() {
                 out.push((acct.did.clone(), acct.handle.clone()));
@@ -962,11 +966,14 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     }
     // the code's session is created only while this login's credential
     // epoch is current (code_grant)
-    let Some(epoch) = flow.device.accounts.iter().find(|a| a.did == did).map(|a| a.auth_epoch.clone()) else {
+    let Some((epoch, auth_cred)) =
+        flow.device.accounts.iter().find(|a| a.did == did).map(|a| (a.auth_epoch.clone(), a.auth_cred.clone()))
+    else {
         return login_page(app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
     };
     let code = store::new_code(&flow.id);
     flow.req.auth_epoch = epoch;
+    flow.req.auth_cred = auth_cred;
     flow.req.did = Some(did.to_string());
     flow.req.code_hash = Some(store::hash_secret(&code));
     flow.req.expires_at = now_secs() + AUTHORIZATION_INACTIVITY_TIMEOUT;
@@ -1636,6 +1643,9 @@ async fn code_grant(
         return Err(OAuthError::invalid_dpop_proof("DPoP proof does not match the expected JKT"));
     }
     ensure_active_any(app, &did).await.map_err(|e| OAuthError::invalid_grant(&e.message))?;
+    if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
+        return Err(fail("The passkey that approved this code was removed"));
+    }
     let token_scope =
         lexicon::build_token_scope_cached(app, &params.scope).await.map_err(|e| OAuthError::invalid_request(&e))?;
     let now = now_secs();

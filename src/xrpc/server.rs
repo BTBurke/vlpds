@@ -1152,6 +1152,30 @@ async fn delete_sessions_where(
     Err(cas_conflict())
 }
 
+/// Every OAuth and legacy session, every device sign-in and code (the
+/// credential epoch) and every trusted browser: what a password change does.
+pub(super) async fn revoke_everything(app: &App, did: &str) -> XResult<()> {
+    crate::oauth::store::revoke_all_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))?;
+    revoke_all_sessions(app, did).await
+}
+
+/// The OAuth and legacy sessions a passkey (`auth_ref`) signed in. Device
+/// sign-ins and codes it approved are refused when used
+/// (`passkeys::still_registered`).
+pub(super) async fn revoke_signed_in_with(app: &App, did: &str, auth_ref: &str) -> XResult<()> {
+    let gone = delete_sessions_where(app, did, |_, st| st.auth_cred.as_deref() == Some(auth_ref)).await?;
+    let fams: Vec<String> = gone.into_iter().map(|st| st.family).collect();
+    revoke_families(app, did, &fams).await?;
+    for s in crate::oauth::store::list_sessions(app, did).await.map_err(|e| XrpcError::internal(e.description))? {
+        if s.auth_cred.as_deref() == Some(auth_ref) {
+            crate::oauth::store::delete_session(app, did, &s.id)
+                .await
+                .map_err(|e| XrpcError::internal(e.description))?;
+        }
+    }
+    Ok(())
+}
+
 async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
     let gone =
         delete_sessions_where(app, did, |_, st| st.app_password.as_ref().is_some_and(|a| a.name == name)).await?;

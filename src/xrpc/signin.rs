@@ -227,13 +227,17 @@ async fn factors(app: &App, acct: &Account) -> XResult<String> {
     let totp = crate::totp::load(app, &acct.did).await?;
     let totp_at = if totp.enabled() { totp.enabled_at.clone().unwrap_or_else(|| "on".into()) } else { String::new() };
     let email_at = acct.extra.get(super::email2fa::FLAG).and_then(|v| v.as_str()).unwrap_or("");
-    let h = Sha256::digest(format!("totp={totp_at}\0email={email_at}").as_bytes());
+    let mut keys: Vec<String> = super::passkeys::load(app, &acct.did).await?.creds.into_iter().map(|c| c.id).collect();
+    keys.sort();
+    let h = Sha256::digest(format!("totp={totp_at}\0email={email_at}\0passkeys={}", keys.join(",")).as_bytes());
     Ok(hex::encode(&h[..16]))
 }
 
 /// Whether a second factor is asked for on a password sign-in.
 pub(super) async fn factor_enabled(app: &App, acct: &Account) -> XResult<bool> {
-    Ok(super::email2fa::enabled(acct) || crate::totp::enabled_for(app, acct).await?)
+    Ok(super::email2fa::enabled(acct)
+        || crate::totp::enabled_for(app, acct).await?
+        || super::passkeys::has_any(app, &acct.did).await?)
 }
 
 /// 0: trusting is off.

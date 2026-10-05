@@ -139,6 +139,7 @@ pub(super) fn count_failure(f: Fail) {
 #[serde(rename_all = "camelCase")]
 pub(super) struct AssertionIn {
     pub id: String,
+    #[serde(rename = "clientDataJSON")]
     pub client_data_json: String,
     pub authenticator_data: String,
     pub signature: String,
@@ -314,6 +315,306 @@ pub(super) async fn security_mail(app: &App, did: &str, what: &str) {
         &email,
         crate::mail::Email::SecurityChange { handle: &acct.handle, what, at: &at },
     );
+}
+
+// ---------------------------------------------------------------- XRPC
+
+pub fn routes() -> Router<Arc<App>> {
+    Router::new()
+        .route("/xrpc/vlpds.server.listPasskeys", get(list_passkeys))
+        .route("/xrpc/vlpds.server.startPasskeyRegistration", post(start_registration))
+        .route("/xrpc/vlpds.server.finishPasskeyRegistration", post(finish_registration))
+        .route("/xrpc/vlpds.server.renamePasskey", post(rename_passkey))
+        .route("/xrpc/vlpds.server.removePasskey", post(remove_passkey))
+}
+
+const TRANSPORTS: [&str; 6] = ["usb", "nfc", "ble", "internal", "hybrid", "smart-card"];
+
+fn rfc3339(secs: u64) -> String {
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
+}
+
+fn bad(msg: &str) -> XrpcError {
+    XrpcError::bad("InvalidRequest", msg)
+}
+
+/// Full account sessions only: a stolen app password or OAuth token can't
+/// add a lasting way in, or take one away.
+fn owner(creds: &super::authn::Credentials) -> XResult<String> {
+    super::server::full_access(creds)
+}
+
+async fn check_password(app: &App, did: &str, password: &str) -> XResult<Account> {
+    let acct = app.account(did).await?;
+    if password.is_empty() || !super::server::verify_password(&acct, password).await? {
+        return Err(XrpcError::auth("Invalid password"));
+    }
+    Ok(acct)
+}
+
+fn clean_name(name: &str) -> XResult<String> {
+    let n: String = name.trim().chars().filter(|c| !c.is_control()).collect();
+    if n.is_empty() || n.chars().count() > MAX_NAME {
+        return Err(bad("name: 1 to 64 characters"));
+    }
+    Ok(n)
+}
+
+/// `allowCredentials` / `excludeCredentials` entries.
+pub(super) fn descriptors(p: &Passkeys) -> Vec<J> {
+    p.creds
+        .iter()
+        .filter(|c| c.suspect_at.is_none())
+        .map(|c| json!({"type": "public-key", "id": c.id, "transports": c.transports}))
+        .collect()
+}
+
+async fn list_passkeys(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    let did = owner(&creds)?;
+    let p = load(&app, &did).await?;
+    let rp = rp(&app)?;
+    let list: Vec<J> = p
+        .creds
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.id,
+                "name": c.name,
+                "createdAt": rfc3339(c.created_at),
+                "lastUsedAt": c.last_used_at.map(rfc3339),
+                "synced": c.backup_eligible,
+                "backedUp": c.backed_up,
+                "discoverable": c.discoverable,
+                "userVerified": c.uv,
+                "passwordless": c.uv && c.discoverable != Some(false) && user_handle(&did).is_some(),
+                "suspectAt": c.suspect_at.map(rfc3339),
+                "transports": c.transports,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "passkeys": list,
+        "max": MAX_PASSKEYS,
+        "passwordlessAvailable": user_handle(&did).is_some(),
+        "rpId": rp.id,
+        "origin": rp.origin,
+    })))
+}
+
+#[derive(Deserialize)]
+struct StartIn {
+    #[serde(default)]
+    password: String,
+}
+
+/// The password is checked here, so a stolen session token alone can't add
+/// a passkey. Returns `PublicKeyCredentialCreationOptions` as JSON.
+async fn start_registration(State(app): AppState, Auth(creds): Auth, Json(inp): Json<StartIn>) -> XResult<Json<J>> {
+    let did = owner(&creds)?;
+    crate::ratelimit::check(&[&crate::ratelimit::PASSKEY_REGISTER_ACCOUNT], &did, 1)?;
+    let acct = check_password(&app, &did, &inp.password).await?;
+    let p = load(&app, &did).await?;
+    if p.creds.len() >= MAX_PASSKEYS {
+        return Err(bad("This account has the most passkeys it can have. Remove one first."));
+    }
+    let rp = rp(&app)?;
+    let challenge = webauthn::mint_challenge(&challenge_key(&app), "register", &did, now_secs());
+    let (user_id, resident) = match user_handle(&did) {
+        Some(h) => (b64u(h), "preferred"),
+        // too long to be the user handle: a second factor only, so it needn't be discoverable
+        None => (b64u(Sha256::digest(did.as_bytes())), "discouraged"),
+    };
+    let algs: Vec<J> = webauthn::ALGS.iter().map(|a| json!({"type": "public-key", "alg": a})).collect();
+    Ok(Json(json!({
+        "rp": {"id": rp.id, "name": rp.id},
+        "user": {"id": user_id, "name": acct.handle, "displayName": acct.handle},
+        "challenge": b64u(&challenge),
+        "pubKeyCredParams": algs,
+        "timeout": webauthn::CHALLENGE_TTL * 1000,
+        "attestation": "none",
+        "authenticatorSelection": {"residentKey": resident, "requireResidentKey": false, "userVerification": "preferred"},
+        "excludeCredentials": descriptors(&p),
+        "extensions": {"credProps": true},
+    })))
+}
+
+#[derive(Deserialize, Default)]
+struct CredPropsIn {
+    rk: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ExtResultsIn {
+    #[serde(default)]
+    cred_props: Option<CredPropsIn>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AttestationIn {
+    #[serde(rename = "clientDataJSON")]
+    client_data_json: String,
+    attestation_object: String,
+    #[serde(default)]
+    transports: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RegistrationIn {
+    raw_id: String,
+    response: AttestationIn,
+    #[serde(default)]
+    client_extension_results: ExtResultsIn,
+}
+
+#[derive(Deserialize)]
+struct FinishIn {
+    #[serde(default)]
+    name: String,
+    credential: RegistrationIn,
+}
+
+async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp): Json<FinishIn>) -> XResult<Json<J>> {
+    let did = owner(&creds)?;
+    let name = clean_name(&inp.name)?;
+    let (cred, ch) = match verify_new(&app, &did, &inp.credential) {
+        Ok(x) => x,
+        Err(f) => {
+            count_failure(f);
+            return Err(refused(f));
+        }
+    };
+    let cred = Cred { name, ..cred };
+    if !super::internal::claim_replay_anywhere(&app, &did, &ch.replay_key(), ch.exp as i64).await? {
+        count_failure(Fail::Replay);
+        return Err(refused(Fail::Replay));
+    }
+    for _ in 0..CAS_ROUNDS {
+        let (mut p, raw) = load_raw(&app, &did).await?;
+        if p.creds.iter().any(|x| x.id == cred.id) {
+            return Err(bad("This passkey is already registered"));
+        }
+        if p.creds.len() >= MAX_PASSKEYS {
+            return Err(bad("This account has the most passkeys it can have. Remove one first."));
+        }
+        p.creds.push(cred.clone());
+        if save_if(&app, &did, &p, raw).await? {
+            crate::metrics::PASSKEYS.with_label_values(&["registered"]).inc();
+            security_mail(&app, &did, &format!("A passkey \u{201c}{}\u{201d} was added to your account.", cred.name))
+                .await;
+            return Ok(Json(json!({"id": cred.id, "name": cred.name, "createdAt": rfc3339(cred.created_at)})));
+        }
+    }
+    Err(super::server::cas_conflict())
+}
+
+/// Every check of a new credential; nothing written.
+fn verify_new(app: &App, did: &str, c: &RegistrationIn) -> Result<(Cred, webauthn::Challenge), Fail> {
+    let raw_id = decode_capped(&c.raw_id, MAX_ID_B64)?;
+    let cdj = decode_capped(&c.response.client_data_json, MAX_CDJ_B64)?;
+    let att = decode_capped(&c.response.attestation_object, MAX_ATT_B64)?;
+    let now = now_secs();
+    let challenge = webauthn::client_data_challenge(&cdj)?;
+    let ch = webauthn::open_challenge(&challenge_key(app), "register", did, &challenge, now)?;
+    let rp = rp(app).map_err(|_| Fail::RpId)?;
+    let r = webauthn::verify_registration(&rp, &challenge, &raw_id, &cdj, &att, false)?;
+    let mut transports: Vec<String> = Vec::new();
+    for t in c.response.transports.iter().take(TRANSPORTS.len()) {
+        if TRANSPORTS.contains(&t.as_str()) && !transports.contains(t) {
+            transports.push(t.clone());
+        }
+    }
+    let cred = Cred {
+        id: b64u(&r.credential_id),
+        public_key: b64u(&r.cose_key),
+        alg: r.alg,
+        sign_count: r.sign_count,
+        backup_eligible: r.backup_eligible,
+        backed_up: r.backed_up,
+        discoverable: c.client_extension_results.cred_props.as_ref().and_then(|p| p.rk),
+        uv: r.uv,
+        transports,
+        aaguid: hex::encode(r.aaguid),
+        name: String::new(),
+        created_at: now,
+        last_used_at: None,
+        suspect_at: None,
+    };
+    Ok((cred, ch))
+}
+
+/// One message whatever failed: the reason is in the metrics.
+pub(super) fn refused(f: Fail) -> XrpcError {
+    XrpcError::bad("PasskeyRefused", format!("The passkey was not accepted ({})", f.reason()))
+}
+
+#[derive(Deserialize)]
+struct RenameIn {
+    id: String,
+    name: String,
+}
+
+async fn rename_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RenameIn>) -> XResult<StatusCode> {
+    let did = owner(&creds)?;
+    let name = clean_name(&inp.name)?;
+    for _ in 0..CAS_ROUNDS {
+        let (mut p, raw) = load_raw(&app, &did).await?;
+        let c = p.creds.iter_mut().find(|c| c.id == inp.id).ok_or_else(|| bad("No such passkey"))?;
+        c.name = name.clone();
+        if save_if(&app, &did, &p, raw).await? {
+            return Ok(StatusCode::OK);
+        }
+    }
+    Err(super::server::cas_conflict())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoveIn {
+    id: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    sign_out_everywhere: bool,
+}
+
+/// Needs the password. Ends what the passkey signed in (OAuth sessions and
+/// account-page sessions record it; device sign-ins and unexchanged codes
+/// are checked against the row when they're used), or everything.
+async fn remove_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RemoveIn>) -> XResult<Json<J>> {
+    let did = owner(&creds)?;
+    check_password(&app, &did, &inp.password).await?;
+    let gone = 'cas: {
+        for _ in 0..CAS_ROUNDS {
+            let (mut p, raw) = load_raw(&app, &did).await?;
+            let i = p.creds.iter().position(|c| c.id == inp.id).ok_or_else(|| bad("No such passkey"))?;
+            let gone = p.creds.remove(i);
+            if save_if(&app, &did, &p, raw).await? {
+                break 'cas gone;
+            }
+        }
+        return Err(super::server::cas_conflict());
+    };
+    crate::metrics::PASSKEYS.with_label_values(&["removed"]).inc();
+    if inp.sign_out_everywhere {
+        super::server::revoke_everything(&app, &did).await?;
+    } else {
+        super::server::revoke_signed_in_with(&app, &did, &gone.auth_ref()).await?;
+    }
+    security_mail(&app, &did, &format!("The passkey \u{201c}{}\u{201d} was removed from your account.", gone.name))
+        .await;
+    Ok(Json(json!({"signedOutEverywhere": inp.sign_out_everywhere})))
+}
+
+/// Whether the passkey a sign-in recorded is still on the account; true
+/// for sign-ins without one.
+pub(super) async fn still_registered(app: &App, did: &str, auth_cred: Option<&str>) -> XResult<bool> {
+    let Some(r) = auth_cred else { return Ok(true) };
+    Ok(load(app, did).await?.creds.iter().any(|c| c.auth_ref() == r))
 }
 
 /// Golden fixtures (`super::private_rows`).

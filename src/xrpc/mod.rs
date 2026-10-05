@@ -316,6 +316,7 @@ pub fn router(app: Arc<App>) -> Router {
             Router::new()
                 .merge(server::routes())
                 .merge(signin::routes())
+                .merge(passkeys::routes())
                 .merge(identity::routes())
                 .merge(repo::routes())
                 .merge(sync::routes())
