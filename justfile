@@ -114,9 +114,10 @@ checker-rs host="http://127.0.0.1:2620" *args:
 docker-build tag="vlpds:local":
     docker build -t {{tag}} .
 
-# Build + push the production image (docker login to the registry first; features e.g. profiling)
-docker-push tag=`git rev-parse --short=12 HEAD` image="ghcr.io/jazware/vlpds" platform="linux/amd64" features="":
-    docker buildx build --platform {{platform}} --build-arg VLPDS_FEATURES={{features}} --build-arg VLPDS_GIT_REV=`git rev-parse --short=12 HEAD` -t {{image}}:{{tag}} --push .
+# Build the production amd64 image on this Mac from the committed tree and push it (build/mac-image.sh;
+# FEATURES=profiling, PUSH=0 to only load it)
+docker-push tag=`git rev-parse --short=12 HEAD`:
+    build/mac-image.sh {{tag}}
 
 # Observability stack for load tests (bench/obs/README.md): Prometheus (1 s scrapes) :9090,
 # Grafana (vlpds dashboard, anonymous admin) :3300, Pyroscope :4040, all on 127.0.0.1

@@ -17,7 +17,8 @@
 # (docker run --ulimit nofile=1048576:1048576 sets the hard limit).
 
 # --- web UI -----------------------------------------------------------------
-FROM node:26-bookworm-slim AS ui
+# the UI build is the same on every platform, so it runs natively
+FROM --platform=$BUILDPLATFORM node:26-bookworm-slim AS ui
 WORKDIR /src/ui
 COPY ui/package.json ui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm npm ci --no-audit --no-fund
@@ -27,16 +28,30 @@ COPY docs/ /src/docs/
 RUN npm run build
 
 # --- rust release build -----------------------------------------------------
-FROM rust:1.99.0-bookworm AS build
+# Runs on the build machine and cross-compiles for the target platform:
+# emulating the whole compile (an amd64 image built on an arm64 Mac) is many
+# times slower than compiling natively for another target.
+FROM --platform=$BUILDPLATFORM rust:1.99.0-bookworm AS build
+ARG TARGETARCH
+ARG BUILDARCH
 
-# cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C builds
+# cmake/clang: aws-lc-sys (rustls) and the vendored libsecp256k1 / jemalloc C
+# builds; a cross build adds the target's gcc and libc
 RUN apt-get update \
     && apt-get install -y --no-install-recommends cmake clang \
+    && if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+         case "$TARGETARCH" in \
+           amd64) apt-get install -y --no-install-recommends gcc-x86-64-linux-gnu g++-x86-64-linux-gnu libc6-dev-amd64-cross ;; \
+           arm64) apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross ;; \
+           *) echo "no cross toolchain for $TARGETARCH" >&2; exit 1 ;; \
+         esac; \
+       fi \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY rust-toolchain.toml ./
-# installs the pinned toolchain if the base image's differs
-RUN rustup show active-toolchain
+# installs the pinned toolchain if the base image's differs, plus the target
+RUN case "$TARGETARCH" in amd64) t=x86_64-unknown-linux-gnu ;; arm64) t=aarch64-unknown-linux-gnu ;; esac \
+    && rustup show active-toolchain && rustup target add "$t" && echo "$t" > /rust-target
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY lexicons ./lexicons
@@ -51,7 +66,6 @@ ARG VLPDS_FEATURES=""
 # with debug = 0 cargo also strips std's): ~half the image. Symbols stay, so
 # panics and backtraces still name functions.
 ENV CARGO_PROFILE_RELEASE_DEBUG=0
-ARG TARGETARCH
 # Unset builds with every core; benchbox-image.sh lowers it while the batch
 # pipeline runs.
 ARG CARGO_BUILD_JOBS
@@ -63,11 +77,17 @@ ARG CARGO_BUILD_JOBS
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi \
-    && cargo build --release --locked --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
+    t=$(cat /rust-target) \
+    && if [ "$TARGETARCH" = arm64 ]; then export JEMALLOC_SYS_WITH_LG_PAGE=16; fi \
+    && if [ "$TARGETARCH" != "$BUILDARCH" ]; then \
+         gnu=$(echo "$t" | sed 's/-unknown-linux-gnu//')-linux-gnu; T=$(echo "$t" | tr a-z- A-Z_); \
+         export "CARGO_TARGET_${T}_LINKER=$gnu-gcc" "CC_$(echo "$t" | tr - _)=$gnu-gcc" \
+                "CXX_$(echo "$t" | tr - _)=$gnu-g++" "AR_$(echo "$t" | tr - _)=$gnu-ar"; \
+       fi \
+    && cargo build --release --locked --target "$t" --bin vlpds --bin vlpds-bucket-probe ${VLPDS_FEATURES:+--features "$VLPDS_FEATURES"} \
     && mkdir -p /out \
-    && cp target/release/vlpds target/release/vlpds-bucket-probe /out/ \
-    && /out/vlpds --help >/dev/null && /out/vlpds-bucket-probe --help >/dev/null
+    && cp target/$t/release/vlpds target/$t/release/vlpds-bucket-probe /out/ \
+    && if [ "$TARGETARCH" = "$BUILDARCH" ]; then /out/vlpds --help >/dev/null && /out/vlpds-bucket-probe --help >/dev/null; fi
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
