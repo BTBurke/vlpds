@@ -1,27 +1,28 @@
-//! TOTP second factor (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step) plus
-//! one-time recovery codes, for password logins and the OAuth sign-in page.
+//! TOTP second factor (RFC 6238, SHA-1, 6 digits, 30 s, ±1 step), for
+//! password logins and the OAuth sign-in page. Recovery codes and the
+//! wrong-code lockout are shared with passkeys (`xrpc::mfa`).
 //!
 //! Accepted codes advance `last_step`, so a code can't be replayed inside its
 //! window. Guessing is bounded per account across both login paths and
 //! restarts: every [`MAX_FAILURES`] wrong codes in a row lock the factor,
-//! doubling per lockout. Every state change is a conditional write
-//! ([`save_if`], src/xrpc/cas.rs) redone on conflict, so concurrent attempts
-//! on several nodes neither lose failures nor accept one code twice.
+//! doubling per lockout. Every state change is a conditional write over
+//! this row and the shared one ([`save_both`], src/xrpc/cas.rs) redone on
+//! conflict, so concurrent attempts on several nodes neither lose failures
+//! nor accept one code twice.
 
 use crate::auth::ct_eq;
 use crate::state::{self, Account};
+use crate::xrpc::mfa::{self, Mfa};
 use crate::xrpc::{App, XrpcError};
 use axum::http::StatusCode;
 use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
-use sha2::Sha256;
 
 pub const STEP_SECS: u64 = 30;
 pub const DIGITS: u32 = 6;
 /// Accepted clock skew, in steps, on either side of now.
 pub const SKEW: u64 = 1;
-pub const RECOVERY_CODES: usize = 10;
 pub const PRIVATE_NAME: &str = "totp";
 pub const MAX_FAILURES: u32 = 5;
 /// First lockout; doubles per further lockout up to [`MAX_LOCKOUT_SECS`].
@@ -36,18 +37,11 @@ pub struct TotpState {
     /// From setupTotp, awaiting confirmTotp.
     #[serde(default)]
     pub pending: Option<String>,
-    #[serde(default)]
-    pub recovery: Vec<String>,
     /// Codes for steps <= this are replays.
     #[serde(default)]
     pub last_step: u64,
     #[serde(default)]
     pub enabled_at: Option<String>,
-    #[serde(default)]
-    pub failures: u32,
-    /// Unix seconds.
-    #[serde(default)]
-    pub locked_until: u64,
     /// The wrapped forms `load` read, by plaintext: `seal` reuses one while
     /// its secret is unchanged (no KEK call per login attempt).
     #[serde(skip)]
@@ -170,25 +164,6 @@ pub fn otpauth_uri(secret_b32: &str, issuer: &str, account: &str) -> String {
     )
 }
 
-pub fn generate_recovery_codes() -> Vec<String> {
-    (0..RECOVERY_CODES)
-        .map(|_| {
-            let s = crate::cid::base32_encode(&rand::random::<[u8; 7]>());
-            format!("{}-{}", &s[..5], &s[5..10])
-        })
-        .collect()
-}
-
-/// Keyed by the TOTP secret (KEK-wrapped at rest), so a leaked state row
-/// can't be brute-forced offline for its ~50-bit codes without the KEK.
-pub fn hash_recovery_code(secret: &[u8], code: &str) -> String {
-    let norm: String = code.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
-    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("hmac accepts any key length");
-    mac.update(b"vlpds-totp-recovery:");
-    mac.update(norm.as_bytes());
-    hex::encode(mac.finalize().into_bytes())
-}
-
 pub async fn load(app: &App, did: &str) -> Result<TotpState, XrpcError> {
     Ok(load_raw(app, did).await?.0)
 }
@@ -201,16 +176,43 @@ pub async fn load_raw(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>)
     }
 }
 
+async fn stored(app: &App, did: &str, st: &TotpState) -> Result<Option<Bytes>, XrpcError> {
+    if st.secret.is_none() && st.pending.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Bytes::from(serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?)))
+}
+
 /// Ok(false): the row is no longer `read` and nothing was written; reload
 /// and redo.
 pub async fn save_if(app: &App, did: &str, st: &TotpState, read: Option<Bytes>) -> Result<bool, XrpcError> {
     use crate::xrpc::cas::{Cond, Op};
-    let val = if st.secret.is_none() && st.pending.is_none() {
-        None
-    } else {
-        Some(Bytes::from(serde_json::to_vec(&seal(app, did, st).await?).map_err(XrpcError::from_err)?))
-    };
+    let val = stored(app, did, st).await?;
     let out = app.private_cas(did, vec![Cond::eq(PRIVATE_NAME, read)], vec![Op::put(PRIVATE_NAME, val)]).await?;
+    Ok(out.applied)
+}
+
+/// This row and the shared `mfa` row, both read as `read` / `mread`.
+pub async fn load_both(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>, Mfa, Option<Bytes>), XrpcError> {
+    let (st, read) = load_raw(app, did).await?;
+    let (m, mread) = mfa::load_raw(app, did).await?;
+    Ok((st, read, m, mread))
+}
+
+/// [`save_if`] over both rows in one write.
+pub async fn save_both(
+    app: &App,
+    did: &str,
+    st: &TotpState,
+    read: Option<Bytes>,
+    m: &Mfa,
+    mread: Option<Bytes>,
+) -> Result<bool, XrpcError> {
+    use crate::xrpc::cas::{Cond, Op};
+    let (mc, mop) = mfa::cas_parts(m, mread);
+    let val = stored(app, did, st).await?;
+    let out =
+        app.private_cas(did, vec![Cond::eq(PRIVATE_NAME, read), mc], vec![Op::put(PRIVATE_NAME, val), mop]).await?;
     Ok(out.applied)
 }
 
@@ -305,7 +307,7 @@ pub async fn enabled_for(app: &App, account: &Account) -> Result<bool, XrpcError
 }
 
 /// `code` is a TOTP code or an unused recovery code. Caller persists.
-fn consume(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
+fn consume(st: &mut TotpState, m: &mut Mfa, did: &str, code: &str, now: u64) -> Result<(), XrpcError> {
     let secret =
         st.secret.as_deref().and_then(base32_decode).ok_or_else(|| XrpcError::internal("corrupt TOTP secret"))?;
     let trimmed = code.trim();
@@ -313,10 +315,11 @@ fn consume(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
         st.last_step = verify_code(&secret, trimmed, now, st.last_step).ok_or_else(invalid_code)?;
         return Ok(());
     }
-    let h = hash_recovery_code(&secret, trimmed);
-    let pos = st.recovery.iter().position(|r| ct_eq(r.as_bytes(), h.as_bytes())).ok_or_else(invalid_code)?;
-    st.recovery.remove(pos);
-    Ok(())
+    if m.take(did, trimmed) {
+        Ok(())
+    } else {
+        Err(invalid_code())
+    }
 }
 
 /// 401 AuthFactorTokenRequired when `code` is missing, 400 InvalidToken when
@@ -325,44 +328,36 @@ pub async fn check_second_factor(app: &App, account: &Account, code: Option<&str
     if flagged_off(account) {
         return Ok(());
     }
-    let _g = lock(&account.did).await;
+    let did = account.did.as_str();
+    let _g = lock(did).await;
     for _ in 0..CAS_ROUNDS {
-        let (mut st, raw) = load_raw(app, &account.did).await?;
+        let (mut st, raw, mut m, mraw) = load_both(app, did).await?;
         if !st.enabled() {
             return Ok(());
         }
         let now = now_secs();
-        if now < st.locked_until {
+        if now < m.locked_until {
             return Err(locked_out());
         }
         let code = code.map(str::trim).filter(|c| !c.is_empty()).ok_or_else(factor_required)?;
         // saved even on failure: the count must survive restarts and be
         // shared by both login paths
-        let r = attempt(&mut st, code, now);
-        crate::xrpc::cas::pause_point("totp", &account.did).await;
-        if save_if(app, &account.did, &st, raw).await? {
+        let r = attempt(&mut st, &mut m, did, code, now);
+        crate::xrpc::cas::pause_point("totp", did).await;
+        if save_both(app, did, &st, raw, &m, mraw).await? {
             return r;
         }
     }
     Err(conflict())
 }
 
-/// The caller holds [`lock`] and persists `st` whatever the outcome.
-pub fn attempt(st: &mut TotpState, code: &str, now: u64) -> Result<(), XrpcError> {
-    if now < st.locked_until {
+/// The caller holds [`lock`] and persists both rows whatever the outcome.
+pub fn attempt(st: &mut TotpState, m: &mut Mfa, did: &str, code: &str, now: u64) -> Result<(), XrpcError> {
+    if now < m.locked_until {
         return Err(locked_out());
     }
-    match consume(st, code, now) {
-        Ok(()) => {
-            st.failures = 0;
-            Ok(())
-        }
-        Err(e) if e.status == StatusCode::INTERNAL_SERVER_ERROR => Err(e),
-        Err(e) => {
-            record_failure_in(&mut st.failures, &mut st.locked_until, now);
-            Err(if now < st.locked_until { locked_out() } else { e })
-        }
-    }
+    let r = consume(st, m, did, code, now);
+    mfa::settle(m, r, now)
 }
 
 #[cfg(test)]
@@ -395,41 +390,43 @@ mod tests {
 
     #[test]
     fn lockout_backoff() {
-        let mut st = TotpState::default();
+        let mut m = Mfa::default();
         for _ in 0..MAX_FAILURES - 1 {
-            record_failure_in(&mut st.failures, &mut st.locked_until, 1000);
+            record_failure_in(&mut m.failures, &mut m.locked_until, 1000);
         }
-        assert_eq!(st.locked_until, 0, "a few wrong codes don't lock");
-        record_failure_in(&mut st.failures, &mut st.locked_until, 1000);
-        assert_eq!(st.locked_until, 1000 + LOCKOUT_SECS);
+        assert_eq!(m.locked_until, 0, "a few wrong codes don't lock");
+        record_failure_in(&mut m.failures, &mut m.locked_until, 1000);
+        assert_eq!(m.locked_until, 1000 + LOCKOUT_SECS);
         for _ in 0..MAX_FAILURES {
-            record_failure_in(&mut st.failures, &mut st.locked_until, 5000);
+            record_failure_in(&mut m.failures, &mut m.locked_until, 5000);
         }
-        assert_eq!(st.locked_until, 5000 + 2 * LOCKOUT_SECS, "doubles");
+        assert_eq!(m.locked_until, 5000 + 2 * LOCKOUT_SECS, "doubles");
         for _ in 0..20 * MAX_FAILURES {
-            record_failure_in(&mut st.failures, &mut st.locked_until, 9000);
+            record_failure_in(&mut m.failures, &mut m.locked_until, 9000);
         }
-        assert_eq!(st.locked_until, 9000 + MAX_LOCKOUT_SECS, "capped");
+        assert_eq!(m.locked_until, 9000 + MAX_LOCKOUT_SECS, "capped");
     }
 
     #[test]
     fn attempt_locks_and_resets() {
         let k = generate_secret();
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
         let mut st = TotpState { secret: Some(base32_encode(&k)), ..Default::default() };
+        let mut m = Mfa::default();
         let now = now_secs();
         let good = code_for_step(&k, step_at(now));
-        assert!(attempt(&mut st, "000000", now).is_err());
-        assert!(attempt(&mut st, &good, now).is_ok());
-        assert_eq!(st.failures, 0, "success resets the count");
+        assert!(attempt(&mut st, &mut m, did, "000000", now).is_err());
+        assert!(attempt(&mut st, &mut m, did, &good, now).is_ok());
+        assert_eq!(m.failures, 0, "success resets the count");
         for i in 0..MAX_FAILURES {
-            let e = attempt(&mut st, "000000", now).unwrap_err();
+            let e = attempt(&mut st, &mut m, did, "000000", now).unwrap_err();
             assert_eq!(is_lockout(&e), i == MAX_FAILURES - 1);
         }
         let next = code_for_step(&k, step_at(now) + 1);
-        assert!(is_lockout(&attempt(&mut st, &next, now).unwrap_err()), "right code refused while locked");
+        assert!(is_lockout(&attempt(&mut st, &mut m, did, &next, now).unwrap_err()), "right code refused while locked");
         let later = now + LOCKOUT_SECS;
         let fresh = code_for_step(&k, step_at(later));
-        assert!(attempt(&mut st, &fresh, later).is_ok(), "accepted after the lock");
+        assert!(attempt(&mut st, &mut m, did, &fresh, later).is_ok(), "accepted after the lock");
     }
 
     #[test]
@@ -438,16 +435,12 @@ mod tests {
         let enc = base32_encode(&sec);
         assert_eq!(enc.len(), 32);
         assert_eq!(base32_decode(&enc).unwrap(), sec);
-        let codes = generate_recovery_codes();
-        assert_eq!(codes.len(), 10);
-        assert_ne!(hash_recovery_code(&sec, &codes[0]), hash_recovery_code(b"another secret", &codes[0]), "keyed");
-        let mut st = TotpState {
-            secret: Some(enc),
-            recovery: codes.iter().map(|c| hash_recovery_code(&sec, c)).collect(),
-            ..Default::default()
-        };
-        assert!(consume(&mut st, &codes[3].to_uppercase(), now_secs()).is_ok());
-        assert_eq!(st.recovery.len(), 9);
-        assert!(consume(&mut st, &codes[3], now_secs()).is_err());
+        let did = "did:plc:abcdefghijklmnopqrstuvwx";
+        let mut m = Mfa::default();
+        let codes = m.issue(did, 1);
+        let mut st = TotpState { secret: Some(enc), ..Default::default() };
+        assert!(consume(&mut st, &mut m, did, &codes[3].to_uppercase(), now_secs()).is_ok());
+        assert_eq!(m.recovery.len(), 9);
+        assert!(consume(&mut st, &mut m, did, &codes[3], now_secs()).is_err());
     }
 }

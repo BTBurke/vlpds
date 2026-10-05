@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner, Status } from '../../components/ui'
+import { CopyText, Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner, Status, saveBlob } from '../../components/ui'
+import { Download } from '../../components/icons'
 import { fmtTime } from '../../lib/format'
-import { useAction, useLoad } from '../../lib/hooks'
+import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { acall } from '../../lib/xrpc'
 import { cancelled, createPasskey, passkeysHere } from '../../lib/webauthn'
 
@@ -29,6 +30,8 @@ export function Passkeys({ onChange, totpOn }: { onChange: () => void; totpOn?: 
   const [removing, setRemoving] = useState<Passkey>()
   const [rpw, setRpw] = useState('')
   const [everywhere, setEverywhere] = useState(false)
+  const [codes, setCodes] = useState<string[]>()
+  const s = useSession()!
 
   const add = useAction(async () => {
     const options = await acall('vlpds.server.startPasskeyRegistration', { body: { password: pw } })
@@ -41,6 +44,7 @@ export function Passkeys({ onChange, totpOn }: { onChange: () => void; totpOn?: 
     }
     const r = await acall('vlpds.server.finishPasskeyRegistration', { body: { name: name.trim() || defaultName(), credential } })
     setAdded(r.name)
+    if (r.recoveryCodes?.length) setCodes(r.recoveryCodes)
     setAdding(false)
     setPw('')
     setName('')
@@ -64,6 +68,7 @@ export function Passkeys({ onChange, totpOn }: { onChange: () => void; totpOn?: 
   const d = list.data
   const here = passkeysHere(d?.origin)
   const keys = d?.passkeys ?? []
+  if (codes) return <SavedCodes codes={codes} handle={s.handle} onDone={() => setCodes(undefined)} />
   return (
     <Panel
       title="Passkeys"
@@ -247,6 +252,85 @@ export function Passkeys({ onChange, totpOn }: { onChange: () => void; totpOn?: 
             </div>
           </form>
         </Dialog>
+      )}
+    </Panel>
+  )
+}
+
+/** Shown once, when a set is issued (the first passkey or authenticator app) or regenerated. */
+export function SavedCodes({ codes, handle, onDone }: { codes: string[]; handle: string; onDone: () => void }) {
+  return (
+    <Panel title="Save your recovery codes" desc="Each code works once, in place of a passkey or an authenticator code, if you lose them. This is the only time they are shown.">
+      <Notice kind="ok">Two-factor sign-in is on.</Notice>
+      <ol className="codes">
+        {codes.map((c) => (
+          <li key={c}>{c}</li>
+        ))}
+      </ol>
+      <div className="row">
+        <button className="btn" onClick={() => saveBlob(new Blob([codes.join('\n') + '\n'], { type: 'text/plain' }), `${handle}-recovery-codes.txt`)}>
+          <Download />
+          Download as text
+        </button>
+        <CopyText text={codes.join('\n')} display="Copy all" mono={false} />
+        <div style={{ flex: 1 }} />
+        <button className="btn primary" onClick={onDone}>
+          I've saved them
+        </button>
+      </div>
+    </Panel>
+  )
+}
+
+/** How many recovery codes are left, and a fresh set behind the password. `ver`: reload when the factors change. */
+export function RecoveryCodes({ ver }: { ver: number }) {
+  const st = useLoad<{ recoveryCodesRemaining: number }>(() => acall('vlpds.server.listPasskeys'), [ver])
+  const s = useSession()!
+  const [asking, setAsking] = useState(false)
+  const [pw, setPw] = useState('')
+  const [codes, setCodes] = useState<string[]>()
+  const regen = useAction(async () => {
+    const r = await acall('vlpds.server.regenerateRecoveryCodes', { body: { password: pw } })
+    setCodes(r.recoveryCodes)
+    setAsking(false)
+    setPw('')
+    st.reload()
+  })
+  if (codes) return <SavedCodes codes={codes} handle={s.handle} onDone={() => setCodes(undefined)} />
+  const left = st.data?.recoveryCodesRemaining ?? 0
+  if (!st.data || (left === 0 && !asking)) return null
+  return (
+    <Panel title="Recovery codes" desc="One set of codes for your passkeys and authenticator app. Each works once if you lose them." id="recovery-codes">
+      <ErrorNotice error={regen.error} />
+      {!asking ? (
+        <div className="row">
+          <span style={{ flex: 1 }}>
+            <b>{left}</b> left{left < 3 && <span className="muted"> — get a new set before you run out</span>}
+          </span>
+          <button className="btn" onClick={() => setAsking(true)}>
+            Get new codes
+          </button>
+        </div>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault()
+            regen.run()
+          }}
+        >
+          <Field label="Password" hint="The codes you have now stop working.">
+            <input type="password" value={pw} onChange={(e) => setPw(e.target.value)} autoComplete="current-password" required autoFocus />
+          </Field>
+          <div className="row">
+            <button type="button" className="btn" onClick={() => setAsking(false)}>
+              Cancel
+            </button>
+            <button className="btn primary" disabled={regen.busy}>
+              {regen.busy && <Spinner />}
+              Get new codes
+            </button>
+          </div>
+        </form>
       )}
     </Panel>
   )

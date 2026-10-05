@@ -19,6 +19,7 @@ pub mod import_budget;
 mod import_stream;
 pub mod internal;
 pub mod key_rotation;
+pub mod mfa;
 pub mod moderation;
 pub mod oauth;
 pub mod passkeys;
@@ -317,6 +318,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(server::routes())
                 .merge(signin::routes())
                 .merge(passkeys::routes())
+                .merge(mfa::routes())
                 .merge(identity::routes())
                 .merge(repo::routes())
                 .merge(sync::routes())

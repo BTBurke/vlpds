@@ -3128,7 +3128,7 @@ async fn confirm_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<C
     let codes = 'cas: {
         let _g = crate::totp::lock(&did).await;
         for _ in 0..crate::totp::CAS_ROUNDS {
-            let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+            let (mut st, raw, mut m, mraw) = crate::totp::load_both(&app, &did).await?;
             if st.enabled() {
                 return Err(invalid_request("TOTP is already enabled"));
             }
@@ -3140,16 +3140,17 @@ async fn confirm_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<C
                 .ok_or_else(|| XrpcError::internal("corrupt pending TOTP secret"))?;
             let step = crate::totp::verify_code(&secret, &inp.code, crate::totp::now_secs(), 0)
                 .ok_or_else(|| invalid_token("Token is invalid"))?;
-            let codes = crate::totp::generate_recovery_codes();
             st.secret = Some(pending);
             st.pending = None;
             st.last_step = step;
-            st.recovery = codes.iter().map(|c| crate::totp::hash_recovery_code(&secret, c)).collect();
             st.enabled_at = Some(crate::events::now_rfc3339());
+            // the first strong factor brings the shared recovery codes; a
+            // passkey may have already
+            let codes = if m.recovery.is_empty() { m.issue(&did, crate::totp::now_secs()) } else { Vec::new() };
             // flag first: a crash between the two writes must not leave TOTP
             // enabled with the login fast path (totpEnabled=false) skipping it
             set_totp_flag(&app, &did, true).await?;
-            if crate::totp::save_if(&app, &did, &st, raw).await? {
+            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw).await? {
                 break 'cas codes;
             }
         }
@@ -3172,10 +3173,11 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
     if !verify_password(&acct, &inp.password).await? {
         return Err(XrpcError::auth("Invalid password"));
     }
+    let passkeys = super::passkeys::has_any(&app, &did).await?;
     'cas: {
         let _g = crate::totp::lock(&did).await;
         for _ in 0..crate::totp::CAS_ROUNDS {
-            let (mut st, raw) = crate::totp::load_raw(&app, &did).await?;
+            let (mut st, raw, mut m, mraw) = crate::totp::load_both(&app, &did).await?;
             if !st.enabled() {
                 return Err(invalid_request("TOTP is not enabled"));
             }
@@ -3186,9 +3188,15 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
                 .filter(|c| !c.trim().is_empty())
                 .ok_or_else(|| invalid_request("code or recoveryCode is required"))?;
             // counts toward the lockout like a sign-in attempt
-            let r = crate::totp::attempt(&mut st, code, crate::totp::now_secs());
-            let next = if r.is_ok() { crate::totp::TotpState::default() } else { st };
-            if crate::totp::save_if(&app, &did, &next, raw).await? {
+            let r = crate::totp::attempt(&mut st, &mut m, &did, code, crate::totp::now_secs());
+            if r.is_ok() {
+                st = crate::totp::TotpState::default();
+                // the last strong factor takes the recovery codes with it
+                if !passkeys {
+                    m = super::mfa::Mfa::default();
+                }
+            }
+            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw).await? {
                 r?;
                 break 'cas;
             }
@@ -3202,8 +3210,8 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
 async fn get_totp_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     let did = standard_no_oauth(&creds)?;
     let st = crate::totp::load(&app, &did).await?;
-    let mut out =
-        json!({"enabled": st.enabled(), "pending": st.pending.is_some(), "recoveryCodesRemaining": st.recovery.len()});
+    let left = super::mfa::remaining(&app, &did).await?;
+    let mut out = json!({"enabled": st.enabled(), "pending": st.pending.is_some(), "recoveryCodesRemaining": left});
     if let Some(at) = &st.enabled_at {
         out["enabledAt"] = json!(at);
     }

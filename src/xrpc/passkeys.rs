@@ -400,6 +400,7 @@ async fn list_passkeys(State(app): AppState, Auth(creds): Auth) -> XResult<Json<
         "passkeys": list,
         "max": MAX_PASSKEYS,
         "passwordlessAvailable": user_handle(&did).is_some(),
+        "recoveryCodesRemaining": super::mfa::remaining(&app, &did).await?,
         "rpId": rp.id,
         "origin": rp.origin,
     })))
@@ -495,8 +496,10 @@ async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp):
         count_failure(Fail::Replay);
         return Err(refused(Fail::Replay));
     }
+    let _g = crate::totp::lock(&did).await;
     for _ in 0..CAS_ROUNDS {
         let (mut p, raw) = load_raw(&app, &did).await?;
+        let (mut m, mraw) = super::mfa::load_raw(&app, &did).await?;
         if p.creds.iter().any(|x| x.id == cred.id) {
             return Err(bad("This passkey is already registered"));
         }
@@ -504,11 +507,20 @@ async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp):
             return Err(bad("This account has the most passkeys it can have. Remove one first."));
         }
         p.creds.push(cred.clone());
-        if save_if(&app, &did, &p, raw).await? {
+        // the first strong factor brings the shared recovery codes
+        let codes = if m.recovery.is_empty() { m.issue(&did, now_secs()) } else { Vec::new() };
+        let (mc, mop) = super::mfa::cas_parts(&m, mraw);
+        let ops = vec![Op::put(ROW, Some(Bytes::from(to_json_bytes(&p)))), mop];
+        if app.private_cas(&did, vec![Cond::eq(ROW, raw), mc], ops).await?.applied {
             crate::metrics::PASSKEYS.with_label_values(&["registered"]).inc();
             security_mail(&app, &did, &format!("A passkey \u{201c}{}\u{201d} was added to your account.", cred.name))
                 .await;
-            return Ok(Json(json!({"id": cred.id, "name": cred.name, "createdAt": rfc3339(cred.created_at)})));
+            return Ok(Json(json!({
+                "id": cred.id,
+                "name": cred.name,
+                "createdAt": rfc3339(cred.created_at),
+                "recoveryCodes": codes,
+            })));
         }
     }
     Err(super::server::cas_conflict())
@@ -589,13 +601,24 @@ struct RemoveIn {
 /// are checked against the row when they're used), or everything.
 async fn remove_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RemoveIn>) -> XResult<Json<J>> {
     let did = owner(&creds)?;
-    check_password(&app, &did, &inp.password).await?;
+    let acct = check_password(&app, &did, &inp.password).await?;
+    let totp = crate::totp::enabled_for(&app, &acct).await?;
     let gone = 'cas: {
+        let _g = crate::totp::lock(&did).await;
         for _ in 0..CAS_ROUNDS {
             let (mut p, raw) = load_raw(&app, &did).await?;
             let i = p.creds.iter().position(|c| c.id == inp.id).ok_or_else(|| bad("No such passkey"))?;
             let gone = p.creds.remove(i);
-            if save_if(&app, &did, &p, raw).await? {
+            let mut conds = vec![Cond::eq(ROW, raw)];
+            let mut ops = vec![Op::put(ROW, (!p.creds.is_empty()).then(|| Bytes::from(to_json_bytes(&p))))];
+            // the last strong factor takes the recovery codes with it
+            if p.creds.is_empty() && !totp {
+                let (_, mraw) = super::mfa::load_raw(&app, &did).await?;
+                let (mc, mop) = super::mfa::cas_parts(&super::mfa::Mfa::default(), mraw);
+                conds.push(mc);
+                ops.push(mop);
+            }
+            if app.private_cas(&did, conds, ops).await?.applied {
                 break 'cas gone;
             }
         }

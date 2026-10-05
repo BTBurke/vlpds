@@ -1,14 +1,13 @@
 import { useState } from 'react'
 import { QR } from '../../components/QR'
-import { Confirm, CopyText, Empty, ErrorNotice, Field, Loading, Notice, PageHead, Panel, Spinner, Status, saveBlob } from '../../components/ui'
-import { Download } from '../../components/icons'
+import { Confirm, CopyText, Empty, ErrorNotice, Field, Loading, Notice, PageHead, Panel, Spinner, Status } from '../../components/ui'
 import { fmtTime } from '../../lib/format'
 import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
 import { RecoveryKeys } from './RecoveryKeys'
 import { SignInSecurity } from './SignIns'
-import { Passkeys } from './Passkeys'
+import { Passkeys, RecoveryCodes, SavedCodes } from './Passkeys'
 
 export function Security() {
   const [ver, setVer] = useState(0)
@@ -17,6 +16,7 @@ export function Security() {
       <PageHead title="Security" desc="Passkeys and two-factor sign-in, where you've signed in, your recovery key, passwords for apps, and the apps you've connected." />
       <Passkeys onChange={() => setVer((v) => v + 1)} />
       <Totp onChange={() => setVer((v) => v + 1)} />
+      <RecoveryCodes ver={ver} />
       <SignInSecurity ver={ver} />
       <RecoveryKeys />
       <AppPasswords />
@@ -43,7 +43,7 @@ function Totp({ onChange }: { onChange: () => void }) {
   const begin = useAction(async () => setSetup(await acall('vlpds.server.setupTotp', { method: 'POST' })))
   const confirm = useAction(async () => {
     const r = await acall('vlpds.server.confirmTotp', { body: { code: code.replace(/\s/g, '') } })
-    setCodes(r.recoveryCodes)
+    setCodes(r.recoveryCodes?.length ? r.recoveryCodes : undefined)
     setSetup(undefined)
     setCode('')
     st.reload()
@@ -60,28 +60,7 @@ function Totp({ onChange }: { onChange: () => void }) {
   })
 
   const desc = 'Ask for a code from an authenticator app whenever someone signs in with your password. App passwords are not affected.'
-  if (codes)
-    return (
-      <Panel title="Save your recovery codes" desc="Each code works once if you lose your authenticator. This is the only time they are shown.">
-        <Notice kind="ok">Two-factor sign-in is on.</Notice>
-        <ol className="codes">
-          {codes.map((c) => (
-            <li key={c}>{c}</li>
-          ))}
-        </ol>
-        <div className="row">
-          <button className="btn" onClick={() => saveBlob(new Blob([codes.join('\n') + '\n'], { type: 'text/plain' }), `${s.handle}-recovery-codes.txt`)}>
-            <Download />
-            Download as text
-          </button>
-          <CopyText text={codes.join('\n')} display="Copy all" mono={false} />
-          <div style={{ flex: 1 }} />
-          <button className="btn primary" onClick={() => setCodes(undefined)}>
-            I've saved them
-          </button>
-        </div>
-      </Panel>
-    )
+  if (codes) return <SavedCodes codes={codes} handle={s.handle} onDone={() => setCodes(undefined)} />
 
   return (
     <Panel title="Two-factor sign-in" desc={desc} id="totp">
@@ -100,7 +79,7 @@ function Totp({ onChange }: { onChange: () => void }) {
             <dt>Recovery codes left</dt>
             <dd>
               {st.data.recoveryCodesRemaining}
-              {st.data.recoveryCodesRemaining < 3 && <span className="muted"> — turn two-factor off and on again for a fresh set</span>}
+              {st.data.recoveryCodesRemaining < 3 && <span className="muted"> — get a fresh set under Recovery codes</span>}
             </dd>
           </dl>
           {!disabling ? (

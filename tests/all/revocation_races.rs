@@ -230,9 +230,9 @@ fn totp_code(secret: &[u8], step: u64) -> String {
 /// attempt on the state it reads, written only if unchanged.
 async fn attempt_elsewhere(s: &TestServer, did: &str, code: &str) -> Result<(), String> {
     loop {
-        let (mut st, raw) = vlpds::totp::load_raw(&s.app, did).await.map_err(|e| e.message).unwrap();
-        let r = vlpds::totp::attempt(&mut st, code, vlpds::totp::now_secs());
-        if vlpds::totp::save_if(&s.app, did, &st, raw).await.map_err(|e| e.message).unwrap() {
+        let (mut st, raw, mut m, mraw) = vlpds::totp::load_both(&s.app, did).await.map_err(|e| e.message).unwrap();
+        let r = vlpds::totp::attempt(&mut st, &mut m, did, code, vlpds::totp::now_secs());
+        if vlpds::totp::save_both(&s.app, did, &st, raw, &m, mraw).await.map_err(|e| e.message).unwrap() {
             return r.map_err(|e| e.error);
         }
     }
@@ -271,7 +271,7 @@ async fn totp_codes_and_failures_are_counted_once_across_nodes() {
         }
         gate.release();
     });
-    let st = vlpds::totp::load(&b.app, &acct.did).await.map_err(|e| e.message).unwrap();
+    let st = vlpds::xrpc::mfa::load(&b.app, &acct.did).await.map_err(|e| e.message).unwrap();
     // 1 wrong code on the first round above, + 3 elsewhere + 1 here
     assert_eq!(st.failures, 5, "no failure lost");
     assert!(st.locked_until > vlpds::totp::now_secs(), "five wrong codes lock the factor");

@@ -5,6 +5,11 @@
     "value": "{\"creds\":[{\"id\":\"9y1xA8Tmg1FEmT-c7_fvWZ_uoTuoih3OvR45_oAK-cwHWhAbXrl2q62iLVTjiyEZ7O7n-CROOY494k7Q3xrs_w\",\"publicKey\":\"pQECAyYgASFYIEhW1CRfuNlIN6XTPKw0RbvzeaIlRMrDwwep-uq_-3WQIlgg1FZwd_RZRsqS_qgKCDvcVh7ScoKNo3w5h5fv3ihUSww\",\"alg\":-7,\"signCount\":23,\"backupEligible\":true,\"backedUp\":true,\"discoverable\":true,\"uv\":true,\"transports\":[\"internal\",\"hybrid\"],\"aaguid\":\"00000000000000000000000000000000\",\"name\":\"iPhone\",\"createdAt\":1790000000,\"lastUsedAt\":1790000100},{\"id\":\"AAEC\",\"publicKey\":\"pAEBAycgBiFYIMz6_SUFLiDid2Yhlq0YboyJ-CDrIrNpkPUGmJp4D3Dp\",\"alg\":-8,\"signCount\":7,\"aaguid\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"name\":\"YubiKey\",\"createdAt\":1790000200,\"suspectAt\":1790000300}]}"
   },
   {
+    "name": "mfa",
+    "routing": "did:plc:fixture0000000000000000",
+    "value": "{\"recovery\":[\"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\",\"1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e\"],\"issuedAt\":1790000000,\"failures\":2,\"lockedUntil\":1790000300}"
+  },
+  {
     "name": "sess/00112233445566778899aabbccddeeff0011223344556622",
     "routing": "did:plc:fixture0000000000000000",
     "value": "{\"family\":\"0006439b2a1c0000aabbccddeeff0033\",\"exp\":1797776000,\"app_password\":null,\"created_at\":1790000000,\"next_id\":null,\"auth_cred\":\"pk:6688ea8f2669ad284d82b62e\"}"

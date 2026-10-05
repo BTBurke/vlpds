@@ -41,6 +41,7 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
     use crate::oauth::store as o;
     let cred = super::passkeys::auth_ref("AAEC");
     let mut rows = super::passkeys::fixture_rows(did);
+    rows.extend(super::mfa::fixture_rows(did));
     rows.extend(super::server::passkey_session_fixture_rows(did, &cred));
     let ses = o::Session {
         id: "ses-passkey".into(),
@@ -86,7 +87,7 @@ pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 8] = [
+    let checks: [Check; 9] = [
         super::server::check_row,
         super::admin::check_row,
         super::email2fa::check_row,
@@ -94,6 +95,7 @@ pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Resul
         super::blob_quota::check_row,
         super::signin::check_row,
         super::passkeys::check_row,
+        super::mfa::check_row,
         check_shared_row,
     ];
     for check in checks {
@@ -144,10 +146,8 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
     use crate::oauth::store as o;
     let mut totp = crate::totp::TotpState::default();
     totp.secret = Some("vw1.kid.dG90cC1zZWNyZXQ".into());
-    totp.recovery = vec!["0f".repeat(32)];
     totp.last_step = 59_666_666;
     totp.enabled_at = Some("2026-10-01T00:00:00.000Z".into());
-    totp.failures = 1;
     let client = "https://app.example/client-metadata.json";
     let params = o::AuthParams {
         client_id: client.into(),

@@ -77,7 +77,7 @@
   {
     "name": "totp",
     "routing": "did:plc:fixture0000000000000000",
-    "value": "{\"secret\":\"vw1.kid.dG90cC1zZWNyZXQ\",\"pending\":null,\"recovery\":[\"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\"],\"last_step\":59666666,\"enabled_at\":\"2026-10-01T00:00:00.000Z\",\"failures\":1,\"locked_until\":0}"
+    "value": "{\"secret\":\"vw1.kid.dG90cC1zZWNyZXQ\",\"pending\":null,\"last_step\":59666666,\"enabled_at\":\"2026-10-01T00:00:00.000Z\"}"
   },
   {
     "name": "oauth/req",

@@ -120,8 +120,10 @@ pub(super) async fn check_second_factor(
                 error: "AuthFactorTokenRequired".into(),
                 message: "Use your passkey, or a recovery code".into(),
             },
-            // recovery codes move to their own row with the next change
-            Some(_) => XrpcError::bad("InvalidToken", "Token is invalid"),
+            Some(c) => match super::mfa::use_recovery_code(app, &acct.did, c).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            },
         };
         return Err(FactorErr { err, factor: Factor::Passkey });
     }

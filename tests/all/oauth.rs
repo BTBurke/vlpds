@@ -1283,7 +1283,7 @@ async fn totp_brute_force_lockout() {
     assert_eq!(b.second_factor(&s, &ru, &csrf, "111111").await.0, 401);
     let (st, html) = b.second_factor(&s, &ru, &csrf, "222222").await;
     assert_eq!(st, 429, "{html}");
-    let Ok(st) = vlpds::totp::load(&s.app, &acct.did).await else { panic!("load totp state") };
+    let Ok(st) = vlpds::xrpc::mfa::load(&s.app, &acct.did).await else { panic!("load the lockout") };
     assert_eq!(st.failures, vlpds::totp::MAX_FAILURES);
     assert!(st.locked_until > vlpds::totp::now_secs(), "lockout persisted");
 

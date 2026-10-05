@@ -654,3 +654,91 @@ async fn across_nodes() {
         passkey_session(other, &a.did, cred).await.err(400, "PasskeyRefused");
     }
 }
+
+// ---------------------------------------------------------------- recovery codes
+
+/// One shared set of codes: issued with the first strong factor, good in
+/// place of a passkey (the OAuth page, the account page) or a TOTP code,
+/// spent once, regenerated behind the password, dropped with the last
+/// strong factor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_recovery_codes() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkrc").await;
+    let mut k1 = SoftKey::synced(&s.url);
+    let first = register_passkey(&s, &a, &mut k1, "one").await;
+    let codes: Vec<String> =
+        first["recoveryCodes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    assert_eq!(codes.len(), 10);
+    assert_eq!(codes[0].len(), 19, "80 bits: {}", codes[0]);
+    let mut k2 = SoftKey::synced(&s.url);
+    let second = register_passkey(&s, &a, &mut k2, "two").await;
+    assert_eq!(second["recoveryCodes"], json!([]), "one set for every factor");
+    assert_eq!(list(&s, &a).await["recoveryCodesRemaining"], json!(10));
+
+    // the account page: the password plus a recovery code; other apps still can't
+    s.login(&a.handle, &a.password, Some(&codes[0])).await.err(401, "PasskeyRequired");
+    let out = own_login(&s, &a, Some(&codes[0])).await.ok();
+    assert!(out["accessJwt"].is_string());
+    own_login(&s, &a, Some(&codes[0])).await.err(400, "InvalidToken");
+    let sec = s.xrpc.get("vlpds.server.getSignInSecurity", &[], &a.auth()).await.ok();
+    assert_eq!(sec["recentSignIns"][0]["factor"], json!("recovery"), "{sec}");
+
+    // TOTP joins the same set; its code or a recovery code both work
+    let (secret, step) = s.enable_totp(&a).await;
+    let st = s.xrpc.get("vlpds.server.getTotpStatus", &[], &a.auth()).await.ok();
+    assert_eq!(st["recoveryCodesRemaining"], json!(9));
+    s.login(&a.handle, &a.password, Some(&codes[1])).await.ok();
+    s.login(&a.handle, &a.password, Some(&vlpds::totp::code_for_step(&secret, step + 1))).await.ok();
+
+    // a new set, behind the password
+    s.xrpc
+        .post("vlpds.server.regenerateRecoveryCodes", &json!({"password": "wrong"}), &a.auth())
+        .await
+        .err(401, "AuthenticationRequired");
+    let fresh =
+        s.xrpc.post("vlpds.server.regenerateRecoveryCodes", &json!({"password": a.password}), &a.auth()).await.ok();
+    let fresh: Vec<String> =
+        fresh["recoveryCodes"].as_array().unwrap().iter().map(|c| c.as_str().unwrap().to_string()).collect();
+    s.login(&a.handle, &a.password, Some(&codes[2])).await.err(400, "InvalidToken");
+    s.login(&a.handle, &a.password, Some(&fresh[0])).await.ok();
+
+    // TOTP off keeps the codes (passkeys are still on) ...
+    let off = json!({"password": a.password, "recoveryCode": fresh[1]});
+    s.xrpc.post("vlpds.server.disableTotp", &off, &a.auth()).await.ok();
+    assert_eq!(list(&s, &a).await["recoveryCodesRemaining"], json!(8));
+    // ... and the last passkey takes them
+    for k in [&k1, &k2] {
+        let rm = json!({"id": k.id_b64(), "password": a.password});
+        s.xrpc.post("vlpds.server.removePasskey", &rm, &a.auth()).await.ok();
+    }
+    assert_eq!(list(&s, &a).await["recoveryCodesRemaining"], json!(0));
+    s.xrpc
+        .post("vlpds.server.regenerateRecoveryCodes", &json!({"password": a.password}), &a.auth())
+        .await
+        .err(400, "InvalidRequest");
+}
+
+/// The OAuth page takes a recovery code in place of the passkey.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oauth_recovery_code() {
+    let s = o::spawn().await;
+    let acct = o::create_account(&s, "pkorc").await;
+    let mut key = SoftKey::synced(&s.base);
+    let (_, opts) = s
+        .bearer(&acct.jwt, "vlpds.server.startPasskeyRegistration", true, Some(json!({"password": o::PASSWORD})))
+        .await;
+    let cred = key.register(&opts, &Lie::default());
+    let body = json!({"name": "key", "credential": cred});
+    let (_, done) = s.bearer(&acct.jwt, "vlpds.server.finishPasskeyRegistration", true, Some(body)).await;
+    let code = done["recoveryCodes"][0].as_str().unwrap().to_string();
+    let dk = o::DpopKey::new();
+    let f = o::Flow::loopback("atproto", &dk);
+    let mut b = o::Browser::default();
+    let (ru, csrf, _) = to_second_step(&s, &mut b, &f, &acct).await;
+    let (st, html) = b.second_factor(&s, &ru, &csrf, "aaaa-bbbb-cccc-dddd").await;
+    assert_eq!(st, 401, "{html}");
+    let (st, html) = b.second_factor(&s, &ru, &csrf, &code).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access"), "{html}");
+}
