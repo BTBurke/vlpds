@@ -1,4 +1,4 @@
-import { Topbar, CopyText, Status, SOURCE_URL } from '../components/ui'
+import { Topbar, CopyText, Status } from '../components/ui'
 import { useLoad, useSession } from '../lib/hooks'
 import { Link } from '../lib/router'
 import { call } from '../lib/xrpc'
@@ -127,7 +127,6 @@ export function Landing() {
           vlpds{health.data?.version ? <span className="mono muted"> {health.data.version.replace(/\+(.{0,12}).*/, '+$1')}</span> : null}
         </span>
         <Link to="/docs">Docs</Link>
-        <a href={SOURCE_URL}>Source on GitHub</a>
         <a href="/xrpc/_health">Health</a>
         <a href="/.well-known/oauth-authorization-server">OAuth metadata</a>
         {info?.links?.privacyPolicy && <a href={info.links.privacyPolicy}>Privacy</a>}

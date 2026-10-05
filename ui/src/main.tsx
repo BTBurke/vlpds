@@ -1,7 +1,6 @@
 import { StrictMode, Suspense, lazy, useEffect } from 'react'
 import { createRoot } from 'react-dom/client'
 import './styles.css'
-import { SiteFooter } from './components/ui'
 import { usePath } from './lib/router'
 import { Landing } from './pages/Landing'
 import { AccountApp } from './pages/account/AccountApp'
@@ -27,19 +26,13 @@ function App() {
     document.title = area === 'account' ? 'Account · vlpds' : area === 'admin' ? 'Console · vlpds' : area === 'migrate' ? 'Move here · vlpds' : `${location.hostname} · vlpds`
   }, [area])
   if (area === 'landing') return <Landing />
-  // the docs link the source repo from their top bar instead
   if (area === 'docs')
     return (
       <Suspense fallback={null}>
         <DocsApp path={path} />
       </Suspense>
     )
-  return (
-    <>
-      {area === 'account' ? <AccountApp path={path} /> : area === 'admin' ? <AdminApp path={path} /> : <Migrate />}
-      <SiteFooter />
-    </>
-  )
+  return area === 'account' ? <AccountApp path={path} /> : area === 'admin' ? <AdminApp path={path} /> : <Migrate />
 }
 
 createRoot(document.getElementById('root')!).render(

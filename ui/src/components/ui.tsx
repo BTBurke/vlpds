@@ -132,6 +132,14 @@ export function CopyValue({
   )
 }
 
+function SourceLink() {
+  return (
+    <a className="gh" href={SOURCE_URL} aria-label="Source on GitHub" title="Source on GitHub">
+      <I.GitHub />
+    </a>
+  )
+}
+
 export function Panel({
   title,
   desc,
@@ -303,6 +311,7 @@ export function Topbar({ where, children }: { where?: string; children?: ReactNo
         </Link>
         <div className="spacer" />
         {children}
+        <SourceLink />
         <ThemeToggle />
       </header>
       <div className="strata" aria-hidden="true" />
@@ -310,17 +319,7 @@ export function Topbar({ where, children }: { where?: string; children?: ReactNo
   )
 }
 
-export const SOURCE_URL = 'https://github.com/jazware/vlpds'
-
-// The landing page has its own, fuller footer
-export function SiteFooter() {
-  return (
-    <footer className="footer">
-      <span>vlpds</span>
-      <a href={SOURCE_URL}>Source on GitHub</a>
-    </footer>
-  )
-}
+const SOURCE_URL = 'https://github.com/jazware/vlpds'
 
 // ---------------------------------------------------------------- JSON
 

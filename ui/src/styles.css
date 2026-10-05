@@ -268,6 +268,24 @@ code,
   width: 15px;
   height: 15px;
 }
+/* the theme switcher's height: its 15px icons plus padding and border */
+.gh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 31px;
+  height: 31px;
+  border-radius: 6px;
+  color: var(--ink2);
+}
+.gh:hover {
+  color: var(--ink);
+  background: var(--paper);
+}
+.gh svg {
+  width: 17px;
+  height: 17px;
+}
 
 /* ------------------------------------------------------------ controls */
 
