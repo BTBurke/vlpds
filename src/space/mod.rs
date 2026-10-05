@@ -82,7 +82,17 @@ pub struct Spaces {
     imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
     /// registerNotify's count-and-write, per space (striped).
     registering: [tokio::sync::Mutex<()>; 64],
+    /// Authorities whose shard's owner (another node) said the cluster
+    /// doesn't host them, and when: their notifies go out over HTTP without
+    /// asking it again on every send.
+    not_hosted: parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
+
+/// An authority that moves into the cluster within this is still told
+/// over HTTP (its DID document then names this cluster), which works, just
+/// with one more hop.
+const NOT_HOSTED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+const NOT_HOSTED_MAX: usize = 4096;
 
 const RESCAN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 const RESCAN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
@@ -99,12 +109,29 @@ impl Spaces {
             cache_fills: Default::default(),
             imports: Default::default(),
             registering: std::array::from_fn(|_| Default::default()),
+            not_hosted: Default::default(),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
             fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE, fanout::RETRY_BASE)),
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
+    }
+
+    /// Whether a peer said lately that the cluster doesn't host `authority`.
+    pub fn known_not_hosted(&self, authority: &str) -> bool {
+        self.not_hosted.lock().get(authority).is_some_and(|at| at.elapsed() < NOT_HOSTED_TTL)
+    }
+
+    pub fn mark_not_hosted(&self, authority: &str) {
+        let mut m = self.not_hosted.lock();
+        if m.len() >= NOT_HOSTED_MAX && !m.contains_key(authority) {
+            m.retain(|_, at| at.elapsed() < NOT_HOSTED_TTL);
+            if m.len() >= NOT_HOSTED_MAX {
+                m.clear();
+            }
+        }
+        m.insert(authority.to_string(), std::time::Instant::now());
     }
 
     /// Re-reads the revocations object; cached credentials it newly

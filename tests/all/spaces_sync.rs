@@ -654,3 +654,61 @@ async fn a_notify_crosses_to_the_authoritys_node() {
     let peer = |n: &TestServer| n.app.spaces.as_ref().unwrap().peer_notifies.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!((peer(&x), peer(&y)), (0, 1), "delivered over the peer link");
 }
+
+/// An authority on another PDS whose DID lands in a shard of the writer's
+/// cluster owned by another node: the owner is asked once whether the
+/// cluster hosts it, and later notifies go straight out over HTTP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notify_to_an_authority_elsewhere_asks_the_owner_once() {
+    let plc = vlpds::plc::mock::MockPlc::start().await;
+    let rotation = Arc::new(vlpds::crypto::Keypair::generate());
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let cfg = |c: &mut vlpds::server::Config| {
+        use_plc(c, plc.url.clone(), rotation.clone());
+        c.spaces = true;
+    };
+    let x = cluster_node("ssnx", store.clone(), 8, cfg).await;
+    let y = cluster_node("ssny", store.clone(), 8, cfg).await;
+    balanced(&[&x, &y]).await;
+    let nodes = [&x, &y];
+    let z = TestServer::spawn_with(cfg).await;
+    let mut owner = None;
+    for i in 0..40 {
+        let c = SpaceClient::new(&z, &format!("ssnz{i}"), OWNER).await;
+        if std::ptr::eq(owner_of(&nodes, &c.did), &y) {
+            owner = Some(c);
+            break;
+        }
+    }
+    let owner = owner.expect("an authority whose DID y's shard holds");
+    let member = owned_by(&x, &nodes, "ssnm", ANY).await;
+    let space = owner.create_space(TYPE, "elsewhere").await;
+    put_member(&owner, &space, &member.did).await;
+
+    let cred = member.credential_at(&z.url, &space).await;
+    let outbox = &x.app.spaces.as_ref().unwrap().outbox;
+    for i in 0..4 {
+        member.create_record(&space, COLL, Some(&i.to_string()), rec("to z")).await.ok();
+        let head =
+            member.get("com.atproto.space.getLatestCommit", &[("space", &space), ("repo", &member.did)]).await.ok()
+                ["commit"]["rev"]
+                .clone();
+        assert!(
+            eventually(Duration::from_secs(10), || async {
+                let r = member
+                    .signed_get(&z.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did)
+                    .await;
+                r.ok()["repos"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["did"] == json!(member.did) && r["repoRev"] == head)
+            })
+            .await,
+            "write {i} never reached the authority"
+        );
+        assert!(eventually(Duration::from_secs(5), || async { outbox.is_empty() }).await);
+    }
+    let peer = y.app.spaces.as_ref().unwrap().peer_notifies.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(peer, 1, "the owner was asked on every send");
+}

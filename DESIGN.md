@@ -5307,7 +5307,9 @@ writes acked while a send is in flight only move the row, and the next
 send carries the newest rev as soon as nothing is in flight. A local
 authority is told on its own worker, one on another node over
 `/internal/v1/space/notify`, anything else with `notifyWrite` and the
-writer's service auth. Retries run from 1 min to 1 h with jitter for 24 h,
+writer's service auth. An authority hosted elsewhere whose DID lands in
+another node's shard would cost an internal call per send to learn that,
+so the answer is kept for 5 min (4,096 authorities at most). Retries run from 1 min to 1 h with jitter for 24 h,
 and a permanent refusal drops the row. A delivered row's delete rides the
 author's next space write. When a shard opens, its `sP` rows are rescanned
 (retried with backoff until it scans or the shard moves, bad rows skipped)

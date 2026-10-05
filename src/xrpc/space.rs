@@ -1495,10 +1495,17 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     // an authority hosted by this cluster is told without HTTP or service
     // auth: here, or at its shard's owner
     if let Some(owner) = app.remote_owner(&space.authority) {
-        match notify_owner(app, &owner, &space, p).await {
-            Ok(Some(r)) => return outcome(r),
-            Ok(None) => {}
-            Err(e) => return Outcome::Retry(format!("{}: {}", e.error, e.message)),
+        let sp = app.spaces.as_ref();
+        if !sp.is_some_and(|sp| sp.known_not_hosted(&space.authority)) {
+            match notify_owner(app, &owner, &space, p).await {
+                Ok(Some(r)) => return outcome(r),
+                Ok(None) => {
+                    if let Some(sp) = sp {
+                        sp.mark_not_hosted(&space.authority);
+                    }
+                }
+                Err(e) => return Outcome::Retry(format!("{}: {}", e.error, e.message)),
+            }
         }
     } else if app.partition(&space.authority).is_ok()
         && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some())
