@@ -31,6 +31,8 @@ mod repo;
 pub mod scheduled_deletion;
 mod server;
 mod signin;
+mod simplespace;
+pub mod space;
 pub mod staged_import;
 mod sync;
 pub mod syntax;
@@ -125,6 +127,9 @@ pub struct App {
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
     pub ui: Arc<WebUi>,
+    /// `--spaces` (src/space): space repo heads, the notifyWrite outbox,
+    /// revocations. None without the flag.
+    pub spaces: Option<Arc<crate::space::Spaces>>,
 }
 
 type AppState = State<Arc<App>>;
@@ -325,7 +330,11 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(blobs::routes())
                 .merge(admin::routes())
                 .merge(admin_tools::routes())
-                .merge(crawlers::routes()),
+                .merge(crawlers::routes())
+                .merge(match app.config.spaces {
+                    true => space::routes().merge(simplespace::routes()),
+                    false => Router::new(),
+                }),
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())

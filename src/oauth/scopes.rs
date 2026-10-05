@@ -379,6 +379,29 @@ fn v_identity_attr(v: &str) -> bool {
 
 const REPO_ACTIONS: [&str; 3] = ["create", "update", "delete"];
 
+/// `read` implies `read_self`, so the default omits it.
+const SPACE_ACTIONS: [&str; 5] = ["read_self", "read", "create", "update", "delete"];
+const SPACE_DEFAULT_ACTIONS: [&str; 4] = ["read", "create", "update", "delete"];
+
+fn v_space_type(v: &str) -> bool {
+    v == "*" || is_nsid(v)
+}
+fn v_space_authority(v: &str) -> bool {
+    v == "*" || v == "self" || crate::xrpc::syntax::valid_did(v)
+}
+fn v_space_key(v: &str) -> bool {
+    v == "*" || crate::xrpc::syntax::valid_rkey(v)
+}
+fn v_space_action(v: &str) -> bool {
+    SPACE_ACTIONS.contains(&v)
+}
+fn v_space_manage(v: &str) -> bool {
+    REPO_ACTIONS.contains(&v)
+}
+fn n_space_action(v: Vec<String>) -> Vec<String> {
+    SPACE_ACTIONS.iter().filter(|a| v.iter().any(|x| x == *a)).map(|s| s.to_string()).collect()
+}
+
 fn n_collection(v: Vec<String>) -> Vec<String> {
     if v.len() > 1 {
         if v.iter().any(|x| x == "*") {
@@ -511,6 +534,63 @@ static IDENTITY: Schema = Schema {
     positional: Some("attr"),
 };
 
+/// `space:<type>`; a missing `collection` means no write targets, and a
+/// missing `manage` no management.
+static SPACE: Schema = Schema {
+    prefix: "space",
+    params: &[
+        ParamDef {
+            name: "type",
+            multiple: false,
+            required: true,
+            default: None,
+            validate: v_space_type,
+            normalize: None,
+        },
+        ParamDef {
+            name: "authority",
+            multiple: false,
+            required: false,
+            default: Some(&["self"]),
+            validate: v_space_authority,
+            normalize: None,
+        },
+        ParamDef {
+            name: "skey",
+            multiple: false,
+            required: false,
+            default: Some(&["*"]),
+            validate: v_space_key,
+            normalize: None,
+        },
+        ParamDef {
+            name: "collection",
+            multiple: true,
+            required: false,
+            default: None,
+            validate: v_collection,
+            normalize: Some(n_collection),
+        },
+        ParamDef {
+            name: "action",
+            multiple: true,
+            required: false,
+            default: Some(&SPACE_DEFAULT_ACTIONS),
+            validate: v_space_action,
+            normalize: Some(n_space_action),
+        },
+        ParamDef {
+            name: "manage",
+            multiple: true,
+            required: false,
+            default: None,
+            validate: v_space_manage,
+            normalize: Some(n_repo_action),
+        },
+    ],
+    positional: Some("type"),
+};
+
 static INCLUDE: Schema = Schema {
     prefix: "include",
     params: &[
@@ -534,6 +614,82 @@ pub enum Permission {
     Blob { accept: Vec<String> },
     Account { attr: String, action: Vec<String> },
     Identity { attr: String },
+    Space(SpacePermission),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SpacePermission {
+    pub space_type: String,
+    /// A DID, `*`, or `self`: the granting account.
+    pub authority: String,
+    pub skey: String,
+    pub collection: Option<Vec<String>>,
+    pub action: Vec<String>,
+    pub manage: Option<Vec<String>>,
+}
+
+/// The space a request touches.
+#[derive(Clone, Copy, Debug)]
+pub struct SpaceTarget<'a> {
+    pub space_type: &'a str,
+    pub authority: &'a str,
+    pub skey: &'a str,
+}
+
+/// What a request does in a space (`SpacePermissionMatchOperation`).
+#[derive(Clone, Copy, Debug)]
+pub enum SpaceAccess<'a> {
+    Read,
+    ReadSelf,
+    /// create | update | delete, of a collection.
+    Write(&'a str, &'a str),
+    /// create | update | delete of the space itself.
+    Manage(&'a str),
+}
+
+impl SpacePermission {
+    /// `self` is the granting account (`user`): the reference resolves it
+    /// when the token is issued, and an unresolved `self` matches nothing.
+    pub fn matches(&self, t: &SpaceTarget, access: SpaceAccess, user: &str) -> bool {
+        let authority = if self.authority == "self" { user } else { &self.authority };
+        if self.space_type != "*" && self.space_type != t.space_type {
+            return false;
+        }
+        if authority != "*" && authority != t.authority {
+            return false;
+        }
+        if self.skey != "*" && self.skey != t.skey {
+            return false;
+        }
+        let has = |a: &str| self.action.iter().any(|x| x == a);
+        match access {
+            SpaceAccess::Manage(op) => self.manage.as_ref().is_some_and(|m| m.iter().any(|x| x == op)),
+            SpaceAccess::Read => has("read"),
+            SpaceAccess::ReadSelf => has("read") || has("read_self"),
+            SpaceAccess::Write(action, coll) => {
+                has(action) && self.collection.as_ref().is_some_and(|c| c.iter().any(|x| x == "*" || x == coll))
+            }
+        }
+    }
+
+    /// `scopeNeededFor`: the narrowest scope that would grant `access`.
+    pub fn needed_for(t: &SpaceTarget, access: SpaceAccess) -> String {
+        let one = |s: &str| Some(vec![s.to_string()]);
+        let (collection, action, manage) = match access {
+            SpaceAccess::Manage(op) => (None, one("read_self"), one(op)),
+            SpaceAccess::Read => (None, one("read"), None),
+            SpaceAccess::ReadSelf => (None, one("read_self"), None),
+            SpaceAccess::Write(action, coll) => (one(coll), one(action), None),
+        };
+        SPACE.format(&vec![
+            ("type", one(t.space_type)),
+            ("authority", one(t.authority)),
+            ("skey", one(t.skey)),
+            ("collection", collection),
+            ("action", action),
+            ("manage", manage),
+        ])
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -578,12 +734,23 @@ impl Permission {
                 let v = IDENTITY.parse(syn)?;
                 Some(Permission::Identity { attr: first(&v, "attr") })
             }
+            "space" => {
+                let v = SPACE.parse(syn)?;
+                Some(Permission::Space(SpacePermission {
+                    space_type: first(&v, "type"),
+                    authority: first(&v, "authority"),
+                    skey: first(&v, "skey"),
+                    collection: val(&v, "collection").cloned(),
+                    action: val(&v, "action")?.clone(),
+                    manage: val(&v, "manage").cloned(),
+                }))
+            }
             _ => None,
         }
     }
 
     pub fn parse(scope: &str) -> Option<Permission> {
-        for p in ["repo", "rpc", "blob", "account", "identity"] {
+        for p in ["repo", "rpc", "blob", "account", "identity", "space"] {
             if is_scope_string_for(scope, p) {
                 return Permission::from_syntax(&Syntax::from_string(scope)?);
             }
@@ -604,6 +771,14 @@ impl Permission {
                 ACCOUNT.format(&vec![("attr", Some(vec![attr.clone()])), ("action", Some(action.clone()))])
             }
             Permission::Identity { attr } => IDENTITY.format(&vec![("attr", Some(vec![attr.clone()]))]),
+            Permission::Space(p) => SPACE.format(&vec![
+                ("type", Some(vec![p.space_type.clone()])),
+                ("authority", Some(vec![p.authority.clone()])),
+                ("skey", Some(vec![p.skey.clone()])),
+                ("collection", p.collection.clone()),
+                ("action", Some(p.action.clone())),
+                ("manage", p.manage.clone()),
+            ]),
         }
     }
 
@@ -700,9 +875,16 @@ impl IncludeScope {
     }
 }
 
-/// `isAtprotoOauthScope`.
+/// `isAtprotoOauthScope`, without `space:` scopes, which are only offered
+/// with `--spaces` ([`is_space_scope`]).
 pub fn is_atproto_oauth_scope(v: &str) -> bool {
-    STATIC_SCOPES.contains(&v) || Permission::parse(v).is_some() || IncludeScope::parse(v).is_some()
+    STATIC_SCOPES.contains(&v)
+        || Permission::parse(v).is_some_and(|p| !matches!(p, Permission::Space(_)))
+        || IncludeScope::parse(v).is_some()
+}
+
+pub fn is_space_scope(v: &str) -> bool {
+    matches!(Permission::parse(v), Some(Permission::Space(_)))
 }
 
 /// `normalizeAtprotoOauthScopeValue`.
@@ -772,6 +954,11 @@ impl ScopeSet {
 
     pub fn allows_identity(&self, attr: &str) -> bool {
         self.perms.iter().any(|p| p.matches_identity(attr))
+    }
+
+    /// No transition scope grants space access. `user`: the token's account.
+    pub fn allows_space(&self, t: &SpaceTarget, access: SpaceAccess, user: &str) -> bool {
+        self.perms.iter().any(|p| matches!(p, Permission::Space(s) if s.matches(t, access, user)))
     }
 }
 
@@ -937,6 +1124,81 @@ mod tests {
         assert!(is_atproto_did("did:web:localhost%3A1234"));
         assert!(!is_atproto_did("did:web:example.com%3A1234"));
     }
+    /// Reference oauth-scopes `space-permission.test.ts`.
+    #[test]
+    fn space() {
+        let sp = |s: &str| match Permission::parse(s) {
+            Some(Permission::Space(p)) => Some(p),
+            _ => None,
+        };
+        let p = sp("space:com.atmoboards.forum").unwrap();
+        assert_eq!((p.authority.as_str(), p.skey.as_str(), p.collection.as_ref()), ("self", "*", None));
+        assert_eq!(p.action, ["read", "create", "update", "delete"]);
+        assert_eq!(Permission::Space(p).to_scope_string(), "space:com.atmoboards.forum");
+        let p = sp("space:com.atmoboards.forum?authority=did:plc:abc123xyz&skey=default").unwrap();
+        assert_eq!((p.authority.as_str(), p.skey.as_str()), ("did:plc:abc123xyz", "default"));
+        assert_eq!(sp("space:*?authority=*").unwrap().space_type, "*");
+        assert_eq!(sp("space:com.x.y?action=create&action=update").unwrap().action, ["create", "update"]);
+        assert_eq!(sp("space:com.x.y?manage=update&manage=delete").unwrap().manage.unwrap(), ["update", "delete"]);
+        let p = Permission::parse("space:com.x.y?manage=delete&manage=update&action=update&action=read").unwrap();
+        assert_eq!(p.to_scope_string(), "space:com.x.y?action=read&action=update&manage=update&manage=delete");
+        for bad in [
+            "space:com.example.x?manage=bogus",
+            "space:foo bar",
+            "space:short",
+            "space:*?authority=not-a-did",
+            "space:*?authority=did:",
+            "space:com.example.x?action=bogus",
+            "space:com.example.x?collection=not_an_nsid",
+            "space:com.example.x?skey=",
+            "space:com.example.x?skey=a%2Fb",
+            "space:com.example.x?skey=..",
+        ] {
+            assert!(sp(bad).is_none(), "{bad}");
+        }
+        assert!(!is_atproto_oauth_scope("space:com.example.x"), "offered only with --spaces");
+        assert!(is_space_scope("space:com.example.x"));
+        let t = SpaceTarget { space_type: "com.atmoboards.forum", authority: "did:plc:abc", skey: "default" };
+        assert_eq!(
+            SpacePermission::needed_for(&t, SpaceAccess::Read),
+            "space:com.atmoboards.forum?authority=did:plc:abc&skey=default&action=read"
+        );
+        assert_eq!(
+            SpacePermission::needed_for(&t, SpaceAccess::Write("create", "com.atmoboards.thread")),
+            "space:com.atmoboards.forum?authority=did:plc:abc&skey=default&collection=com.atmoboards.thread&action=create"
+        );
+        assert_eq!(
+            SpacePermission::needed_for(&t, SpaceAccess::Manage("update")),
+            "space:com.atmoboards.forum?authority=did:plc:abc&skey=default&action=read_self&manage=update"
+        );
+        // what a refusal suggests grants exactly that
+        for a in [
+            SpaceAccess::Read,
+            SpaceAccess::ReadSelf,
+            SpaceAccess::Write("create", "com.atmoboards.thread"),
+            SpaceAccess::Manage("update"),
+        ] {
+            let p = sp(&SpacePermission::needed_for(&t, a)).unwrap();
+            assert!(p.matches(&t, a, "did:plc:other"), "{a:?}");
+        }
+        // `self` is the token's account; reads ignore collections; read implies read_self
+        let p = sp("space:com.atmoboards.forum?action=read&action=create&collection=com.atmoboards.thread").unwrap();
+        assert!(p.matches(&t, SpaceAccess::Read, "did:plc:abc"));
+        assert!(p.matches(&t, SpaceAccess::ReadSelf, "did:plc:abc"));
+        assert!(!p.matches(&t, SpaceAccess::Read, "did:plc:other"));
+        assert!(p.matches(&t, SpaceAccess::Write("create", "com.atmoboards.thread"), "did:plc:abc"));
+        assert!(!p.matches(&t, SpaceAccess::Write("create", "com.atmoboards.post"), "did:plc:abc"));
+        assert!(!p.matches(&t, SpaceAccess::Write("update", "com.atmoboards.thread"), "did:plc:abc"));
+        assert!(!p.matches(&t, SpaceAccess::Manage("create"), "did:plc:abc"));
+        let p = sp("space:com.atmoboards.forum?action=read_self").unwrap();
+        assert!(p.matches(&t, SpaceAccess::ReadSelf, "did:plc:abc"));
+        assert!(!p.matches(&t, SpaceAccess::Read, "did:plc:abc"));
+        // no collection: no write targets
+        assert!(!sp("space:*?authority=*").unwrap().matches(&t, SpaceAccess::Write("create", "a.b.c"), "x"));
+        let p = sp("space:com.atmoboards.forum?authority=*&skey=other").unwrap();
+        assert!(!p.matches(&t, SpaceAccess::Read, "did:plc:abc"));
+    }
+
     /// `is_atproto_did` delegates did:plc to `plc::valid_plc_did`; both must
     /// accept exactly the old inline rule (24 base32-lowercase chars).
     #[test]

@@ -510,7 +510,7 @@ async fn validate_authorization_request(
             .map(String::from)
             .ok_or_else(|| OAuthError::invalid_request("redirect_uri is required"))?,
     };
-    let scope = requested_scope(client, &g("scope").unwrap_or_default())?;
+    let scope = requested_scope(client, &g("scope").unwrap_or_default(), app.config.spaces)?;
     let (code_challenge, method) = pkce_challenge(p)?;
     let response_mode = g("response_mode");
     match response_mode.as_deref() {
@@ -572,8 +572,9 @@ async fn validate_authorization_request(
     })
 }
 
-/// Declared by the client, deduplicated, with `atproto`.
-fn requested_scope(client: &Client, requested: &str) -> Result<String, OAuthError> {
+/// Declared by the client, deduplicated, with `atproto`. `space:` scopes
+/// only with `--spaces`.
+fn requested_scope(client: &Client, requested: &str, spaces: bool) -> Result<String, OAuthError> {
     let mut scopes: Vec<&str> = Vec::new();
     for s in requested.split(' ').filter(|s| !s.is_empty()) {
         if !client.scopes.iter().any(|c| c == s) {
@@ -584,7 +585,8 @@ fn requested_scope(client: &Client, requested: &str) -> Result<String, OAuthErro
         if s == "openid" {
             return Err(OAuthError::invalid_scope("OpenID Connect is not compatible with atproto"));
         }
-        if is_atproto_oauth_scope(s) && !scopes.contains(&s) {
+        let known = is_atproto_oauth_scope(s) || (spaces && crate::oauth::scopes::is_space_scope(s));
+        if known && !scopes.contains(&s) {
             scopes.push(s);
         }
     }

@@ -284,9 +284,10 @@ pub(super) fn full_access(creds: &Credentials) -> XResult<String> {
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
         Credentials::AppPassword { .. } => Err(bad_scope()),
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
-        Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
-            Err(XrpcError::auth("user credentials required"))
-        }
+        Credentials::Admin
+        | Credentials::ModService { .. }
+        | Credentials::UserServiceAuth { .. }
+        | Credentials::SpaceCredential { .. } => Err(XrpcError::auth("user credentials required")),
     }
 }
 
@@ -300,9 +301,10 @@ fn standard_no_oauth(creds: &Credentials) -> XResult<String> {
             Ok(did.clone())
         }
         Credentials::OAuth { .. } => Err(oauth_forbidden()),
-        Credentials::Admin | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
-            Err(XrpcError::auth("user credentials required"))
-        }
+        Credentials::Admin
+        | Credentials::ModService { .. }
+        | Credentials::UserServiceAuth { .. }
+        | Credentials::SpaceCredential { .. } => Err(XrpcError::auth("user credentials required")),
     }
 }
 

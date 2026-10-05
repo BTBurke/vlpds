@@ -9,15 +9,83 @@
 //!   token or a space credential.
 //! - [`token`]: delegation tokens, space credentials, client attestations.
 //!
-//! Serving is behind `--spaces` (`Config::spaces`), off by default. No
-//! method is implemented yet: with the flag on, every Spaces NSID answers
-//! 501 here rather than reaching the `atproto-proxy` fallback.
+//! Serving is behind `--spaces` (`Config::spaces`), off by default; with it
+//! on, a Spaces NSID without a handler answers 501 rather than reaching the
+//! `atproto-proxy` fallback. The serving side:
+//!
+//! - [`rows`]: the values of the `s*` state families (keys in `crate::state`).
+//! - [`repo`]: space writes and space host ops on the repo worker.
+//! - [`heads`]: durable space repo heads for reads.
+//! - [`outbox`]: delivery of notifyWrite to space authorities.
+//! - [`revocations`]: revoked credentials.
 
 pub mod commit;
+pub mod heads;
 pub mod httpsig;
 pub mod lthash;
+pub mod outbox;
+pub mod repo;
+pub mod revocations;
+pub mod rows;
 mod sfv;
 pub mod token;
+
+use std::sync::Arc;
+
+/// A node's Spaces state (`App::spaces`, `Node::spaces`), with `--spaces`.
+pub struct Spaces {
+    pub heads: heads::Heads,
+    pub outbox: Arc<outbox::Outbox>,
+    pub revocations: revocations::Revocations,
+}
+
+impl Spaces {
+    pub fn new() -> Spaces {
+        Spaces {
+            heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
+            outbox: Default::default(),
+            revocations: Default::default(),
+        }
+    }
+
+    /// Enqueues the `sP` rows of shards just opened (a start, a takeover, a
+    /// handback, a split's children): notifies this node now owes. In the
+    /// background; a row found twice is enqueued once.
+    pub fn spawn_outbox_rescan(self: Arc<Self>, shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>)>) {
+        if shards.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for (shard, db) in shards {
+                match self.rescan_outbox(&db).await {
+                    Ok(n) if n > 0 => tracing::info!(shard = shard.0, rows = n, "space notify outbox resumed"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(shard = shard.0, "space notify outbox rescan failed: {e:#}"),
+                }
+            }
+        });
+    }
+
+    async fn rescan_outbox(&self, db: &slatedb::Db) -> anyhow::Result<usize> {
+        let opts = slatedb::config::ScanOptions::default();
+        let mut scan = crate::state::FamilyScan::new(db, crate::state::SPACE_OUTBOX_FAMILY, None, &opts).await?;
+        let mut n = 0;
+        while let Some(kv) = scan.next().await? {
+            let Some((did, sid)) = rows::did_sid(&kv.key) else { continue };
+            let row = rows::OutboxRow::decode(&kv.value)?;
+            anyhow::ensure!(crate::state::space_id(&row.uri) == sid, "outbox row of {did} names another space");
+            self.outbox.enqueue(did, sid, &row.uri, row.repo_rev, row.hash, false);
+            n += 1;
+        }
+        Ok(n)
+    }
+}
+
+impl Default for Spaces {
+    fn default() -> Self {
+        Spaces::new()
+    }
+}
 
 /// The XRPC methods of the Spaces lexicons. NSID authorities are
 /// case-insensitive, as the proxy's method lists match them.

@@ -617,11 +617,59 @@ pub fn init_scheduled_deletion_counters() {
 pub const SCOPE_KINDS: [&str; 5] = ["repo", "rpc", "blob", "account", "identity"];
 
 /// `scope`: the missing one (`repo:...`, `rpc:...`); labelled by its kind.
+/// `space` (`--spaces` only) isn't pre-registered.
 pub fn scope_rejected(credential: &str, scope: &str) {
     let kind = scope.split(':').next().unwrap_or("");
-    if let Some(kind) = SCOPE_KINDS.iter().find(|k| **k == kind) {
+    if let Some(kind) = SCOPE_KINDS.iter().chain(&["space"]).find(|k| **k == kind) {
         SCOPE_REJECTIONS.with_label_values(&[credential, kind]).inc();
     }
+}
+
+// Spaces (`--spaces`, src/space). Registered on first use, so a node
+// without the flag exports none of them.
+lazy!(SPACE_WRITES: IntCounterVec = register_int_counter_vec!("vlpds_space_writes_total", "Space record write requests (createRecord, putRecord, deleteRecord, applyWrites) by method and result", &["op", "result"]));
+lazy!(SPACE_READS: IntCounterVec = register_int_counter_vec!("vlpds_space_reads_total", "Space repo reads by method and auth (credential: a space credential; oauth: the account's own read)", &["method", "auth"]));
+lazy!(SPACE_LIST_REPO_OPS: IntCounterVec = register_int_counter_vec!("vlpds_space_list_repo_ops_total", "listRepoOps answered by path (noop: since was the head, served from memory; scan: an oplog range scan)", &["path"]));
+lazy!(SPACE_LIST_REPO_OPS_SECONDS: HistogramVec = register_histogram_vec!("vlpds_space_list_repo_ops_seconds", "listRepoOps server time by path, auth excluded", &["path"], latency_buckets()));
+lazy!(SPACE_NOTIFY: IntCounterVec = register_int_counter_vec!("vlpds_space_notify_total", "notifyWrite hops by direction (out: this node's writes to their authorities; in: received as an authority; fanout: forwarded to syncers) and result", &["hop", "result"]));
+lazy!(SPACE_NOTIFY_ACK: Histogram = register_histogram!("vlpds_space_notify_ack_seconds", "A space write's ack to its authority's acknowledgement of the notify", exponential_buckets(0.001, 2.0, 24).unwrap()));
+lazy!(SPACE_OUTBOX_ROWS: IntGauge = register_int_gauge!("vlpds_space_outbox_rows", "notifyWrite outbox rows this node owes (one per repo and space)"));
+lazy!(SPACE_OUTBOX_OLDEST: Gauge = register_gauge!("vlpds_space_outbox_oldest_seconds", "Age of the oldest notifyWrite outbox row"));
+lazy!(SPACE_DELEGATIONS: IntCounter = register_int_counter!("vlpds_space_delegations_total", "Delegation tokens minted (getDelegationToken)"));
+lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "getSpaceCredential answers as a space authority, by result", &["result"]));
+
+pub fn space_write(op: &str, result: &str) {
+    SPACE_WRITES.with_label_values(&[op, result]).inc();
+}
+
+pub fn space_read(method: &str, auth: &str) {
+    SPACE_READS.with_label_values(&[method, auth]).inc();
+}
+
+pub fn space_list_repo_ops(path: &str, took: std::time::Duration) {
+    SPACE_LIST_REPO_OPS.with_label_values(&[path]).inc();
+    SPACE_LIST_REPO_OPS_SECONDS.with_label_values(&[path]).observe(took.as_secs_f64());
+}
+
+pub fn space_notify(hop: &str, result: &str) {
+    SPACE_NOTIFY.with_label_values(&[hop, result]).inc();
+}
+
+pub fn space_notify_ack(took: std::time::Duration) {
+    SPACE_NOTIFY_ACK.observe(took.as_secs_f64());
+}
+
+pub fn space_outbox_gauges(rows: usize, oldest_secs: f64) {
+    SPACE_OUTBOX_ROWS.set(rows as i64);
+    SPACE_OUTBOX_OLDEST.set(oldest_secs);
+}
+
+pub fn space_delegation() {
+    SPACE_DELEGATIONS.inc();
+}
+
+pub fn space_credential_issued(result: &str) {
+    SPACE_CREDENTIALS_ISSUED.with_label_values(&[result]).inc();
 }
 
 pub fn init_reshard_gc_counters() {

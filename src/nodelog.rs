@@ -788,6 +788,10 @@ impl Open {
             e.pending = None;
         }
         let epoch = sink.epoch;
+        debug_assert!(
+            e.frames.is_empty() || !e.muts.iter().any(|m| crate::state::is_space_key(&m.key)),
+            "a log entry with space state carries a firehose frame"
+        );
         if e.frames.is_empty() {
             // private-state write: an empty frame, skipped by the firehose
             e.frames.push(Frame { prefix: Vec::new(), suffix: Vec::new(), derived_muts: 0, derived_gen: 0 });

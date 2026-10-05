@@ -304,6 +304,7 @@ pub enum Queued {
     Write(WriteReq),
     Account(AccountReq),
     Snapshot(SnapshotReq),
+    Space(crate::space::repo::SpaceReq),
 }
 
 impl Queued {
@@ -312,6 +313,7 @@ impl Queued {
             Queued::Write(r) => &r.did,
             Queued::Account(r) => &r.did,
             Queued::Snapshot(r) => &r.did,
+            Queued::Space(r) => &r.did,
         }
     }
     fn fail(self, e: WriteError) {
@@ -319,6 +321,7 @@ impl Queued {
             Queued::Write(r) => _ = r.reply.send(Err(e)),
             Queued::Account(r) => _ = r.reply.send(Err(e)),
             Queued::Snapshot(r) => _ = r.reply.send(Err(e)),
+            Queued::Space(r) => _ = r.reply.send(Err(e.into())),
         }
     }
 }
@@ -327,6 +330,8 @@ pub enum WorkerMsg {
     Write(WriteReq),
     Account(AccountReq),
     Snapshot(SnapshotReq),
+    /// A space write or space host op (`crate::space::repo`).
+    Space(crate::space::repo::SpaceReq),
     CreateRepo(CreateRepoReq),
     /// Forget cached repos of a partition this node no longer owns; replies
     /// once no repo state referencing it remains in this worker.
@@ -357,6 +362,11 @@ pub enum WorkerMsg {
     },
     /// A new [`CacheLimits::bytes`] (src/memory.rs resizes the repo cache).
     SetCacheBytes(usize),
+    /// Result of `Worker::start_space_fetch`.
+    SpaceFetched {
+        did: Arc<str>,
+        res: Box<anyhow::Result<crate::space::repo::Fetched>>,
+    },
 }
 
 pub type BlobRefs = HashMap<String, Vec<Cid>>;
@@ -440,6 +450,8 @@ pub struct RepoState {
     pub inflight: std::collections::VecDeque<(Arc<std::sync::atomic::AtomicBool>, Option<HashSet<Cid>>)>,
     /// `G/{did}` at the in-memory head: a staged import, generations to sweep.
     pub imports: state::ImportState,
+    /// The spaces the account writes to or governs, as loaded so far.
+    pub spaces: crate::space::repo::SpaceStates,
 }
 
 impl RepoState {
@@ -483,7 +495,7 @@ const REPO_BASE_BYTES: usize = 2048;
 
 /// Approximate heap of a cached repo: what the cache budget counts.
 pub fn repo_bytes(st: &RepoState) -> usize {
-    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96 + st.backlinks.heap_bytes()
+    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96 + st.backlinks.heap_bytes() + st.spaces.heap_bytes()
 }
 
 /// A repo charged more than this is unloaded as soon as nothing of it is in
@@ -688,6 +700,7 @@ impl Worker {
                     WorkerMsg::Write(req) => Some(Queued::Write(req)),
                     WorkerMsg::Account(req) => Some(Queued::Account(req)),
                     WorkerMsg::Snapshot(req) => Some(Queued::Snapshot(req)),
+                    WorkerMsg::Space(req) => Some(Queued::Space(req)),
                     other => {
                         self.handle_control(other, &mut order, &mut groups);
                         None
@@ -722,6 +735,14 @@ impl Worker {
                     self.requeue(&did, reqs);
                     continue;
                 };
+                // space state (heads, prev CIDs) is read off this thread too
+                let reqs = match space_needs(st, reqs) {
+                    Ok(reqs) => reqs,
+                    Err((reqs, need)) => {
+                        self.start_space_fetch(did, reqs, *need);
+                        continue;
+                    }
+                };
                 // paths the repo hasn't loaded are loaded on the blocking
                 // pool first, never on this thread
                 let reqs = match lazy_needs(st, reqs) {
@@ -738,7 +759,9 @@ impl Worker {
                 };
                 let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
                 let had_key = st.key.is_some();
-                let leftover = match process(st, reqs, self.clock_id, &self.rt) {
+                let res = process(st, reqs, self.clock_id, &self.rt);
+                st.spaces.clear_fetched();
+                let leftover = match res {
                     Ok(l) => l,
                     Err(e) => {
                         // in-memory state can't be trusted: reload from durable
@@ -775,7 +798,10 @@ impl Worker {
 
     fn handle_control(&mut self, m: WorkerMsg, order: &mut Vec<Arc<str>>, groups: &mut HashMap<Arc<str>, Vec<Queued>>) {
         match m {
-            WorkerMsg::Write(_) | WorkerMsg::Account(_) | WorkerMsg::Snapshot(_) => unreachable!(),
+            WorkerMsg::Write(_) | WorkerMsg::Account(_) | WorkerMsg::Snapshot(_) | WorkerMsg::Space(_) => {
+                unreachable!()
+            }
+            WorkerMsg::SpaceFetched { did, res } => self.space_fetched(did, *res, order, groups),
             WorkerMsg::Loaded { did, res } => self.loaded(did, *res, order, groups),
             WorkerMsg::Fetched { did, res } => self.fetched(did, res, order, groups),
             WorkerMsg::CreateRepo(req) => self.create_repo(req),
@@ -1048,7 +1074,8 @@ impl Worker {
         let charge = REPO_BASE_BYTES
             + st.heap.heap_bytes(&st.mst.tree.root)
             + st.blob_refs.len() * 96
-            + st.backlinks.heap_bytes();
+            + st.backlinks.heap_bytes()
+            + st.spaces.heap_bytes();
         debug_assert_eq!(charge, repo_bytes(st));
         if charge > LAZY_REPO_MAX_BYTES {
             self.big.insert(did.clone());
@@ -1112,6 +1139,64 @@ impl Worker {
             });
             let _ = me.send(WorkerMsg::Fetched { did: d, res });
         });
+    }
+
+    /// Reads what a repo's space requests need ([`crate::space::repo::fetch`])
+    /// off this thread, as [`Self::start_fetch`] loads MST paths; the result
+    /// comes back as [`WorkerMsg::SpaceFetched`].
+    fn start_space_fetch(&mut self, did: Arc<str>, reqs: Vec<Queued>, need: crate::space::repo::SpaceNeed) {
+        let Some(st) = self.cache.peek_mut(&did) else {
+            self.loading.insert(did.clone(), reqs);
+            self.reload_buffered(&did);
+            return;
+        };
+        st.fetching = true;
+        let db = st.partition.db.clone();
+        let (me, d) = (self.me.clone(), did.clone());
+        self.loading.insert(did, reqs);
+        self.rt.spawn(async move {
+            let res = crate::space::repo::fetch(&db, &d, need).await;
+            let _ = me.send(WorkerMsg::SpaceFetched { did: d, res: Box::new(res) });
+        });
+    }
+
+    fn space_fetched(
+        &mut self,
+        did: Arc<str>,
+        res: anyhow::Result<crate::space::repo::Fetched>,
+        order: &mut Vec<Arc<str>>,
+        groups: &mut HashMap<Arc<str>, Vec<Queued>>,
+    ) {
+        let buffered = self.loading.remove(&did).unwrap_or_default();
+        let Some(st) = self.cache.peek_mut(&did).filter(|st| st.fetching) else {
+            self.reload(did, buffered);
+            return;
+        };
+        st.fetching = false;
+        let buffered = match res {
+            Ok(f) => {
+                crate::space::repo::install(&mut st.spaces, f);
+                buffered
+            }
+            // only the space requests fail; the rest go on
+            Err(e) => {
+                tracing::error!(%did, "space state fetch failed: {e:#}");
+                let msg = format!("space state fetch failed: {e}");
+                let closed = msg.contains("not owned") || msg.contains("db is closed") || msg.contains("Closed");
+                let (space, rest): (Vec<Queued>, Vec<Queued>) =
+                    buffered.into_iter().partition(|q| matches!(q, Queued::Space(_)));
+                for q in space {
+                    q.fail(if closed {
+                        WriteError::Unavailable(msg.clone())
+                    } else {
+                        WriteError::Internal(msg.clone())
+                    });
+                }
+                rest
+            }
+        };
+        order.push(did.clone());
+        groups.insert(did, buffered);
     }
 
     /// Drops the loaded paths of repos over [`LAZY_REPO_MAX_BYTES`], then of
@@ -1270,6 +1355,7 @@ impl Worker {
             backfill_stats: false,
             inflight: [(applied, None)].into(),
             imports,
+            spaces: Default::default(),
         };
         self.cache_put(did.clone(), st);
         if partition.tx.blocking_send(entry).is_err() {
@@ -1382,7 +1468,7 @@ impl Need {
                     n.blobs = true;
                     n.bl_all = true;
                 }
-                Queued::Account(_) | Queued::Snapshot(_) => {}
+                Queued::Account(_) | Queued::Snapshot(_) | Queued::Space(_) => {}
             }
         }
         n
@@ -1475,6 +1561,28 @@ impl Need {
 /// Requests to run later, and what to load first (None: the walk failed
 /// and the repo must be reloaded).
 type Deferred = (Vec<Queued>, Option<Box<Need>>);
+
+/// `Ok` if a repo's space requests run on the space state it holds; else
+/// what to read first.
+fn space_needs(
+    st: &mut RepoState,
+    reqs: Vec<Queued>,
+) -> Result<Vec<Queued>, (Vec<Queued>, Box<crate::space::repo::SpaceNeed>)> {
+    if !reqs.iter().any(|q| matches!(q, Queued::Space(_))) {
+        return Ok(reqs);
+    }
+    st.spaces.prune();
+    let mut need = crate::space::repo::SpaceNeed::default();
+    for q in &reqs {
+        if let Queued::Space(r) = q {
+            need.add(&st.spaces, r);
+        }
+    }
+    match need.is_empty() {
+        true => Ok(reqs),
+        false => Err((reqs, Box::new(need))),
+    }
+}
 
 /// `Ok` if a repo's `reqs` run on its loaded paths alone.
 fn lazy_needs(st: &mut RepoState, reqs: Vec<Queued>) -> Result<Vec<Queued>, Deferred> {
@@ -1917,6 +2025,7 @@ fn finish_load(
         backfill_stats: false,
         inflight: Default::default(),
         imports: Default::default(),
+        spaces: Default::default(),
     })
 }
 
@@ -2209,6 +2318,10 @@ fn process_reqs(
                 let _ = r.reply.send(if deleted { Err(WriteError::RepoNotFound) } else { Ok(st.view.clone()) });
                 continue;
             }
+            Queued::Space(r) => {
+                process_space(st, r, clock_id)?;
+                continue;
+            }
             Queued::Account(a) => {
                 flush_pending(st, &mut batch, clock_id, src)?;
                 let gen = st.gen();
@@ -2312,6 +2425,119 @@ fn process_reqs(
     // what durable state holds again is read from it next time
     st.backlinks.prune();
     Ok(())
+}
+
+/// A space request ([`crate::space::repo`]): its own private log entry
+/// (no frame), acked like a commit. The account's status is checked here,
+/// in order with its takedowns and deactivations.
+fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: u64) -> anyhow::Result<()> {
+    use crate::space::repo::{self as sr, SpaceAck, SpaceError, SpaceOp};
+    let sr::SpaceReq { did, uri, sid, op, spaces, reply, permit } = r;
+    drop(permit);
+    let status = st.account.status.clone();
+    if status.as_deref() == Some("deleted") {
+        let _ = reply.send(Err(WriteError::RepoNotFound.into()));
+        return Ok(());
+    }
+    let (muts, on_ack): (Vec<Mutation>, Box<dyn FnOnce() -> SpaceAck + Send>) = match op {
+        SpaceOp::Write { writes } => {
+            if let Some(s) = status {
+                let _ = reply.send(Err(WriteError::RepoInactive(s).into()));
+                return Ok(());
+            }
+            let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let delivered = spaces.outbox.take_delivered(&did);
+            let mut b = match sr::write(&mut st.spaces, &did, sid, &uri, writes, clock_id, &applied, delivered) {
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return Ok(());
+                }
+                Ok(Err(results)) => return space_noop(st, reply, SpaceAck::Write { rev: None, results }),
+                Ok(Ok(b)) => b,
+            };
+            b.head.shard = st.partition.id;
+            b.head.epoch = st.partition.epoch;
+            let (head, notify, rev, results) = (Arc::new(b.head), b.notify, b.rev, b.results);
+            let (sp, d) = (spaces.clone(), did.clone());
+            let ack = move || {
+                sp.heads.publish(&d, &sid, head);
+                if let Some(n) = notify {
+                    sp.outbox.enqueue(&d, sid, &n.uri, n.repo_rev, n.hash, true);
+                }
+                applied.store(true, Ordering::Release);
+                SpaceAck::Write { rev: Some(rev), results }
+            };
+            (b.muts, Box::new(ack))
+        }
+        SpaceOp::RecordWriter { writer, repo_rev, hash } => {
+            match sr::record_writer(&mut st.spaces, &did, sid, &uri, &writer, repo_rev, hash, clock_id) {
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return Ok(());
+                }
+                Ok(None) => return space_noop(st, reply, SpaceAck::Writer(None)),
+                Ok(Some((muts, seq))) => (muts, Box::new(move || SpaceAck::Writer(Some(seq)))),
+            }
+        }
+        SpaceOp::CreateSpace { row } => {
+            if let Some(s) = status {
+                let _ = reply.send(Err(WriteError::RepoInactive(s).into()));
+                return Ok(());
+            }
+            match sr::create_space(&mut st.spaces, &did, sid, row) {
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return Ok(());
+                }
+                Ok(m) => (vec![m], Box::new(|| SpaceAck::Created)),
+            }
+        }
+    };
+    let entry = LogEntry {
+        shard: st.partition.id,
+        frames: Vec::new(),
+        muts,
+        ack: Some(Box::new(move |r| {
+            let _ = reply.send(match r {
+                Ok(()) => Ok(on_ack()),
+                // refused by the log, nothing applied: the entry node resends
+                Err(e) if e.to_string() == crate::nodelog::NOT_HELD => {
+                    Err(SpaceError::Write(WriteError::Unavailable(e.to_string())))
+                }
+                Err(e) => Err(SpaceError::Write(WriteError::Internal(e.to_string()))),
+            });
+        })),
+        pending: Some(st.pending.clone()),
+        enqueued: Instant::now(),
+        totals: None,
+    };
+    send_entry(st, entry)
+}
+
+/// Answers a space request that wrote nothing: at once with nothing in
+/// flight, else after the repo's earlier entries, so a caller never learns
+/// of state that isn't durable yet.
+fn space_noop(
+    st: &RepoState,
+    reply: oneshot::Sender<Result<crate::space::repo::SpaceAck, crate::space::repo::SpaceError>>,
+    ack: crate::space::repo::SpaceAck,
+) -> anyhow::Result<()> {
+    if st.pending.load(Ordering::Acquire) == 0 {
+        let _ = reply.send(Ok(ack));
+        return Ok(());
+    }
+    let entry = LogEntry {
+        shard: st.partition.id,
+        frames: Vec::new(),
+        muts: Vec::new(),
+        ack: Some(Box::new(move |r| {
+            let _ = reply.send(r.map(|_| ack).map_err(|e| WriteError::Internal(e.to_string()).into()));
+        })),
+        pending: Some(st.pending.clone()),
+        enqueued: Instant::now(),
+        totals: None,
+    };
+    send_entry(st, entry)
 }
 
 /// Deletes of the records a `prune_backlinks` create among `writes`

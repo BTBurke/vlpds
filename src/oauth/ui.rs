@@ -619,6 +619,32 @@ pub fn describe_permission(p: &Permission) -> String {
                 "Manage your identity (handle and DID document)".into()
             }
         }
+        Permission::Space(p) => {
+            let kind = if p.space_type == "*" { "any type".to_string() } else { p.space_type.clone() };
+            let whose = match p.authority.as_str() {
+                "self" => "your own spaces".to_string(),
+                "*" => "any account's spaces".to_string(),
+                did => format!("spaces of {did}"),
+            };
+            let mut verbs: Vec<&str> = Vec::new();
+            if p.action.iter().any(|a| a == "read") {
+                verbs.push("read");
+            } else if p.action.iter().any(|a| a == "read_self") {
+                verbs.push("read your own records in");
+            }
+            if p.collection.is_some() {
+                verbs.extend(p.action.iter().filter_map(|a| match a.as_str() {
+                    "create" => Some("create"),
+                    "update" => Some("update"),
+                    "delete" => Some("delete"),
+                    _ => None,
+                }));
+            }
+            if p.manage.is_some() {
+                verbs.push("manage");
+            }
+            format!("{} {whose} ({kind})", capitalize(&join_and(&verbs)))
+        }
     }
 }
 

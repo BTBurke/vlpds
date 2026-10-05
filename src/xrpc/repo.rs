@@ -24,7 +24,7 @@ pub const DEFAULT_MAX_IMPORT_BYTES: usize = 1 << 30;
 /// record costs every later read.
 const MAX_IMPORT_RECORD_BYTES: usize = 2 << 20;
 
-fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
+pub(super) fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
     if !super::syntax::valid_nsid(collection) {
         return Err(XrpcError::bad("InvalidRequest", format!("Invalid collection: {collection} is not a valid NSID")));
     }
@@ -35,7 +35,7 @@ fn check_path(collection: &str, rkey: Option<&str>) -> XResult<()> {
 }
 
 /// Reference prepareCreate/prepareUpdate; deletes are not checked.
-fn check_rkey_slur(rkey: Option<&str>) -> XResult<()> {
+pub(super) fn check_rkey_slur(rkey: Option<&str>) -> XResult<()> {
     if rkey.is_some_and(crate::handle_policy::has_explicit_slur) {
         return Err(XrpcError::bad("InvalidRequest", "Unacceptable slur in record key"));
     }
@@ -54,14 +54,14 @@ const CREATE: &str = "com.atproto.repo.applyWrites#create";
 const UPDATE: &str = "com.atproto.repo.applyWrites#update";
 const DELETE: &str = "com.atproto.repo.applyWrites#delete";
 
-type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus, Vec<BlobDecl>);
+pub(super) type Encoded = (Cid, Bytes, Vec<Cid>, crate::lexicon::ValidationStatus, Vec<BlobDecl>);
 
 /// A blob ref as the record declares it: (cid, mimeType, size).
-type BlobDecl = (Cid, Option<String>, Option<i64>);
+pub(super) type BlobDecl = (Cid, Option<String>, Option<i64>);
 
 /// Reference prepareWrite: a missing `$type` defaults to the collection.
 /// `resolved` is the dynamically resolved lexicon of `collection`, if any.
-fn encode_record(
+pub(super) fn encode_record(
     v: &mut JsonValue,
     collection: &str,
     rkey: &str,
@@ -96,7 +96,7 @@ fn encode_record(
     Ok((Cid::dag_cbor(&bytes), Bytes::from(bytes), blobs, status, refs.blobs))
 }
 
-fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
+pub(super) fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
     if let Some(st) = status {
         out["validationStatus"] = json!(st);
     }
@@ -104,11 +104,11 @@ fn with_status(mut out: J, status: crate::lexicon::ValidationStatus) -> J {
 }
 
 /// Serde's wording, for fields read from the body tree.
-fn field_err(m: String) -> XrpcError {
+pub(super) fn field_err(m: String) -> XrpcError {
     XrpcError::bad("InvalidRequest", format!("Invalid JSON body: {m}"))
 }
 
-fn opt_str(v: &JsonValue, k: &str) -> XResult<Option<String>> {
+pub(super) fn opt_str(v: &JsonValue, k: &str) -> XResult<Option<String>> {
     match v.get(k) {
         None | Some(JsonValue::Null) => Ok(None),
         Some(JsonValue::Str(s)) => Ok(Some(s.to_string())),
@@ -116,11 +116,11 @@ fn opt_str(v: &JsonValue, k: &str) -> XResult<Option<String>> {
     }
 }
 
-fn req_str(v: &JsonValue, k: &str) -> XResult<String> {
+pub(super) fn req_str(v: &JsonValue, k: &str) -> XResult<String> {
     opt_str(v, k)?.ok_or_else(|| field_err(format!("missing field `{k}`")))
 }
 
-fn opt_bool(v: &JsonValue, k: &str) -> XResult<Option<bool>> {
+pub(super) fn opt_bool(v: &JsonValue, k: &str) -> XResult<Option<bool>> {
     match v.get(k) {
         None | Some(JsonValue::Null) => Ok(None),
         Some(JsonValue::Bool(b)) => Ok(Some(*b)),
@@ -128,7 +128,7 @@ fn opt_bool(v: &JsonValue, k: &str) -> XResult<Option<bool>> {
     }
 }
 
-fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
+pub(super) fn take<'a>(v: &mut JsonValue<'a>, k: &str) -> XResult<JsonValue<'a>> {
     v.get_mut(k).map(|x| std::mem::replace(x, JsonValue::Null)).ok_or_else(|| field_err(format!("missing field `{k}`")))
 }
 
@@ -597,7 +597,7 @@ fn write_record_json(out: &mut Vec<u8>, uri: &str, cid: &Cid, bytes: &[u8]) -> X
     Ok(())
 }
 
-fn json_bytes(body: Vec<u8>) -> Response {
+pub(super) fn json_bytes(body: Vec<u8>) -> Response {
     ([(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 

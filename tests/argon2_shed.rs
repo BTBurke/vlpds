@@ -8,6 +8,10 @@
 //! Its own binary because the Argon2 permits are process-wide: saturating
 //! them inside tests/all would shed every other test's logins.
 
+macro_rules! suite_only {
+    ($($i:item)*) => {};
+}
+
 #[path = "all/common/mod.rs"]
 mod common;
 

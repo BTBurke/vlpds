@@ -91,6 +91,19 @@ fn retryable_write(req: &Request) -> bool {
         )
 }
 
+/// Space record writes resend like repo writes (`--spaces` only).
+fn retryable_space_write(req: &Request, spaces: bool) -> bool {
+    spaces
+        && req.method() == Method::POST
+        && matches!(
+            req.uri().path(),
+            "/xrpc/com.atproto.space.createRecord"
+                | "/xrpc/com.atproto.space.putRecord"
+                | "/xrpc/com.atproto.space.deleteRecord"
+                | "/xrpc/com.atproto.space.applyWrites"
+        )
+}
+
 /// An XRPC query: no side effects, so resending one is safe whatever the
 /// first attempt did. Not a websocket upgrade (subscribeRepos), and no body
 /// to buffer.
@@ -426,6 +439,45 @@ async fn named_account(router: &dyn Router, app: Option<&crate::xrpc::App>, path
     crate::xrpc::reset_token_did(app?, n.token.0.as_deref()?).await.ok()?
 }
 
+/// Space host methods run at the space authority's owner, whatever DIDs
+/// their other fields name (notifyWrite's `repo` is the writer, putMember's
+/// `did` the member, getSpaceCredential's token the user).
+fn space_host_method(nsid: &str) -> bool {
+    matches!(
+        nsid,
+        "com.atproto.space.getSpaceCredential"
+            | "com.atproto.space.notifyWrite"
+            | "com.atproto.space.listRepos"
+            | "com.atproto.space.registerNotify"
+            | "com.atproto.space.unregisterNotify"
+    ) || nsid.starts_with("com.atproto.simplespace.")
+}
+
+/// The authority DID of the `space` field (the query of a GET, the JSON
+/// body of a POST); without one (createSpace), the caller's.
+#[allow(clippy::result_large_err)]
+async fn space_host_target(req: Request) -> Result<(Request, Option<String>), Response> {
+    let authority = |space: &str| crate::xrpc::syntax::parse_space_uri(space).map(|s| s.authority.to_string());
+    if req.method() != Method::POST {
+        let space = req.uri().query().unwrap_or("").split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (k == "space").then(|| percent_decode(v))
+        });
+        let did = space.as_deref().and_then(authority).or_else(|| token_sub(&req));
+        return Ok((req, did));
+    }
+    let (req, raw) = buffer(req).await?;
+    #[derive(Deserialize)]
+    struct SpaceField<'a> {
+        #[serde(borrow, default)]
+        space: Str<'a>,
+    }
+    let b = routing_body(req.headers(), &raw);
+    let space = serde_json::from_slice::<SpaceField>(&b).ok().and_then(|f| f.space.0.map(Cow::into_owned));
+    let did = space.as_deref().and_then(authority).or_else(|| token_sub(&req));
+    Ok((req, did))
+}
+
 #[allow(clippy::result_large_err)]
 async fn xrpc_target(
     router: &dyn Router,
@@ -437,6 +489,9 @@ async fn xrpc_target(
         // e.g. tools.ozone.moderation.getRepo?did= still routes by caller
         let sub = token_sub(&req);
         return Ok((req, sub));
+    }
+    if app.is_some_and(|a| a.config.spaces) && space_host_method(nsid) {
+        return space_host_target(req).await;
     }
     let admin = nsid.starts_with("com.atproto.admin.");
     // the body names the account: neither the query nor an (unverified,
@@ -530,12 +585,14 @@ pub async fn route(
         return r.await;
     }
     let retry = app.is_some_and(|a| a.config.retry_unapplied_writes);
+    let spaces = app.is_some_and(|a| a.config.spaces);
+    let resend = |req: &Request| retryable_write(req) || retryable_space_write(req, spaces) || retryable_read(req);
     if router.alone() {
         // Served here without the routing work. A write can still find its
         // shard gone before it starts (frozen for a split, or taken by a
         // node that joined after this check): resent like any other, its
         // routing key worked out only then. A query likewise.
-        if xrpc && retry && (retryable_write(&req) || retryable_read(&req)) {
+        if xrpc && retry && resend(&req) {
             return with_retries(router, client, None, req, token, next).await;
         }
         return next.run(req).await;
@@ -545,7 +602,7 @@ pub async fn route(
         Ok(t) => t,
         Err(r) => return r,
     };
-    if let Some(k) = key.as_deref().filter(|_| retry && (retryable_write(&req) || retryable_read(&req))) {
+    if let Some(k) = key.as_deref().filter(|_| retry && resend(&req)) {
         return with_retries(router, client, Some(k), req, token, next).await;
     }
     let Some(owner) = key.as_deref().and_then(|k| router.remote_owner(k)) else {

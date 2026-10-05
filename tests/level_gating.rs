@@ -16,6 +16,10 @@
 //!
 //! Its own binary because the active level is process-wide.
 
+macro_rules! suite_only {
+    ($($i:item)*) => {};
+}
+
 #[path = "all/common/mod.rs"]
 mod common;
 #[path = "all/formats.rs"]

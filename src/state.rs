@@ -25,6 +25,22 @@
 //! `{gen}` is the repo's generation (`Account::repo_gen`, LEB128): importRepo
 //! stages the new repo under a fresh one and moves the account to it in one
 //! entry (DESIGN.md "Staged imports").
+//!
+//! Spaces (`--spaces`; values in `crate::space::rows`). `{sid}` is the first
+//! 16 bytes of sha256(space URI); the URI itself is in `sH`/`sS`/`sP` and
+//! checked by every reader. Repo-host rows are in the author's slot:
+//!
+//! sH/{did}\0{sid}                   -> space repo head: URI, rev, LtHash state, count, created
+//! sR/{did}\0{sid}{coll}/{rkey}      -> record cid | rev | record bytes (as `R/`)
+//! sO/{did}\0{sid}{rev u64}{idx u16} -> oplog op: action, coll, rkey, cid?, prev?
+//! sP/{did}\0{sid}                   -> notifyWrite outbox: URI, repoRev, hash
+//!
+//! Space-host rows are in the authority's slot:
+//!
+//! sS/{auth}\0{sid}                  -> the space (JSON: URI, policies, created, deleted)
+//! sM/{auth}\0{sid}{member}          -> member access
+//! sW/{auth}\0{sid}{writer}          -> writer state: repoRev, hash, spaceRev
+//! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listRepos order; latest state per writer only)
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -205,6 +221,75 @@ pub const BACKLINK_FAMILY: &[u8] = b"bl/";
 /// are exactly these prefixes ([`gen_prefix`]).
 pub const GEN_FAMILIES: [&[u8]; 5] =
     [RECORD_FAMILY, RECORD_CID_FAMILY, BLOB_REF_FAMILY, BACKLINK_FAMILY, MST_NODE_FAMILY];
+
+pub const SPACE_HEAD_FAMILY: &[u8] = b"sH/";
+pub const SPACE_RECORD_FAMILY: &[u8] = b"sR/";
+pub const SPACE_OPLOG_FAMILY: &[u8] = b"sO/";
+pub const SPACE_OUTBOX_FAMILY: &[u8] = b"sP/";
+pub const SPACE_FAMILY: &[u8] = b"sS/";
+pub const SPACE_MEMBER_FAMILY: &[u8] = b"sM/";
+pub const SPACE_WRITER_FAMILY: &[u8] = b"sW/";
+pub const SPACE_SEQ_FAMILY: &[u8] = b"sQ/";
+
+/// Every Spaces family: rows that must never reach a firehose frame.
+pub const SPACE_FAMILIES: [&[u8]; 8] = [
+    SPACE_HEAD_FAMILY,
+    SPACE_RECORD_FAMILY,
+    SPACE_OPLOG_FAMILY,
+    SPACE_OUTBOX_FAMILY,
+    SPACE_FAMILY,
+    SPACE_MEMBER_FAMILY,
+    SPACE_WRITER_FAMILY,
+    SPACE_SEQ_FAMILY,
+];
+
+pub const SPACE_ID_LEN: usize = 16;
+pub type SpaceId = [u8; SPACE_ID_LEN];
+
+pub fn space_id(uri: &str) -> SpaceId {
+    Sha256::digest(uri.as_bytes())[..SPACE_ID_LEN].try_into().unwrap()
+}
+
+pub fn is_space_key(key: &[u8]) -> bool {
+    key_slot(key).is_some() && SPACE_FAMILIES.iter().any(|f| key_body(key).starts_with(f))
+}
+
+/// `fam ‖ did ‖ \0 ‖ sid`: one (account, space)'s rows of a family.
+pub fn space_prefix(fam: &[u8], did: &str, sid: &SpaceId) -> Vec<u8> {
+    keyed(did, fam, &[did.as_bytes(), b"\0", sid])
+}
+
+pub fn space_head_key(did: &str, sid: &SpaceId) -> Vec<u8> {
+    space_prefix(SPACE_HEAD_FAMILY, did, sid)
+}
+
+pub fn space_record_key(did: &str, sid: &SpaceId, path: &str) -> Vec<u8> {
+    keyed(did, SPACE_RECORD_FAMILY, &[did.as_bytes(), b"\0", sid, path.as_bytes()])
+}
+
+pub fn space_oplog_key(did: &str, sid: &SpaceId, rev: u64, idx: u16) -> Vec<u8> {
+    keyed(did, SPACE_OPLOG_FAMILY, &[did.as_bytes(), b"\0", sid, &rev.to_be_bytes(), &idx.to_be_bytes()])
+}
+
+pub fn space_outbox_key(did: &str, sid: &SpaceId) -> Vec<u8> {
+    space_prefix(SPACE_OUTBOX_FAMILY, did, sid)
+}
+
+pub fn space_key(authority: &str, sid: &SpaceId) -> Vec<u8> {
+    space_prefix(SPACE_FAMILY, authority, sid)
+}
+
+pub fn space_member_key(authority: &str, sid: &SpaceId, member: &str) -> Vec<u8> {
+    keyed(authority, SPACE_MEMBER_FAMILY, &[authority.as_bytes(), b"\0", sid, member.as_bytes()])
+}
+
+pub fn space_writer_key(authority: &str, sid: &SpaceId, writer: &str) -> Vec<u8> {
+    keyed(authority, SPACE_WRITER_FAMILY, &[authority.as_bytes(), b"\0", sid, writer.as_bytes()])
+}
+
+pub fn space_seq_key(authority: &str, sid: &SpaceId, space_rev: u64) -> Vec<u8> {
+    keyed(authority, SPACE_SEQ_FAMILY, &[authority.as_bytes(), b"\0", sid, &space_rev.to_be_bytes()])
+}
 
 /// A repo generation in keys: LEB128, which is prefix-free, so no
 /// generation's range holds another's keys.

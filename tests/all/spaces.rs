@@ -20,6 +20,17 @@ const METHODS: &[(&str, bool)] = &[
     ("COM.ATPROTO.Space.getRecord", false),
 ];
 
+/// Spaces methods without a handler yet: with the flag they answer 501
+/// locally.
+const UNIMPLEMENTED: &[(&str, bool)] = &[
+    ("com.atproto.space.getRepo?repo=did:plc:x", false),
+    ("com.atproto.space.listSpaces", false),
+    ("com.atproto.space.notifyWrite", true),
+    ("com.atproto.simplespace.putMember", true),
+    // NSID authorities are case-insensitive
+    ("COM.ATPROTO.Space.getRecord", false),
+];
+
 /// A did:web service on loopback that records what reaches it.
 async fn upstream() -> (String, Arc<Mutex<Vec<String>>>) {
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -66,7 +77,7 @@ async fn spaces_methods_answer_501_locally_with_the_flag() {
     let (proxy, seen) = upstream().await;
     let s = TestServer::spawn_with(|c| c.spaces = true).await;
     let a = s.create_account("spc").await;
-    for &(nsid, post) in METHODS {
+    for &(nsid, post) in UNIMPLEMENTED {
         for p in [None, Some(proxy.as_str())] {
             let r = call(&s, &a, nsid, post, p).await;
             assert_eq!(

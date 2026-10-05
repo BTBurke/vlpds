@@ -508,15 +508,31 @@ pub(crate) fn account_changed(did: &str) {
 }
 
 async fn cached_account(app: &App, did: &str) -> XResult<CachedAcct> {
+    cached_account_counted(app, did, true).await
+}
+
+/// An account's signing key and status from the proxy's account cache, for
+/// Spaces (a commit signed per read, the repo's availability): a hot repo's
+/// reads touch no state. Not counted in `vlpds_proxy_cache_total`.
+pub(crate) async fn account_key_status(app: &App, did: &str) -> XResult<(Arc<Keypair>, Option<String>)> {
+    let a = cached_account_counted(app, did, false).await?;
+    Ok((a.key, a.status))
+}
+
+async fn cached_account_counted(app: &App, did: &str, count: bool) -> XResult<CachedAcct> {
     let part = app.partition(did)?;
     let prev = match ACCTS.get_aged(did) {
         Some((a, age)) if age < ACCT_TTL && a.part == (part.id, part.epoch) => {
-            crate::metrics::PROXY_CACHE.with_label_values(&["account_hit"]).inc();
+            if count {
+                crate::metrics::PROXY_CACHE.with_label_values(&["account_hit"]).inc();
+            }
             return Ok(a);
         }
         prev => prev.map(|(a, _)| a),
     };
-    crate::metrics::PROXY_CACHE.with_label_values(&["account_miss"]).inc();
+    if count {
+        crate::metrics::PROXY_CACHE.with_label_values(&["account_miss"]).inc();
+    }
     // borrowed fields only: a full `Account` parse buffers the whole
     // document (its flattened extension map) and costs more than the read
     #[derive(serde::Deserialize)]

@@ -8,6 +8,10 @@
 //! Its own binary because metrics are process-wide: in tests/all other
 //! tests' nodes move them.
 
+macro_rules! suite_only {
+    ($($i:item)*) => {};
+}
+
 #[path = "all/common/mod.rs"]
 mod common;
 

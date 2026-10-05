@@ -134,8 +134,8 @@ pub struct Config {
     pub trusted_device_days: u32,
     /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
-    /// AT Protocol Spaces (`--spaces`; src/space). No methods yet: their
-    /// NSIDs answer 501 instead of being proxied.
+    /// AT Protocol Spaces (`--spaces`; src/space). Their NSIDs are never
+    /// proxied: one without a handler answers 501.
     pub spaces: bool,
     /// Largest importRepo body.
     pub max_import_bytes: usize,
@@ -491,6 +491,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         }
         None => crate::http::PeerClient::lone(),
     };
+    let spaces = cfg.spaces.then(|| Arc::new(crate::space::Spaces::new()));
     let node = Arc::new(crate::node::Node {
         cluster: cluster.clone(),
         log: log.clone(),
@@ -509,6 +510,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         http: http.clone(),
         recent_cap: cfg.preload_recent,
         followers: Default::default(),
+        spaces: spaces.clone(),
     });
     crate::node::export_sst_meta_bytes(&table);
     crate::memory::register(&table, &cluster, &workers);
@@ -545,7 +547,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         owned = cluster.owned().len(), elapsed_ms = started.elapsed().as_millis() as u64, "node ready"
     );
 
-    Ok(Arc::new(xrpc::App {
+    let app = Arc::new(xrpc::App {
+        spaces,
         jwt: auth::Jwt::new(&cfg.jwt_secret, &cfg.service_did),
         store: state_store,
         workers,
@@ -572,7 +575,11 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         log,
         node: node_handle,
         ui,
-    }))
+    });
+    if let Some(s) = &app.spaces {
+        s.outbox.start(Arc::downgrade(&app));
+    }
+    Ok(app)
 }
 
 pub fn spawn_reporters(app: &Arc<xrpc::App>) {

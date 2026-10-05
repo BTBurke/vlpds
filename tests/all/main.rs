@@ -4,6 +4,12 @@
 
 #![allow(clippy::type_complexity)]
 
+/// Items of `common` that need this suite's own modules (the other test
+/// binaries sharing `common` define it to drop them).
+macro_rules! suite_only {
+    ($($i:item)*) => { $($i)* };
+}
+
 mod account;
 mod account_counts;
 mod account_deactivation;
@@ -139,6 +145,7 @@ mod sign_in_security;
 mod signature_faults;
 mod smtp_mail;
 mod spaces;
+mod spaces_e2e;
 mod staged_import;
 mod subscribe_repos;
 mod sync;

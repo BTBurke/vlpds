@@ -43,6 +43,8 @@ pub struct Node {
     /// 0 = off.
     pub recent_cap: usize,
     pub(crate) followers: Mutex<HashMap<String, Follower>>,
+    /// `--spaces`: its heads leave with a shard, its outbox resumes with one.
+    pub spaces: Option<Arc<crate::space::Spaces>>,
 }
 
 /// Exports `vlpds_sst_meta_bytes` at every render: the encoded filters and
@@ -110,6 +112,9 @@ impl Node {
         self.log.closed.store(true, Ordering::Release);
         for p in self.table.owned() {
             self.table.set(p.id, None);
+            if let Some(s) = &self.spaces {
+                s.heads.drop_shard(p.id);
+            }
             for w in self.workers.senders.iter() {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
                 let _ = w.send(WorkerMsg::DropPartition(p.id, tx));
@@ -173,6 +178,11 @@ impl Node {
     }
 
     async fn purge_worker_caches(&self, shards: &[ShardId]) {
+        if let Some(s) = &self.spaces {
+            for &shard in shards {
+                s.heads.drop_shard(shard);
+            }
+        }
         let mut acks = Vec::new();
         for w in self.workers.senders.iter() {
             for &shard in shards {
@@ -327,6 +337,9 @@ impl ShardHost for Node {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "shards opened"
         );
+        if let Some(s) = &self.spaces {
+            s.clone().spawn_outbox_rescan(preload.iter().map(|(shard, db, _)| (*shard, db.clone())).collect());
+        }
         crate::worker::spawn_preload(&self.workers, preload);
         results
     }
