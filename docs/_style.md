@@ -27,13 +27,13 @@ The docs site is built from the Markdown files in this directory and served by t
 
 ## Adding a page
 
-1. Create `docs/<slug>.md` (or `docs/operations/<slug>.md`) with front matter:
+1. Create `docs/<slug>.md` (or `docs/operations/<slug>.md`, `docs/spaces/<slug>.md`) with front matter:
 
    ```yaml
    ---
    title: Firehose                 # sidebar and page title
-   section: vlPDS                  # "vlPDS" for docs/*.md, "Operations" for docs/operations/*.md
-   order: 6                        # position in its section (vlPDS 1-99, Operations 100+); unique
+   section: vlPDS                  # "vlPDS" for docs/*.md, "Operations" for docs/operations/*.md, "Spaces" for docs/spaces/*.md
+   order: 6                        # position in its section (vlPDS 1-99, Operations 100+, Spaces 200+); unique
    status: ready                   # stub (an outline; grey dot in the nav) | draft | ready (default)
    summary: "One sentence under the title. Quote it if it contains ': '."
    ---

@@ -1,0 +1,80 @@
+---
+title: Interop and divergences
+section: Spaces
+order: 206
+status: draft
+summary: "Which upstream vlpds tracks, where it deliberately differs from the reference PDS, and the gaps in the spec it works around."
+---
+
+```hero
+diagram:
+  caption: "vlpds speaks the reference's wire in every role, and the interop harness runs it both ways: ref-ref, vlpds-authority, ref-authority and vlpds-only, plus a three-node vlpds cluster on MinIO."
+  nodes:
+    - { id: v, label: vlpds, sub: "repo host · simplespace host", at: [0, 3], size: [12, 3], tone: accent }
+    - { id: r, label: Reference PDS, sub: "atproto `5b95b2f2`", at: [26, 3], size: [12, 3], tone: muted }
+    - { id: s, label: Syncer, sub: "`@atproto/space` consumer", at: [13, 10], size: [12, 3], tone: blue }
+  edges:
+    - "v <-> r: notifyWrite · credential reads"
+    - { from: s.t25, to: v.b, label: listRepoOps, tone: blue }
+    - { from: s.t75, to: r.b, label: listRepoOps, tone: blue }
+facts:
+  - { value: "5b95b2f2", label: reference pin, note: "bluesky-social/atproto PR #5187, Oct 1 wire" }
+  - { value: "211", unit: cases, label: of the reference's space suites mapped, note: "187 ported · 7 divergent · 17 N/A", tone: accent }
+  - { value: in order, label: fan-out per syncer, note: "the reference's unordered sends leave ~3–5 gaps per ~80", tone: violet }
+  - { value: OAuth, label: only, note: "the biggest divergence", tone: rust }
+```
+
+vlpds tracks the reference implementation, since the proposal leaves a lot of the wire to it.
+Where the spec is silent, vlpds matches the reference's behaviour. Where vlpds differs, it's on
+purpose, and `tests/REFERENCE_COVERAGE.md` lists each case.
+
+## The pin
+
+The pin is bluesky-social/atproto PR #5187 (branch `permissioned-data`) at `5b95b2f2`, which has the
+Oct 1 changes: HTTP message signatures in place of DPoP, 10-minute credentials with revocation, and
+`repoRev`/`spaceRev`. The lexicons are vendored unmodified in `lexicons/spaces-alpha` and the test
+vectors in `testdata/spaces-alpha`, both generated from that commit.
+
+Open upstream changes that would move it:
+
+| Upstream | What it changes |
+|---|---|
+| proposals #114 (STAR) | replaces the 2-root CAR that `getRepo` sends. vlpds's export sits behind a `RepoEncoder` trait so STAR can be a second encoder |
+| proposals #119 | moves space management into `com.atproto.space.*` behind a policy token |
+| proposals #118 | renames `name` to `title` in space type declarations |
+
+Where the spec is silent and vlpds copies the reference: a removed member stays in `listRepos` at its
+last `repoRev`, `listRepoOps` leaves out values for superseded ops, and `listSpaces` treats its
+filters as the scope target, so an unfiltered listing needs a wildcard grant.
+
+## Where vlpds differs
+
+| | Reference PDS | vlpds |
+|---|---|---|
+| Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes or delegation tokens |
+| Fan-out to syncers | each forward goes out as it's sequenced, unordered | one lane per (space, service), in spaceRev order, a writer's waiting forward replaced by its newer one |
+| notifyWrite delivery | a retry row written only after a send fails, so an acked write's notify can be lost in a crash | the `sP` row is in the write's own log entry |
+| Delegation tokens and client attestations | any lifetime (it mints 60 s) | refused past 300 s, since their `jti`s are held until `exp` |
+| Request signatures | no size cap, and header values decoded as latin1 | `Signature-Input` and `Signature` over 8 KiB refused, and header values must be visible ASCII |
+| did:keys | refuses hybrid (0x06/0x07) points | the same, checked explicitly, since libsecp256k1 alone would parse them |
+| Token claims | `iss` and `sub` need only be truthy | they must be non-empty strings |
+| Credential keys | resolves the authority's key on every request | caches a verified credential until `exp`, so a key rotation shows up within the hour |
+| Account takedown | the app's session works again after a reversal (what the harness expects) | revokes the account's OAuth sessions, and they stay revoked after a reversal. The app has to sign in again |
+| Record takedown | none for space records | hidden from every space read (a vlpds extension, see [Takedowns](privacy.md#takedowns)) |
+| Oplog | keeps every op | keeps 7 days. A `since` past that gets the window's start, and the syncer falls back to `getRepo` |
+| Space repo size | no cap | 100k records |
+| Backlinks | a like of a space URI is recorded as a backlink | public URIs only |
+| `sync.getBlob` with Spaces on | serves only publicly referenced blobs | the same, once space blobs are built. Today vlpds keeps serving unreferenced uploads |
+
+## Upstream gaps
+
+```steps
+- title: HTTP signatures cover two headers
+  body: "A request signature covers only `authorization` and `atproto-space-audience`, with no method or URL. So a captured request can be replayed against any read of the same repo while its credential lives. vlpds requires the audience to be a DID and the target repo, checks the credential's space against the request, and checks revocation on every request."
+- title: Takedowns and the LtHash (Q11)
+  body: "The spec has no record takedown for space data, and a hidden record still counts in the repo's hash. vlpds matches public-repo semantics for now. The decided answer, a takedown-adjusted view signed at serve time, isn't built yet. It keeps every view verifiable, so upstream could adopt it as is."
+- title: The getRepo format
+  body: "The 2-root CAR has one index block (~6 MB at 100k records) and needs its record blocks in canonical key order, which is why vlpds caps repos at 100k records and exports in two passes. STAR (#114) would remove both problems."
+- title: No import endpoint
+  body: "Nothing upstream moves a space repo into a new host. vlpds plans `vlpds.space.importRepo`, which isn't built yet, and will follow the upstream contract once there is one."
+```
