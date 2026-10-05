@@ -7,7 +7,7 @@
 export const U = 20 // px per grid unit
 const PAD = 14
 const ARROW = 7
-const TONES = new Set(['ink', 'accent', 'amber', 'blue', 'violet', 'rust', 'cyan', 'muted', 'solid', 'danger', 'ok'])
+export const TONES = new Set(['ink', 'accent', 'amber', 'blue', 'violet', 'rust', 'cyan', 'muted', 'solid', 'danger', 'ok'])
 const SHAPES = new Set(['box', 'store', 'pill', 'note'])
 
 export function esc(s) {
@@ -15,21 +15,21 @@ export function esc(s) {
 }
 
 // Rough advance widths, only used to size label backgrounds and the viewBox.
-function textWidth(s, size, mono) {
+export function textWidth(s, size, mono) {
   let w = 0
   for (const ch of s) w += mono ? 0.6 : /[mwMW@]/.test(ch) ? 0.82 : /[ilj.,:;'|!]/.test(ch) ? 0.3 : /[A-Z]/.test(ch) ? 0.66 : 0.54
   return w * size
 }
 
 /** `code` spans become mono tspans. */
-function tspans(s) {
+export function tspans(s) {
   return String(s)
     .split(/(`[^`]*`)/)
     .filter(Boolean)
     .map((p) => (p.startsWith('`') && p.endsWith('`') ? `<tspan class="dg-code">${esc(p.slice(1, -1))}</tspan>` : esc(p)))
     .join('')
 }
-function plainWidth(s, size) {
+export function plainWidth(s, size) {
   return String(s)
     .split(/(`[^`]*`)/)
     .filter(Boolean)
@@ -42,7 +42,7 @@ const KEYS = {
   edge: ['from', 'to', 'label', 'dash', 'arrow', 'tone', 'via', 'labelAt'],
   note: ['at', 'text', 'align', 'tone'],
   diagram: ['caption', 'title', 'nodes', 'groups', 'edges', 'notes'],
-  hero: ['diagram', 'facts'],
+  hero: ['diagram', 'timeline', 'facts'],
 }
 
 /**
@@ -61,7 +61,7 @@ function labelCapsWidth(s) {
   return textWidth(t.toUpperCase(), 10.5, false) + t.length * 0.84
 }
 
-function num(v, what) {
+export function num(v, what) {
   if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`${what}: expected a number, got ${JSON.stringify(v)}`)
   return v
 }
@@ -199,7 +199,7 @@ function trim(pts, atEnd, by) {
   return out
 }
 
-function arrowHead(tip, from, cls) {
+export function arrowHead(tip, from, cls) {
   const dx = tip[0] - from[0]
   const dy = tip[1] - from[1]
   const len = Math.hypot(dx, dy) || 1
@@ -212,7 +212,7 @@ function arrowHead(tip, from, cls) {
   return `<polygon class="${cls}" points="${pts.map((p) => p.map(r).join(',')).join(' ')}"/>`
 }
 
-const r = (v) => Math.round(v * 10) / 10
+export const r = (v) => Math.round(v * 10) / 10
 
 /** A path through `pts` with rounded corners. */
 function pathD(pts) {
@@ -246,7 +246,7 @@ function labelPos(pts) {
   return [(pts[best][0] + pts[best + 1][0]) / 2, (pts[best][1] + pts[best + 1][1]) / 2]
 }
 
-function tone(t, what) {
+export function tone(t, what) {
   const v = t ?? 'ink'
   if (!TONES.has(v)) throw new Error(`${what}: unknown tone ${JSON.stringify(v)} (${[...TONES].join(', ')})`)
   return v

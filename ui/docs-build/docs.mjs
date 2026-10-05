@@ -1,7 +1,8 @@
 // Loads docs/**/*.md at build time: front matter, markdown →
 // HTML (markdown-it + highlight.js, nothing shipped to the browser), the
-// fenced visuals (hero, diagram, facts, steps, pages), and validation: front
-// matter, a hero first on every page, internal links and their anchors.
+// fenced visuals (hero, diagram, timeline, facts, steps, pages), and
+// validation: front matter, a hero first on every page, internal links and
+// their anchors.
 // Files whose name starts with "_" (the style guide) are not published.
 
 import fs from 'node:fs'
@@ -17,6 +18,7 @@ import ini from 'highlight.js/lib/languages/ini'
 import plaintext from 'highlight.js/lib/languages/plaintext'
 import { load as loadYaml } from 'js-yaml'
 import { renderDiagram, esc, checkKeys } from './diagram.mjs'
+import { renderTimeline } from './timeline.mjs'
 
 hljs.registerLanguage('bash', bash)
 hljs.registerLanguage('json', json)
@@ -29,7 +31,7 @@ const LANG_ALIASES = { sh: 'bash', shell: 'bash', console: 'bash', yml: 'yaml', 
 
 export const DOCS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../docs')
 const STATUSES = new Set(['stub', 'draft', 'ready'])
-const VISUAL_FENCES = new Set(['hero', 'diagram', 'facts', 'steps', 'pages'])
+const VISUAL_FENCES = new Set(['hero', 'diagram', 'timeline', 'facts', 'steps', 'pages'])
 
 export function slugify(s) {
   return (
@@ -90,14 +92,15 @@ function renderFacts(facts, md, where) {
   )
 }
 
-function renderFigure(spec, where) {
+function renderFigure(spec, where, render = renderDiagram) {
   let d
   try {
-    d = renderDiagram(spec)
+    d = render(spec)
   } catch (e) {
     throw new Error(`${where}: ${e.message}`)
   }
-  const wide = d.width > 560 ? ' dg-wide' : ''
+  // timelines keep their text readable on a phone and scroll instead
+  const wide = render === renderTimeline ? (d.width > 620 ? ' tl-wide' : '') : d.width > 560 ? ' dg-wide' : ''
   // DocsApp opens the diagram full screen from this button (or a click on the diagram)
   const expand =
     `<button type="button" class="dg-expand" aria-label="Expand diagram" title="Expand">` +
@@ -140,6 +143,8 @@ function makeMd(ctx) {
       switch (info) {
         case 'diagram':
           return renderFigure(spec, where)
+        case 'timeline':
+          return renderFigure(spec, where, renderTimeline)
         case 'facts':
           return renderFacts(spec, md, where)
         case 'steps':
@@ -147,13 +152,15 @@ function makeMd(ctx) {
         case 'pages':
           return ctx.renderPages(spec, where)
         case 'hero': {
-          if (!spec?.diagram || !spec?.facts) throw new Error(`${where}: hero needs diagram and facts`)
+          if (!(spec?.diagram || spec?.timeline) || !spec?.facts) throw new Error(`${where}: hero needs a diagram (or a timeline) and facts`)
+          if (spec.diagram && spec.timeline) throw new Error(`${where}: hero takes a diagram or a timeline, not both`)
           try {
             checkKeys(spec, 'hero', 'hero')
           } catch (e) {
             throw new Error(`${where}: ${e.message}`)
           }
-          return `<section class="hero">${renderFigure(spec.diagram, where)}${renderFacts(spec.facts, md, where)}</section>`
+          const fig = spec.timeline ? renderFigure(spec.timeline, where, renderTimeline) : renderFigure(spec.diagram, where)
+          return `<section class="hero">${fig}${renderFacts(spec.facts, md, where)}</section>`
         }
       }
     }

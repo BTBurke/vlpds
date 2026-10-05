@@ -177,6 +177,40 @@ Diagram rules:
 - **Short labels.** A box label is a noun of one to three words; details go in `sub` or the text.
   A box is 160 px wide by default: a `sub` longer than ~24 characters needs a wider box.
 
+### timeline (swimlanes)
+
+Lanes are rows and time runs left to right, for anything where order and waiting matter: the
+life of a write, pipelining, a takeover. Time is in abstract units (`scale` px each, default 56),
+so a 44 µs step and a 300 ms PUT fit one figure. Put real durations in `dur` and `ticks`, and say
+in the caption when the spacing isn't to scale. A hero can take `timeline:` in place of `diagram:`.
+Timelines wider than 620 px scroll sideways on a phone instead of shrinking their text.
+
+```yaml
+caption: Required. What the reader should see in it.
+scale: 44
+lanes:
+  - { id: log, label: Node log, sub: sequencer · finalizer, tone: accent }
+  - { id: store, label: Object store, sub: "`log/` segments", tone: amber }
+spans:                                      # bars; one lane does one thing at a time
+  - { lane: log, from: 4, to: 6, label: batch, dur: "0–1 PUT wait" }
+  - { lane: store, from: 6, to: 10, label: segment PUT, dur: "~30 ms", tone: amber, dash: true }
+events:                                     # a diamond, label underneath
+  - { lane: log, at: 11, label: lease check, tone: muted }
+arrows:                                     # between lanes, at a time or [sent, arrived]
+  - { from: log, to: store, at: 6.1, label: If-None-Match, side: left }
+marks:                                      # a labelled rule across every lane
+  - { at: 10, label: durable, tone: amber }  # tone defaults to solid
+ticks:                                      # the axis under the lanes
+  - { at: 10, label: "~30–50 ms" }
+```
+
+The build places every label by fixed rules and fails, naming both parties, when something
+doesn't fit: an unknown lane or key, a missing caption, `to` not after `from`, two spans
+overlapping in one lane, a span label wider than its bar, two labels overlapping, an arrow running
+through a span in a lane it passes, or a mark's rule cutting through text. Fix it by moving a
+time, shortening a label, flipping an arrow label to `side: left`, or raising `scale`. Spans may
+touch end to end. Tones mean the same as in diagrams.
+
 ## Tone and content
 
 - **Operator-focused.** Write for someone running a server: what it does, what it costs, what to
