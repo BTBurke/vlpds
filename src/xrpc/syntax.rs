@@ -63,6 +63,35 @@ pub fn valid_did(s: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"._:%-".contains(&b))
 }
 
+/// A space URI without its fragment: `at://{space DID}/space/{space type
+/// NSID}/{skey}`, plus `/{author DID}/{collection}/{rkey}` for a record in
+/// it (@atproto/syntax `parseSpaceAtUriString`, strict). Both DIDs must be
+/// DIDs, not handles, and the skey follows the record-key syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceUri<'a> {
+    pub authority: &'a str,
+    pub space_type: &'a str,
+    pub skey: &'a str,
+    /// (author, collection, rkey)
+    pub record: Option<(&'a str, &'a str, &'a str)>,
+}
+
+pub fn parse_space_uri(s: &str) -> Option<SpaceUri<'_>> {
+    let mut parts = s.strip_prefix("at://")?.split('/');
+    let (authority, marker, space_type, skey) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let record = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (None, ..) => None,
+        (Some(a), Some(c), Some(r), None) => Some((a, c, r)),
+        _ => return None,
+    };
+    let ok = marker == "space"
+        && valid_did(authority)
+        && valid_nsid(space_type)
+        && valid_rkey(skey)
+        && record.is_none_or(|(a, c, r)| valid_did(a) && valid_nsid(c) && valid_rkey(r));
+    ok.then_some(SpaceUri { authority, space_type, skey, record })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
