@@ -1144,7 +1144,8 @@ async fn spaces_microbench_smoke() {
 async fn spaces_microbench_cluster_smoke() {
     let out = run(Cfg { sections: vec!["cluster".into()], ..Cfg::tiny() }).await;
     let text = out.0.join("\n");
-    let line = |want: &str| out.0.iter().find(|l| l.contains(want)).unwrap_or_else(|| panic!("no {want:?} in:\n{text}"));
+    let line =
+        |want: &str| out.0.iter().find(|l| l.contains(want)).unwrap_or_else(|| panic!("no {want:?} in:\n{text}"));
     assert!(!line("write ack -> authority notify ack").contains("n=0 "), "no notify acked:\n{text}");
     assert!(!line("syncer 0:").contains(" 0 notifies"), "the syncer heard nothing:\n{text}");
 }

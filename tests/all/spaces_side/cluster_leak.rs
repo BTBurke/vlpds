@@ -40,7 +40,7 @@ fn collect(mut sub: Sub, marker: Arc<Mutex<Option<Cid>>>) -> tokio::task::JoinHa
         let mut frames = Vec::new();
         let mut idle_since = None::<Instant>;
         loop {
-            let m = marker.lock().clone();
+            let m = *marker.lock();
             match sub.next(Duration::from_millis(250)).await {
                 Some(f) => {
                     let done = m.as_ref().is_some_and(|c| is_commit(&f, c));
@@ -71,9 +71,10 @@ async fn tap(n: &TestServer, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<V
     let url = format!("{}/internal/v1/log/stream", n.peer_url.replacen("https", "wss", 1));
     let mut req = tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str()).unwrap();
     req.headers_mut().insert("x-vlpds-internal", vlpds::server::DEV_INTERNAL_TOKEN.parse().unwrap());
-    let (mut ws, _) = tokio_tungstenite::connect_async_tls_with_config(req, None, false, peer_client().ws_connector(&id))
-        .await
-        .expect("the peer log stream");
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async_tls_with_config(req, None, false, peer_client().ws_connector(&id))
+            .await
+            .expect("the peer log stream");
     tokio::spawn(async move {
         let mut out = Vec::new();
         while !stop.load(Ordering::SeqCst) {
@@ -145,7 +146,11 @@ async fn space_writes_stay_off_every_stream_of_a_loaded_cluster() {
         let from = n.settled_now().await;
         full.push(collect(live, marker.clone()));
         for k in 0..SHARDS {
-            shards.push((cluster(n).cfg.node_id.clone(), k, collect(sub_shard(n, from, k, SHARDS).await, marker.clone())));
+            shards.push((
+                cluster(n).cfg.node_id.clone(),
+                k,
+                collect(sub_shard(n, from, k, SHARDS).await, marker.clone()),
+            ));
         }
     }
     let stop = Arc::new(AtomicBool::new(false));
@@ -177,7 +182,8 @@ async fn space_writes_stay_off_every_stream_of_a_loaded_cluster() {
     for (_, p) in &planted {
         all.extend(&p.sentinels);
     }
-    let last = Cid::parse(nodes[0].post(&planted[0].1.author, "public after").await.commit_cid.as_deref().unwrap()).unwrap();
+    let last =
+        Cid::parse(nodes[0].post(&planted[0].1.author, "public after").await.commit_cid.as_deref().unwrap()).unwrap();
     *marker.lock() = Some(last);
 
     let mut fulls = Vec::new();

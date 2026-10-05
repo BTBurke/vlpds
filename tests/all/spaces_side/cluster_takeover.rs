@@ -88,7 +88,8 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         },
         async {
             while !stop.load(Ordering::SeqCst) {
-                if let Ok(Ok(repos)) = tokio::time::timeout(Duration::from_secs(5), list_repos(&auth, &local, &cred)).await
+                if let Ok(Ok(repos)) =
+                    tokio::time::timeout(Duration::from_secs(5), list_repos(&auth, &local, &cred)).await
                 {
                     polls.lock().push(repos);
                 }

@@ -21,7 +21,6 @@ fn tag() -> String {
     random_bytes(5).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-
 fn jti(credential: &str) -> String {
     use base64::Engine;
     let payload = credential.split('.').nth(1).expect("a JWT");
@@ -104,7 +103,11 @@ async fn refused_within(fx: &Fixture, node: &TestServer, credential: &str, since
             return since.elapsed();
         }
         assert_eq!(r.status, 200, "{ctx}: neither served nor refused as revoked: {}", r.text());
-        assert!(since.elapsed() < Duration::from_secs(10), "{ctx}: still served {:?} after the revoke", since.elapsed());
+        assert!(
+            since.elapsed() < Duration::from_secs(10),
+            "{ctx}: still served {:?} after the revoke",
+            since.elapsed()
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -156,11 +159,8 @@ async fn revocations_hold_across_restarts_missed_nudges_and_joins() {
     let (n1, n2) = (node("rvr-1").await, node("rvr-2").await);
     balanced(&[&n1, &n2]).await;
     let fx = Fixture::new(&n1, &n2).await;
-    let (first, second, kept) = (
-        fx.auth.credential(&fx.space).await,
-        fx.auth.credential(&fx.space).await,
-        fx.auth.credential(&fx.space).await,
-    );
+    let (first, second, kept) =
+        (fx.auth.credential(&fx.space).await, fx.auth.credential(&fx.space).await, fx.auth.credential(&fx.space).await);
     for c in [&first, &second, &kept] {
         fx.read(&n1, c).await.ok();
         fx.read(&n2, c).await.ok();

@@ -39,7 +39,6 @@ fn tag() -> String {
     random_bytes(5).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-
 fn layout(n: &TestServer) -> Arc<Layout> {
     cluster(n).layout()
 }
@@ -263,7 +262,9 @@ impl World {
         let repos = list_repos(a, &self.local, &self.credential).await.unwrap();
         let rows = by_did(&repos);
         assert_eq!(rows.len(), repos.len(), "listRepos repeats a repo: {repos:?}");
-        rows.into_iter().map(|(d, r)| (d, (r["repoRev"].clone(), r["spaceRev"].clone(), bytes_field(&r["hash"])))).collect()
+        rows.into_iter()
+            .map(|(d, r)| (d, (r["repoRev"].clone(), r["spaceRev"].clone(), bytes_field(&r["hash"]))))
+            .collect()
     }
 
     /// Rows, repo views and host state, checked against `want` if given.
@@ -357,8 +358,9 @@ async fn split_and_merge_keep_every_space_row() {
     let t = Instant::now();
     loop {
         let got = w.stub.accepted();
-        let done =
-            heads.iter().all(|(did, rev)| got.iter().any(|n| n.body["repo"] == json!(did) && n.body["repoRev"] == json!(rev)));
+        let done = heads
+            .iter()
+            .all(|(did, rev)| got.iter().any(|n| n.body["repo"] == json!(did) && n.body["repoRev"] == json!(rev)));
         if done {
             break;
         }
