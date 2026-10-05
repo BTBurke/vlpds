@@ -1212,34 +1212,42 @@ forwarded write for that long), or telling "busy loading" apart from
   its reads. So a first attempt answered `ShardMoved` / `RepoLoading`
   *after* authenticating (a write not started in 1 s, a query whose repo's
   shard left, the 1.5 s auth answer above) left the proof claimed, and the
-  resend was refused 401 `invalid_dpop_proof` "DPoP proof replayed": every
-  OAuth client lost the resend (`tests/all/dpop_resend.rs` reproduced it).
-  Now the request remembers the claim it made, and when its answer is a
-  503 `ShardMoved` / `RepoLoading` for a request the entry node resends,
-  the DPoP layer gives the claim back (`/internal/v1/oauth/replay`
-  release) before the answer leaves (`xrpc::oauth::dpop_layer`).
-  Security: replay protection's job is that one proof authorizes at most
-  one request that does something. Those answers mean nothing was done
-  (the same guarantee the resend itself relies on), so after the release
-  the proof is exactly as if it had never been presented: a replay racing
-  the resend can win the claim, and then the resend is refused, but never
-  both are served. Until the release, any replay is refused as before.
-  Only a claim this request made is released (never one it found taken),
-  and only on those two answers to resendable requests (repo writes and
-  queries), not other endpoints, whose 503s promise nothing.
-  Alternatives rejected: an entry-node "retry token" letting the owner
-  accept a claimed `jti` once more needs the claim bound to a request id
-  (or a replay racing the first attempt gets served alongside the
-  resend), and verifying DPoP at the entry node and forwarding an
-  assertion would move every proof check off the owner, which reads the
-  session it checks anyway. Residual: an auth wait cancelled at 1.5 s
-  while its claim call to the DID's owner was in flight (that owner
-  frozen) leaves the claim in place; that resend is refused. Service-auth
-  JWTs track no `jti` (as the reference), Bearer access tokens are
-  reusable, and the remaining single-use tokens (refresh tokens,
-  authorization-server DPoP proofs, client assertions, codes, email and
-  2FA tokens) are spent on `/oauth/*` or on procedures the entry node
-  never resends.
+  resend was refused 401 `invalid_dpop_proof` "DPoP proof replayed"
+  (`tests/all/dpop_resend.rs` reproduced it). A first fix gave the claim
+  back with such an answer, but only for repo writes and queries: a space
+  write resent after `ShardMoved` still got the 401, and a release that
+  failed (its owner unreachable, an auth wait cancelled mid-claim) left the
+  resend refused too. Now the claim belongs to the client request: the
+  entry node gives each request it may resend a random 64-bit id, sent with
+  every attempt as the peer-only `x-vlpds-resend: {id:x}.{attempt}` (and as
+  a request extension when served locally), and the claim records it
+  (`ReplayCache::insert_held`, the `holder` of `/internal/v1/oauth/replay`).
+  The same id meeting its own claim passes; anything else is a replay.
+  Security: the marker is trusted only next to a valid forwarded marker on
+  the peer listener (the public listener drops it with the other peer-only
+  headers), and a client request gets a fresh id at its entry node, so an
+  outside replay of the proof, through any node, is refused 401 as before,
+  also while the resend is pending. The proof still authorizes one client
+  request, and the entry node resends that request only after an answer
+  that means nothing was done, so it is applied at most once. A replay
+  that claims the proof between two attempts makes the later attempt fail:
+  503 `ResendRefused` (not resent), never a 401, since a resend must not
+  end in a definite refusal. Service-auth JWTs track no `jti` (as the
+  reference), Bearer access tokens are reusable, and the remaining
+  single-use tokens (refresh tokens, authorization-server DPoP proofs,
+  client assertions, codes, delegation tokens and client attestations,
+  email and 2FA tokens) are spent on `/oauth/*` or on procedures the entry
+  node never resends.
+- **"Nothing done" only before the log.** `ShardMoved` and `RepoLoading`
+  promise that nothing was applied, so the entry node resends. A log entry
+  is refused `nodelog::NOT_HELD` only before it is in a segment; one already
+  durable whose shard is gone (never expected: a sink goes only after its
+  close barrier) is acked `NOT_HELD_LOGGED`, a 500. A space write whose
+  follow-up fails after its ack (the authority's served-hash push when
+  some of its records are taken down, e.g. its shard left in between) is
+  answered 500 too: before, that was `ShardMoved`, and the resend was
+  refused (a replayed proof, or `RecordAlreadyExists` for a create) for a
+  write that was applied (`tests/all/spaces_side/applied_writes.rs`).
 - Directly received writes (the client called the owner) just wait for
   their load. Every 503 vlpds answers carries `Retry-After: 1`.
 
@@ -1997,7 +2005,24 @@ most one step of observation delay, plus replay.
   SlateDB writes, most of them marker-only).
 - *Graceful stop keeps serving* until its shards are handed out, its lease is
   gone and 500 ms more: a forward it would drop mid-request is ambiguous to
-  the peer (a client 503), one it answers "not owned" is resent.
+  the peer (a client 503), one it answers "not owned" is resent. Then its
+  listeners drain (`server::Drain`): no new connections, idle ones closed,
+  and every request in flight answered (HTTP/1 closes after it, HTTP/2 sends
+  GOAWAY) for up to 30 s before the process exits. It used to exit right
+  after the 500 ms, dropping answers it owed: the spaces fault run (spaces-2
+  47dc3a5c, 3 nodes behind a balancer that resends a request whose
+  connection failed) had a space write forwarded by the exiting node and
+  applied by its owner, resent by the balancer with its spent DPoP proof and
+  answered 401 `invalid_dpop_proof`, an applied write refused.
+  `applied_writes.rs` reproduced it with the drain cut at once, and runs
+  clean with it. Requests still reaching a node after its handoff are
+  resent by it on its last routing table (it no longer steps), so one sent
+  to a shard that moved again meanwhile is answered 503 `ShardMoved` after
+  the 20 s budget, nothing done; a load balancer that stops routing to the
+  node at SIGTERM avoids that wait. A balancer must not resend a request
+  that may have reached a node (only one refused at connect): after a
+  kill -9 nothing can answer the first attempt, and a resend with the same
+  proof is refused as the replay it is.
 
 Laptop (3 nodes x 3+3 threads, 100k accounts / 10k active, inj25, 6k/s
 across 3 loadgens, unrouted; per-second errors on the survivors' two
@@ -2007,7 +2032,7 @@ loadgen for 15 s (9.8k each), now ~40 each, all in the second of the kill
 HEAD ~1.4k errors in 2 s, then 0.4–1.4k/s from +22 s to past the window's
 end (the restarted node's replay under resends took 61 s), now ~40 each.
 SIGTERM: 0 at HEAD and now (3–8 when a forward is in flight as the node
-exits). The killed node's own loadgen fails until its restart either way.
+exits; the drain above answers those now). The killed node's own loadgen fails until its restart either way.
 
 ### Why safety needs no clocks
 
