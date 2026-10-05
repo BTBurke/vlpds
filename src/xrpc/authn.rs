@@ -12,10 +12,13 @@ pub enum Credentials {
     Session {
         did: String,
     },
-    /// Privileged app passwords may use DMs.
+    /// Privileged app passwords may use DMs. A scoped one (vlpds) is also
+    /// held to `scopes` as an OAuth token is: it gets what both the app
+    /// password and the scopes allow.
     AppPassword {
         did: String,
         privileged: bool,
+        scopes: Option<super::oauth::ScopeSet>,
     },
     OAuth {
         did: String,
@@ -94,8 +97,24 @@ impl Credentials {
         self.did().ok_or_else(|| XrpcError::auth("user credentials required"))
     }
 
+    /// A scoped app password's scopes.
+    pub fn app_pass_scopes(&self) -> Option<&super::oauth::ScopeSet> {
+        match self {
+            Credentials::AppPassword { scopes, .. } => scopes.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn scoped(&self, f: impl FnOnce(&super::oauth::ScopeSet) -> bool) -> bool {
+        self.app_pass_scopes().is_none_or(f)
+    }
+
     /// action: "create" | "update" | "delete"
     pub fn allows_repo(&self, collection: &str, action: &str) -> bool {
+        self.base_repo(collection, action) && self.scoped(|s| s.allows_repo(collection, action))
+    }
+
+    fn base_repo(&self, collection: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_repo(collection, action),
             Credentials::Takendown { .. } | Credentials::ModService { .. } | Credentials::UserServiceAuth { .. } => {
@@ -106,6 +125,10 @@ impl Credentials {
     }
 
     pub fn allows_rpc(&self, lxm: &str, aud: &str) -> bool {
+        self.base_rpc(lxm, aud) && self.scoped(|s| s.allows_rpc(lxm, aud))
+    }
+
+    fn base_rpc(&self, lxm: &str, aud: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_rpc(lxm, aud),
             Credentials::AppPassword { privileged, .. } => {
@@ -117,6 +140,10 @@ impl Credentials {
     }
 
     pub fn allows_blob(&self, mime: &str) -> bool {
+        self.base_blob(mime) && self.scoped(|s| s.allows_blob(mime))
+    }
+
+    fn base_blob(&self, mime: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_blob(mime),
             Credentials::Takendown { .. } | Credentials::ModService { .. } => false,
@@ -126,6 +153,10 @@ impl Credentials {
 
     /// action: "read" | "manage"
     pub fn allows_account(&self, attr: &str, action: &str) -> bool {
+        self.base_account(attr, action) && self.scoped(|s| s.allows_account(attr, action))
+    }
+
+    fn base_account(&self, attr: &str, action: &str) -> bool {
         match self {
             Credentials::OAuth { scopes, .. } => scopes.allows_account(attr, action),
             Credentials::AppPassword { .. } => action == "read",
@@ -148,46 +179,47 @@ impl Credentials {
     }
 
     /// OAuth refusals name the scope that would grant it (reference
-    /// `ScopeMissingError`).
-    fn require_scope(&self, ok: bool, scope: impl FnOnce() -> String) -> XResult<()> {
+    /// `ScopeMissingError`), and so do a scoped app password's when its
+    /// scopes are all that is missing (`base`: the app password allows it).
+    fn require_scope(&self, base: bool, ok: bool, scope: impl FnOnce() -> String) -> XResult<()> {
         if ok {
             return Ok(());
         }
         match self {
-            Credentials::OAuth { .. } => Err(XrpcError {
-                status: StatusCode::FORBIDDEN,
-                error: "ScopeMissingError".into(),
-                message: format!("Missing required scope \"{}\"", scope()),
-            }),
+            Credentials::OAuth { .. } => Err(scope_missing(&scope())),
+            Credentials::AppPassword { scopes: Some(_), .. } if base => Err(scope_missing(&scope())),
             _ => self.require(false),
         }
     }
 
     pub fn need_repo(&self, collection: &str, action: &str) -> XResult<()> {
-        self.require_scope(self.allows_repo(collection, action), || format!("repo:{collection}?action={action}"))
+        self.require_scope(self.base_repo(collection, action), self.allows_repo(collection, action), || {
+            format!("repo:{collection}?action={action}")
+        })
     }
 
     pub fn need_rpc(&self, lxm: &str, aud: &str) -> XResult<()> {
+        let base = self.base_rpc(lxm, aud);
         // the reference pipethrough's answer to a non-privileged app password
-        if matches!(self, Credentials::AppPassword { .. }) && !self.allows_rpc(lxm, aud) {
+        if matches!(self, Credentials::AppPassword { .. }) && !base {
             return Err(XrpcError::bad("InvalidToken", "Bad token method"));
         }
-        self.require_scope(self.allows_rpc(lxm, aud), || format!("rpc:{lxm}?aud={}", aud.replace('#', "%23")))
+        self.require_scope(base, self.allows_rpc(lxm, aud), || format!("rpc:{lxm}?aud={}", aud.replace('#', "%23")))
     }
 
     pub fn need_blob(&self, mime: &str) -> XResult<()> {
-        self.require_scope(self.allows_blob(mime), || format!("blob:{mime}"))
+        self.require_scope(self.base_blob(mime), self.allows_blob(mime), || format!("blob:{mime}"))
     }
 
     pub fn need_account(&self, attr: &str, action: &str) -> XResult<()> {
-        self.require_scope(self.allows_account(attr, action), || match action {
-            "read" => format!("account:{attr}"),
-            _ => format!("account:{attr}?action={action}"),
+        self.require_scope(self.base_account(attr, action), self.allows_account(attr, action), || {
+            account_scope(attr, action)
         })
     }
 
     pub fn need_identity(&self, attr: &str) -> XResult<()> {
-        self.require_scope(self.allows_identity(attr), || format!("identity:{attr}"))
+        let ok = self.allows_identity(attr);
+        self.require_scope(ok, ok, || format!("identity:{attr}"))
     }
 
     fn require(&self, ok: bool) -> XResult<()> {
@@ -200,6 +232,21 @@ impl Credentials {
                 message: "credentials do not grant this action".into(),
             })
         }
+    }
+}
+
+pub fn scope_missing(scope: &str) -> XrpcError {
+    XrpcError {
+        status: StatusCode::FORBIDDEN,
+        error: "ScopeMissingError".into(),
+        message: format!("Missing required scope \"{scope}\""),
+    }
+}
+
+pub fn account_scope(attr: &str, action: &str) -> String {
+    match action {
+        "read" => format!("account:{attr}"),
+        _ => format!("account:{attr}?action={action}"),
     }
 }
 

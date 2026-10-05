@@ -18,7 +18,12 @@ async function serverExtras(): Promise<Record<string, unknown>> {
     acall('vlpds.identity.getPlcData'),
   ])
   if (pw.status === 'fulfilled') {
-    out['vlpds/app-passwords.json'] = (pw.value.passwords ?? []).map((p: any) => ({ name: p.name, createdAt: p.createdAt, privileged: !!p.privileged }))
+    out['vlpds/app-passwords.json'] = (pw.value.passwords ?? []).map((p: any) => ({
+      name: p.name,
+      createdAt: p.createdAt,
+      privileged: !!p.privileged,
+      ...(p.scopes ? { scopes: p.scopes } : {}),
+    }))
   }
   if (apps.status === 'fulfilled') {
     out['vlpds/connected-apps.json'] = (apps.value.sessions ?? []).map((x: any) => ({

@@ -101,6 +101,9 @@ pub struct Claims {
     /// Refresh tokens: the token id; access tokens: the session family id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
+    /// vlpds: a scoped app password's OAuth scopes, on its access tokens.
+    #[serde(default, rename = "appPassScope", skip_serializing_if = "Option::is_none")]
+    pub app_pass_scope: Option<String>,
 }
 
 impl Jwt {
@@ -117,6 +120,18 @@ impl Jwt {
     }
 
     pub fn issue_with_jti(&self, did: &str, scope: &str, ttl_secs: u64, typ: &str, jti: Option<&str>) -> String {
+        self.issue_scoped(did, scope, None, ttl_secs, typ, jti)
+    }
+
+    pub fn issue_scoped(
+        &self,
+        did: &str,
+        scope: &str,
+        app_pass_scope: Option<&str>,
+        ttl_secs: u64,
+        typ: &str,
+        jti: Option<&str>,
+    ) -> String {
         let now = crate::tid::now_micros() / 1_000_000;
         let header = B64.encode(format!(r#"{{"alg":"HS256","typ":"{typ}"}}"#));
         let claims = Claims {
@@ -126,6 +141,7 @@ impl Jwt {
             iat: now,
             exp: now + ttl_secs,
             jti: jti.map(Into::into),
+            app_pass_scope: app_pass_scope.map(Into::into),
         };
         let payload = B64.encode(serde_json::to_vec(&claims).unwrap());
         let signing_input = format!("{header}.{payload}");

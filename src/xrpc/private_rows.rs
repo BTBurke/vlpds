@@ -23,6 +23,12 @@ pub fn blob_quota_row_fixtures(did: &str) -> Vec<PrivateRow> {
     super::blob_quota::fixture_rows(did)
 }
 
+/// Scoped app passwords, also added after level 1's `private/rows.json`
+/// was frozen (`private/app_password_scopes.json`).
+pub fn app_password_scope_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    super::server::scoped_app_password_fixture_rows(did)
+}
+
 /// Decodes a private row the way its readers do: Ok(the row's kind), Err if
 /// it doesn't decode, lacks a field its readers use, or doesn't re-encode to
 /// the same bytes (a field this build would drop).

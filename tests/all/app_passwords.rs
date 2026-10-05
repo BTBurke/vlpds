@@ -147,3 +147,106 @@ async fn app_password_cannot_manage_account() {
     s.xrpc.post("com.atproto.identity.updateHandle", &json!({"handle": handle}), &sess.auth()).await.client_err();
     assert_eq!(s.get_session(&sess.auth()).await.ok()["did"], json!(a.did));
 }
+
+/// The account page's "Post only" preset.
+const POST_ONLY: &str = "atproto repo?collection=app.bsky.feed.like&collection=app.bsky.feed.post&collection=app.bsky.feed.repost&collection=app.bsky.graph.follow&action=create&action=delete blob:*/*";
+
+async fn create_scoped(s: &TestServer, auth: &Auth, name: &str, privileged: bool, scopes: &str) -> Resp {
+    let body = json!({"name": name, "privileged": privileged, "scopes": scopes});
+    s.xrpc.post("com.atproto.server.createAppPassword", &body, auth).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_only_app_password() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("poster").await;
+    // privileged too: the scopes still withhold DMs and the rest
+    let j = create_scoped(&s, &a.auth(), "bot", true, POST_ONLY).await.ok();
+    assert_eq!(j["scopes"], json!(POST_ONLY));
+    let pw = j["password"].as_str().unwrap().to_string();
+    let sess = app_login(&s, &a, &pw).await;
+    let claims = jwt_claims(&sess.access);
+    assert_eq!(claims["scope"], json!("com.atproto.appPassPrivileged"));
+    assert_eq!(claims["appPassScope"], json!(POST_ONLY));
+
+    // granted: posts, likes, blobs, deletes
+    let post = json!({"repo": a.did, "collection": "app.bsky.feed.post", "record": post_record("bot post")});
+    let p = s.xrpc.post("com.atproto.repo.createRecord", &post, &sess.auth()).await.ok();
+    let like =
+        json!({"$type": "app.bsky.feed.like", "subject": {"uri": p["uri"], "cid": p["cid"]}, "createdAt": now_iso()});
+    let body = json!({"repo": a.did, "collection": "app.bsky.feed.like", "record": like});
+    s.xrpc.post("com.atproto.repo.createRecord", &body, &sess.auth()).await.ok();
+    s.xrpc.post_bytes("com.atproto.repo.uploadBlob", PNG_1X1.to_vec(), "image/png", &sess.auth()).await.ok();
+    let rkey = p["uri"].as_str().unwrap().rsplit('/').next().unwrap().to_string();
+    let del = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": rkey});
+    s.xrpc.post("com.atproto.repo.deleteRecord", &del, &sess.auth()).await.ok();
+
+    // withheld by the scopes
+    let profile = json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {"$type": "app.bsky.actor.profile", "displayName": "pwned"}});
+    s.xrpc.post("com.atproto.repo.putRecord", &profile, &sess.auth()).await.err(403, "ScopeMissingError");
+    let edit = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3l3qo2vutsw2b", "record": post_record("edit")});
+    s.xrpc.post("com.atproto.repo.putRecord", &edit, &sess.auth()).await.err(403, "ScopeMissingError");
+    // an unscoped app password may ask for an email confirmation; this one may not
+    s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &sess.auth()).await.err(403, "ScopeMissingError");
+    service_auth(&s, &sess.auth(), None).await.err(403, "ScopeMissingError");
+    service_auth(&s, &sess.auth(), Some("com.atproto.repo.uploadBlob")).await.err(403, "ScopeMissingError");
+    s.xrpc.get("com.atproto.server.listAppPasswords", &[], &sess.auth()).await.err(403, "InsufficientScope");
+    // withheld from any app password
+    create_app_password(&s, &sess.auth(), "another-one", false).await.client_err();
+    create_scoped(&s, &sess.auth(), "another-one", false, POST_ONLY).await.client_err();
+    s.xrpc.post_empty("com.atproto.server.requestAccountDelete", &sess.auth()).await.client_err();
+    s.xrpc.post_empty("com.atproto.server.requestEmailUpdate", &sess.auth()).await.client_err();
+    let upd = json!({"email": "new@example.com"});
+    s.xrpc.post("com.atproto.server.updateEmail", &upd, &sess.auth()).await.client_err();
+    s.xrpc.post("com.atproto.server.deactivateAccount", &json!({}), &sess.auth()).await.client_err();
+
+    // getSession works, without the email (no account:email)
+    let me = s.get_session(&sess.auth()).await.ok();
+    assert_eq!(me["did"], json!(a.did));
+    assert!(me.get("email").is_none(), "{me}");
+    let login = s.create_session(&a.handle, &pw).await.ok();
+    assert!(login.get("email").is_none(), "{login}");
+
+    // the scopes survive a refresh
+    let sess2 = refresh(&s, &sess).await;
+    assert_eq!(jwt_claims(&sess2.access)["appPassScope"], json!(POST_ONLY));
+    can_post(&s, &a, &sess2.auth()).await;
+    s.xrpc.post("com.atproto.repo.putRecord", &profile, &sess2.auth()).await.err(403, "ScopeMissingError");
+
+    let j = s.xrpc.get("com.atproto.server.listAppPasswords", &[], &a.auth()).await.ok();
+    assert_eq!(j["passwords"][0]["scopes"], json!(POST_ONLY), "{j}");
+
+    // revocation as today
+    s.xrpc.post("com.atproto.server.revokeAppPassword", &json!({"name": "bot"}), &a.auth()).await.ok();
+    s.xrpc.post_empty("com.atproto.server.refreshSession", &Auth::Bearer(sess2.refresh.clone())).await.client_err();
+    s.create_session(&a.handle, &pw).await.err(401, "AuthenticationRequired");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_password_scopes_validated() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("scopecheck").await;
+    for bad in ["bogus", "atproto repo:not..an.nsid", "include:com.example.authBasic", "rpc:*?aud=*", "blob:nope"] {
+        create_scoped(&s, &a.auth(), "x", false, bad).await.err(400, "InvalidRequest");
+    }
+    let long = (0..200).map(|i| format!("repo:com.example.c{i}")).collect::<Vec<_>>().join(" ");
+    create_scoped(&s, &a.auth(), "x", false, &long).await.err(400, "InvalidRequest");
+    let j = s.xrpc.get("com.atproto.server.listAppPasswords", &[], &a.auth()).await.ok();
+    assert!(j["passwords"].as_array().unwrap().is_empty(), "{j}");
+
+    // blank is unscoped; whitespace and repeats are normalized
+    let j = create_scoped(&s, &a.auth(), "blank", false, "  ").await.ok();
+    assert!(j.get("scopes").is_none(), "{j}");
+    let j = create_scoped(&s, &a.auth(), "spaced", false, " atproto\n blob:image/*  atproto ").await.ok();
+    assert_eq!(j["scopes"], json!("atproto blob:image/*"));
+
+    // an unscoped password is unchanged: no claim, nothing listed
+    let pw = create_app_password(&s, &a.auth(), "plain", false).await.ok()["password"].as_str().unwrap().to_string();
+    let sess = app_login(&s, &a, &pw).await;
+    assert!(jwt_claims(&sess.access).get("appPassScope").is_none());
+    let j = s.xrpc.get("com.atproto.server.listAppPasswords", &[], &sess.auth()).await.ok();
+    let plain = j["passwords"].as_array().unwrap().iter().find(|p| p["name"] == json!("plain")).cloned().unwrap();
+    assert!(plain.get("scopes").is_none(), "{plain}");
+    s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &sess.auth()).await.ok();
+    assert!(s.get_session(&sess.auth()).await.ok()["email"].is_string());
+}

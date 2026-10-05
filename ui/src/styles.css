@@ -2481,7 +2481,8 @@ table.data.rl-side-table td {
     opacity: 0.4;
   }
 }
-.mig-choice {
+.mig-choice,
+.ap-choice {
   display: flex;
   gap: 12px;
   align-items: flex-start;
@@ -2491,9 +2492,18 @@ table.data.rl-side-table td {
   margin: 0 0 12px;
   cursor: pointer;
 }
-.mig-choice:has(input[type='radio']:checked) {
+.ap-choice {
+  padding: 10px 14px;
+  margin-bottom: 8px;
+}
+.mig-choice:has(input[type='radio']:checked),
+.ap-choice:has(input[type='radio']:checked) {
   border-color: var(--accent);
   background: var(--accent-wash);
+}
+.ap-choice > input {
+  margin-top: 5px;
+  accent-color: var(--accent);
 }
 .mig-choice.solo {
   border: 0;
