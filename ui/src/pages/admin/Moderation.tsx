@@ -587,7 +587,7 @@ function AuditLog() {
   return (
     <>
       <ErrorNotice error={l.error} />
-      <Panel flush title="Audit log" desc="Every takedown, restore, purge, case and quota change: who, from where, and why. Newest first." actions={<button className="btn sm" onClick={l.reload}>Refresh</button>}>
+      <Panel flush title="Audit log" desc="Every takedown, restore, purge, case, quota change and second-factor reset: who, from where, and why. Newest first." actions={<button className="btn sm" onClick={l.reload}>Refresh</button>}>
         {!l.data ? <Loading /> : l.data.entries.length === 0 ? <Empty title="Nothing yet" /> : <AuditTable entries={l.data.entries} />}
       </Panel>
     </>

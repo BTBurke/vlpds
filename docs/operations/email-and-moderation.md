@@ -100,7 +100,7 @@ plus HTML (`multipart/alternative`), its own sign-in alert in the same layout, a
 | Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
 | PLC operation | PLC Update Operation Requested | `plc_operation` | `requestPlcOperationSignature` |
 | Sign-in alert | New Sign-in to Your Account | `sign_in_alert` | a sign-in from a new device (vlpds's own, see [Sign-in alerts](../oauth-2fa.md#sign-in-alerts-and-recent-sign-ins)) |
-| Sign-in settings change | Your Account's Sign-in Settings Changed | `security_change` | a passkey added, removed or refused as a copy, or the operator's second-factor reset (vlpds's own, see [Passkeys](../oauth-2fa.md#passkeys)) |
+| Sign-in settings change | Your Account's Sign-in Settings Changed | `security_change` | a passkey added, renamed, removed or refused as a copy, new recovery codes, TOTP turned on or off, or the operator's second-factor reset (vlpds's own, see [Passkeys](../oauth-2fa.md#passkeys)) |
 | Moderation | the moderator's subject | `admin` | admin `sendEmail` |
 
 ### Mail budgets

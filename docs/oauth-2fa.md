@@ -181,11 +181,11 @@ operator can reset them ([Operator reset](#operator-reset)).
 caption: "Two ways a passkey signs in on this server's pages. After the password it's the second factor, and with a PIN or biometric it replaces both. Either way the browser signs a challenge that names this server's origin, and the account's owner checks it against the account's `passkeys` row."
 nodes:
   - { id: page, label: sign-in page, sub: "challenge · RP ID", at: [0, 3], size: [9, 3], tone: accent }
-  - { id: dev, label: passkey, sub: device or security key, at: [13, 3], size: [9, 3], tone: violet }
-  - { id: owner, label: account's owner, sub: "verify · claim once", at: [26, 3], size: [10, 3], tone: accent }
-  - { id: row, label: "`passkeys` row", sub: public keys · counters, at: [26, 8], size: [10, 3], shape: store, tone: amber }
+  - { id: dev, label: passkey, sub: device or security key, at: [17, 3], size: [9, 3], tone: violet }
+  - { id: owner, label: account's owner, sub: "verify · claim once", at: [32, 3], size: [10, 3], tone: accent }
+  - { id: row, label: "`passkeys` row", sub: public keys · counters, at: [32, 8], size: [10, 3], shape: store, tone: amber }
 edges:
-  - "page -> dev: navigator.credentials.get"
+  - "page -> dev: credentials.get()"
   - "dev -> owner: assertion"
   - "owner -- row"
 ```
@@ -229,8 +229,9 @@ calls of its own:
   `PasskeyRequired`, or next to a TOTP prompt), it checks the password and returns that account's
   passkeys, with a challenge bound to the DID and the credential epoch. So a password change voids it.
 - `vlpds.server.createPasskeySession` takes `did`, the assertion and (on the second step) `trustDevice`, and returns
-  the same legacy session `createSession` would. It's limited by `passkey-sign-in-ip` (100 per 5 min),
-  `sign-in-account` and the `createSession-*` buckets keyed by the DID and IP.
+  the same legacy session `createSession` would. It's limited by `passkey-sign-in-ip` (100 per 5 min)
+  and the `createSession-*` buckets keyed by the DID and IP. It doesn't spend `sign-in-account`, since
+  anyone can name any account and a passkey can't be guessed.
 
 `createSession` can't take a passkey, since there's no browser to vouch for the origin. So an account
 with passkeys and no TOTP refuses a password `createSession` with 401 `PasskeyRequired`, and the message
@@ -266,7 +267,10 @@ Removing a passkey needs the password. OAuth sessions and account-page sessions 
 signed them in, and those are revoked. Device sign-ins and unexchanged codes it approved are refused when
 they're next used. The removal dialog's "Sign out everywhere" box runs a revoke-all. A password change or
 reset doesn't remove passkeys, so someone holding the inbox can't reset the factor away. Adding or
-removing a passkey always mails the owner (`security_change`, "Your Account's Sign-in Settings Changed").
+removing a passkey always mails the owner (`security_change`, "Your Account's Sign-in Settings Changed"),
+and so do renaming one, new recovery codes and turning TOTP on or off. The mail about a new passkey says
+to remove it on the Security page and then change the password, since a password change alone leaves
+passkeys in place. A registration's challenge only finishes with the session token that started it.
 
 ### Operator reset
 
@@ -274,8 +278,11 @@ A user who lost every passkey, the authenticator and the recovery codes still ha
 can't get past the second step. The operator can reset their second factors from the console (the
 account page's "Two-factor sign-in" panel) or with `vlpds.admin.resetSecondFactors`. It removes passkeys,
 TOTP, the recovery codes and trusted browsers, and ends what the passkeys signed in. The password and the
-email factor stay. A reason is required, the action goes in the audit log as `second_factors.reset`, and
-the user is mailed. Whoever talks the operator into a reset still needs the password. Steps:
+email factor stay. With "Also sign out everywhere" (`revokeSessions: true`) it runs a revoke-all too, for
+when someone other than the owner may be signed in. A reason is required. The audit log gets a
+`second_factors.reset` entry marked `started` before anything changes and one marked `done` (or
+`failed`) after, and the user is mailed. Whoever talks the operator into a reset still needs the
+password. Steps:
 `ops/RUNBOOK.md` "Resetting a user's second factors".
 
 Passkeys are bound to this PDS's hostname, so they don't move with the account
@@ -287,13 +294,13 @@ Passkeys are bound to this PDS's hostname, so they don't move with the account
 caption: "The password step on a browser the account trusts. Its device cookie names a `trust/` row in the account's private state, and the row counts only while the credential epoch and the account's second factors are what they were when it was written."
 nodes:
   - { id: pw, label: password ok, at: [0, 3], size: [8, 3], tone: accent }
-  - { id: row, label: "`trust/{hash}`", sub: "device cookie · ≤ 30 d", at: [13, 3], size: [10, 3], shape: store, tone: amber }
-  - { id: skip, label: session, sub: no code asked, at: [29, 0], size: [9, 3], tone: solid }
-  - { id: code, label: second factor, sub: "passkey, TOTP or email", at: [29, 6], size: [9, 3], tone: violet }
+  - { id: row, label: "`trust/{hash}`", sub: "device cookie · ≤ 30 d", at: [11, 3], size: [10, 3], shape: store, tone: amber }
+  - { id: skip, label: session, sub: no code asked, at: [32, 0], size: [9, 3], tone: solid }
+  - { id: code, label: second factor, sub: "passkey, TOTP or email", at: [32, 6], size: [9, 3], tone: violet }
 edges:
   - pw -> row
-  - "row.r -> skip.l: epoch · factors unchanged"
-  - "row.r -> code.l: missing · expired · changed"
+  - "row.r25 -> skip.l: unchanged"
+  - "row.r75 -> code.l: missing · expired · changed"
 ```
 
 The code step on the OAuth sign-in page and on the account page has a "Trust this browser" box. If the

@@ -45,8 +45,12 @@ budgets (`password-reset-account-*`, `mail-*`) and `requestPlcOperationSignature
 DNS lookup and an HTTPS fetch of a domain the caller picks, so it's capped per account too. Passkey
 registration rewrites the account's passkeys row and mails its owner, so it's capped per account
 (`passkey-register-account`). The account page's passkey sign-in has its own per-IP cap
-(`passkey-sign-in-ip`), since the OAuth form's bucket doesn't cover it, and it also spends
-`sign-in-account` and the `createSession-*` buckets (keyed by the DID and IP).
+(`passkey-sign-in-ip`), since the OAuth form's bucket doesn't cover it, and it also spends the
+`createSession-*` buckets (keyed by the DID and IP). Passkey sign-ins don't spend `sign-in-account`:
+anyone can name any account in one, and a passkey can't be guessed, so charging the account would only
+let a stranger use up its password sign-ins. Asking for the password again to change how the account
+signs in (adding or removing a passkey, turning TOTP off, new recovery codes) does spend
+`sign-in-account`, so a stolen session can't guess the password any faster than a sign-in could.
 
 ## The buckets
 
@@ -78,7 +82,7 @@ the start of the next. The names are what the console, the config and the metric
 | `repo-write-hour` | DID | 1 h | 5,000 | `createRecord`, `putRecord`, `deleteRecord`, `applyWrites` | 429 |
 | `repo-write-day` | DID | 1 day | 35,000 | the same | 429 |
 | `oauth-sign-in-ip` | IP | 5 min | 100 | OAuth sign-in form posts (`/oauth/authorize/sign-in`, `/oauth/account/sign-in`) | the sign-in page shows an error (429) |
-| `sign-in-account` | DID | 1 h | 100 | `server.createSession` and OAuth sign-in (both steps), from any IP | 429 · the sign-in page shows an error |
+| `sign-in-account` | DID | 1 h | 100 | `server.createSession` and OAuth sign-in (both steps), from any IP · the account page's password re-checks (passkeys, TOTP off, recovery codes) | 429 · the sign-in page shows an error |
 | `oauth-ip` | IP | 5 min | 3,000 | POST `/oauth/par`, `/oauth/token`, `/oauth/revoke` (in place of `global-ip`) | 429 `rate_limit_exceeded` (OAuth error JSON) |
 | `com.atproto.server.reserveSigningKey-0` | IP | 1 h | 100 | `server.reserveSigningKey` | 429 |
 | `reserve-signing-key-node` | node | 1 day | 5,000 | `reserveSigningKey` calls that reserve a new key (one KMS wrap each) | 429 |

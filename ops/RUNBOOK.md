@@ -2419,8 +2419,14 @@ and the email factor stay.
   confirm.
 - Or: `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"did": "DID", "reason": "verified by video call", "actor": "you"}' $NODE/xrpc/vlpds.admin.resetSecondFactors`.
   The reason is required (2,000 characters at most).
-- Audited as `second_factors.reset` in the console's Moderation audit log, with
-  what was removed (`passkeys`, `totp`, `trustedBrowsers`).
+- If someone other than the owner may be signed in now, tick "Also sign out
+  everywhere" (`"revokeSessions": true`): it also ends every session and
+  device sign-in, as a password change does.
+- Audited as `second_factors.reset` in the console's Moderation page, Audit log
+  tab: an entry marked `started` before anything changes, then one marked
+  `done` with what was removed (`passkeys`, `totp`, `trustedBrowsers`,
+  `signedOut`), or `failed` with the error. A `started` with no `done` after
+  it means the reset may have stopped partway; run it again.
 - Counted in `vlpds_passkeys_total{event="reset"}` when it removed passkeys.
 - The user signs in with the password (plus an emailed code, if that's on) and
   sets up two-factor again on the Security tab.
