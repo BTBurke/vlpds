@@ -82,10 +82,13 @@ impl DecodedJwt {
         if self.alg() != "ES256" || self.sig.len() != 64 {
             return false;
         }
-        match Signature::from_slice(&self.sig) {
-            Ok(sig) => key.verify(self.signing_input.as_bytes(), &sig).is_ok(),
-            Err(_) => false,
-        }
+        // ring's P-256 verify takes ~30 µs to p256's ~110, and every OAuth
+        // request checks a DPoP proof; it accepts the same signatures
+        // (high-S included, `verify_es256_matches_p256`)
+        let pt = key.to_sec1_point(false);
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, pt.as_bytes())
+            .verify(self.signing_input.as_bytes(), &self.sig)
+            .is_ok()
     }
 
     pub fn is_unsecured(&self) -> bool {
@@ -328,6 +331,49 @@ mod tests {
             format!("{}.{}", b64u(serde_json::to_vec(&header).unwrap()), b64u(serde_json::to_vec(&payload).unwrap()));
         let sig: Signature = sk.sign(input.as_bytes());
         format!("{input}.{}", b64u(sig.to_bytes()))
+    }
+
+    /// ring and p256 agree on valid, high-S, tampered and out-of-range
+    /// signatures.
+    #[test]
+    fn verify_es256_matches_p256() {
+        use p256::elliptic_curve::ops::Reduce;
+        let sk = SigningKey::generate();
+        let vk = *sk.verifying_key();
+        let jwt = |input: &str, sig: Vec<u8>| DecodedJwt {
+            header: json!({"alg": "ES256"}),
+            payload: json!({}),
+            signing_input: input.to_string(),
+            sig,
+        };
+        let n_minus = |s: &[u8]| {
+            let s = <p256::Scalar as Reduce<p256::FieldBytes>>::reduce(&p256::FieldBytes::try_from(s).unwrap());
+            (-s).to_bytes().to_vec()
+        };
+        for i in 0..64 {
+            let input = format!("header.payload-{i}");
+            let sig: Signature = sk.sign(input.as_bytes());
+            let b = sig.to_bytes().to_vec();
+            let high = [&b[..32], &n_minus(&b[32..])[..]].concat();
+            let mut flipped = b.clone();
+            flipped[i % 64] ^= 1;
+            let zero_s = [&b[..32], &[0u8; 32][..]].concat();
+            let big_r = [&[0xffu8; 32][..], &b[32..]].concat();
+            for (what, sig, other) in [
+                ("valid", b.clone(), &input),
+                ("high-S", high, &input),
+                ("flipped", flipped, &input),
+                ("zero s", zero_s, &input),
+                ("r over n", big_r, &input),
+                ("other input", b.clone(), &format!("{input}x")),
+            ] {
+                let p256_ok = Signature::from_slice(&sig).is_ok_and(|s| vk.verify(other.as_bytes(), &s).is_ok());
+                assert_eq!(jwt(other, sig).verify_es256(&vk), p256_ok, "{what} #{i}");
+                if what == "valid" || what == "high-S" {
+                    assert!(p256_ok, "{what} #{i}");
+                }
+            }
+        }
     }
 
     #[test]
