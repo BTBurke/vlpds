@@ -58,7 +58,18 @@ table{width:100%;border-collapse:collapse;font-size:13.5px}
 td{border-top:1px solid var(--rule);padding:10px 4px;vertical-align:top;overflow-wrap:anywhere}
 td:last-child{text-align:right;width:1%;white-space:nowrap;overflow-wrap:normal;padding-left:10px}
 footer{margin-top:14px;text-align:center}
-label.check{display:flex;align-items:center;gap:8px;font-weight:500;margin:12px 0 4px}
+fieldset{border:0;margin:14px 0 0;padding:0;min-width:0}
+legend{padding:0;font-weight:600}
+ul.scopes{list-style:none;padding:0;margin:8px 0 12px}
+ul.scopes>li{display:flex;gap:11px;align-items:flex-start;padding:10px 0;border-top:1px solid var(--rule)}
+ul.scopes>li>input[type=checkbox]{flex:none;width:17px;height:17px;margin:3px 0 0;accent-color:var(--accent)}
+ul.scopes>li>div{min-width:0;flex:1}
+ul.scopes label{display:inline;margin:0;font-size:15px;font-weight:600;cursor:pointer}
+ul.scopes input:disabled+div label{cursor:default}
+.req{display:inline-block;margin-left:7px;padding:0 5px;border:1px solid var(--rule);border-radius:3px;color:var(--ink2);font-size:11.5px;font-weight:600;vertical-align:1px}
+code.sc{display:block;margin-top:2px;color:var(--ink2);font:12px/1.5 "JetBrains Mono",ui-monospace,Menlo,monospace;overflow-wrap:anywhere}
+.sd{margin:4px 0 0;color:var(--ink2);font-size:13.5px}
+.warn{margin:6px 0 0;padding:6px 9px;border-left:3px solid var(--amber);background:var(--paper);font-size:13.5px}
 "#;
 
 static STYLE_HASH: LazyLock<String> = LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(STYLE)));
@@ -309,41 +320,65 @@ pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {
     page("Choose an account", &b)
 }
 
-/// One plain-language line per requested permission; a line starting with
-/// NUL is already-escaped HTML.
-pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<String> {
+/// One requested scope on the consent page. `title` and `detail` are
+/// escaped HTML.
+pub struct ScopeRow {
+    pub scope: String,
+    pub title: String,
+    pub detail: String,
+    pub required: bool,
+    pub warning: Option<&'static str>,
+}
+
+/// atproto has no client-declared "required" scopes; only `atproto` itself,
+/// without which the token grants nothing.
+pub const REQUIRED_SCOPES: [&str; 1] = ["atproto"];
+
+const GENERIC_WARNING: &str = "A broad grant: it covers everything except private messages and account settings, \
+and it can't be narrowed. Untick it to refuse it entirely.";
+const CHAT_WARNING: &str =
+    "A broad grant covering all of your private messages. It only works together with full access to your account.";
+
+/// One row per requested scope, in request order.
+pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<ScopeRow> {
     let mut out = Vec::new();
     for s in scope.split(' ').filter(|s| !s.is_empty()) {
+        let row = |title: &str, warning| ScopeRow {
+            scope: s.to_string(),
+            title: e(title),
+            detail: String::new(),
+            required: REQUIRED_SCOPES.contains(&s),
+            warning,
+        };
         match s {
-            "atproto" => out.push("Know who you are: your account identifier (DID) and handle".into()),
-            "transition:generic" => out.push(
-                "Full access to your account: create, change and delete any of your public data, upload media, and use other services on your behalf (except private messages)".into(),
-            ),
-            "transition:chat.bsky" => out.push("Read and send your private messages (Bluesky chat)".into()),
-            "transition:email" => out.push("See your email address".into()),
+            "atproto" => out.push(row("Know who you are: your account identifier (DID) and handle", None)),
+            "transition:generic" => out.push(row(
+                "Full access to your account: create, change and delete any of your public data, upload media, and use other services on your behalf",
+                Some(GENERIC_WARNING),
+            )),
+            "transition:chat.bsky" => out.push(row("Read and send your Bluesky private messages", Some(CHAT_WARNING))),
+            "transition:email" => out.push(row("Read your email address", None)),
             _ => {
                 if let Some(p) = Permission::parse(s) {
-                    out.push(describe_permission(&p));
+                    out.push(row(&describe_permission(&p), None));
                 } else if let Some(inc) = IncludeScope::parse(s) {
                     let set = sets.iter().find(|(i, _)| i == &inc).map(|(_, j)| j);
                     let title = set.and_then(|j| j.get("title")).and_then(|t| t.as_str()).unwrap_or(&inc.nsid);
-                    let mut line = format!("{} <span class=\"muted\">({})</span>", e(title), e(&inc.nsid));
+                    let mut r = row(title, None);
                     if let Some(d) = set.and_then(|j| j.get("detail")).and_then(|t| t.as_str()) {
-                        line.push_str(&format!("<br><span class=\"muted\">{}</span>", e(d)));
+                        r.detail.push_str(&format!("<p class=\"sd\">{}</p>", e(d)));
                     }
                     if let Some(set) = set {
                         let inner: Vec<String> = inc.to_permissions(set).iter().map(describe_permission).collect();
                         if !inner.is_empty() {
-                            line.push_str("<ul class=\"perms\">");
-                            // escaped like the rest of the line: never rely on
-                            // the scope validators keeping markup out
+                            r.detail.push_str("<ul class=\"perms\">");
                             for i in inner {
-                                line.push_str(&format!("<li>{}</li>", e(&i)));
+                                r.detail.push_str(&format!("<li>{}</li>", e(&i)));
                             }
-                            line.push_str("</ul>");
+                            r.detail.push_str("</ul>");
                         }
                     }
-                    out.push(format!("\u{0}{line}"));
+                    out.push(r);
                 }
             }
         }
@@ -351,12 +386,31 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)]) -> Vec<String> {
     out
 }
 
-fn list(v: &[String], any: &str) -> String {
-    if v.iter().any(|x| x == "*") {
-        any.to_string()
-    } else {
-        v.join(", ")
+/// "a, b and c".
+fn join_and(v: &[&str]) -> String {
+    match v {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
+}
+
+fn collection_name(nsid: &str) -> Option<&'static str> {
+    Some(match nsid {
+        "app.bsky.feed.post" => "posts",
+        "app.bsky.feed.like" => "likes",
+        "app.bsky.feed.repost" => "reposts",
+        "app.bsky.graph.follow" => "follows",
+        "app.bsky.graph.block" => "blocks",
+        "app.bsky.graph.list" => "lists",
+        "app.bsky.graph.listitem" => "list members",
+        "app.bsky.graph.starterpack" => "starter packs",
+        "app.bsky.actor.profile" => "profile",
+        "app.bsky.feed.threadgate" => "reply settings",
+        "app.bsky.feed.postgate" => "quote settings",
+        "app.bsky.feed.generator" => "feeds",
+        _ => return None,
+    })
 }
 
 pub fn describe_permission(p: &Permission) -> String {
@@ -370,14 +424,36 @@ pub fn describe_permission(p: &Permission) -> String {
                     _ => "delete",
                 })
                 .collect();
-            format!("{} records in {}", capitalize(&verbs.join(", ")), list(collection, "any collection"))
+            let verbs = capitalize(&join_and(&verbs));
+            let names: Option<Vec<&str>> = collection.iter().map(|c| collection_name(c)).collect();
+            match names {
+                Some(n) if !n.is_empty() => format!("{verbs} your {}", join_and(&n)),
+                _ if collection.iter().any(|c| c == "*") => format!("{verbs} records in any collection"),
+                _ => format!("{verbs} records in {}", collection.join(", ")),
+            }
         }
         Permission::Rpc { aud, lxm } => {
             let svc = if aud == "*" { "any service".to_string() } else { aud.clone() };
-            format!("Make requests on your behalf to {} ({})", svc, list(lxm, "any method"))
+            if !lxm.is_empty() && lxm.iter().all(|l| l.starts_with("chat.bsky.")) {
+                format!("Read and send your Bluesky private messages (through {svc})")
+            } else if lxm.iter().any(|l| l == "*") {
+                format!("Make any request on your behalf to {svc}")
+            } else {
+                format!("Make requests on your behalf to {svc} ({})", lxm.join(", "))
+            }
         }
         Permission::Blob { accept } => {
-            format!("Upload files ({})", list(accept, "any type").replace("*/*", "any type"))
+            let kinds: Vec<&str> = accept
+                .iter()
+                .map(|a| match a.as_str() {
+                    "*/*" => "files of any type",
+                    "image/*" => "images",
+                    "video/*" => "video",
+                    "audio/*" => "audio",
+                    other => other,
+                })
+                .collect();
+            format!("Upload {}", join_and(&kinds))
         }
         Permission::Account { attr, action } => {
             let manage = action.iter().any(|a| a == "manage");
@@ -406,33 +482,37 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-/// `email_choice`: offer to withhold the email address, as the reference
-/// consent form does.
-pub fn consent(ctx: &Ctx, did: &str, handle: &str, perms: &[String], email_choice: bool) -> String {
+/// One checkbox per scope, all ticked, posted as repeated `scope` fields so
+/// the page needs no script. Disabled inputs aren't submitted, so a hidden
+/// field carries each required scope.
+pub fn consent(ctx: &Ctx, did: &str, handle: &str, rows: &[ScopeRow]) -> String {
     let mut b = format!(
-        "<h1>Authorize access</h1><p class=\"muted\">Signed in as <b>@{}</b></p><p>This app wants access to your account:</p>{}<p>It will be able to:</p><ul class=\"perms\">",
+        "<h1>Authorize access</h1><p class=\"muted\">Signed in as <b>@{}</b></p><p>This app wants access to your account:</p>{}\
+<form method=\"post\" action=\"/oauth/authorize/consent\">{}<input type=\"hidden\" name=\"did\" value=\"{}\">\
+<fieldset><legend>It will be able to:</legend><p class=\"hint\">Untick anything you don't want to allow. The app might not work fully without it.</p><ul class=\"scopes\">",
         e(handle),
-        client_block(ctx)
-    );
-    for p in perms {
-        match p.strip_prefix('\u{0}') {
-            Some(html) => b.push_str(&format!("<li>{html}</li>")),
-            None => b.push_str(&format!("<li>{}</li>", e(p))),
-        }
-    }
-    b.push_str("</ul><p class=\"muted\">You can revoke this access at any time under <b>Connected apps</b> in your account settings on this server.</p>");
-    let email = if email_choice {
-        "<input type=\"hidden\" name=\"email_choice\" value=\"1\">\
-<label class=\"check\"><input type=\"checkbox\" name=\"allow_email\" value=\"1\" checked>Share my email address with this app</label>"
-    } else {
-        ""
-    };
-    b.push_str(&format!(
-        "<form method=\"post\" action=\"/oauth/authorize/consent\">{}<input type=\"hidden\" name=\"did\" value=\"{}\">{email}<div class=\"row\">\
-<button type=\"submit\" name=\"action\" value=\"deny\">Deny</button><button type=\"submit\" class=\"primary\" name=\"action\" value=\"allow\" autofocus>Allow</button></div></form>",
+        client_block(ctx),
         hidden(ctx),
         e(did)
-    ));
+    );
+    for (i, r) in rows.iter().enumerate() {
+        let sc = e(&r.scope);
+        let input = if r.required {
+            format!("<input type=\"hidden\" name=\"scope\" value=\"{sc}\"><input type=\"checkbox\" id=\"s{i}\" checked disabled aria-describedby=\"s{i}d\">")
+        } else {
+            format!("<input type=\"checkbox\" id=\"s{i}\" name=\"scope\" value=\"{sc}\" checked aria-describedby=\"s{i}d\">")
+        };
+        let req = if r.required { "<span class=\"req\">Required</span>" } else { "" };
+        let warn = r.warning.map(|w| format!("<p class=\"warn\">{}</p>", e(w))).unwrap_or_default();
+        b.push_str(&format!(
+            "<li>{input}<div><label for=\"s{i}\">{}{req}</label><div id=\"s{i}d\"><code class=\"sc\">{sc}</code>{warn}{}</div></div></li>",
+            r.title, r.detail
+        ));
+    }
+    b.push_str(
+        "</ul></fieldset><p class=\"muted\">You can revoke this access at any time under <b>Connected apps</b> in your account settings on this server.</p>\
+<div class=\"row\"><button type=\"submit\" name=\"action\" value=\"deny\">Deny</button><button type=\"submit\" class=\"primary\" name=\"action\" value=\"allow\" autofocus>Allow</button></div></form>",
+    );
     page("Authorize access", &b)
 }
 

@@ -940,11 +940,10 @@ async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
         Err(e) => return server_error_page(app, "Authorization failed", &e.description),
     }
     let sets = lexicon::permission_sets_for_scope(app, &flow.req.params.scope).await.unwrap_or_default();
-    let perms = ui::describe_scopes(&flow.req.params.scope, &sets);
+    let rows = ui::describe_scopes(&flow.req.params.scope, &sets);
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    let email_choice = can_withhold_email(&flow.req.params.scope);
-    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &perms, email_choice);
+    let body = ui::consent(&flow.ctx(&csrf, &name), did, &acct.handle, &rows);
     flow.page(app, body)
 }
 
@@ -1434,7 +1433,7 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
         return login_page(&app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
     }
     let mut flow = flow;
-    match granted_scope(&flow.req.params.scope, &f) {
+    match granted_scope(&flow.req.params.scope, consent_scopes(&body).as_deref()) {
         Some(scope) => flow.req.params.scope = scope,
         None => {
             let _ = store::put_request(&app, &flow.id, None).await;
@@ -1444,29 +1443,36 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
     issue_code(&app, flow, &did).await
 }
 
-fn is_email_read_scope(s: &str) -> bool {
-    crate::oauth::scopes::Permission::parse(s).is_some_and(|p| p.matches_account("email", "read"))
-}
-
-/// Only a granular `account:email` scope can be withheld: transition scopes
-/// cannot be narrowed.
-fn can_withhold_email(scope: &str) -> bool {
-    !scope.split(' ').any(|s| s.starts_with("transition:")) && scope.split(' ').any(is_email_read_scope)
+/// Every `scope` field: one per ticked checkbox, or a space-separated list.
+/// None when the form has none (grant as requested).
+fn consent_scopes(body: &[u8]) -> Option<Vec<String>> {
+    let mut out: Option<Vec<String>> = None;
+    for (k, v) in ou::parse_form(std::str::from_utf8(body).unwrap_or("")) {
+        if k == "scope" {
+            out.get_or_insert_with(Vec::new).extend(v.split(' ').filter(|s| !s.is_empty()).map(String::from));
+        }
+    }
+    out
 }
 
 /// The reference's `setAuthorized` scope override: the form can only remove
-/// scopes, never add them. None if the result lacks `atproto`.
-fn granted_scope(requested: &str, f: &HashMap<String, String>) -> Option<String> {
-    let allowed: Option<Vec<&str>> = f.get("scope").map(|s| s.split(' ').collect());
-    let withhold_email =
-        f.contains_key("email_choice") && !f.contains_key("allow_email") && can_withhold_email(requested);
-    let granted: Vec<&str> = requested
+/// scopes, never add them. None if a required scope was removed, so a forged
+/// post can't get a token without one.
+fn granted_scope(requested: &str, ticked: Option<&[String]>) -> Option<String> {
+    let mut granted: Vec<&str> = requested
         .split(' ')
         .filter(|s| !s.is_empty())
-        .filter(|s| allowed.as_ref().is_none_or(|a| a.contains(s)))
-        .filter(|s| !(withhold_email && is_email_read_scope(s)))
+        .filter(|s| ticked.is_none_or(|t| t.iter().any(|x| x == s)))
         .collect();
-    granted.contains(&"atproto").then(|| granted.join(" "))
+    if !ui::REQUIRED_SCOPES.iter().all(|r| granted.contains(r)) {
+        return None;
+    }
+    // the spec: transition:chat.bsky "depends on and does not function
+    // without" transition:generic, so it goes when generic is refused
+    if requested.split(' ').any(|s| s == "transition:generic") && !granted.contains(&"transition:generic") {
+        granted.retain(|s| *s != "transition:chat.bsky");
+    }
+    Some(granted.join(" "))
 }
 
 async fn token(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {

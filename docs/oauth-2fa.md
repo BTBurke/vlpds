@@ -73,7 +73,7 @@ the user's token.
 - title: Sign in on this server
   body: "The browser opens `/oauth/authorize`. A device cookie remembers accounts that signed in on that browser within 7 days, so the user can pick one without a password unless the client sends `prompt=login`. Otherwise the user enters a handle and password, then the second factor if one is on. Sign-up (`prompt=create`) goes through the same checks as `createAccount`."
 - title: Consent
-  body: "Public clients always show the consent screen. A confidential client's consent is remembered per account, and the user is asked again only for scopes it hasn't been granted."
+  body: "Public clients always show the consent screen. It lists each requested scope in plain words with a checkbox, so the user can untick what they don't want (the page needs no script). `atproto` can't be unticked, and the server refuses a post without it. The token's scope is exactly what was left ticked, and `transition:chat.bsky` goes with `transition:generic` since the spec says it doesn't work without it. A confidential client's consent is remembered per account, and the user is asked again only for scopes it hasn't been granted."
 - title: Code exchange
   body: "The client posts the code, its PKCE verifier and a DPoP proof to `/oauth/token`. A code lives 5 min and works once, and reusing it revokes the session it created. A PKCE challenge seen in the last 24 h is refused."
 - title: Use and refresh

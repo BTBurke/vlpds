@@ -1718,38 +1718,80 @@ async fn consent_scope_narrowing() {
         (q, scope)
     }
 
-    // allowed as requested
+    // what a browser posts for the page's `scope` fields with every box
+    // left ticked: the hidden required ones and each enabled checkbox
+    fn page_scopes(html: &str) -> Vec<String> {
+        html.split("name=\"scope\" value=\"").skip(1).map(|r| r[..r.find('"').unwrap()].replace("&amp;", "&")).collect()
+    }
+    fn scope_pairs(v: &[&str]) -> Vec<(&'static str, String)> {
+        v.iter().map(|x| ("scope", x.to_string())).collect()
+    }
+    async fn post(
+        s: &Srv,
+        b: &mut Browser,
+        f: &Flow<'_>,
+        acct: &Account,
+        scopes: &[&str],
+    ) -> (HashMap<String, String>, Option<String>) {
+        let pairs = scope_pairs(scopes);
+        let extra: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        consent(s, b, f, acct, &extra).await
+    }
+
+    // no scope field: allowed as requested
     assert_eq!(consent(&s, &mut b, &f, &acct, &[]).await.1.as_deref(), Some(scope));
-    // the consent page offers to withhold the email address
+
+    // one checkbox per requested scope; atproto is ticked, disabled and
+    // carried by a hidden field
     let f = f.with("login_hint", &acct.handle);
     let ru = f.request_uri(&s, &pkce(), "page").await;
     let (_, _, html) = b.authorize(&s, &f, &ru).await;
-    assert!(html.contains("name=\"allow_email\""), "{html}");
-    assert!(html.contains("name=\"email_choice\""), "{html}");
-    // checkbox cleared: the token has no account:email
-    let (_, sc) = consent(&s, &mut b, &f, &acct, &[("email_choice", "1")]).await;
+    assert_eq!(page_scopes(&html), scope.split(' ').collect::<Vec<_>>(), "{html}");
+    assert!(html.contains("<input type=\"hidden\" name=\"scope\" value=\"atproto\"><input type=\"checkbox\" id=\"s0\" checked disabled"), "{html}");
+    assert!(html.contains("Required</span>"), "{html}");
+    assert!(html.contains("Read your email address"), "{html}");
+    assert!(html.contains("Create, update and delete your posts"), "{html}");
+    assert!(!html.contains("<script"), "the consent page works without script: {html}");
+    assert_eq!(html.matches("type=\"checkbox\"").count(), 3, "{html}");
+
+    // everything left ticked: unchanged
+    let all = page_scopes(&html);
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+    assert_eq!(post(&s, &mut b, &f, &acct, &all).await.1.as_deref(), Some(scope));
+    // email unticked: the token's scope is exactly the narrowed set
+    let (_, sc) = post(&s, &mut b, &f, &acct, &["atproto", "repo:app.bsky.feed.post"]).await;
     assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
-    // checkbox kept
-    let (_, sc) = consent(&s, &mut b, &f, &acct, &[("email_choice", "1"), ("allow_email", "1")]).await;
-    assert_eq!(sc.as_deref(), Some(scope));
-    // explicit scope override: intersection only (nothing can be added)
-    let (_, sc) =
-        consent(&s, &mut b, &f, &acct, &[("scope", "atproto transition:generic repo:app.bsky.feed.post")]).await;
-    assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
-    // removing atproto is a denial
-    let (q, sc) = consent(&s, &mut b, &f, &acct, &[("scope", "repo:app.bsky.feed.post")]).await;
-    assert_eq!(sc, None);
-    assert_eq!(q["error"], "access_denied");
     // the narrowed grant is what the session holds
     let sessions = vlpds::oauth::store::list_sessions(&s.app, &acct.did).await.unwrap();
     assert!(sessions.iter().any(|x| x.scope == "atproto repo:app.bsky.feed.post"));
+    // every optional box unticked
+    assert_eq!(post(&s, &mut b, &f, &acct, &["atproto"]).await.1.as_deref(), Some("atproto"));
+    // a space-separated override works too, and is an intersection only
+    // (nothing can be added)
+    let (_, sc) =
+        consent(&s, &mut b, &f, &acct, &[("scope", "atproto transition:generic repo:app.bsky.feed.post")]).await;
+    assert_eq!(sc.as_deref(), Some("atproto repo:app.bsky.feed.post"));
+    // a forged post without the required scope is refused, not granted
+    // without it
+    for forged in [&["repo:app.bsky.feed.post", "account:email"][..], &[""][..], &["transition:generic"][..]] {
+        let (q, sc) = post(&s, &mut b, &f, &acct, forged).await;
+        assert_eq!(sc, None, "{forged:?}");
+        assert_eq!(q["error"], "access_denied", "{forged:?}");
+    }
 
-    // transition scopes cannot be narrowed: no checkbox
-    let f2 = Flow::loopback("atproto transition:generic account:email", &key).with("login_hint", &acct.handle);
+    // transition scopes: broad grants with a warning, each droppable whole;
+    // chat.bsky doesn't work without generic, so it goes with it
+    let ts = "atproto transition:generic transition:chat.bsky transition:email";
+    let f2 = Flow::loopback(ts, &key).with("login_hint", &acct.handle);
     let ru = f2.request_uri(&s, &pkce(), "page2").await;
     let (_, _, html) = b.authorize(&s, &f2, &ru).await;
-    assert!(html.contains("Authorize access"), "{html}");
-    assert!(!html.contains("allow_email"), "{html}");
+    assert_eq!(page_scopes(&html), ts.split(' ').collect::<Vec<_>>(), "{html}");
+    assert_eq!(html.matches("class=\"warn\"").count(), 2, "{html}");
+    assert_eq!(post(&s, &mut b, &f2, &acct, &ts.split(' ').collect::<Vec<_>>()).await.1.as_deref(), Some(ts));
+    let (_, sc) = post(&s, &mut b, &f2, &acct, &["atproto", "transition:generic", "transition:email"]).await;
+    assert_eq!(sc.as_deref(), Some("atproto transition:generic transition:email"));
+    let (_, sc) = post(&s, &mut b, &f2, &acct, &["atproto", "transition:chat.bsky", "transition:email"]).await;
+    assert_eq!(sc.as_deref(), Some("atproto transition:email"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
