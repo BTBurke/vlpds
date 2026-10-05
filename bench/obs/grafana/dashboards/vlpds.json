@@ -1685,6 +1685,18 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "passkey_required"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "password refused (account signs in with a passkey)"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "rate_limited"
       },
       "properties": [
@@ -1812,7 +1824,7 @@
    "type": "stat",
    "id": 18,
    "title": "Second step at sign-in (24 h)",
-   "description": "Successful sign-ins in the last day by their second step: a code from an authenticator app, a code sent by email, a browser the user chose to trust (it skips the code for --trusted-device-days), or none (no two-factor sign-in set up, or an app password, which never asks for one).",
+   "description": "Successful sign-ins in the last day by their second step: a code from an authenticator app, a code sent by email, a passkey (also a sign-in with a passkey instead of the password), a recovery code, a browser the user chose to trust (it skips the code for --trusted-device-days), or none (no two-factor sign-in set up, or an app password, which never asks for one).",
    "datasource": {
     "type": "prometheus",
     "uid": "${ds_prometheus}"
@@ -1850,10 +1862,30 @@
       "type": "prometheus",
       "uid": "${ds_prometheus}"
      },
+     "expr": "round(sum (increase(vlpds_sign_in_factors_total{cluster=~\"$cluster\", factor=\"passkey\"}[1d]))) or vector(0)",
+     "legendFormat": "passkey",
+     "range": true,
+     "refId": "C"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "round(sum (increase(vlpds_sign_in_factors_total{cluster=~\"$cluster\", factor=\"recovery\"}[1d]))) or vector(0)",
+     "legendFormat": "recovery code",
+     "range": true,
+     "refId": "D"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
      "expr": "round(sum (increase(vlpds_sign_in_factors_total{cluster=~\"$cluster\", factor=\"trusted\"}[1d]))) or vector(0)",
      "legendFormat": "trusted browser",
      "range": true,
-     "refId": "C"
+     "refId": "E"
     },
     {
      "datasource": {
@@ -1863,7 +1895,7 @@
      "expr": "round(sum (increase(vlpds_sign_in_factors_total{cluster=~\"$cluster\", factor=\"none\"}[1d]))) or vector(0)",
      "legendFormat": "none",
      "range": true,
-     "refId": "D"
+     "refId": "F"
     }
    ],
    "fieldConfig": {
@@ -2180,6 +2212,30 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "passkey"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "passkey"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "recovery"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "recovery code"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "trusted"
       },
       "properties": [
@@ -2249,7 +2305,7 @@
    "type": "timeseries",
    "id": 22,
    "title": "Account protection changes, per hour",
-   "description": "Users changing their Security settings (OAuth only, blocking app passwords, new-sign-in emails), removing trusted browsers, and sign-ins those settings refused (oauth_required: the main password outside the sign-in page; app_passwords_blocked). Each point counts the hour before it.",
+   "description": "Users changing their Security settings (OAuth only, blocking app passwords, new-sign-in emails), removing trusted browsers, and sign-ins those settings refused (oauth_required: the main password outside the sign-in page; app_passwords_blocked; passkey_required: the password alone, from an app, on an account whose only second step is a passkey). Each point counts the hour before it.",
    "datasource": {
     "type": "prometheus",
     "uid": "${ds_prometheus}"
@@ -2286,7 +2342,7 @@
       "type": "prometheus",
       "uid": "${ds_prometheus}"
      },
-     "expr": "sum by (result) (increase(vlpds_logins_total{cluster=~\"$cluster\", result=~\"oauth_required|app_passwords_blocked\"}[1h])) > 0",
+     "expr": "sum by (result) (increase(vlpds_logins_total{cluster=~\"$cluster\", result=~\"oauth_required|app_passwords_blocked|passkey_required\"}[1h])) > 0",
      "legendFormat": "refused: {{result}}",
      "range": true,
      "refId": "C"
@@ -2329,6 +2385,154 @@
   {
    "type": "timeseries",
    "id": 23,
+   "title": "Passkeys, per hour",
+   "description": "Passkeys users added and removed, accounts whose second factors you reset, passkey sign-ins refused (a fake site, a used or expired challenge, a key that isn't the account's), and hardware keys flagged because their counter went backwards, which can mean a copied key. Each point counts the hour before it.",
+   "datasource": {
+    "type": "prometheus",
+    "uid": "${ds_prometheus}"
+   },
+   "gridPos": {
+    "x": 0,
+    "y": 40,
+    "w": 24,
+    "h": 6
+   },
+   "targets": [
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum by (event) (increase(vlpds_passkeys_total{cluster=~\"$cluster\"}[1h])) > 0",
+     "legendFormat": "{{event}}",
+     "range": true,
+     "refId": "A"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum (increase(vlpds_passkey_failures_total{cluster=~\"$cluster\"}[1h])) > 0",
+     "legendFormat": "refused",
+     "range": true,
+     "refId": "B"
+    },
+    {
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "expr": "sum (increase(vlpds_passkey_counter_regressions_total{cluster=~\"$cluster\", result=\"refused\"}[1h])) > 0",
+     "legendFormat": "flagged as copied",
+     "range": true,
+     "refId": "C"
+    }
+   ],
+   "fieldConfig": {
+    "defaults": {
+     "unit": "short",
+     "custom": {
+      "lineWidth": 1,
+      "fillOpacity": 8,
+      "showPoints": "never",
+      "spanNulls": false,
+      "gradientMode": "none",
+      "stacking": {
+       "mode": "none",
+       "group": "A"
+      },
+      "axisSoftMin": 0
+     },
+     "color": {
+      "mode": "palette-classic"
+     },
+     "noValue": "no passkey activity"
+    },
+    "overrides": [
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "registered"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "added"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "removed"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "removed by the owner"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "reset"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "reset by you"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "refused"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "orange"
+        }
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "flagged as copied"
+      },
+      "properties": [
+       {
+        "id": "color",
+        "value": {
+         "mode": "fixed",
+         "fixedColor": "red"
+        }
+       }
+      ]
+     }
+    ]
+   },
+   "options": {
+    "legend": {
+     "displayMode": "list",
+     "placement": "bottom",
+     "showLegend": true
+    },
+    "tooltip": {
+     "mode": "multi",
+     "sort": "desc"
+    }
+   }
+  },
+  {
+   "type": "timeseries",
+   "id": 24,
    "title": "Account deletions per hour",
    "description": "Accounts deleted, by who asked, each point counting the hour before it; and accounts waiting for a scheduled deletion (right, dashed). A sudden jump in scheduled accounts is the 'Many accounts were just scheduled for deletion' alert: you have at least 3 days to look.",
    "datasource": {
@@ -2337,7 +2541,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 40,
+    "y": 46,
     "w": 12,
     "h": 8
    },
@@ -2488,7 +2692,7 @@
   },
   {
    "type": "timeseries",
-   "id": 24,
+   "id": 25,
    "title": "App permissions, per hour",
    "description": "What users answered when an app asked for access (all it asked for, some of it, or no), and requests an app or a limited app password made beyond what it was allowed (403). The latter is usually an app asking for more than it should, not an attack. Each point counts the hour before it.",
    "datasource": {
@@ -2497,7 +2701,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 40,
+    "y": 46,
     "w": 12,
     "h": 8
    },
@@ -2608,12 +2812,12 @@
   },
   {
    "type": "row",
-   "id": 25,
+   "id": 26,
    "title": "Content",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 48,
+    "y": 54,
     "w": 24,
     "h": 1
    },
@@ -2621,7 +2825,7 @@
   },
   {
    "type": "stat",
-   "id": 26,
+   "id": 27,
    "title": "Created in the last 24 h",
    "description": "New posts, likes, reposts and follows your users made in the last day (deletions not subtracted), images and videos they uploaded, and the uploads' total size.",
    "datasource": {
@@ -2630,7 +2834,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 49,
+    "y": 55,
     "w": 24,
     "h": 4
    },
@@ -2758,7 +2962,7 @@
   },
   {
    "type": "timeseries",
-   "id": 27,
+   "id": 28,
    "title": "Created per hour, by type",
    "description": "Posts, likes, follows and everything else your users created, by type, each point counting the hour before it. 'Other apps' are records of non-Bluesky apps (e.g. other atproto apps your users use).",
    "datasource": {
@@ -2767,7 +2971,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 53,
+    "y": 59,
     "w": 12,
     "h": 8
    },
@@ -3121,7 +3325,7 @@
   },
   {
    "type": "timeseries",
-   "id": 28,
+   "id": 29,
    "title": "Media uploads per hour",
    "description": "Uploads per hour by kind (left) and their total size (right, dashed).",
    "datasource": {
@@ -3130,7 +3334,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 53,
+    "y": 59,
     "w": 12,
     "h": 8
    },
@@ -3281,12 +3485,12 @@
   },
   {
    "type": "row",
-   "id": 29,
+   "id": 30,
    "title": "Federation: relays, directory, identity",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 61,
+    "y": 67,
     "w": 24,
     "h": 1
    },
@@ -3294,7 +3498,7 @@
   },
   {
    "type": "stat",
-   "id": 30,
+   "id": 31,
    "title": "Firehose subscribers",
    "description": "Relays and other services following your PDS's live update stream (the 'firehose'), on every server. 0 means the network isn't hearing about new posts: check requestCrawl below. The operator console's Firehose page lists who they are.",
    "datasource": {
@@ -3303,7 +3507,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 62,
+    "y": 68,
     "w": 5,
     "h": 4
    },
@@ -3362,7 +3566,7 @@
   },
   {
    "type": "stat",
-   "id": 31,
+   "id": 32,
    "title": "Relays dropped for falling behind (24 h)",
    "description": "Relays cut off because they read updates too slowly. They reconnect and catch up; repeated drops mean that relay (or its network) can't keep up.",
    "datasource": {
@@ -3371,7 +3575,7 @@
    },
    "gridPos": {
     "x": 5,
-    "y": 62,
+    "y": 68,
     "w": 5,
     "h": 4
    },
@@ -3430,7 +3634,7 @@
   },
   {
    "type": "stat",
-   "id": 32,
+   "id": 33,
    "title": "Delay before relays see new posts",
    "description": "99% of new posts, likes, etc. reached the relay stream within this time after being saved (15 min).",
    "datasource": {
@@ -3439,7 +3643,7 @@
    },
    "gridPos": {
     "x": 10,
-    "y": 62,
+    "y": 68,
     "w": 5,
     "h": 4
    },
@@ -3502,7 +3706,7 @@
   },
   {
    "type": "stat",
-   "id": 33,
+   "id": 34,
    "title": "Last crawl request accepted",
    "description": "How long ago a relay accepted your PDS's requestCrawl ('please follow me'), sent at startup to --crawlers and by 'vlpds admin request-crawl'. Failed attempts are in Directory and identity.",
    "datasource": {
@@ -3511,7 +3715,7 @@
    },
    "gridPos": {
     "x": 15,
-    "y": 62,
+    "y": 68,
     "w": 5,
     "h": 4
    },
@@ -3566,7 +3770,7 @@
   },
   {
    "type": "stat",
-   "id": 34,
+   "id": 35,
    "title": "PLC directory errors (24 h)",
    "description": "Failed calls to the PLC directory (plc.directory), which publishes your users' identities. While it fails, sign-ups and handle changes fail.",
    "datasource": {
@@ -3575,7 +3779,7 @@
    },
    "gridPos": {
     "x": 20,
-    "y": 62,
+    "y": 68,
     "w": 4,
     "h": 4
    },
@@ -3634,7 +3838,7 @@
   },
   {
    "type": "timeseries",
-   "id": 35,
+   "id": 36,
    "title": "Directory and identity, per hour",
    "description": "Identity updates announced to the network (identity: new account or handle change; account: status change), PLC directory calls by result (rejected / unavailable are failures), custom-domain handle lookups, the account page's checks of a new handle (available / taken for a name here; verified / unverified for the user's own domain), and requestCrawl calls to relays (rejected / failed are failures).",
    "datasource": {
@@ -3643,7 +3847,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 66,
+    "y": 72,
     "w": 24,
     "h": 7
    },
@@ -3735,7 +3939,7 @@
   },
   {
    "type": "timeseries",
-   "id": 36,
+   "id": 37,
    "title": "Firehose subscribers over time",
    "description": "Relays and other services connected to the firehose, and how many of them are reading old updates from storage (they asked to start from a point in the past) before they get new ones live.",
    "datasource": {
@@ -3744,7 +3948,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 73,
+    "y": 79,
     "w": 12,
     "h": 7
    },
@@ -3806,7 +4010,7 @@
   },
   {
    "type": "timeseries",
-   "id": 37,
+   "id": 38,
    "title": "Firehose connects, disconnects and refusals, per hour",
    "description": "Firehose connections per hour by how they started and how they ended. A few drops a day are normal (relays restart and reconnect). The same relay dropped for falling behind again and again can't keep up.",
    "datasource": {
@@ -3815,7 +4019,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 73,
+    "y": 79,
     "w": 12,
     "h": 7
    },
@@ -4020,7 +4224,7 @@
   },
   {
    "type": "timeseries",
-   "id": 38,
+   "id": 39,
    "title": "Firehose: events/s per connection vs this PDS",
    "description": "Updates per second each connection gets (5 min average), against the updates your PDS puts on its firehose (the bold line). A connection that's keeping up sits on the bold line. One below it for long is falling behind. Lines are named relay (when it's one you list in --crawlers), address and connection number (#conn, as the console's Firehose page shows it). Past 1,000 connections on a server the rest are one line, other.",
    "datasource": {
@@ -4029,7 +4233,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 80,
+    "y": 86,
     "w": 24,
     "h": 9
    },
@@ -4121,12 +4325,12 @@
   },
   {
    "type": "row",
-   "id": 39,
+   "id": 40,
    "title": "Moderation and safety",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 89,
+    "y": 95,
     "w": 24,
     "h": 1
    },
@@ -4134,7 +4338,7 @@
   },
   {
    "type": "stat",
-   "id": 40,
+   "id": 41,
    "title": "Reports and takedowns (24 h)",
    "description": "Reports your users filed (on posts, accounts...) and passed to the moderation service (failed: the service refused or couldn't be reached), and takedowns applied by you or your moderation service (com.atproto.admin.updateSubjectStatus), and reversals.",
    "datasource": {
@@ -4143,7 +4347,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 90,
+    "y": 96,
     "w": 12,
     "h": 4
    },
@@ -4263,7 +4467,7 @@
   },
   {
    "type": "stat",
-   "id": 41,
+   "id": 42,
    "title": "Abusive traffic blocked (24 h)",
    "description": "Requests refused for coming too fast (rate limits), plus connections refused from one address opening too many, plus one account flooding the Bluesky app proxy.",
    "datasource": {
@@ -4272,7 +4476,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 90,
+    "y": 96,
     "w": 6,
     "h": 4
    },
@@ -4327,7 +4531,7 @@
   },
   {
    "type": "stat",
-   "id": 42,
+   "id": 43,
    "title": "Emails (24 h)",
    "description": "Emails sent (address confirmation, password reset, sign-in codes, account deletion...) and ones that could not be delivered. Failures mean users can't confirm, reset or sign in with 2FA codes.",
    "datasource": {
@@ -4336,7 +4540,7 @@
    },
    "gridPos": {
     "x": 18,
-    "y": 90,
+    "y": 96,
     "w": 6,
     "h": 4
    },
@@ -4426,7 +4630,7 @@
   },
   {
    "type": "timeseries",
-   "id": 43,
+   "id": 44,
    "title": "Blocked and refused, per hour",
    "description": "Abusive or excessive traffic your PDS turned away, each point counting the hour before it. Sign-ups blocked by policy: invite (no or bad invite code), email_policy (disposable email), handle_policy (reserved or offensive handle).",
    "datasource": {
@@ -4435,7 +4639,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 94,
+    "y": 100,
     "w": 12,
     "h": 8
    },
@@ -4527,7 +4731,7 @@
   },
   {
    "type": "timeseries",
-   "id": 44,
+   "id": 45,
    "title": "Emails per hour",
    "description": "Emails sent by kind, and ones that failed or were dropped (red), each point counting the hour before it.",
    "datasource": {
@@ -4536,7 +4740,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 94,
+    "y": 100,
     "w": 12,
     "h": 8
    },
@@ -4670,6 +4874,18 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "security_change"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "sign-in settings changed"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "not delivered"
       },
       "properties": [
@@ -4698,12 +4914,12 @@
   },
   {
    "type": "row",
-   "id": 45,
+   "id": 46,
    "title": "Resources and cost",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 102,
+    "y": 108,
     "w": 24,
     "h": 1
    },
@@ -4711,7 +4927,7 @@
   },
   {
    "type": "stat",
-   "id": 46,
+   "id": 47,
    "title": "Busiest server: CPU and memory in use",
    "description": "On the busiest server: CPU used out of the cores available to vlpds (5 min; sustained over 70% leaves little headroom for spikes), and memory used out of what the server or its container allows (85% and 95% are the memory alerts; at 100% the server is killed and restarts).",
    "datasource": {
@@ -4720,7 +4936,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 103,
+    "y": 109,
     "w": 8,
     "h": 4
    },
@@ -4823,7 +5039,7 @@
   },
   {
    "type": "stat",
-   "id": 47,
+   "id": 48,
    "title": "Disk cache",
    "description": "Local disk cache (--cache-dir) used out of its size limit (the cache's own count of its files). It saves storage requests; full is normal (oldest entries make room).",
    "datasource": {
@@ -4832,7 +5048,7 @@
    },
    "gridPos": {
     "x": 8,
-    "y": 103,
+    "y": 109,
     "w": 8,
     "h": 4
    },
@@ -4911,7 +5127,7 @@
   },
   {
    "type": "stat",
-   "id": 48,
+   "id": 49,
    "title": "Estimated storage request bill",
    "description": "ESTIMATE: object-storage request charges for a month at the last hour's request rate, at the Class A (writes, lists) and Class B (reads) prices picked at the top (S3 or R2 list prices; R2's free tier and S3's free deletes are not subtracted, so the real bill can be lower). Storage space and data transfer are not included. A one-account PDS is about $2-5/month on S3 and $0 on R2.",
    "datasource": {
@@ -4920,7 +5136,7 @@
    },
    "gridPos": {
     "x": 16,
-    "y": 103,
+    "y": 109,
     "w": 8,
     "h": 4
    },
@@ -4976,7 +5192,7 @@
   },
   {
    "type": "timeseries",
-   "id": 49,
+   "id": 50,
    "title": "CPU and memory by server",
    "description": "Per server: CPU used out of its available cores, and memory used out of its limit.",
    "datasource": {
@@ -4985,7 +5201,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 107,
+    "y": 113,
     "w": 12,
     "h": 8
    },
@@ -5063,7 +5279,7 @@
   },
   {
    "type": "timeseries",
-   "id": 50,
+   "id": 51,
    "title": "Storage requests and estimated monthly cost",
    "description": "Object-store requests per second by price class (left) and what the last hour's rate would cost over a month (right, dashed; an estimate, see the bill stat).",
    "datasource": {
@@ -5072,7 +5288,7 @@
    },
    "gridPos": {
     "x": 12,
-    "y": 107,
+    "y": 113,
     "w": 12,
     "h": 8
    },
@@ -5196,12 +5412,12 @@
   },
   {
    "type": "row",
-   "id": 51,
+   "id": 52,
    "title": "Alerts",
    "collapsed": false,
    "gridPos": {
     "x": 0,
-    "y": 115,
+    "y": 121,
     "w": 24,
     "h": 1
    },
@@ -5209,7 +5425,7 @@
   },
   {
    "type": "table",
-   "id": 52,
+   "id": 53,
    "title": "Alerts firing now",
    "description": "Alerts from the PDS's alert rules (ops/alerts.yml), in plain words. 'urgent' (page) means users are or soon will be affected; 'soon' (ticket) means look at it today. Empty = nothing firing, or the alert rules aren't loaded. Each alert's fix is in the runbook. Needs ops/alerts.yml loaded in the rule evaluator that writes ALERTS to this Prometheus; without it this stays empty ([monitoring docs](https://github.com/jazware/vlpds/blob/main/docs/operations/monitoring.md)).",
    "datasource": {
@@ -5218,7 +5434,7 @@
    },
    "gridPos": {
     "x": 0,
-    "y": 116,
+    "y": 122,
     "w": 16,
     "h": 6
    },
@@ -5580,11 +5796,11 @@
   },
   {
    "type": "text",
-   "id": 53,
+   "id": 54,
    "title": "Digging deeper",
    "gridPos": {
     "x": 16,
-    "y": 116,
+    "y": 122,
     "w": 8,
     "h": 6
    },

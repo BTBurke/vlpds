@@ -114,6 +114,13 @@ edges:
   `vlpds_last_exit_reason_info{reason,code}`. It reads that from the exit-state file in
   `--cache-dir`, so keep that directory on a disk that survives restarts. See
   [exit codes](runbook.md#exit-codes-and-fail-stops).
+- Passkeys have their own counters. `vlpds_passkeys_total{event}` counts registrations, removals
+  and operator resets, `vlpds_passkey_failures_total{reason}` counts refused ceremonies by the check
+  that failed, and `vlpds_passkey_counter_regressions_total{result}` counts counters that went
+  backwards. Passkey sign-ins show up in `vlpds_logins_total{method="passkey"}` and
+  `vlpds_sign_in_factors_total{factor="passkey"}` (`factor="recovery"` for a recovery code), and
+  `vlpds_logins_total{result="passkey_required"}` counts `createSession` refusals. See
+  [Passkeys](../oauth-2fa.md#passkeys).
 
 ### Per-connection firehose series
 
@@ -150,7 +157,7 @@ against `vlpds_firehose_events_total`.
 ```
 
 - `vlpds` (uid `vlpds`) is for someone running a PDS for a community. It shows request outcomes,
-  how long common actions take, accounts and sign-ups, sign-in security (second factors, trusted
+  how long common actions take, accounts and sign-ups, sign-in security (second factors and passkeys, trusted
   browsers, new-device alerts, OAuth-only refusals, app permissions) and scheduled deletions, posts
   and likes written, relay and PLC health (firehose subscribers, connects and drops, events/s per
   connection against the PDS's own), moderation actions, resources and cost, and firing alerts. It reads the same for one

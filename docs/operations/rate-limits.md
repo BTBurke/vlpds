@@ -42,7 +42,11 @@ Argon2 CPU, so there's a per-IP cap on the OAuth sign-in form and a cross-IP cap
 and a stored row per new key, so it has a per-IP and a per-node cap. Account mail has its own
 budgets (`password-reset-account-*`, `mail-*`) and `requestPlcOperationSignature` has a limit
 (the reference has none there). The account page's handle check (`vlpds.identity.checkHandle`) does a
-DNS lookup and an HTTPS fetch of a domain the caller picks, so it's capped per account too.
+DNS lookup and an HTTPS fetch of a domain the caller picks, so it's capped per account too. Passkey
+registration rewrites the account's passkeys row and mails its owner, so it's capped per account
+(`passkey-register-account`). The account page's passkey sign-in has its own per-IP cap
+(`passkey-sign-in-ip`), since the OAuth form's bucket doesn't cover it, and it also spends
+`sign-in-account` and the `createSession-*` buckets (keyed by the DID and IP).
 
 ## The buckets
 

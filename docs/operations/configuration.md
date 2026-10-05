@@ -36,6 +36,13 @@ Most deployments only set a few things. There's the identity (`--public-url`, `-
 TTL. Everything else has a measured default. The settings below are the ones that change how a node
 behaves, each with the trade-off behind its default.
 
+> [!WARNING]
+> `--public-url` is also the passkeys' relying party. The browser binds each passkey to its host, and
+> vlpds only accepts an assertion made on exactly that origin. Changing the hostname makes every passkey
+> on the PDS stop working (users fall back to their password with TOTP or a recovery code). Passkeys also
+> don't work on any other address of the node, such as the tailnet console's, so the account page hides
+> them there. See [Passkeys](../oauth-2fa.md#passkeys).
+
 ## Where configuration comes from
 
 ```diagram

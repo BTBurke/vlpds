@@ -285,6 +285,7 @@ def build(g):
                         "second_factor_failed": "wrong 2FA code", "inactive": "account taken down / inactive",
                         "oauth_required": "password refused (account is OAuth only)",
                         "app_passwords_blocked": "app password refused (turned off by the owner)",
+                        "passkey_required": "password refused (account signs in with a passkey)",
                         "rate_limited": "too many attempts (blocked)", "error": "server error"})
        + [color("succeeded", "green"), color("wrong password", "yellow"), color("wrong 2FA code", "orange"),
           color("too many attempts (blocked)", "purple"), color("server error", "red")],
@@ -297,12 +298,15 @@ def build(g):
     stat("Second step at sign-in (24 h)",
          [t(day("vlpds_sign_in_factors_total", 'factor="totp"'), "authenticator code"),
           t(day("vlpds_sign_in_factors_total", 'factor="email"'), "emailed code"),
+          t(day("vlpds_sign_in_factors_total", 'factor="passkey"'), "passkey"),
+          t(day("vlpds_sign_in_factors_total", 'factor="recovery"'), "recovery code"),
           t(day("vlpds_sign_in_factors_total", 'factor="trusted"'), "trusted browser"),
           t(day("vlpds_sign_in_factors_total", 'factor="none"'), "none")],
          w=8, h=4, text_mode="value_and_name", spark=False,
          desc="Successful sign-ins in the last day by their second step: a code from an authenticator app, a code "
-              "sent by email, a browser the user chose to trust (it skips the code for --trusted-device-days), or "
-              "none (no two-factor sign-in set up, or an app password, which never asks for one).")
+              "sent by email, a passkey (also a sign-in with a passkey instead of the password), a recovery code, a "
+              "browser the user chose to trust (it skips the code for --trusted-device-days), or none (no two-factor "
+              "sign-in set up, or an app password, which never asks for one).")
     stat("New-device alerts (24 h)",
          [t(day("vlpds_sign_in_alerts_total", 'result="mailed"'), "emailed"),
           t(day("vlpds_sign_in_alerts_total", 'result="account_limit"'), "over the daily 3"),
@@ -325,18 +329,30 @@ def build(g):
        [t(f"sum by (factor) (increase(vlpds_sign_in_factors_total{{{C}}}[1h])) > 0", "{{factor}}"),
         t(inc("vlpds_trusted_browsers_total", 'event="granted"') + " > 0", "browsers newly trusted")],
        "short", w=12, empty="no sign-ins",
-       overrides=names({"totp": "authenticator code", "email": "emailed code", "trusted": "trusted browser",
-                        "none": "no second step"}) + [color("trusted browser", "blue"), color("browsers newly trusted", "purple")],
+       overrides=names({"totp": "authenticator code", "email": "emailed code", "passkey": "passkey",
+                        "recovery": "recovery code", "trusted": "trusted browser", "none": "no second step"})
+       + [color("trusted browser", "blue"), color("browsers newly trusted", "purple")],
        desc="Successful sign-ins by their second step, and browsers users chose to trust, each point counting the "
             "hour before it.")
     ts("Account protection changes, per hour",
        [t(f"sum by (setting, value) (increase(vlpds_sign_in_settings_total{{{C}}}[1h])) > 0", "{{setting}} turned {{value}}"),
         t(inc("vlpds_trusted_browsers_total", 'event="revoked"') + " > 0", "trusted browsers removed"),
-        t(f'sum by (result) (increase(vlpds_logins_total{{{C}, result=~"oauth_required|app_passwords_blocked"}}[1h])) > 0', "refused: {{result}}")],
+        t(f'sum by (result) (increase(vlpds_logins_total{{{C}, result=~"oauth_required|app_passwords_blocked|passkey_required"}}[1h])) > 0', "refused: {{result}}")],
        "short", w=12, empty="no changes",
        desc="Users changing their Security settings (OAuth only, blocking app passwords, new-sign-in emails), "
             "removing trusted browsers, and sign-ins those settings refused (oauth_required: the main password "
-            "outside the sign-in page; app_passwords_blocked). Each point counts the hour before it.")
+            "outside the sign-in page; app_passwords_blocked; passkey_required: the password alone, from an app, on "
+            "an account whose only second step is a passkey). Each point counts the hour before it.")
+    ts("Passkeys, per hour",
+       [t(f"sum by (event) (increase(vlpds_passkeys_total{{{C}}}[1h])) > 0", "{{event}}"),
+        t(inc("vlpds_passkey_failures_total") + " > 0", "refused"),
+        t(inc("vlpds_passkey_counter_regressions_total", 'result="refused"') + " > 0", "flagged as copied")],
+       "short", w=24, h=6, empty="no passkey activity",
+       overrides=names({"registered": "added", "removed": "removed by the owner", "reset": "reset by you"})
+       + [color("refused", "orange"), color("flagged as copied", "red")],
+       desc="Passkeys users added and removed, accounts whose second factors you reset, passkey sign-ins refused (a "
+            "fake site, a used or expired challenge, a key that isn't the account's), and hardware keys flagged "
+            "because their counter went backwards, which can mean a copied key. Each point counts the hour before it.")
     ts("Account deletions per hour",
        [t(f"sum by (reason) (increase(vlpds_account_deletions_total{{{C}}}[1h])) > 0", "{{reason}}"),
         t(f'sum(vlpds_scheduled_deletion_accounts{{{C}, state="scheduled"}})', "scheduled (right)")],
@@ -493,7 +509,7 @@ def build(g):
        "short", w=12, empty="no email sent",
        overrides=names({"reset_password": "password reset", "delete_account": "account deletion", "confirm_email": "email confirmation",
                         "update_email": "email change", "plc_operation": "identity change", "auth_factor": "sign-in code (2FA)",
-                        "sign_in_alert": "new sign-in alert"})
+                        "sign_in_alert": "new sign-in alert", "security_change": "sign-in settings changed"})
        + [color("not delivered", "red")],
        desc="Emails sent by kind, and ones that failed or were dropped (red), each point counting the hour before it.")
 

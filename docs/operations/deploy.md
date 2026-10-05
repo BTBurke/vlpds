@@ -54,6 +54,13 @@ rebuild, so moving to more nodes later just means starting another one on the sa
 | Secrets | JWT secret, admin token, internal token, S3 key pair, KEK (or Cloud KMS), PLC rotation key | The three tokens are 32+ bytes and must all differ. The KEK and the PLC key aren't in the bucket, so back them up offline. |
 | Mail | an SMTP URL and a sender domain with SPF/DKIM | Optional. Without it, verification and 2FA mails only go to the log. See [Email and moderation](email-and-moderation.md). |
 
+> [!WARNING]
+> Pick the hostname for good before users add passkeys. A passkey is bound to the `--public-url` host
+> (its relying-party ID), so a new hostname makes every passkey on the PDS useless. Users then sign in
+> with their password and TOTP or a recovery code, and the operator's reset
+> ([Resetting a user's second factors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#resetting-a-users-second-factors))
+> covers anyone left with nothing. See [Passkeys](../oauth-2fa.md#passkeys).
+
 The node only listens on `127.0.0.1`, with `:2583` for the app and `:9583` for metrics. Caddy terminates
 TLS in front of it and blocks the operator paths (`/admin`, `/xrpc/vlpds.admin.*`, `/metrics`,
 `/internal/*`).

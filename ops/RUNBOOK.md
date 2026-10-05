@@ -2335,8 +2335,11 @@ vlpds TOTP. With both on, only TOTP is asked for.
   (any address change does, as in the reference). The user re-confirms and
   re-enables it.
 - Lost the authenticator (TOTP). A recovery code works in place of a code.
-  There's no admin reset of TOTP.
-- App passwords bypass both factors (reference behaviour), so a user with one
+  Lost the codes too: "Resetting a user's second factors".
+- Lost a passkey: "A user lost their passkeys".
+- Too many wrong codes count across TOTP and recovery codes (one lockout in
+  the `mfa` row). A refused passkey never counts toward it.
+- App passwords bypass every factor (reference behaviour), so a user with one
   can still use apps while sorting out the factor, unless they blocked app
   passwords (see the next section).
 
@@ -2382,6 +2385,60 @@ of these applied (`mailed`, `baseline`, `muted`, `no_email`, `email_code`,
 Ask the user to check Recent sign-ins on the Security tab. A sign-in marked
 "New" was a new device. Mail problems in general: "Email (SMTP, moderation
 mail, branding)".
+
+### A user lost their passkeys
+
+Passkeys are a second factor, and a discoverable one with a PIN or biometric
+replaces the password (docs `oauth-2fa.md` "Passkeys").
+- An app shows 401 `PasskeyRequired` on createSession
+  (`vlpds_logins_total{result="passkey_required"}`). The account has passkeys
+  and no TOTP, so the password alone only works on this server's own pages.
+  Not an outage. Sign in through the app's OAuth option, or use an app
+  password.
+- One passkey lost, others left: the user signs in with another one, then
+  removes the lost one on the Security tab with "Sign out everywhere" ticked.
+  Removing it ends what it signed in, and the box ends everything else.
+- Every passkey lost: the user signs in with the password and a recovery code,
+  on the OAuth sign-in page ("Use a recovery code instead") or on the account
+  page. TOTP, if it's on, works too.
+- No codes left either: "Resetting a user's second factors".
+- The PDS changed hostname: every passkey stops working at once (they're bound
+  to the `--public-url` host). Users fall back to the steps above.
+- Passkeys don't move with the account. On a new PDS the user sets up new ones.
+
+### Resetting a user's second factors
+
+For a user who lost every passkey, their authenticator app and their recovery
+codes. It removes passkeys, TOTP, the recovery codes (and the lockout) and
+trusted browsers, and ends the sessions the passkeys signed in. The password
+and the email factor stay.
+- Verify the user out of band first. Whoever talks you into a reset still needs
+  the password, and the user gets a mail ("Your Account's Sign-in Settings
+  Changed", purpose `security_change`).
+- Console: Accounts, the account, "Two-factor sign-in" panel. Give a reason and
+  confirm.
+- Or: `curl -XPOST -u admin:$ADMIN -H 'content-type: application/json' -d '{"did": "DID", "reason": "verified by video call", "actor": "you"}' $NODE/xrpc/vlpds.admin.resetSecondFactors`.
+  The reason is required (2,000 characters at most).
+- Audited as `second_factors.reset` in the console's Moderation audit log, with
+  what was removed (`passkeys`, `totp`, `trustedBrowsers`).
+- Counted in `vlpds_passkeys_total{event="reset"}` when it removed passkeys.
+- The user signs in with the password (plus an emailed code, if that's on) and
+  sets up two-factor again on the Security tab.
+
+### A passkey flagged as copied
+
+A hardware key (one that can't be synced) reported a signature counter older
+than the last one vlpds saw. That means a cloned key or a replayed signature.
+- The sign-in is refused, the key is flagged (Security tab: "Refused: looks
+  copied"), and the owner gets a `security_change` mail.
+- Counted in `vlpds_passkey_counter_regressions_total{result="refused"}`.
+  `{result="accepted"}` is a synced passkey (iCloud Keychain, Google Password
+  Manager), whose copies are expected, so it isn't refused.
+- A flagged key stays refused. The owner removes it on the Security tab and
+  adds it again if it's theirs. If it wasn't them, tick "Sign out everywhere"
+  and change the password.
+- Many at once across accounts: check `vlpds_passkey_failures_total{reason}`
+  for a pattern and look at the accounts' recent sign-ins.
 
 ### Cancelling a scheduled deletion
 

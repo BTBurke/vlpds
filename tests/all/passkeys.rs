@@ -789,3 +789,32 @@ async fn operator_reset() {
     let mail = s.dev_mail(&a.email).await.ok();
     assert!(mail.to_string().contains("operator reset your two-factor sign-in"), "{mail}");
 }
+
+/// A passkey sign-in from a new device sends the new-device alert, saying
+/// how it signed in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn new_device_alert_names_the_passkey() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkalert").await;
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "phone").await;
+    let go = async |k: &mut SoftKey, ua: &str| {
+        let opts = start_sign_in(&s, json!({})).await.ok();
+        let cred = k.assert(opts["challenge"].as_str().unwrap(), &Lie::default());
+        let rb = s
+            .xrpc
+            .http
+            .post(format!("{}/xrpc/vlpds.server.createPasskeySession", s.url))
+            .header("user-agent", ua)
+            .json(&json!({"did": a.did, "credential": cred}));
+        s.xrpc.send(rb).await.ok();
+    };
+    go(&mut k, "first-device/1.0").await;
+    go(&mut k, "second-device/1.0").await;
+    let mail = s.dev_mail(&a.email).await.ok();
+    let alerts: Vec<&J> =
+        mail["messages"].as_array().unwrap().iter().filter(|m| m["purpose"] == "sign_in_alert").collect();
+    assert_eq!(alerts.len(), 1, "the first sign-in is the baseline: {mail}");
+    let body = alerts[0]["body"].as_str().unwrap();
+    assert!(body.contains("Signed in with a passkey") && body.contains("second-device/1.0"), "{body}");
+}

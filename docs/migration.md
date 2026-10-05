@@ -124,7 +124,10 @@ edges:
 4. Preferences. `app.bsky.actor.getPreferences` there, then `putPreferences` here.
 
 Sessions, app passwords and OAuth authorisations aren't copied (the user signs in again), and
-neither is any two-factor setting on the old server.
+neither is any two-factor setting on the old server. Passkeys don't move in either direction. A
+passkey is bound to its PDS's hostname, so the old server's passkeys can't sign in here, and the
+passkeys added here stay here if the account moves on. The user sets up new ones on the new PDS
+([Passkeys](oauth-2fa.md#passkeys)).
 
 See [Record storage](record-storage.md#imports) for how big imports are admitted and why they stay
 cheap.

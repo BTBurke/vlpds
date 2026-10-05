@@ -33,7 +33,7 @@ facts:
 
 These are the reference PDS's account-facing features, ported with the same behaviour and messages.
 Each flag falls back to the reference's environment variable, so a reference `pds.env` works as is.
-Every node of a cluster needs the same values. Sign-in second factors (email codes, TOTP) are on
+Every node of a cluster needs the same values. Sign-in second factors (email codes, TOTP, passkeys) are on
 [OAuth and 2FA](../oauth-2fa.md#second-factors).
 
 ## Email
@@ -100,6 +100,7 @@ plus HTML (`multipart/alternative`), its own sign-in alert in the same layout, a
 | Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
 | PLC operation | PLC Update Operation Requested | `plc_operation` | `requestPlcOperationSignature` |
 | Sign-in alert | New Sign-in to Your Account | `sign_in_alert` | a sign-in from a new device (vlpds's own, see [Sign-in alerts](../oauth-2fa.md#sign-in-alerts-and-recent-sign-ins)) |
+| Sign-in settings change | Your Account's Sign-in Settings Changed | `security_change` | a passkey added, removed or refused as a copy, or the operator's second-factor reset (vlpds's own, see [Passkeys](../oauth-2fa.md#passkeys)) |
 | Moderation | the moderator's subject | `admin` | admin `sendEmail` |
 
 ### Mail budgets

@@ -1798,6 +1798,11 @@ function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onRes
           <strong>Keep your old account for now.</strong>
           It is deactivated at {hostOf(saved.oldPds)}, not deleted. Once you're happy here, you can delete it there.
         </li>
+        <li>
+          <strong>Set up two-factor sign-in again.</strong>
+          Passkeys and authenticator apps belong to the server they were set up on, so none came with you. Add them under <b>Security</b> in your account
+          settings here.
+        </li>
       </ol>
       {newPds.tokens && (
         <details className="mig-adv mig-backup">

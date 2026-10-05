@@ -670,10 +670,21 @@ ts("Sign-in factors and alerts", [rate("vlpds_sign_in_factors_total", by="method
    empty="no sign-ins",
    desc="Successful sign-ins by method and second factor (trusted = a trusted browser skipped it), and new-device "
         f"sign-ins by what became of their alert mail. budget: {rb('VlpdsSignInAlertsSuppressed')}")
-ts("Sign-in refusals and settings", [t(f'sum by (method, result) (rate(vlpds_logins_total{{{I}, result=~"inactive|oauth_required|app_passwords_blocked"}}{RI})) > 0', "{{method}} {{result}}"),
+ts("Sign-in refusals and settings", [t(f'sum by (method, result) (rate(vlpds_logins_total{{{I}, result=~"inactive|oauth_required|app_passwords_blocked|passkey_required"}}{RI})) > 0', "{{method}} {{result}}"),
                                      t(f"sum by (setting, value) (rate(vlpds_sign_in_settings_total{{{I}}}{RI})) > 0", "{{setting}} -> {{value}}"),
                                      t(f"sum by (event) (rate(vlpds_trusted_browsers_total{{{I}}}{RI})) > 0", "trusted browser {{event}}")], "ops",
-   empty="none", desc="createSession refused by the account (taken down, OAuth-only, app passwords off), and owners changing those settings.")
+   empty="none", desc="createSession refused by the account (taken down, OAuth-only, app passwords off, passkey_required: "
+                      "a passkey is its only strong factor), and owners changing those settings.")
+ts("Passkeys", [t(f"sum by (event) (rate(vlpds_passkeys_total{{{I}}}{RI})) > 0", "{{event}}"),
+                t(f"sum by (reason) (rate(vlpds_passkey_failures_total{{{I}}}{RI})) > 0", "refused: {{reason}}"),
+                t(f"sum by (result) (rate(vlpds_passkey_counter_regressions_total{{{I}}}{RI})) > 0", "counter back: {{result}}"),
+                t(f'sum by (result) (rate(vlpds_logins_total{{{I}, method="passkey"}}{RI})) > 0', "passwordless {{result}}")], "ops",
+   empty="no passkey activity",
+   desc="Passkeys registered, removed and reset by the operator; registrations and assertions refused by the check "
+        "that failed (origin / rp_id from another site, challenge = expired or another flow's, replay = a challenge "
+        "used twice, unknown_credential = not one of the account's); signature counters that went backwards "
+        "(refused = a hardware key, now flagged; accepted = a synced passkey); passwordless sign-ins by result. "
+        f"{rb('a-passkey-flagged-as-copied', 'A passkey flagged as copied')}")
 ts("Scope rejections (ScopeMissingError)", [t(f"sum by (credential, kind) (rate(vlpds_scope_rejections_total{{{I}}}{RI})) > 0", "{{credential}} {{kind}}")], "reqps",
    empty="none",
    desc="403s for a scope the OAuth token or scoped app password lacks, by the missing scope's kind. A steady rate from "

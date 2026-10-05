@@ -62,14 +62,22 @@ groups:
 | Repo signing key (secp256k1, one per account) | commits, service-auth JWTs | account row `a/{did}` | KEK, bound to the DID | admin `updateAccountSigningKey` |
 | Reserved signing key | migrations in (`reserveSigningKey`) | `p/_reserved:{did:key}` | KEK, bound to the did:key | used once |
 | TOTP secret | second factor | `p/{did}` private row | KEK, bound to the DID | the user re-enrolls |
+| Passkey public keys | checking passkey sign-ins | `p/{did}\0passkeys` private row | nothing (public keys aren't secrets) | the user adds or removes passkeys |
 | PLC rotation key (one per deployment) | signing PLC ops for every DID | a `vw1.` file on each node (`--plc-rotation-key-file`) | KEK · never in the bucket | `rotate-plc-keys` |
 | Operator recovery key | undoing a bad PLC op within 72 h | offline · nodes get only its did:key | not on any host | `ensure-recovery-key` with a new one |
 | User recovery keys | the user's own control of their DID | the user's device | the user | the account page |
-| `jwt_secret` | legacy session JWTs (HMAC) · derives the OAuth signing key, DPoP nonce, CSRF, refresh-token and email-token MAC keys | a secret file | file mode | no overlap, so changing it signs everyone out |
+| `jwt_secret` | legacy session JWTs (HMAC) · derives the OAuth signing key, DPoP nonce, CSRF, refresh-token, email-token and passkey-challenge MAC keys | a secret file | file mode | no overlap, so changing it signs everyone out |
 | Admin and internal tokens | admin XRPC and node-to-node calls | secret files | file mode | restart with a new value |
 | Peer TLS CA and node certs | mTLS between nodes | `ca.crt` + node pair in `--peer-tls-dir` · `ca.key` offline | CA key offline | renew without restart ([Peer TLS](#peer-tls)) |
-| Passwords, app passwords, recovery codes, email tokens | verifying, not using | private rows | Argon2id · SHA-256 · HMAC keyed by the TOTP secret · HMAC under `jwt_secret` | n/a |
+| Passwords, app passwords, recovery codes, email tokens | verifying, not using | private rows | Argon2id · SHA-256 · SHA-256 salted by the DID · HMAC under `jwt_secret` | n/a |
 | DPoP keys | binding OAuth tokens | the client | never on the server | the client |
+
+Passkeys and recovery codes need no KEK. A passkey's public key isn't a secret, so its row is stored
+in the clear. Someone who can read the bucket learns nothing they can sign with, and someone who can
+write it could already replace the password hash. That also means a passkey sign-in never calls the key
+service. Recovery codes have 80 bits each and are stored as SHA-256 salted by the DID, like app
+passwords, so checking one doesn't need the TOTP secret either. Passkey challenges are MAC'd with a key
+derived from `jwt_secret`, like the CSRF tokens. Details: [Passkeys](oauth-2fa.md#passkeys).
 
 Every secret flag has a file form (`--jwt-secret-file`, `--admin-token-file`, `--s3-secret-key-file`,
 `--email-smtp-url-file`, ... and `VLPDS_*_FILE`). The node reads each file once at startup and drops one
@@ -254,7 +262,8 @@ between nodes)", and joining a node is in [Scaling and clustering](operations/sc
   (`default-src 'none'`, scripts, styles and API calls from `'self'` only, `base-uri` and `form-action 'none'`),
   plus `X-Frame-Options: DENY`, `nosniff` and `no-referrer`. `/migrate` also allows `connect-src https:`,
   because it talks to the account's old PDS. The OAuth pages are server-rendered. Their CSP allows only their
-  own style and auto-submit script by hash, and they post only to this server and the client's redirect.
+  own style by hash, plus one fixed script by hash where it's used (the `form_post` auto-submit, or the
+  passkey ceremony on the sign-in pages). They post only to this server and the client's redirect.
 - Outbound requests. Some requests go to hosts that users or clients name (DID and handle resolution, OAuth
   client metadata, services named in DID documents, push registration). They all go through one client whose
   resolver drops non-public addresses, so a hostname can't be used to reach internal services. Responses are

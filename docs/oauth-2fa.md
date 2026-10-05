@@ -3,7 +3,7 @@ title: OAuth and 2FA
 section: vlPDS
 order: 9
 status: ready
-summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, the account page, and how auth state stays correct under concurrency."
+summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, passkeys, TOTP and email second factors, recovery codes, trusted browsers, sign-in alerts, the OAuth-only switch, the account page, and how auth state stays correct under concurrency."
 ---
 
 ```hero
@@ -13,7 +13,7 @@ diagram:
     - { id: app, label: OAuth client, sub: an app, at: [0, 0], size: [8, 3] }
     - { id: par, label: "`/oauth/par`", sub: pushed request, at: [14, 0], size: [8, 3], tone: accent }
     - { id: page, label: sign-in page, sub: "`/oauth/authorize`", at: [28, 0], size: [9, 3], tone: accent }
-    - { id: tfa, label: second factor, sub: TOTP or email code, at: [28, 6.5], size: [9, 3], tone: violet }
+    - { id: tfa, label: second factor, sub: "passkey, TOTP or email", at: [28, 6.5], size: [9, 3], tone: violet }
     - { id: token, label: "`/oauth/token`", sub: code → tokens, at: [14, 6.5], size: [8, 3], tone: accent }
     - { id: xrpc, label: XRPC, sub: access token + DPoP, at: [0, 6.5], size: [8, 3], tone: blue }
   edges:
@@ -56,7 +56,7 @@ edges:
 | Used by | third-party apps | this server's account page, password-login clients, scripts | apps the user doesn't want to give a full login |
 | Access token | ES256 JWT, 15 min, bound to the client's DPoP key | HMAC JWT under `jwt_secret`, 2 h | as legacy, scope `com.atproto.appPass` (or privileged) |
 | Refresh | rotated each use · 14 d (public clients) or 91 d idle and 730 d total (confidential, `private_key_jwt`) | rotated each use · 90 d | as legacy |
-| Second factor | on the sign-in page, unless the browser is [trusted](#trusted-browsers) | `authFactorToken`, unless the account page's browser is trusted | skipped, as in the reference |
+| Second factor | on the sign-in page, unless the browser is [trusted](#trusted-browsers) · a [passkey](#passkeys) can replace the password | `authFactorToken`, unless the account page's browser is trusted · refused with `PasskeyRequired` when a passkey is the only strong factor | skipped, as in the reference |
 | Revoked by | `/oauth/revoke`, the account page, any revoke-all | `deleteSession`, any revoke-all | `revokeAppPassword`, any revoke-all |
 
 App passwords are server-generated (~80 bits) and stored as SHA-256 hashes. They can't change the account's
@@ -129,39 +129,157 @@ Users see and revoke their OAuth sessions on the account page and at `/oauth/acc
 ## Second factors
 
 ```diagram
-caption: After the password, the strongest enabled factor is asked for. TOTP wins when both are on; the email code is never accepted in its place.
+caption: After the password, the strong factors are offered. A passkey and a TOTP code (or a recovery code for either) both work when both are on. The email code is only asked for when neither is, and it's never accepted in their place.
 nodes:
-  - { id: pw, label: password ok, at: [0, 3.5], size: [8, 3], tone: accent }
-  - { id: totp, label: TOTP code, sub: or a recovery code, at: [13, 0], size: [9, 3], tone: violet }
-  - { id: email, label: email code, sub: "mailed · 15 min", at: [13, 7], size: [9, 3], tone: violet }
-  - { id: none, label: no factor, at: [13, 3.5], size: [9, 3], tone: muted }
-  - { id: ok, label: session, at: [27, 3.5], size: [8, 3], tone: solid }
+  - { id: pw, label: password ok, at: [0, 5], size: [8, 3], tone: accent }
+  - { id: pk, label: passkey, sub: or a recovery code, at: [13, 0], size: [9, 3], tone: violet }
+  - { id: totp, label: TOTP code, sub: or a recovery code, at: [13, 3.5], size: [9, 3], tone: violet }
+  - { id: none, label: no factor, at: [13, 7], size: [9, 3], tone: muted }
+  - { id: email, label: email code, sub: "mailed · 15 min", at: [13, 10.5], size: [9, 3], tone: violet }
+  - { id: ok, label: session, at: [27, 5], size: [8, 3], tone: solid }
 edges:
-  - "pw.r25 -> totp.l: TOTP on"
+  - "pw.r -> pk.l: passkeys"
+  - "pw.r -> totp.l: TOTP on"
   - pw.r -> none.l
-  - "pw.r75 -> email.l: email factor on"
-  - totp.r -> ok.l25
+  - "pw.r -> email.l: email factor only"
+  - pk.r -> ok.l
+  - totp.r -> ok.l
   - none.r -> ok.l
-  - email.r -> ok.l75
+  - email.r -> ok.l
 ```
 
-| | TOTP | Email code |
-|---|---|---|
-| What it is | RFC 6238: SHA-1, 6 digits, 30 s steps, ±1 step | the reference's `emailAuthFactor` · what the Bluesky app offers |
-| Turned on by | `vlpds.server.setupTotp` + `confirmTotp` (account page) | `updateEmail` with `emailAuthFactor: true` and a confirmed address |
-| Stored | secret KEK-wrapped in `p/{did}` · 10 one-time recovery codes as HMACs keyed by it | a keyed digest of the mailed code · newest replaces older |
-| Lost it | a recovery code works in place of a code · there's no admin reset | an admin email change (`updateAccountEmail`) drops the factor |
+| | Passkey | TOTP | Email code |
+|---|---|---|---|
+| What it is | WebAuthn: a signature from the user's device or security key over a challenge, bound to this server's hostname | RFC 6238: SHA-1, 6 digits, 30 s steps, ±1 step | the reference's `emailAuthFactor` · what the Bluesky app offers |
+| Turned on by | adding a passkey on the Security tab (see [Passkeys](#passkeys)) | `vlpds.server.setupTotp` + `confirmTotp` (account page) | `updateEmail` with `emailAuthFactor: true` and a confirmed address |
+| Stored | public keys in the clear in `p/{did}\0passkeys` | secret KEK-wrapped in `p/{did}` | a keyed digest of the mailed code · newest replaces older |
+| Lost it | another passkey, TOTP or a recovery code · the operator's reset | a passkey or a recovery code · the operator's reset | an admin email change (`updateAccountEmail`) drops the factor |
 
-Both factors share one guessing bound. After 5 wrong codes the factor locks for 5 min, and each further
-lockout doubles that, up to a day (429 `RateLimitExceeded`). No mail is sent while it's locked. The counter
-lives in the account's private state, so it holds across nodes, restarts, and both the OAuth page and
-`createSession`. The OAuth page also drops a pending sign-in after 3 wrong codes. An accepted code is spent
-cluster-wide, and a TOTP step can't be reused inside its window. Since TOTP secrets are KEK-wrapped,
-enrolling or checking TOTP needs the key service (503 during a KMS outage).
+Passkeys and TOTP are the strong factors. When the first one goes on, the account gets 10 recovery
+codes, one set shared by both and kept in the `mfa` private row. A code has 80 bits
+(`xxxx-xxxx-xxxx-xxxx`) and is stored as SHA-256 salted by the DID, so checking one needs neither the
+TOTP secret nor the key service. Each works once, `vlpds.server.regenerateRecoveryCodes` (with the
+password) replaces the set, and the codes go when the last strong factor does.
+
+TOTP codes and recovery codes share one guessing bound in the `mfa` row, and the email code has its own
+on the same schedule. After 5 wrong codes the factor locks for 5 min, and each further lockout doubles
+that, up to a day (429 `RateLimitExceeded`). No mail is sent while it's locked. The counter lives in the
+account's private state, so it holds across nodes, restarts, and both the OAuth page and
+`createSession`. The OAuth page also drops a pending sign-in after 3 wrong codes or refused passkeys. A
+refused passkey doesn't count toward the lockout, since there's nothing to guess. An accepted code is
+spent cluster-wide, and a TOTP step can't be reused inside its window. Since TOTP secrets are
+KEK-wrapped, enrolling or checking TOTP needs the key service (503 during a KMS outage).
 
 `ops/RUNBOOK.md` "A user locked out by a second factor" covers a locked-out user. Lockouts clear on their
 own, and you can lift the per-account sign-in limit early with a DID override in the
-[admin console](operations/admin-console.md).
+[admin console](operations/admin-console.md). For a user who lost every factor and every code, the
+operator can reset them ([Operator reset](#operator-reset)).
+
+## Passkeys
+
+```diagram
+caption: "Two ways a passkey signs in on this server's pages. After the password it's the second factor, and with a PIN or biometric it replaces both. Either way the browser signs a challenge that names this server's origin, and the account's owner checks it against the account's `passkeys` row."
+nodes:
+  - { id: page, label: sign-in page, sub: "challenge · RP ID", at: [0, 3], size: [9, 3], tone: accent }
+  - { id: dev, label: passkey, sub: device or security key, at: [13, 3], size: [9, 3], tone: violet }
+  - { id: owner, label: account's owner, sub: "verify · claim once", at: [26, 3], size: [10, 3], tone: accent }
+  - { id: row, label: "`passkeys` row", sub: public keys · counters, at: [26, 8], size: [10, 3], shape: store, tone: amber }
+edges:
+  - "page -> dev: navigator.credentials.get"
+  - "dev -> owner: assertion"
+  - "owner -- row"
+```
+
+A passkey can't be phished the way a code can. The browser signs over the origin it's on, and vlpds
+only accepts a `clientDataJSON.origin` equal to the `--public-url` origin. The relying-party ID is the public URL's host. So an assertion
+made on a lookalike site, or framed (`crossOrigin` or `topOrigin` set), is refused. The flip side is that
+passkeys only work on the public hostname, so the account page hides them on the tailnet console's
+address, and changing the hostname invalidates every passkey on the PDS
+([Configuration](operations/configuration.md#where-configuration-comes-from)).
+
+| | |
+|---|---|
+| Algorithms | ES256, EdDSA and RS256 (Windows Hello), verified with `ring` · attestation isn't checked (`attestation: "none"`) |
+| Per account | up to 20 passkeys, each with a name of up to 64 characters |
+| Adding one | the password first (`startPasskeyRegistration`, `passkey-register-account`: 10 a day), then `finishPasskeyRegistration` · it turns the second factor on and mails the user |
+| As a second factor | presence (UP) is enough · a PIN or biometric is welcome, not required |
+| In place of the password | needs user verification (UV) and a discoverable passkey, whose user handle is the DID |
+| Removing one | the password · ends what it signed in · "Sign out everywhere" ends everything |
+| Lost | another passkey, TOTP or a recovery code ([Second factors](#second-factors)) |
+
+### Signing in with a passkey
+
+On the OAuth sign-in page (and `/oauth/account`) the password form is still there. Below it is a "Sign in
+with a passkey" button, and the handle field has `autocomplete="username webauthn"`, so browsers offer
+the passkey in autofill (conditional UI). This passwordless sign-in needs a discoverable passkey with
+user verification. The browser hands back the user handle, which is the DID's bytes, so the post goes to
+that account's owner with no index. Someone can send any DID as the user handle, but the signature still
+has to verify against a key in that DID's own row, so a forged handle only picks which row fails. It
+counts as both factors, so no second step follows.
+
+After a password, an account with passkeys gets the factor-agnostic second step (`step=2fa`). The page
+offers "Use your passkey" (listing only that account's passkeys), a TOTP code if TOTP is on, and a
+recovery code. Trusted browsers still skip it, and "Trust this browser" works with a passkey too.
+
+The account page (`/account`) signs in with `createSession`, which can't run a passkey, so it has two
+calls of its own:
+
+- `vlpds.server.startPasskeySignIn` returns options for `navigator.credentials.get`. Without a body it's
+  passwordless and names no account. With `identifier` and `password` (after `createSession` answered
+  `PasskeyRequired`, or next to a TOTP prompt), it checks the password and returns that account's
+  passkeys, with a challenge bound to the DID and the credential epoch. So a password change voids it.
+- `vlpds.server.createPasskeySession` takes `did`, the assertion and (on the second step) `trustDevice`, and returns
+  the same legacy session `createSession` would. It's limited by `passkey-sign-in-ip` (100 per 5 min),
+  `sign-in-account` and the `createSession-*` buckets keyed by the DID and IP.
+
+`createSession` can't take a passkey, since there's no browser to vouch for the origin. So an account
+with passkeys and no TOTP refuses a password `createSession` with 401 `PasskeyRequired`, and the message
+points to OAuth or an app password. The email code doesn't stand in for a passkey. This server's own
+account page (`Sec-Fetch-Site: same-origin`) still gets through with a recovery code, or on a trusted
+browser. App passwords keep working, and with TOTP on, `createSession` takes a TOTP or recovery code as
+before.
+
+Nothing before the password says whether an account has passkeys. The passwordless options list no
+credentials, `allowCredentials` only comes after a correct password, and every failed passwordless sign-in
+says "Passkey not recognized". Each refusal is counted by reason in
+`vlpds_passkey_failures_total{reason}`. A DID longer than 64 bytes (a long `did:web`) can't be a user
+handle, so its passkeys are a second factor only, and the Security tab says so.
+
+### Challenges, counters and removal
+
+Challenges are stateless, like DPoP nonces and CSRF tokens. Each one is a nonce and an expiry (5 min)
+MAC'd with a key derived from `jwt_secret`, bound to its purpose (sign-in, second factor, registration or
+the account page) and to what it can finish. On the OAuth pages that's the browser and the flow, plus
+the account for a second step. Rendering a sign-in page writes
+nothing, and any node can mint or check one. After the signature verifies, the owner claims the nonce
+cluster-wide (`claim_replay_anywhere`, written to the bucket before it counts), so a challenge works once
+even across a failover, and junk posts never cost a write.
+
+Synced passkeys (iCloud Keychain, Google Password Manager) report a signature counter of 0 forever, and
+their copies are expected. So a counter that stays at 0 or goes up is accepted. One that goes backwards
+on a passkey that can't be synced (a hardware key) means a clone or a replayed signature. That sign-in is
+refused, the key is flagged until the owner removes it, and the owner is mailed. On a synced passkey it's
+accepted and counted (`vlpds_passkey_counter_regressions_total{result}`). Each use updates the counter
+with a compare-and-set, so a passkey removed mid-sign-in fails that sign-in.
+
+Removing a passkey needs the password. OAuth sessions and account-page sessions record which passkey
+signed them in, and those are revoked. Device sign-ins and unexchanged codes it approved are refused when
+they're next used. The removal dialog's "Sign out everywhere" box runs a revoke-all. A password change or
+reset doesn't remove passkeys, so someone holding the inbox can't reset the factor away. Adding or
+removing a passkey always mails the owner (`security_change`, "Your Account's Sign-in Settings Changed").
+
+### Operator reset
+
+A user who lost every passkey, the authenticator and the recovery codes still has their password, but
+can't get past the second step. The operator can reset their second factors from the console (the
+account page's "Two-factor sign-in" panel) or with `vlpds.admin.resetSecondFactors`. It removes passkeys,
+TOTP, the recovery codes and trusted browsers, and ends what the passkeys signed in. The password and the
+email factor stay. A reason is required, the action goes in the audit log as `second_factors.reset`, and
+the user is mailed. Whoever talks the operator into a reset still needs the password. Steps:
+`ops/RUNBOOK.md` "Resetting a user's second factors".
+
+Passkeys are bound to this PDS's hostname, so they don't move with the account
+([Migration](migration.md)).
 
 ## Trusted browsers
 
@@ -171,7 +289,7 @@ nodes:
   - { id: pw, label: password ok, at: [0, 3], size: [8, 3], tone: accent }
   - { id: row, label: "`trust/{hash}`", sub: "device cookie · ≤ 30 d", at: [13, 3], size: [10, 3], shape: store, tone: amber }
   - { id: skip, label: session, sub: no code asked, at: [29, 0], size: [9, 3], tone: solid }
-  - { id: code, label: second factor, sub: TOTP or email code, at: [29, 6], size: [9, 3], tone: violet }
+  - { id: code, label: second factor, sub: "passkey, TOTP or email", at: [29, 6], size: [9, 3], tone: violet }
 edges:
   - pw -> row
   - "row.r -> skip.l: epoch · factors unchanged"
@@ -188,7 +306,8 @@ cookie, so a copy of the bucket doesn't give anyone a usable cookie.
 A trust only counts while two things are unchanged since it was granted. The first is the
 [credential epoch](#auth-state-under-concurrency), so a password change or reset, a takedown or any
 revoke-all ends it (revoke-all also deletes the rows). The second is the account's set of second
-factors. Turning TOTP or the email factor off or on, or enrolling a new authenticator, ends every
+factors. Turning TOTP or the email factor off or on, enrolling a new authenticator, or adding or
+removing a passkey ends every
 trust too. The trust is checked before any factor, so it covers whichever factors the account has.
 
 On `createSession` the cookie only counts on this server's own pages (`Sec-Fetch-Site:
@@ -203,9 +322,9 @@ once they expire.
 
 | | Recent sign-ins | Sign-in alert |
 |---|---|---|
-| Recorded or sent for | every successful sign-in · OAuth page, `createSession` with the password or an app password | a sign-in from a device the account hasn't used in 180 days |
+| Recorded or sent for | every successful sign-in · OAuth page, `createSession` with the password or an app password, a passkey on either page | a sign-in from a device the account hasn't used in 180 days |
 | Kept | the last 50, at most 30 days old, in `signin/log` | at most 3 a day per account (`ALERTS_PER_DAY`) |
-| Shows | when, method (app password name, OAuth client), device, address, factor | device, method, address and time · links to change the password and to the Security tab |
+| Shows | when, method (app password name, OAuth client, `passkey` for one in place of the password), device, address, factor (`totp`, `email`, `passkey`, `recovery` or `trusted`) | device, method, address and time · links to change the password and to the Security tab |
 | Skipped when | never | the user turned that kind off · the account has no email · the sign-in used an emailed code · it's the first sign-in vlpds records for the account |
 
 Each sign-in writes one row in the account's private state, at the account's owner, with a
@@ -248,7 +367,13 @@ messages say what to do instead. This server's account page signs in with `creat
 same-origin requests from it still go through, and they still need the second factor (or a trusted
 browser).
 
-`ops/RUNBOOK.md` "A user locked out by OAuth only" covers a user an app refuses.
+Passkeys and the switch don't interact. Passkeys only exist on this server's pages, which the switch
+leaves alone, and a passkey counts as a second factor, so it lets the switch be turned on. An account
+whose only strong factor is a passkey already refuses a password `createSession` with
+`PasskeyRequired`, switch or not ([Passkeys](#passkeys)).
+
+`ops/RUNBOOK.md` "A user locked out by OAuth only" covers a user an app refuses, and "A user lost their
+passkeys" covers `PasskeyRequired`.
 
 ## The account page
 
@@ -256,13 +381,14 @@ browser).
 |---|---|---|
 | Overview | see the handle, DID, status (with the date of a scheduled deletion), repo counts and the DID document | |
 | Handle and email | change the handle to a name on this server or to their own domain, with a guided check · change and confirm the email | [Changing a handle](operations/email-and-moderation.md#changing-a-handle-on-the-account-page) |
-| Security | TOTP and recovery codes · recent sign-ins · trusted browsers · sign-in alerts · OAuth only · the recovery key · app passwords, scoped or not · connected OAuth apps · the password | [Second factors](#second-factors), [Trusted browsers](#trusted-browsers), [Sign-in alerts](#sign-in-alerts-and-recent-sign-ins), [OAuth only](#oauth-only), [Scoped app passwords](#scoped-app-passwords), [Recovery keys](keys-security.md#plc-rotation-key-and-recovery-keys) |
+| Security | passkeys · TOTP · recovery codes · recent sign-ins · trusted browsers · sign-in alerts · OAuth only · the recovery key · app passwords, scoped or not · connected OAuth apps · the password | [Passkeys](#passkeys), [Second factors](#second-factors), [Trusted browsers](#trusted-browsers), [Sign-in alerts](#sign-in-alerts-and-recent-sign-ins), [OAuth only](#oauth-only), [Scoped app passwords](#scoped-app-passwords), [Recovery keys](keys-security.md#plc-rotation-key-and-recovery-keys) |
 | Repository, Media | browse records and delete one · preview blobs | |
 | Export, Preferences | download a full backup or the repo CAR · view and edit stored app preferences | [Backups](migration.md#backups) |
 | Deactivate or delete | deactivate, reactivate (which cancels a scheduled deletion) · delete with an emailed token | [Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion) |
 
 Users manage their account at `/account` on this server. The page signs in with `createSession`, so
-the second factor applies there too, unless the browser is trusted.
+the second factor applies there too, unless the browser is trusted. It also signs in with a passkey,
+through its own two calls ([Signing in with a passkey](#signing-in-with-a-passkey)).
 
 ## Auth state under concurrency
 
@@ -319,6 +445,8 @@ Rate limits run before any hashing, so a flood from a few addresses or one accou
 | `com.atproto.server.createSession-0` / `-1` | identifier + IP | 300 per day / 30 per 5 min |
 | `oauth-sign-in-ip` | IP, OAuth sign-in form posts | 100 per 5 min |
 | `oauth-ip` | IP, `/oauth/par`, `/oauth/token`, `/oauth/revoke` | 3,000 per 5 min |
+| `passkey-sign-in-ip` | IP, the account page's passkey sign-in (`startPasskeySignIn`, `createPasskeySession`) | 100 per 5 min |
+| `passkey-register-account` | account, `startPasskeyRegistration` | 10 per day |
 
 An OAuth client whose backend calls `/oauth/token` for all its users from one address may need an IP override.
 Overrides and live changes are in the [admin console](operations/admin-console.md).
@@ -346,8 +474,8 @@ edges:
   rows through a per-node view. On the owner that view is cached until it changes, and elsewhere it's re-read
   every 10 s. The check fails closed. If the owner can't be read and the cached view is more than 300 s old,
   the request gets a 503 instead of a guess.
-- Revoke-all. This happens on a password change or reset, takedown, account deletion and OAuth credential
-  deletion. It deletes every legacy and OAuth session and every trusted browser, and replaces the
+- Revoke-all. This happens on a password change or reset, takedown, account deletion, OAuth credential
+  deletion and removing a passkey with "Sign out everywhere". It deletes every legacy and OAuth session and every trusted browser, and replaces the
   credential epoch, in one write. Its row
   is kept for the refresh-token lifetime (90 d), so a session that somehow survived still fails.
 - Cleanup. A per-node sweep runs every 60 s. It deletes expired OAuth rows (requests, codes, sessions past
