@@ -1,11 +1,16 @@
 //! Spaces phase 1 side lane: leak, durability and fuzz harnesses and the
 //! sync micro-bench, which drive the space surface over XRPC (see
 //! tests/all/common/spaces.rs), and the ported reference space suites
-//! (`ref_*`, on the `ref_net` harness).
+//! (`ref_*`, on the `ref_net` harness). Phase 2's cluster checks are the
+//! `cluster_*` modules: split and merge with space rows, revocation across
+//! nodes, the leak test across nodes and their peer streams, and takeover
+//! mid-burst.
 
 mod accept;
 mod bench;
 mod check;
+mod cluster;
+mod cluster_leak;
 mod durability;
 mod fuzz;
 mod hooks;

@@ -17,31 +17,35 @@ use vlpds::slots::{slot_of, SlotRange};
 
 /// Every state family a space write or the space host may put in the log
 /// (plan §2.1, C5's sb/sc blob refs).
-const SPACE_FAMILIES: &[&[u8]] =
+pub(super) const SPACE_FAMILIES: &[&[u8]] =
     &[b"sH/", b"sR/", b"sO/", b"sP/", b"sS/", b"sW/", b"sQ/", b"sM/", b"sN/", b"sb/", b"sc/"];
 
-const SHARDS: u32 = 4;
+pub(super) const SHARDS: u32 = 4;
 const IDLE: Duration = Duration::from_millis(600);
 
 #[derive(Default)]
-struct Sentinels(Vec<(String, Vec<u8>)>);
+pub(super) struct Sentinels(Vec<(String, Vec<u8>)>);
 
 impl Sentinels {
-    fn push(&mut self, what: impl Into<String>, b: impl AsRef<[u8]>) {
+    pub(super) fn push(&mut self, what: impl Into<String>, b: impl AsRef<[u8]>) {
         assert!(b.as_ref().len() >= 8, "a short sentinel would match by chance");
         self.0.push((what.into(), b.as_ref().to_vec()));
     }
 
-    fn push_cid(&mut self, what: &str, cid: &str) {
+    pub(super) fn extend(&mut self, other: &Sentinels) {
+        self.0.extend(other.0.iter().cloned());
+    }
+
+    pub(super) fn push_cid(&mut self, what: &str, cid: &str) {
         self.push(format!("{what} {cid}"), cid);
         self.push(format!("{what} {cid} (binary)"), Cid::parse(cid).expect("cid").to_bytes());
     }
 
-    fn find(&self, bytes: &[u8]) -> Option<(&str, usize)> {
+    pub(super) fn find(&self, bytes: &[u8]) -> Option<(&str, usize)> {
         self.0.iter().find_map(|(what, s)| bytes.windows(s.len()).position(|w| w == s).map(|i| (what.as_str(), i)))
     }
 
-    fn assert_clean(&self, source: &str, bytes: &[u8]) {
+    pub(super) fn assert_clean(&self, source: &str, bytes: &[u8]) {
         if let Some((what, at)) = self.find(bytes) {
             let lo = at.saturating_sub(48);
             panic!(
@@ -51,7 +55,7 @@ impl Sentinels {
         }
     }
 
-    fn assert_frames_clean(&self, source: &str, frames: &[Frame]) {
+    pub(super) fn assert_frames_clean(&self, source: &str, frames: &[Frame]) {
         for f in frames {
             self.assert_clean(&format!("{source} (seq {:?}, {})", f.seq(), f.kind()), &f.raw);
         }
@@ -61,18 +65,18 @@ impl Sentinels {
 /// A space anchored on a fresh OAuth account (authority self) and what was
 /// written into it: its sentinels, the space record CIDs and how many space
 /// write calls were acked.
-struct Planted {
-    sc: SpaceClient,
+pub(super) struct Planted {
+    pub sc: SpaceClient,
     /// The space client's account, for public writes with its session.
-    author: TestAccount,
-    space: String,
+    pub author: TestAccount,
+    pub space: String,
     collection: String,
     rkey: String,
     value: String,
     field: String,
-    sentinels: Sentinels,
+    pub sentinels: Sentinels,
     cids: Vec<String>,
-    writes: usize,
+    pub writes: usize,
 }
 
 fn tag() -> String {
@@ -86,7 +90,7 @@ fn space_record(collection: &str, value: &str, field: &str, i: usize) -> J {
 impl Planted {
     /// The account (with one public post) and its space; nothing written
     /// into the space yet.
-    async fn new(via: &TestServer) -> Planted {
+    pub(super) async fn new(via: &TestServer) -> Planted {
         let t = tag();
         let space_type = format!("com.example.zqtype{t}.space");
         let skey = format!("zqskey{t}");
@@ -140,7 +144,7 @@ impl Planted {
     /// `n` + 5 space write calls (create, TID create, put, a dependent
     /// applyWrites batch, delete, then `n` creates), every op carrying
     /// sentinels. `public` must not be the author.
-    async fn fill(&mut self, via: &TestServer, public: &TestAccount, n: usize) {
+    pub(super) async fn fill(&mut self, via: &TestServer, public: &TestAccount, n: usize) {
         let (c, rk, space, did) = (self.collection.clone(), self.rkey.clone(), self.space.clone(), self.sc.did.clone());
         let body = |extra: J| {
             let mut b = json!({"space": space, "repo": did});
@@ -186,7 +190,7 @@ impl Planted {
     }
 }
 
-async fn sub_shard(s: &TestServer, cursor: i64, k: u32, n: u32) -> Sub {
+pub(super) async fn sub_shard(s: &TestServer, cursor: i64, k: u32, n: u32) -> Sub {
     Sub::connect(&format!("ws://{}/xrpc/com.atproto.sync.subscribeRepos?cursor={cursor}&shard={k}/{n}", s.addr)).await
 }
 
@@ -195,13 +199,13 @@ fn is_commit(f: &Frame, cid: &Cid) -> bool {
 }
 
 /// Reads `sub` up to and including the #commit `marker`.
-async fn read_to_commit(sub: &mut Sub, marker: &Cid) -> Vec<Frame> {
+pub(super) async fn read_to_commit(sub: &mut Sub, marker: &Cid) -> Vec<Frame> {
     sub.until(FH_TIMEOUT, |fs| fs.last().is_some_and(|f| is_commit(f, marker))).await
 }
 
 /// Reads a k/n stream up to the last event of `full` in its slot range
 /// (drained until idle when the range has none).
-async fn read_shard(sub: &mut Sub, full: &[Frame], k: u32) -> Vec<Frame> {
+pub(super) async fn read_shard(sub: &mut Sub, full: &[Frame], k: u32) -> Vec<Frame> {
     let range = SlotRange::new(k, SHARDS).unwrap();
     let last = full.iter().rev().find(|f| f.did().is_some_and(|d| range.contains(slot_of(d)))).and_then(|f| f.seq());
     match last {
@@ -212,7 +216,7 @@ async fn read_shard(sub: &mut Sub, full: &[Frame], k: u32) -> Vec<Frame> {
 
 /// Every (seq, frame) in S3 under the cluster's logs, through the same
 /// segment::events path a cursor older than the ring replays.
-async fn s3_backfill(s: &TestServer) -> Vec<(i64, Vec<u8>)> {
+pub(super) async fn s3_backfill(s: &TestServer) -> Vec<(i64, Vec<u8>)> {
     let s3 = s.app.firehose.store.read().clone().unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 16);
     let job = tokio::spawn(async move { vlpds::backfill::backfill(&s3, 0, i64::MAX, &tx).await });
@@ -228,7 +232,7 @@ async fn s3_backfill(s: &TestServer) -> Vec<(i64, Vec<u8>)> {
 /// empty frame, and no non-empty frame carries a sentinel. Returns how many
 /// entries carried s* keys and whether a sentinel turned up inside their
 /// muts (proof the scan sees the space writes at all).
-async fn scan_log(s: &TestServer, p: &Planted) -> (usize, bool) {
+pub(super) async fn scan_log(s: &TestServer, p: &Planted) -> (usize, bool) {
     use futures::StreamExt;
     let store = &s.app.store;
     let prefix = object_store::path::Path::from(format!("{}/log/{}", store.prefix, s.app.log.log_id));
@@ -276,21 +280,27 @@ async fn scan_log(s: &TestServer, p: &Planted) -> (usize, bool) {
     (private, seen)
 }
 
+/// `r`'s body, less what was asked for if it's an error: an error naming it
+/// (RecordNotFound's URI, BlockNotFound's CIDs) echoes the request, not
+/// space data.
+fn unechoed(r: &Resp, asked: &[String]) -> Vec<u8> {
+    if r.status == 200 {
+        return r.body.to_vec();
+    }
+    let mut text = String::from_utf8_lossy(&r.body).into_owned();
+    for v in asked {
+        text = text.replace(v.as_str(), "");
+    }
+    text.into_bytes()
+}
+
 /// The author's public sync and repo surface, each response checked for
 /// sentinels; the space collection and records are absent from it.
-async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
+pub(super) async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
     let get = |nsid: &'static str, q: Vec<(&'static str, String)>| async move {
         let qs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let mut r = s.xrpc.get(nsid, &qs, &Auth::None).await;
-        // an error message may echo what was asked for: not a leak
-        if r.status >= 400 {
-            let mut body = String::from_utf8_lossy(&r.body).into_owned();
-            for (_, v) in &q {
-                body = body.replace(v.as_str(), "");
-            }
-            r.body = body.into_bytes().into();
-        }
-        (nsid, r)
+        let r = s.xrpc.get(nsid, &qs, &Auth::None).await;
+        (nsid, r, q.into_iter().map(|(_, v)| v).collect::<Vec<String>>())
     };
     let d = || did.to_string();
     let rk = format!("{}-n0", p.rkey);
@@ -322,11 +332,11 @@ async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
             break;
         }
     }
-    for (nsid, r) in &checked {
+    for (nsid, r, asked) in &checked {
         assert!(r.status < 500, "{nsid}: {}", r.text());
-        p.sentinels.assert_clean(nsid, &r.body);
+        p.sentinels.assert_clean(nsid, &unechoed(r, asked));
     }
-    let by_nsid = |n: &str| &checked.iter().find(|(x, _)| *x == n).unwrap().1;
+    let by_nsid = |n: &str| &checked.iter().find(|(x, ..)| *x == n).unwrap().1;
     assert_eq!(by_nsid("com.atproto.sync.getRepo").status, 200);
     let collections = &by_nsid("com.atproto.repo.describeRepo").json["collections"];
     assert!(
@@ -348,9 +358,7 @@ async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
         assert_ne!(r.status, 200, "sync.getBlob served space record {cid}");
         let r = s.get_blocks(did, &[Cid::parse(cid).unwrap()]).await;
         assert_ne!(r.status, 200, "sync.getBlocks served space record {cid}");
-        // the error names the CIDs asked for: not a leak
-        let body = String::from_utf8_lossy(&r.body).replace(cid.as_str(), "");
-        p.sentinels.assert_clean("sync.getBlocks", body.as_bytes());
+        p.sentinels.assert_clean("sync.getBlocks", &unechoed(&r, std::slice::from_ref(cid)));
     }
 }
 
