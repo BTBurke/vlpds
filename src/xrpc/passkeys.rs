@@ -158,7 +158,7 @@ pub(super) fn decode_capped(s: &str, max: usize) -> Result<Vec<u8>, Fail> {
     if s.len() > max {
         return Err(Fail::TooLarge);
     }
-    b64u_decode(s).ok_or(Fail::Malformed)
+    webauthn::b64u_strict(s).ok_or(Fail::Malformed)
 }
 
 struct Decoded {

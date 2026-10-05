@@ -1,21 +1,12 @@
 //! Helpers shared by the OAuth modules, and the single-use (replay) claims.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 pub fn now_secs() -> i64 {
     (crate::tid::now_micros() / 1_000_000) as i64
 }
 
-pub fn b64u(b: impl AsRef<[u8]>) -> String {
-    B64.encode(b)
-}
-
-pub fn b64u_decode(s: &str) -> Option<Vec<u8>> {
-    B64.decode(s.trim_end_matches('=')).ok()
-}
+pub use crate::prims::{b64u, b64u_decode, hmac_sha256};
 
 pub fn sha256(b: impl AsRef<[u8]>) -> [u8; 32] {
     Sha256::digest(b.as_ref()).into()
@@ -30,15 +21,6 @@ pub fn random_id(prefix: &str, n: usize) -> String {
     let mut b = vec![0u8; n];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut b);
     format!("{prefix}{}", b64u(b))
-}
-
-pub fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    for p in parts {
-        m.update(&(p.len() as u64).to_be_bytes());
-        m.update(p);
-    }
-    m.finalize().into_bytes().into()
 }
 
 /// Every node shares `jwt_secret`, so derived keys agree across nodes with

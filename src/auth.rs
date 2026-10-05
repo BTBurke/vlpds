@@ -211,10 +211,7 @@ pub fn token_eq(expected: &str, given: &str) -> bool {
     !expected.is_empty() && ct_eq(&Sha256::digest(expected), &Sha256::digest(given))
 }
 
-/// Constant time for equal lengths.
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
-}
+pub use crate::prims::ct_eq;
 
 /// `b64` is the `Authorization: Basic` value after the scheme.
 pub fn basic_admin_ok(b64: &str, admin_token: &str) -> bool {

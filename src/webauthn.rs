@@ -267,6 +267,41 @@ pub enum PublicKey {
     },
 }
 
+/// An Ed25519 key that isn't a usable one: a point of small order (the
+/// identity verifies any message for some implementations), in either sign,
+/// or a y coordinate that isn't reduced mod p. libsodium's blocklist.
+fn weak_ed25519(x: &[u8; 32]) -> bool {
+    let mut c = *x;
+    c[31] &= 0x7f;
+    let ff = |lo: u8| {
+        let mut v = [0xffu8; 32];
+        v[0] = lo;
+        v[31] = 0x7f;
+        v
+    };
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    const ORDER8_A: [u8; 32] = [
+        0x26, 0xe8, 0x95, 0x8f, 0xc2, 0xb2, 0x27, 0xb0, 0x45, 0xc3, 0xf4, 0x89, 0xf2, 0xef, 0x98, 0xf0, 0xd5, 0xdf,
+        0xac, 0x05, 0xd3, 0xc6, 0x33, 0x39, 0xb1, 0x38, 0x02, 0x88, 0x6d, 0x53, 0xfc, 0x05,
+    ];
+    const ORDER8_B: [u8; 32] = [
+        0xc7, 0x17, 0x6a, 0x70, 0x3d, 0x4d, 0xd8, 0x4f, 0xba, 0x3c, 0x0b, 0x76, 0x0d, 0x10, 0x67, 0x0f, 0x2a, 0x20,
+        0x53, 0xfa, 0x2c, 0x39, 0xcc, 0xc6, 0x4e, 0xc7, 0xfd, 0x77, 0x92, 0xac, 0x03, 0x7a,
+    ];
+    // y >= p = 2^255 - 19: not canonical (this also covers p and p + 1)
+    let unreduced = c[31] == 0x7f && c[1..31].iter().all(|b| *b == 0xff) && c[0] >= 0xed;
+    unreduced || [[0u8; 32], one, ORDER8_A, ORDER8_B, ff(0xec)].contains(&c)
+}
+
+/// Base64url as WebAuthn JSON carries it: no padding.
+pub fn b64u_strict(s: &str) -> Option<Vec<u8>> {
+    if s.contains('=') {
+        return None;
+    }
+    b64u_decode(s)
+}
+
 fn strip_zeros(b: &[u8]) -> Vec<u8> {
     let i = b.iter().position(|x| *x != 0).unwrap_or(b.len());
     b[i..].to_vec()
@@ -303,12 +338,25 @@ impl PublicKey {
                 if int(-1) != Some(6) || x.len() != 32 {
                     return Err(Fail::Key);
                 }
-                Ok(PublicKey::Ed25519(x.try_into().unwrap()))
+                let x: [u8; 32] = x.try_into().unwrap();
+                if weak_ed25519(&x) {
+                    return Err(Fail::Key);
+                }
+                Ok(PublicKey::Ed25519(x))
             }
             (3, ALG_RS256) => {
                 let (n, e) = (strip_zeros(bytes(-1).ok_or(Fail::Key)?), strip_zeros(bytes(-2).ok_or(Fail::Key)?));
-                let bits = n.len() * 8 - n.first().map_or(8, |b| b.leading_zeros() as usize);
-                if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) || e.is_empty() || e.len() > 4 {
+                let (Some(first), Some(last)) = (n.first(), n.last()) else { return Err(Fail::Key) };
+                let bits = n.len() * 8 - first.leading_zeros() as usize;
+                // a modulus is odd, and so is a usable exponent (at least 3)
+                let e_val = e.iter().fold(0u64, |a, b| (a << 8) | *b as u64);
+                if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits)
+                    || last & 1 == 0
+                    || e.is_empty()
+                    || e.len() > 4
+                    || e_val < 3
+                    || e_val & 1 == 0
+                {
                     return Err(Fail::Key);
                 }
                 Ok(PublicKey::Rs256 { n, e })
@@ -442,13 +490,17 @@ fn client_data(b: &[u8]) -> Result<ClientData, Fail> {
     if b.len() > MAX_CLIENT_DATA {
         return Err(Fail::TooLarge);
     }
+    // serde would also take a struct as a JSON array of its fields
+    if b.iter().find(|c| !c.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(Fail::Malformed);
+    }
     serde_json::from_slice(b).map_err(|_| Fail::Malformed)
 }
 
 /// The challenge a `clientDataJSON` answers, so the caller can find what
 /// it was minted for before checking the rest.
 pub fn client_data_challenge(b: &[u8]) -> Result<Vec<u8>, Fail> {
-    b64u_decode(&client_data(b)?.challenge).ok_or(Fail::Challenge)
+    b64u_strict(&client_data(b)?.challenge).ok_or(Fail::Challenge)
 }
 
 fn check_client_data(b: &[u8], ty: &str, challenge: &[u8], rp: &Rp) -> Result<(), Fail> {
@@ -456,7 +508,7 @@ fn check_client_data(b: &[u8], ty: &str, challenge: &[u8], rp: &Rp) -> Result<()
     if c.ty != ty {
         return Err(Fail::Type);
     }
-    if !b64u_decode(&c.challenge).is_some_and(|got| ct_eq(&got, challenge)) {
+    if !b64u_strict(&c.challenge).is_some_and(|got| ct_eq(&got, challenge)) {
         return Err(Fail::Challenge);
     }
     if c.origin != rp.origin {
@@ -975,6 +1027,82 @@ mod tests {
         assert_eq!(PublicKey::from_cose(&[0xa1, 0x01, 0x02]).unwrap_err(), Fail::Key);
         // kty and alg that don't go together
         assert_eq!(PublicKey::from_cose(&[0xa2, 0x01, 0x02, 0x03, 0x27]).unwrap_err(), Fail::Algorithm);
+    }
+
+    #[test]
+    fn rsa_key_with_an_empty_modulus_is_refused() {
+        // n = 00 (empty once its zeros are stripped), e = 65537
+        let k = [0xa4, 0x01, 0x03, 0x03, 0x39, 0x01, 0x00, 0x20, 0x40, 0x21, 0x43, 0x01, 0x00, 0x01];
+        assert_eq!(PublicKey::from_cose(&k).unwrap_err(), Fail::Key);
+        let k = [0xa4, 0x01, 0x03, 0x03, 0x39, 0x01, 0x00, 0x20, 0x41, 0x00, 0x21, 0x43, 0x01, 0x00, 0x01];
+        assert_eq!(PublicKey::from_cose(&k).unwrap_err(), Fail::Key);
+    }
+
+    fn rsa_cose(n: &[u8], e: &[u8]) -> Cbor {
+        Cbor::Map(vec![
+            (Cbor::Uint(1), Cbor::Uint(3)),
+            (Cbor::Uint(3), Cbor::Nint(256)),
+            (Cbor::Nint(0), Cbor::Bytes(n.to_vec())),
+            (Cbor::Nint(1), Cbor::Bytes(e.to_vec())),
+        ])
+    }
+
+    #[test]
+    fn rsa_keys_must_be_usable() {
+        let Cbor::Map(m) = cbor_read_exact(&d(RS256_KEY)).unwrap() else { panic!() };
+        let n = m.iter().find(|(k, _)| k.int() == Some(-1)).unwrap().1.bytes().unwrap().to_vec();
+        assert!(PublicKey::from_cose_item(&rsa_cose(&n, &[1, 0, 1])).is_ok());
+        let mut even = n.clone();
+        *even.last_mut().unwrap() &= 0xfe;
+        assert_eq!(PublicKey::from_cose_item(&rsa_cose(&even, &[1, 0, 1])).unwrap_err(), Fail::Key, "even modulus");
+        for e in [&[1u8][..], &[2], &[1, 0, 0], &[]] {
+            assert_eq!(PublicKey::from_cose_item(&rsa_cose(&n, e)).unwrap_err(), Fail::Key, "e = {e:?}");
+        }
+    }
+
+    #[test]
+    fn small_order_ed25519_keys_are_refused() {
+        let key = |x: [u8; 32]| {
+            let mut c = vec![0xa4, 0x01, 0x01, 0x03, 0x27, 0x20, 0x06, 0x21, 0x58, 0x20];
+            c.extend_from_slice(&x);
+            PublicKey::from_cose(&c)
+        };
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        let mut p_minus_1 = [0xffu8; 32];
+        p_minus_1[0] = 0xec;
+        p_minus_1[31] = 0x7f;
+        let mut p = p_minus_1;
+        p[0] = 0xed;
+        let mut big = [0xffu8; 32];
+        big[31] = 0x7f;
+        let mut signed_identity = identity;
+        signed_identity[31] = 0x80;
+        for x in [identity, signed_identity, [0; 32], p_minus_1, p, big] {
+            assert_eq!(key(x).unwrap_err(), Fail::Key, "{x:x?}");
+        }
+        // the recorded key is fine
+        assert!(PublicKey::from_cose(&d("pAEBAycgBiFYIMz6_SUFLiDid2Yhlq0YboyJ-CDrIrNpkPUGmJp4D3Dp")).is_ok());
+    }
+
+    #[test]
+    fn client_data_must_be_an_object_and_unpadded() {
+        let rp = localhost();
+        let ch = b"the challenge".to_vec();
+        let arr = format!(r#"["webauthn.get","{}","http://localhost:5000"]"#, b64u(&ch));
+        assert_eq!(check_client_data(arr.as_bytes(), "webauthn.get", &ch, &rp).unwrap_err(), Fail::Malformed);
+        let ok = format!(r#" {{"type":"webauthn.get","challenge":"{}","origin":"http://localhost:5000"}}"#, b64u(&ch));
+        assert!(check_client_data(ok.as_bytes(), "webauthn.get", &ch, &rp).is_ok());
+        let padded = format!(
+            r#"{{"type":"webauthn.get","challenge":"{}=","origin":"http://localhost:5000"}}"#,
+            b64u(b"the challeng")
+        );
+        assert_eq!(
+            check_client_data(padded.as_bytes(), "webauthn.get", b"the challeng", &rp).unwrap_err(),
+            Fail::Challenge
+        );
+        assert_eq!(b64u_strict("AA=="), None);
+        assert_eq!(b64u_strict("AA"), Some(vec![0]));
     }
 
     #[test]

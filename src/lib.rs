@@ -38,6 +38,7 @@ pub mod partition;
 pub mod partitions;
 pub mod peer_tls;
 pub mod plc;
+pub mod prims;
 pub mod profiling;
 pub mod ptr;
 pub mod ratelimit;
