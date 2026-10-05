@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { ErrorNotice, Field, Loading, Notice, PageHead, Panel, Spinner, Status } from '../../components/ui'
 import { useAction, useLoad } from '../../lib/hooks'
 import { acall, call } from '../../lib/xrpc'
+import { HandleChange } from './HandleChange'
 import { loadSession } from './Overview'
 
 export function Identity() {
@@ -16,59 +17,17 @@ export function Identity() {
         <Loading />
       ) : (
         <>
-          <HandleForm current={d.handle} domains={desc.data?.availableUserDomains ?? []} onDone={info.reload} />
+          {desc.data ? (
+            <HandleChange current={d.handle} did={d.did} domain={desc.data.availableUserDomains[0] ?? ''} onDone={info.reload} />
+          ) : desc.error ? (
+            <ErrorNotice error={desc.error} />
+          ) : (
+            <Loading />
+          )}
           <EmailPanel email={d.email} confirmed={!!d.emailConfirmed} onDone={info.reload} />
         </>
       )}
     </>
-  )
-}
-
-function HandleForm({ current, domains, onDone }: { current: string; domains: string[]; onDone: () => void }) {
-  const [handle, setHandle] = useState('')
-  const [done, setDone] = useState<string>()
-  const domain = domains[0] ?? ''
-  const full = handle.includes('.') ? handle.trim().replace(/^@/, '') : handle.trim() ? `${handle.trim()}${domain}` : ''
-  const act = useAction(async () => {
-    await acall('com.atproto.identity.updateHandle', { body: { handle: full } })
-    setDone(full)
-    setHandle('')
-    onDone()
-  })
-  return (
-    <Panel title="Handle" desc={<>Currently <b>@{current}</b>.</>} id="handle">
-      {done && <Notice kind="ok">Your handle is now @{done}. Apps may take a few minutes to show it.</Notice>}
-      <ErrorNotice error={act.error} />
-      <form
-        onSubmit={(e) => {
-          e.preventDefault()
-          act.run()
-        }}
-      >
-        <Field
-          label="New handle"
-          action={
-            <button className="btn primary" disabled={act.busy || !full}>
-              {act.busy && <Spinner />}
-              Change handle
-            </button>
-          }
-          hint={
-            <>
-              A name ending in <span className="mono">{domain || '.your-domain'}</span>, or a domain you own with a matching DNS record.
-              {full && full !== handle.trim() && (
-                <>
-                  {' '}
-                  You'll be <b>@{full}</b>.
-                </>
-              )}
-            </>
-          }
-        >
-          <input type="text" value={handle} onChange={(e) => setHandle(e.target.value)} autoCapitalize="none" spellCheck={false} placeholder="alice" required />
-        </Field>
-      </form>
-    </Panel>
   )
 }
 
