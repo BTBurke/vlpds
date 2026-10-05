@@ -222,6 +222,18 @@ fn record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid>> {
     crate::cbor::scan_blob_refs(bytes).map_err(|_| invalid(format!("Could not parse record at '{path}'")))
 }
 
+/// How far a repo's rev may be before its space's `createdAt`: the
+/// writer's clock and the authority's needn't agree.
+const CREATED_SLACK_MICROS: u64 = 120_000_000;
+
+/// A space row's `createdAt`, in Unix microseconds.
+fn created_micros(at: &str) -> XResult<u64> {
+    chrono::DateTime::parse_from_rfc3339(at)
+        .ok()
+        .and_then(|t| u64::try_from(t.timestamp_micros()).ok())
+        .ok_or_else(|| XrpcError::internal("bad space createdAt"))
+}
+
 /// A key held a little before and after its PLC operation's `createdAt`,
 /// as the rev and the directory's clock needn't agree.
 const KEY_SLACK_MICROS: u64 = 300_000_000;
@@ -366,6 +378,7 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, headers: &Head
     // an authority hears of the import as of any write and refuses a
     // non-writer then, but by that time the repo is in; when it's hosted on
     // this node, refuse up front
+    let rev = Tid::parse(&commit.rev).ok_or_else(|| invalid("commit.rev must be a TID"))?;
     let authority_here = app.partitions.for_key(&space.authority).is_some()
         && super::server::account_if_exists(app, &space.authority).await?.is_some();
     // (no row: the authority moved in without its spaces, which aren't
@@ -375,12 +388,17 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, headers: &Head
             if !row.live() {
                 return Err(super::simplespace::space_not_found());
             }
+            // a repo from before the space was (re)created belongs to an
+            // incarnation that was deleted: importing it would bring that
+            // back, signed by a key the account held then
+            if rev.micros() + CREATED_SLACK_MICROS < created_micros(&row.created_at)? {
+                return Err(invalid("the imported commit predates the space (it was deleted and made again since)"));
+            }
             if !super::simplespace::authorize_user(app, &space, &row, &did, "write", None).await? {
                 return Err(bad("NotAuthorized", "Not a member allowed to write in this space"));
             }
         }
     }
-    let rev = Tid::parse(&commit.rev).ok_or_else(|| invalid("commit.rev must be a TID"))?;
     // every later write's rev follows it, and an authority refuses a
     // notify this far ahead (FutureRev), so the account would go unheard
     if rev.micros() > crate::tid::now_micros() + super::space::FUTURE_REV.as_micros() as u64 {

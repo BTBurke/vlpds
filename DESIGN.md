@@ -5592,7 +5592,11 @@ the space row, and counts a mismatch in
   with an empty oplog. The CAR's layout is verifyRepoCarFull's (commit,
   index, one block per entry in index order, nothing else), and an
   authority on the same node must let the account write. It follows the upstream contract once there is one.
-  A rev more than 5 min ahead gets FutureRev. An import over a repo that's
+  A rev more than 5 min ahead gets FutureRev. A past key verifies only a
+  rev from before the DID rotated away from it (5 min of slack), and with
+  the authority here a rev from before the space's `createdAt` (2 min of
+  slack) is refused, so a space deleted and made again never gets an old
+  incarnation's repo back. An import over a repo that's
   there replaces it at a newer rev, as the public importRepo does: the old
   head goes in the first entry, the old rows in bounded batches, and the
   new head in the last, so reads see no repo in between. The same rev
