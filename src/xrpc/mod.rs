@@ -337,7 +337,8 @@ pub fn router(app: Arc<App>) -> Router {
                     true => space::routes()
                         .merge(simplespace::routes())
                         .merge(space_admin::routes())
-                        .merge(space_import::routes()),
+                        .merge(space_import::routes())
+                        .merge(admin_tools::space_routes()),
                     false => Router::new(),
                 }),
         ))
@@ -547,6 +548,14 @@ impl App {
 
     /// A DID in a partition this node owns, so account creation never needs
     /// forwarding.
+    /// Drops `did`'s signing key from every cache that holds it, so its next
+    /// use unwraps it again (the cold-key path the Spaces bench measures).
+    #[doc(hidden)]
+    pub fn forget_signing_key(&self, did: &str) {
+        proxy::account_changed(did);
+        self.secrets.forget(did);
+    }
+
     pub fn mint_local_did(&self) -> Result<String, XrpcError> {
         if self.cluster.is_none() {
             return Ok(crypto::random_plc_did());

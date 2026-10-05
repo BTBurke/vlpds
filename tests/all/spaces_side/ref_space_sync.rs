@@ -48,7 +48,6 @@ async fn authority_space(net: &Net) -> (SpaceClient, String, Cred) {
 
 /// oplog paging: "pages through a single rev without dropping ops"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn pages_through_a_single_rev_without_dropping_ops() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -72,7 +71,6 @@ async fn pages_through_a_single_rev_without_dropping_ops() {
 
 /// oplog paging: "withholds the commit until the oplog is drained to head"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn withholds_the_commit_until_drained_to_head() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -100,7 +98,6 @@ async fn withholds_the_commit_until_drained_to_head() {
 
 /// oplog paging: "pages with since and cursor together"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn pages_with_since_and_cursor_together() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -128,7 +125,6 @@ async fn pages_with_since_and_cursor_together() {
 
 /// oplog paging: "inlines only a record current value"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn inlines_only_a_record_current_value() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -143,7 +139,6 @@ async fn inlines_only_a_record_current_value() {
 
 /// oplog paging: "omits values entirely with excludeValues"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn omits_values_with_exclude_values() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -157,7 +152,6 @@ async fn omits_values_with_exclude_values() {
 
 /// oplog paging: "rejects a malformed cursor"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn rejects_a_malformed_cursor() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -172,7 +166,6 @@ async fn rejects_a_malformed_cursor() {
 
 /// incremental catch-up: "replays the oplog to the repo signed commit"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn replays_the_oplog_to_the_signed_commit() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -187,7 +180,6 @@ async fn replays_the_oplog_to_the_signed_commit() {
 
 /// incremental catch-up: "detects divergence when an op is missed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn detects_divergence_when_an_op_is_missed() {
     let net = Net::new(0).await;
     let (alice, space, cred) = authority_space(&net).await;
@@ -203,7 +195,6 @@ async fn detects_divergence_when_an_op_is_missed() {
 /// 7-day window is the only pruning), so the incremental mismatch isn't
 /// forced here. Paged listRecords folds to getLatestCommit's hash.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn recovers_full_state_via_list_records() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -294,7 +285,6 @@ fn verify_repo_car(car: &[u8], space: &str, author: &str, did_key: &str) -> (Sig
 
 /// getRepo: "serves a verifiable CAR for full-state recovery"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C4"]
 async fn get_repo_serves_a_verifiable_car() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -330,7 +320,6 @@ async fn get_repo_serves_a_verifiable_car() {
 
 /// getRepo: "serves an index-only CAR with excludeValues"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C4"]
 async fn get_repo_serves_an_index_only_car_with_exclude_values() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -349,7 +338,6 @@ async fn get_repo_serves_an_index_only_car_with_exclude_values() {
 
 /// getRepo: "refuses a CAR without a credential for that space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn get_repo_refuses_a_credential_for_another_space() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -366,7 +354,6 @@ async fn get_repo_refuses_a_credential_for_another_space() {
 
 /// getRepo: "reports RepoNotFound for an unwritten repo"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn reports_repo_not_found_for_an_unwritten_repo() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -385,7 +372,6 @@ async fn reports_repo_not_found_for_an_unwritten_repo() {
 /// endpoint" (the PLC directory is down during the write instead of a
 /// mocked resolver)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn records_a_co_located_writer_without_resolving_it() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -399,7 +385,6 @@ async fn records_a_co_located_writer_without_resolving_it() {
 /// writer set: "records a writer from notifyWrite, and it is not the member
 /// list"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn records_a_writer_from_notify_write() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -418,7 +403,6 @@ async fn records_a_writer_from_notify_write() {
 /// writer set: "records a writer admitted by public write policy, who was
 /// never a member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn records_a_public_policy_writer_who_was_never_a_member() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -430,7 +414,6 @@ async fn records_a_public_policy_writer_who_was_never_a_member() {
 /// writer set: "records a writer into an allowList space, whose PDS
 /// presents no attestation"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn records_a_writer_into_an_allow_list_space() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -464,7 +447,6 @@ fn repo_dids(page: &J) -> Vec<String> {
 
 /// space catch-up: "recovers missed notifications with a space checkpoint"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn recovers_missed_notifications_with_a_space_checkpoint() {
     let net = Net::new(2).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -524,7 +506,6 @@ async fn recovers_missed_notifications_with_a_space_checkpoint() {
 /// space catch-up: "resumes after an empty page using the last processed
 /// repo revision"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn resumes_after_an_empty_page() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -552,7 +533,6 @@ async fn resumes_after_an_empty_page() {
 
 /// space catch-up: "accepts arbitrary string listRepos cursors"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn accepts_arbitrary_string_list_repos_cursors() {
     let net = Net::new(0).await;
     let (alice, space, _) = authority_space(&net).await;
@@ -567,7 +547,6 @@ async fn accepts_arbitrary_string_list_repos_cursors() {
 /// space catch-up: "chains forwarded notifications across local and remote
 /// writers" (vlpds also sends them in spaceRev order per registration)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C4"]
 async fn chains_forwarded_notifications() {
     let net = Net::new(2).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -603,7 +582,6 @@ async fn chains_forwarded_notifications() {
 /// `#atproto_space_host` when the authority names one, to `#atproto_pds`
 /// when it doesn't, and nowhere when the space host entry is unusable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn notify_resolves_the_space_host_and_falls_back_to_the_pds() {
     let net = Net::new(0).await;
     let writer = net.actor("writer", 0).await;
@@ -624,7 +602,6 @@ async fn notify_resolves_the_space_host_and_falls_back_to_the_pds() {
 /// worker restart": the authority refuses (503) two writes' notifies; after
 /// a restart the node that opens the shard sends the newest repoRev.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn retries_the_latest_state_after_failure_and_restart() {
     let host = MockService::space_host().await;
     host.respond(503, json!({"error": "Unavailable"}));
@@ -670,7 +647,6 @@ fn notify_body(space: &str, repo: &str, rev: &str, hash: &[u8]) -> J {
 /// notifyWrite: "ignores duplicate and older revisions without forwarding
 /// them"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_ignores_duplicate_and_older_revisions() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -705,7 +681,6 @@ async fn notify_write_ignores_duplicate_and_older_revisions() {
 
 /// notifyWrite: "keeps the newest repo revision when notifications race"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_keeps_the_newest_revision_when_racing() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -729,7 +704,6 @@ async fn notify_write_keeps_the_newest_revision_when_racing() {
 
 /// notifyWrite: "rejects future revisions while allowing a small clock skew"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_future_revisions() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -744,7 +718,6 @@ async fn notify_write_rejects_future_revisions() {
 
 /// notifyWrite: "rejects one that spoofs the writer"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_a_spoofed_writer() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -756,7 +729,6 @@ async fn notify_write_rejects_a_spoofed_writer() {
 
 /// notifyWrite: "rejects one addressed to another authority"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_one_addressed_to_another_authority() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -769,7 +741,6 @@ async fn notify_write_rejects_one_addressed_to_another_authority() {
 
 /// notifyWrite: "rejects one from a non-member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_a_non_member() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -781,7 +752,6 @@ async fn notify_write_rejects_a_non_member() {
 
 /// notifyWrite: "rejects a member without write access"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_a_member_without_write_access() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -793,7 +763,6 @@ async fn notify_write_rejects_a_member_without_write_access() {
 
 /// notifyWrite: "rejects a repoRev that is not a TID before any auth check"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn notify_write_rejects_a_rev_that_is_not_a_tid() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -846,7 +815,6 @@ impl Outbox {
 
 /// "sends immediately without queueing a successful notification"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_sends_immediately() {
     let o = Outbox::new().await;
     let space = o.space("now");
@@ -863,7 +831,6 @@ async fn outbox_sends_immediately() {
 /// refused send leaves the row backing off, and the next write sends its
 /// newer rev at once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_a_newer_write_sends_at_once_after_a_refusal() {
     let o = Outbox::new().await;
     let space = o.space("fresh");
@@ -886,7 +853,6 @@ async fn outbox_a_newer_write_sends_at_once_after_a_refusal() {
 /// `sP` delete rides the author's next write (no PUT of its own), so one
 /// last write lands before the restart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_keeps_retryable_refusals_and_drops_permanent_ones() {
     let host = MockService::space_host().await;
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
@@ -929,7 +895,6 @@ async fn outbox_keeps_retryable_refusals_and_drops_permanent_ones() {
 /// document doesn't resolve at write time; the row is in the write's own
 /// entry, so a restart delivers it once the document is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_persists_a_send_that_never_reached_the_host() {
     let host = MockService::space_host().await;
     host.serve_doc(false);
@@ -952,7 +917,6 @@ async fn outbox_persists_a_send_that_never_reached_the_host() {
 /// (200, 403 Forbidden, 400 SpaceNotFound): a send stalls, two writes land,
 /// the stalled one finishes with `code`, and the newest rev is still sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_keeps_newer_work_when_an_older_send_finishes() {
     for (code, name) in [(200u16, None), (403, Some("Forbidden")), (400, Some("SpaceNotFound"))] {
         let o = Outbox::new().await;
@@ -976,7 +940,6 @@ async fn outbox_keeps_newer_work_when_an_older_send_finishes() {
 /// drops the row: nothing reaches the writer set, and a later admitted
 /// write goes through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn outbox_stops_on_local_authority_rejections() {
     let net = Net::new(0).await;
     let (writer, outsider) = (net.actor("writer", 0).await, net.actor("outsider", 0).await);
@@ -991,7 +954,6 @@ async fn outbox_stops_on_local_authority_rejections() {
 
 /// "defers retries for inactive accounts and resumes after activation"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn outbox_defers_inactive_accounts_and_resumes_on_activation() {
     let host = MockService::space_host().await;
     host.respond(503, json!({}));

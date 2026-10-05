@@ -55,7 +55,8 @@ pub struct HeadRow {
     pub rev: Tid,
     pub hash: LtHash,
     pub records: u64,
-    /// Unix microseconds of the first write.
+    /// Unix microseconds of the first write; 0 for an imported repo, whose
+    /// oplog never began at empty.
     pub created: u64,
 }
 

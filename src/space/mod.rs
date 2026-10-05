@@ -72,6 +72,11 @@ pub struct Spaces {
     pub limits: Limits,
     /// notifyWrites received from the cluster's other nodes' outboxes.
     pub peer_notifies: std::sync::atomic::AtomicU64,
+    /// Account and takedown-set reads from SlateDB on this node: the caches
+    /// a no-op listRepoOps poll answers from, so tests can assert that
+    /// polls read nothing.
+    #[doc(hidden)]
+    pub cache_fills: std::sync::atomic::AtomicU64,
     /// (account, space) -> the importRepo staging it on this node. Not
     /// with the worker's state, which can be evicted mid-import.
     imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
@@ -86,6 +91,7 @@ impl Spaces {
         Spaces {
             limits,
             peer_notifies: Default::default(),
+            cache_fills: Default::default(),
             imports: Default::default(),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),

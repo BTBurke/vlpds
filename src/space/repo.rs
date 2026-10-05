@@ -798,7 +798,7 @@ pub fn import_commit(
     clock_id: u64,
 ) -> Result<BuiltWrite, SpaceError> {
     import_begin(st, sid, uri)?;
-    let created = tid::now_micros();
+    let created = 0;
     let mut head = SpaceHead::new(uri.clone(), None);
     (head.rev, head.hash, head.records, head.created) = (Some(rev), hash.clone(), records, created);
     st.repos.insert(sid, head);

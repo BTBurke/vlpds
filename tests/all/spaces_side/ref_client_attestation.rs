@@ -57,7 +57,6 @@ impl Fixture {
 
 /// "accepts an attestation signed by a key in the client jwks"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn accepts_an_attestation_signed_by_a_key_in_the_client_jwks() {
     let f = Fixture::new(Keys::Inline).await;
     f.mint(&f.app.attest(&f.aud(), Attest::default())).await.ok();
@@ -67,7 +66,6 @@ async fn accepts_an_attestation_signed_by_a_key_in_the_client_jwks() {
 /// (simplespace: "mints for an allow-listed app that signs with its
 /// published key")
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn accepts_an_attestation_when_the_client_publishes_a_jwks_uri() {
     let f = Fixture::new(Keys::Uri).await;
     f.mint(&f.app.attest(&f.aud(), Attest::default())).await.ok();
@@ -75,7 +73,6 @@ async fn accepts_an_attestation_when_the_client_publishes_a_jwks_uri() {
 
 /// "refuses a replayed attestation, but not a second fresh one"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_replayed_attestation_but_not_a_fresh_one() {
     let f = Fixture::new(Keys::Uri).await;
     let replayed = f.app.attest(&f.aud(), Attest::default());
@@ -86,7 +83,6 @@ async fn refuses_a_replayed_attestation_but_not_a_fresh_one() {
 
 /// "refuses an attestation with no jti to consume"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_with_no_jti() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -97,7 +93,6 @@ async fn refuses_an_attestation_with_no_jti() {
 /// (simplespace: "refuses an attestation signed by a key the app does not
 /// publish")
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_signed_by_an_unpublished_key() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -108,7 +103,6 @@ async fn refuses_an_attestation_signed_by_an_unpublished_key() {
 /// "refuses an attestation addressed to another space host" (simplespace:
 /// "refuses an attestation addressed to another authority")
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_addressed_to_another_space_host() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -117,7 +111,6 @@ async fn refuses_an_attestation_addressed_to_another_space_host() {
 
 /// "refuses an expired attestation" (both suites)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_expired_attestation() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -126,7 +119,6 @@ async fn refuses_an_expired_attestation() {
 
 /// Divergence: attestations live at most 300 s (single-use token cap).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_living_past_300_seconds() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -135,7 +127,6 @@ async fn refuses_an_attestation_living_past_300_seconds() {
 
 /// "refuses an attestation whose iss and sub disagree"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_whose_iss_and_sub_disagree() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;
@@ -146,7 +137,6 @@ async fn refuses_an_attestation_whose_iss_and_sub_disagree() {
 
 /// "refuses when the client publishes no keys"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_when_the_client_publishes_no_keys() {
     let f = Fixture::new(Keys::None).await;
     f.mint(&f.app.attest(&f.aud(), Attest::default())).await.client_err();
@@ -154,7 +144,6 @@ async fn refuses_when_the_client_publishes_no_keys() {
 
 /// "refuses when the client metadata cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_when_the_client_metadata_cannot_be_resolved() {
     let f = Fixture::new(Keys::Uri).await;
     f.app.serve_metadata(false);
@@ -163,7 +152,6 @@ async fn refuses_when_the_client_metadata_cannot_be_resolved() {
 
 /// "refuses when the jwks_uri cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_when_the_jwks_uri_cannot_be_resolved() {
     let f = Fixture::new(Keys::UriMissing).await;
     f.mint(&f.app.attest(&f.aud(), Attest::default())).await.client_err();
@@ -172,7 +160,6 @@ async fn refuses_when_the_jwks_uri_cannot_be_resolved() {
 /// simplespace client attestation: "refuses an attestation from an app that
 /// is not allow-listed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_attestation_from_an_app_that_is_not_allow_listed() {
     let f = Fixture::new(Keys::Uri).await;
     f.control().await;

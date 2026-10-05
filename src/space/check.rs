@@ -12,12 +12,10 @@ use super::commit::element;
 use super::lthash::LtHash;
 use crate::cid::Cid;
 use crate::tid::Tid;
+use anyhow::Context;
+use bytes::Bytes;
 use serde_json::{json, Value as J};
 use std::collections::{BTreeMap, HashMap};
-
-/// Oplog retention (plan C4). A repo created within it has never had an op
-/// pruned, so its oplog must replay from empty to exactly its records.
-pub const OPLOG_RETENTION_US: u64 = 7 * 86_400 * 1_000_000;
 
 /// Problems listed per check (counts are exact).
 const LIST_MAX: usize = 20;
@@ -89,7 +87,7 @@ pub struct Writer {
 /// The space host's rows, when the account is the space's authority.
 #[derive(Clone, Debug, Default)]
 pub struct Host {
-    /// `sS` holds a live (not tombstoned) space.
+    /// `sS` holds a live space, or none (the defaults): not a tombstone.
     pub live: bool,
     pub writers: Vec<Writer>,
     /// `sQ`: (spaceRev, writer DID).
@@ -122,6 +120,91 @@ impl Rows {
     }
 }
 
+/// The rows of `did`'s repo in `uri` (and, when `did` is its authority, the
+/// space host's) from `db`, a snapshot taken under the apply lock.
+pub async fn load<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, uri: &str) -> anyhow::Result<Rows> {
+    use super::rows;
+    use crate::state;
+    let sid = state::space_id(uri);
+    let mut out = Rows::default();
+    if let Some(v) = db.get(state::space_head_key(did, &sid)).await? {
+        let h = rows::HeadRow::decode(&v).context("the head (sH) doesn't decode")?;
+        out.head = Some(Head { uri: h.uri, rev: h.rev, hash: h.hash, records: h.records, created: h.created });
+    }
+    let rp = state::space_prefix(state::SPACE_RECORD_FAMILY, did, &sid);
+    for (k, v) in scan(db, &rp).await? {
+        let path = String::from_utf8_lossy(&k[rp.len()..]).into_owned();
+        match state::record_value_parts(&v) {
+            Ok((cid, bytes)) => out.records.push(Record {
+                path,
+                cid,
+                rev: Tid(state::record_value_rev(&v)),
+                hashes: Cid::dag_cbor(bytes) == cid,
+            }),
+            Err(_) => out.bad_records.push(path),
+        }
+    }
+    let op = state::space_prefix(state::SPACE_OPLOG_FAMILY, did, &sid);
+    for (k, v) in scan(db, &op).await? {
+        let pos = rows::oplog_position(&k).filter(|_| k.len() == op.len() + 10);
+        match (pos, rows::OpRow::decode(&v)) {
+            (Some((rev, idx)), Ok(o)) => out.ops.push(Op {
+                rev,
+                idx,
+                action: match o.action {
+                    rows::OpAction::Create => Action::Create,
+                    rows::OpAction::Update => Action::Update,
+                    rows::OpAction::Delete => Action::Delete,
+                },
+                collection: o.collection,
+                rkey: o.rkey,
+                cid: o.cid,
+                prev: o.prev,
+            }),
+            (Some((rev, idx)), Err(_)) => out.bad_ops.push(format!("{rev}/{idx}")),
+            (None, _) => out.bad_ops.push(hex::encode(&k[op.len()..])),
+        }
+    }
+    if let Some(v) = db.get(state::space_outbox_key(did, &sid)).await? {
+        let o = rows::OutboxRow::decode(&v).context("the outbox row (sP) doesn't decode")?;
+        out.outbox = Some(Outbox { uri: o.uri, repo_rev: o.repo_rev, hash: o.hash });
+    }
+    if authority(uri) == Some(did) {
+        let space = match db.get(state::space_key(did, &sid)).await? {
+            Some(v) => Some(rows::SpaceRow::decode(&v).context("the space row (sS) doesn't decode")?),
+            None => None,
+        };
+        let wp = state::space_prefix(state::SPACE_WRITER_FAMILY, did, &sid);
+        let mut writers = Vec::new();
+        for (k, v) in scan(db, &wp).await? {
+            let w = rows::WriterRow::decode(&v).context("a writer row (sW) doesn't decode")?;
+            let did = String::from_utf8_lossy(&k[wp.len()..]).into_owned();
+            writers.push(Writer { did, repo_rev: w.repo_rev, hash: w.hash, space_rev: w.space_rev });
+        }
+        let qp = state::space_prefix(state::SPACE_SEQ_FAMILY, did, &sid);
+        let mut seq = Vec::new();
+        for (k, v) in scan(db, &qp).await? {
+            let rev = rows::seq_rev(&k).filter(|_| k.len() == qp.len() + 8).context("a bad listRepos (sQ) key")?;
+            seq.push((rev, String::from_utf8_lossy(&v).into_owned()));
+        }
+        if space.is_some() || !writers.is_empty() || !seq.is_empty() {
+            // no sS row: governed with the defaults (ensureSpace), not deleted
+            let live = space.as_ref().is_none_or(|s| s.live() && s.uri == uri);
+            out.host = Some(Host { live, writers, seq });
+        }
+    }
+    Ok(out)
+}
+
+async fn scan<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, prefix: &[u8]) -> anyhow::Result<Vec<(Bytes, Bytes)>> {
+    let mut it = db.scan(prefix.to_vec()..crate::state::prefix_end(prefix)).await?;
+    let mut out = Vec::new();
+    while let Some(kv) = it.next().await? {
+        out.push((kv.key, kv.value));
+    }
+    Ok(out)
+}
+
 fn sample<T: ToString>(v: impl IntoIterator<Item = T>) -> Vec<String> {
     v.into_iter().take(LIST_MAX).map(|x| x.to_string()).collect()
 }
@@ -143,7 +226,11 @@ fn split_path(path: &str) -> (&str, &str) {
 
 /// The report of [`Rows`] for `did`'s repo in `uri` at `now_us`: the
 /// checkRepo shape (`ok`, `problems` and per-check sections).
-pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64) -> J {
+///
+/// A repo created within `retention` (None: never pruned) has never had an
+/// op pruned, so its oplog must replay from empty to exactly its records.
+/// An imported repo (`created` 0) never had the ops before its import.
+pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<std::time::Duration>) -> J {
     let mut problems: Vec<String> = Vec::new();
     let head = rows.head.as_ref();
     let head_rev = head.map(|h| h.rev);
@@ -191,7 +278,9 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64) -> J {
     }
 
     // the oplog, replayed onto the records
-    let expect_complete = head.is_some_and(|h| now_us.saturating_sub(h.created) < OPLOG_RETENTION_US);
+    let expect_complete = head.is_some_and(|h| {
+        h.created != 0 && retention.is_none_or(|r| u128::from(now_us.saturating_sub(h.created)) < r.as_micros())
+    });
     let mut revs: BTreeMap<Tid, Vec<u16>> = BTreeMap::new();
     let (mut malformed, mut prev_wrong) = (Vec::new(), Vec::new());
     let mut replay: BTreeMap<String, (Option<Cid>, Tid)> = BTreeMap::new();
@@ -356,6 +445,8 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64) -> J {
 mod tests {
     use super::*;
 
+    const RET: Option<std::time::Duration> = Some(crate::space::retention::DEFAULT_RETENTION);
+
     const DID: &str = "did:plc:writer";
     const URI: &str = "at://did:plc:auth/space/com.example.group/x";
     const NOW: u64 = 1_800_000_000_000_000;
@@ -414,7 +505,7 @@ mod tests {
 
     #[track_caller]
     fn assert_problem(rows: &Rows, now: u64, needle: &str) {
-        let r = check(DID, URI, rows, now);
+        let r = check(DID, URI, rows, now, RET);
         assert_eq!(r["ok"], json!(false), "{r}");
         assert!(problems(&r).iter().any(|p| p.contains(needle)), "no problem with {needle:?}: {r}");
     }
@@ -422,14 +513,14 @@ mod tests {
     #[test]
     fn healthy_rows_are_ok() {
         let rows = healthy();
-        let r = check(DID, URI, &rows, NOW);
+        let r = check(DID, URI, &rows, NOW, RET);
         assert_eq!(r["ok"], json!(true), "{r}");
         assert_eq!(r["records"]["count"], json!(2));
         assert_eq!(r["oplog"]["ops"], json!(8));
         assert_eq!(r["oplog"]["revs"], json!(3));
         assert_eq!(r["oplog"]["complete"], json!(true));
         assert_eq!(r["records"]["matchesHead"], json!(true));
-        assert!(check(DID, URI, &Rows::default(), NOW)["ok"] == json!(true));
+        assert!(check(DID, URI, &Rows::default(), NOW, RET)["ok"] == json!(true));
     }
 
     #[test]
@@ -505,8 +596,8 @@ mod tests {
         let first_rev = rows.ops[0].rev;
         rows.ops.retain(|o| o.rev != first_rev);
         assert_problem(&rows, NOW, "2 op(s) whose prev isn't the path's CID");
-        let later = NOW + OPLOG_RETENTION_US;
-        let r = check(DID, URI, &rows, later);
+        let later = NOW + RET.unwrap().as_micros() as u64;
+        let r = check(DID, URI, &rows, later, RET);
         assert_eq!(r["ok"], json!(true), "{r}");
         assert_eq!(r["oplog"]["complete"], json!(false));
 
@@ -520,18 +611,18 @@ mod tests {
         let mut rows = healthy();
         let h = rows.head.clone().unwrap();
         rows.outbox = Some(Outbox { uri: URI.into(), repo_rev: h.rev, hash: h.hash.digest() });
-        assert_eq!(check(DID, URI, &rows, NOW)["ok"], json!(true));
+        assert_eq!(check(DID, URI, &rows, NOW, RET)["ok"], json!(true));
         rows.outbox.as_mut().unwrap().hash = [0; 32];
         assert_problem(&rows, NOW, "at the head's rev with another hash");
         rows.outbox.as_mut().unwrap().repo_rev = Tid(h.rev.0 - (1 << 10));
-        assert_eq!(check(DID, URI, &rows, NOW)["ok"], json!(true), "an older rev still owed");
+        assert_eq!(check(DID, URI, &rows, NOW, RET)["ok"], json!(true), "an older rev still owed");
         rows.outbox.as_mut().unwrap().repo_rev = Tid(h.rev.0 + 1);
         assert_problem(&rows, NOW, "the outbox row is at rev");
         let own = "at://did:plc:writer/space/com.example.group/x";
         let mut self_rows = rows.clone();
         self_rows.head.as_mut().unwrap().uri = own.into();
         self_rows.outbox = Some(Outbox { uri: own.into(), repo_rev: h.rev, hash: h.hash.digest() });
-        let r = check(DID, own, &self_rows, NOW);
+        let r = check(DID, own, &self_rows, NOW, RET);
         assert!(problems(&r).iter().any(|p| p.contains("governs")), "{r}");
 
         // the authority's view of its own repo, and listRepos rows
@@ -546,7 +637,7 @@ mod tests {
             writers: vec![me, other.clone()],
             seq: vec![(s1, other.did.clone()), (s2, DID.into())],
         });
-        let r = check(DID, own, &rows, NOW);
+        let r = check(DID, own, &rows, NOW, RET);
         assert_eq!(r["ok"], json!(true), "{r}");
         assert_eq!(r["host"]["maxSpaceRev"], json!(s2.to_string()));
         let mut stale = rows.clone();

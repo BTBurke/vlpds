@@ -503,4 +503,9 @@ async fn import_repo_round_trip_and_refusals() {
     b.create_record(&space, COLL, Some("dd"), rec("four")).await.ok();
     let next = b.get("com.atproto.space.getLatestCommit", &rq).await.ok()["commit"]["rev"].clone();
     assert!(next.as_str().unwrap() > at_x["rev"].as_str().unwrap(), "{next} after {}", at_x["rev"]);
+    // check-space takes the imported base without its ops
+    let chk =
+        y.xrpc.get("vlpds.admin.checkSpace", &[("did", a.did.as_str()), ("space", space.as_str())], &Auth::Admin).await;
+    assert_eq!(chk.ok()["ok"], json!(true), "{}", chk.json);
+    assert_eq!(chk.json["records"]["count"], json!(3));
 }

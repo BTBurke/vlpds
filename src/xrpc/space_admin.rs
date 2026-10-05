@@ -87,7 +87,9 @@ async fn get_space_repo(
     let head = load_head(spaces(&app)?, &p, &q.repo, &space)
         .await?
         .ok_or_else(|| XrpcError::bad("RepoNotFound", format!("{} has no repo in {}", q.repo, space.uri)))?;
-    let created = chrono::DateTime::from_timestamp_micros(head.created as i64)
+    let created = (head.created != 0)
+        .then(|| chrono::DateTime::from_timestamp_micros(head.created as i64))
+        .flatten()
         .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
     Ok(Json(json!({
         "space": space.uri,

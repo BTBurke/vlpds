@@ -35,7 +35,6 @@ async fn own_reads(dan: &SpaceClient, space: &str, repo: &str) -> Vec<Resp> {
 
 /// the repo boundary: "refuses a co-located non-member reading a member repo"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_co_located_non_member_reading_a_member_repo() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -56,7 +55,6 @@ async fn refuses_a_co_located_non_member_reading_a_member_repo() {
 /// app password's space write too (OAuth-only), and a password session
 /// alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_space_access_to_app_passwords_and_password_sessions() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -90,7 +88,6 @@ async fn refuses_space_access_to_app_passwords_and_password_sessions() {
 
 /// space credentials: "reads another member repo across PDSes"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn reads_another_member_repo_across_pdses() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -115,7 +112,6 @@ async fn reads_another_member_repo_across_pdses() {
 /// HTTP message signature binding: "refuses a credential presented as a
 /// bearer token"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_credential_presented_as_a_bearer_token() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -131,7 +127,6 @@ async fn refuses_a_credential_presented_as_a_bearer_token() {
 /// HTTP message signature binding: "refuses a credential without a
 /// signature"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_a_credential_without_a_signature() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -146,7 +141,6 @@ async fn refuses_a_credential_without_a_signature() {
 /// $name fields": a repeated authorization or audience is refused, an
 /// extra signature label is ignored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn responds_to_repeated_signature_fields() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -171,7 +165,6 @@ async fn responds_to_repeated_signature_fields() {
 /// HTTP message signature binding: "refuses a credential presented with a
 /// key of the holder own"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_credential_presented_with_another_key() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -186,7 +179,6 @@ async fn refuses_a_credential_presented_with_another_key() {
 /// HTTP message signature binding: "refuses a signature addressed to
 /// another repo owner (remote|co-located)"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_signature_addressed_to_another_repo_owner() {
     let net = Net::new(2).await;
     let (alice, bob, dan) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("dan", 0).await);
@@ -204,7 +196,6 @@ async fn refuses_a_signature_addressed_to_another_repo_owner() {
 /// HTTP message signature binding: "requires the space authority as
 /// audience for space-host requests"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn requires_the_authority_as_audience_for_space_host_requests() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -219,7 +210,6 @@ async fn requires_the_authority_as_audience_for_space_host_requests() {
 /// HTTP message signature binding: "reuses a signature for the same
 /// audience across requests"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn reuses_a_signature_for_the_same_audience_across_requests() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -239,7 +229,6 @@ async fn reuses_a_signature_for_the_same_audience_across_requests() {
 /// HTTP message signature binding: "reuses one credential across many
 /// hosts, each with its own audience signature"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn reuses_one_credential_across_many_hosts() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -256,7 +245,6 @@ async fn reuses_one_credential_across_many_hosts() {
 
 /// space credentials: "is scoped to one space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn credential_is_scoped_to_one_space() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -279,7 +267,6 @@ async fn credential_is_scoped_to_one_space() {
 /// The forger is a did:web whose key the test holds (the reference uses a
 /// member's account key).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_credential_the_authority_did_not_issue() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -308,7 +295,6 @@ async fn refuses_a_credential_the_authority_did_not_issue() {
 /// and alice holds a repo in its space; a credential it signs under kid
 /// `#atproto` reads, one claiming `#atproto_space` doesn't.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn refuses_a_credential_whose_kid_the_authority_does_not_publish() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -329,7 +315,6 @@ async fn refuses_a_credential_whose_kid_the_authority_does_not_publish() {
 
 /// space credentials: "refuses one for a revoked member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_credential_for_a_removed_member() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -353,7 +338,6 @@ async fn revoke(net: &Net, signer: &SpaceClient, aud: &str, lxm: &str, space: &s
 /// credential revocation: "revokes a batch idempotently on a remote repo
 /// host"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn revokes_a_batch_idempotently_on_a_remote_repo_host() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -374,7 +358,7 @@ async fn revokes_a_batch_idempotently_on_a_remote_repo_host() {
     revoke(&net, &alice, &bob.did, NOTIFY_REVOKED, &space, &again).await.ok();
 
     for cred in [&first, &second] {
-        cred.get(pds2, "com.atproto.space.listRecords", &at_bob).await.err(400, "CredentialRevoked");
+        cred.get(pds2, "com.atproto.space.listRecords", &at_bob).await.err(401, "CredentialRevoked");
     }
     untouched.get(pds2, "com.atproto.space.listRecords", &at_bob).await.ok();
     // Revoked at bob's host only.
@@ -386,7 +370,6 @@ async fn revokes_a_batch_idempotently_on_a_remote_repo_host() {
 /// credential revocation: "requires service auth from the authority
 /// addressed to a local repo and method"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn revocation_requires_service_auth_from_the_authority() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -413,7 +396,6 @@ async fn revocation_requires_service_auth_from_the_authority() {
 
 /// credential revocation: "scopes revocations to the space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn scopes_revocations_to_the_space() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -432,7 +414,6 @@ async fn scopes_revocations_to_the_space() {
 
 /// delegation tokens: "are useless at a host that does not govern the space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn delegation_tokens_are_useless_at_a_host_that_does_not_govern_the_space() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -445,7 +426,6 @@ async fn delegation_tokens_are_useless_at_a_host_that_does_not_govern_the_space(
 /// delegation tokens: "requires proof of possession when exchanging a
 /// delegation token"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn exchange_requires_proof_of_possession() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -460,7 +440,6 @@ async fn exchange_requires_proof_of_possession() {
 /// delegation tokens: "binds the credential to the key that signed the
 /// exchange"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn binds_the_credential_to_the_exchange_key() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -473,7 +452,6 @@ async fn binds_the_credential_to_the_exchange_key() {
 
 /// delegation tokens: "binds the exchange signature to the delegation token"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn binds_the_exchange_signature_to_the_delegation_token() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -489,7 +467,6 @@ async fn binds_the_exchange_signature_to_the_delegation_token() {
 
 /// delegation tokens: "refuses a replayed credential exchange"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_replayed_credential_exchange() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -504,7 +481,6 @@ async fn refuses_a_replayed_credential_exchange() {
 /// delegation tokens: "are refused when the audience names another
 /// authority". The user is a did:web whose key the test holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn delegation_tokens_are_refused_when_the_audience_names_another_authority() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -519,7 +495,6 @@ async fn delegation_tokens_are_refused_when_the_audience_names_another_authority
 
 /// delegation tokens: "are single-use — a replayed jti is refused"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn delegation_tokens_are_single_use() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -532,7 +507,6 @@ async fn delegation_tokens_are_single_use() {
 
 /// delegation tokens: "are refused for a space other than their subject"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn delegation_tokens_are_refused_for_a_space_other_than_their_subject() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -546,7 +520,6 @@ async fn delegation_tokens_are_refused_for_a_space_other_than_their_subject() {
 /// own tokens live within it, and a longer one is refused at the exchange
 /// (the reference accepts any lifetime).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn delegation_tokens_live_at_most_300_seconds() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -568,7 +541,6 @@ async fn delegation_tokens_live_at_most_300_seconds() {
 
 /// takedowns: "stops serving permissioned records for a taken-down account"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn stops_serving_space_records_of_a_taken_down_account() {
     let net = Net::new(2).await;
     let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
@@ -587,7 +559,6 @@ async fn stops_serving_space_records_of_a_taken_down_account() {
 
 /// takedowns: "stops accepting permissioned writes from a taken-down account"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn stops_accepting_space_writes_from_a_taken_down_account() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -618,7 +589,6 @@ fn scope_missing(r: &Resp) {
 
 /// OAuth scopes: "enforces the collection a grant names on a write"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_enforces_the_collection_a_grant_names() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -631,7 +601,6 @@ async fn oauth_enforces_the_collection_a_grant_names() {
 
 /// OAuth scopes: "enforces the action a grant names"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_enforces_the_action_a_grant_names() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -645,7 +614,6 @@ async fn oauth_enforces_the_action_a_grant_names() {
 /// OAuth scopes: "resolves putRecord to update rather than demanding create
 /// too"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn oauth_resolves_put_record_to_update() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -659,7 +627,6 @@ async fn oauth_resolves_put_record_to_update() {
 
 /// OAuth scopes: "refuses a space of a type the grant does not name"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_refuses_a_space_of_a_type_the_grant_does_not_name() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -670,7 +637,6 @@ async fn oauth_refuses_a_space_of_a_type_the_grant_does_not_name() {
 
 /// OAuth scopes: "refuses a space under an authority the grant does not name"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_refuses_a_space_under_an_authority_the_grant_does_not_name() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -681,7 +647,6 @@ async fn oauth_refuses_a_space_under_an_authority_the_grant_does_not_name() {
 
 /// OAuth scopes: "reads own repo on read_self, and refuses whole-space read"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_read_self_reads_own_repo_but_mints_no_delegation() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -695,7 +660,6 @@ async fn oauth_read_self_reads_own_repo_but_mints_no_delegation() {
 
 /// OAuth scopes: "exchanges a whole-space read grant for a delegation token"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn oauth_whole_space_read_mints_a_delegation_token() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -706,7 +670,6 @@ async fn oauth_whole_space_read_mints_a_delegation_token() {
 
 /// OAuth scopes: "requires a wildcard grant to list spaces unfiltered"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn oauth_requires_a_wildcard_grant_to_list_spaces_unfiltered() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -726,7 +689,6 @@ async fn oauth_requires_a_wildcard_grant_to_list_spaces_unfiltered() {
 /// bare grant". The space type's lexicon is published in alice's repo
 /// (`com.atproto.lexicon.schema`) under an NSID authority pinned to her.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C6"]
 async fn oauth_materializes_declared_collections_into_a_bare_grant() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;

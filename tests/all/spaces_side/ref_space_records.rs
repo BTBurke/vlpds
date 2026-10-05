@@ -13,7 +13,6 @@ use crate::common::*;
 
 /// "writes a record as a co-located member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn writes_a_record_as_a_co_located_member() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -40,7 +39,6 @@ async fn writes_a_record_as_a_co_located_member() {
 
 /// "writes a record from a remote PDS"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn writes_a_record_from_a_remote_pds() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -63,7 +61,6 @@ async fn writes_a_record_from_a_remote_pds() {
 
 /// "refuses a write to another account repo"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_a_write_to_another_account_repo() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -79,7 +76,6 @@ async fn refuses_a_write_to_another_account_repo() {
 
 /// "deletes a record"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn deletes_a_record() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -98,7 +94,6 @@ async fn deletes_a_record() {
 
 /// "deleteRecord is idempotent"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn delete_record_is_idempotent() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -111,7 +106,6 @@ async fn delete_record_is_idempotent() {
 
 /// putRecord: "creates a record that does not yet exist"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn put_record_creates_a_record_that_does_not_yet_exist() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -131,7 +125,6 @@ async fn put_record_creates_a_record_that_does_not_yet_exist() {
 /// putRecord: "overwrites an existing record, and the oplog names what it
 /// replaced"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn put_record_overwrites_and_the_oplog_names_what_it_replaced() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -164,7 +157,6 @@ async fn put_record_overwrites_and_the_oplog_names_what_it_replaced() {
 
 /// applyWrites: "applies a batch as one rev"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_applies_a_batch_as_one_rev() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -182,7 +174,6 @@ async fn apply_writes_applies_a_batch_as_one_rev() {
 
 /// applyWrites: "rejects a duplicate create within one batch"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_rejects_a_duplicate_create_within_one_batch() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -194,7 +185,6 @@ async fn apply_writes_rejects_a_duplicate_create_within_one_batch() {
 
 /// applyWrites: "applies dependent writes within one batch"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_applies_dependent_writes_within_one_batch() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -214,7 +204,6 @@ async fn apply_writes_applies_dependent_writes_within_one_batch() {
 
 /// applyWrites: "treats an empty batch as a no-op"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_treats_an_empty_batch_as_a_no_op() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -231,7 +220,6 @@ async fn apply_writes_treats_an_empty_batch_as_a_no_op() {
 
 /// applyWrites: "reports each result against the write it came from"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_reports_each_result_against_its_write() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -259,7 +247,6 @@ async fn apply_writes_reports_each_result_against_its_write() {
 
 /// applyWrites: "refuses a batch over the write limit"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_refuses_a_batch_over_the_write_limit() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -271,7 +258,6 @@ async fn apply_writes_refuses_a_batch_over_the_write_limit() {
 
 /// applyWrites: "refuses an unrecognized write type at the schema"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn apply_writes_refuses_an_unrecognized_write_type() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -282,7 +268,6 @@ async fn apply_writes_refuses_an_unrecognized_write_type() {
 
 /// validation: "rejects a record whose $type disagrees with its collection"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn rejects_a_record_whose_type_disagrees_with_its_collection() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -293,7 +278,6 @@ async fn rejects_a_record_whose_type_disagrees_with_its_collection() {
 
 /// validation: "reports unknown for a collection with no resolvable schema"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn reports_unknown_for_a_collection_with_no_resolvable_schema() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -304,7 +288,6 @@ async fn reports_unknown_for_a_collection_with_no_resolvable_schema() {
 
 /// validation: "refuses an unvalidatable record when validation is demanded"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_an_unvalidatable_record_when_validation_is_demanded() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -314,7 +297,6 @@ async fn refuses_an_unvalidatable_record_when_validation_is_demanded() {
 
 /// listRecords: "paginates across collections"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn list_records_paginates_across_collections() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -344,7 +326,6 @@ async fn list_records_paginates_across_collections() {
 
 /// listRecords: "filters to one collection"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn list_records_filters_to_one_collection() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -365,7 +346,6 @@ async fn list_records_filters_to_one_collection() {
 
 /// listRecords: "reverses the listing order"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn list_records_reverses_the_listing_order() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -392,7 +372,6 @@ async fn list_records_reverses_the_listing_order() {
 
 /// listRecords: "scopes a listing to one space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn list_records_scopes_a_listing_to_one_space() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -405,7 +384,6 @@ async fn list_records_scopes_a_listing_to_one_space() {
 
 /// getRecord: "returns the record and its current cid"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn get_record_returns_the_record_and_its_current_cid() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -424,7 +402,6 @@ async fn get_record_returns_the_record_and_its_current_cid() {
 
 /// getRecord: "reports RecordNotFound for a record that never existed"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn get_record_reports_record_not_found() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -455,7 +432,6 @@ async fn space_get_blob(net: &Net, cred: &Cred, space: &str, repo: &str, cid: &s
 
 /// blobs: "tracks a blob on a space record and serves it to a member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_tracks_a_blob_and_serves_it_to_a_member() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -478,7 +454,6 @@ async fn blobs_tracks_a_blob_and_serves_it_to_a_member() {
 /// (vlpds: the reference's rule applies with --spaces on; see
 /// [`flag_off_serves_an_unreferenced_upload`])
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_does_not_serve_a_space_only_blob_through_public_sync() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -504,7 +479,6 @@ async fn flag_off_serves_an_unreferenced_upload() {
 
 /// blobs: "keeps a blob shared with a public record"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_keeps_a_blob_shared_with_a_public_record() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -532,7 +506,6 @@ async fn blobs_keeps_a_blob_shared_with_a_public_record() {
 
 /// blobs: "filters listBlobs by revision"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_filters_list_blobs_by_revision() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -558,7 +531,6 @@ async fn blobs_filters_list_blobs_by_revision() {
 
 /// blobs: "scopes listBlobs to one space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_scopes_list_blobs_to_one_space() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -578,7 +550,6 @@ async fn blobs_scopes_list_blobs_to_one_space() {
 
 /// blobs: "refuses a blob to a credential for another space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_refuses_a_blob_to_a_credential_for_another_space() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -596,7 +567,6 @@ async fn blobs_refuses_a_blob_to_a_credential_for_another_space() {
 
 /// blobs: "refuses a blob that the authorized space does not reference"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_refuses_a_blob_the_authorized_space_does_not_reference() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -617,7 +587,6 @@ async fn blobs_refuses_a_blob_the_authorized_space_does_not_reference() {
 
 /// blobs: "serves a blob the authorized space does reference"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn blobs_serves_a_blob_the_authorized_space_does_reference() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);

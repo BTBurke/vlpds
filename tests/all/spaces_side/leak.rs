@@ -280,8 +280,17 @@ async fn scan_log(s: &TestServer, p: &Planted) -> (usize, bool) {
 /// sentinels; the space collection and records are absent from it.
 async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
     let get = |nsid: &'static str, q: Vec<(&'static str, String)>| async move {
-        let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        (nsid, s.xrpc.get(nsid, &q, &Auth::None).await)
+        let qs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut r = s.xrpc.get(nsid, &qs, &Auth::None).await;
+        // an error message may echo what was asked for: not a leak
+        if r.status >= 400 {
+            let mut body = String::from_utf8_lossy(&r.body).into_owned();
+            for (_, v) in &q {
+                body = body.replace(v.as_str(), "");
+            }
+            r.body = body.into_bytes().into();
+        }
+        (nsid, r)
     };
     let d = || did.to_string();
     let rk = format!("{}-n0", p.rkey);
@@ -339,12 +348,13 @@ async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
         assert_ne!(r.status, 200, "sync.getBlob served space record {cid}");
         let r = s.get_blocks(did, &[Cid::parse(cid).unwrap()]).await;
         assert_ne!(r.status, 200, "sync.getBlocks served space record {cid}");
-        p.sentinels.assert_clean("sync.getBlocks", &r.body);
+        // the error names the CIDs asked for: not a leak
+        let body = String::from_utf8_lossy(&r.body).replace(cid.as_str(), "");
+        p.sentinels.assert_clean("sync.getBlocks", body.as_bytes());
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn space_writes_never_reach_the_firehose_backfill_or_public_sync() {
     // A 2 KiB ring: a cursor-0 replay comes from the segments in S3
     // (firehose_backfill.rs), not memory.
@@ -404,26 +414,26 @@ async fn space_writes_never_reach_the_firehose_backfill_or_public_sync() {
 /// The same checks on a 2-node cluster: each node's stream merges the
 /// peer's log, so a private entry must stay out of the peer stream too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C4"]
 async fn space_writes_stay_private_through_the_peer_stream() {
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-    let set = |c: &mut vlpds::server::Config| {
-        c.spaces = true;
-        c.firehose_ring_bytes = 2048;
+    // one public URL for both nodes, so the author's OAuth grant (minted on
+    // its home node: a DID lands where it was created) holds on either
+    let front = super::hooks::Front::new().await;
+    let set = |url: String| {
+        move |c: &mut vlpds::server::Config| {
+            c.spaces = true;
+            c.firehose_ring_bytes = 2048;
+            c.public_url = url;
+        }
     };
-    let n1 = cluster_node("lk-1", store.clone(), 4, set).await;
-    let n2 = cluster_node("lk-2", store.clone(), 4, set).await;
+    let n1 = cluster_node("lk-1", store.clone(), 4, set(front.url.clone())).await;
+    let n2 = cluster_node("lk-2", store.clone(), 4, set(front.url.clone())).await;
     balanced(&[&n1, &n2]).await;
     let public = n1.create_account("lkcp").await;
-    // an author owned by n2, so the space client (bound to n1) writes
-    // through the forwarding path
-    let mut p = Planted::new(&n1).await;
-    for _ in 0..16 {
-        if std::ptr::eq(owner_of(&[&n1, &n2], &p.author.did), &n2) {
-            break;
-        }
-        p = Planted::new(&n1).await;
-    }
+    // an author owned by n2, written through n1's forwarding path
+    front.point(&n2);
+    let mut p = Planted::new(&front.view(&n2)).await;
+    front.point(&n1);
     let a = p.author.clone();
     let (owner, other) = (&n2, &n1);
     assert!(std::ptr::eq(owner_of(&[&n1, &n2], &a.did), owner), "no account landed on n2");
@@ -462,7 +472,6 @@ async fn space_writes_stay_private_through_the_peer_stream() {
 /// and its CID stays off the firehose and the public repo. A public
 /// reference to the same blob then serves it (the control).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn space_only_blobs_stay_off_public_endpoints() {
     let s = TestServer::spawn_with(|c| {
         c.spaces = true;

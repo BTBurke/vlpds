@@ -57,6 +57,9 @@ struct Row {
     since: Instant,
     /// When the write of `repo_rev` was acked (None: found on open).
     acked: Option<Instant>,
+    /// Held for an inactive writer: left out of the age gauge, which would
+    /// otherwise page for as long as an account stays deactivated.
+    waiting: bool,
 }
 
 /// A send to make: the row as it was when taken.
@@ -78,6 +81,7 @@ pub struct Outbox {
     overflowed: AtomicBool,
     in_flight: std::sync::atomic::AtomicUsize,
     max_rows: usize,
+    retry_base_ms: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Outbox {
@@ -96,7 +100,13 @@ impl Outbox {
             overflowed: AtomicBool::new(false),
             in_flight: Default::default(),
             max_rows,
+            retry_base_ms: (RETRY_BASE.as_millis() as u64).into(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_retry_base(&self, base: Duration) {
+        self.retry_base_ms.store(base.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// A write of (did, space) at `repo_rev` is durable; `acked`: it was
@@ -122,6 +132,7 @@ impl Outbox {
                 r.attempts = 0;
                 r.next_at = now;
                 r.acked = acked.then_some(now);
+                r.waiting = false;
             }
             None if full => {
                 self.overflowed.store(true, Ordering::Release);
@@ -140,6 +151,7 @@ impl Outbox {
                         next_at: now,
                         since: now,
                         acked: acked.then_some(now),
+                        waiting: false,
                     },
                 );
             }
@@ -166,6 +178,7 @@ impl Outbox {
         for ((d, _), r) in self.rows.lock().iter_mut() {
             if &**d == did && !r.in_flight {
                 r.next_at = now;
+                r.waiting = false;
                 any = true;
             }
         }
@@ -190,6 +203,10 @@ impl Outbox {
 
     /// Whether the rows left in the bucket should be scanned for again:
     /// some were, and there's room for them now.
+    fn retry_base(&self) -> Duration {
+        Duration::from_millis(self.retry_base_ms.load(Ordering::Relaxed))
+    }
+
     fn take_overflow(&self) -> bool {
         self.overflowed.load(Ordering::Acquire)
             && self.rows.lock().len() <= self.max_rows / 2
@@ -224,7 +241,7 @@ impl Outbox {
             }
         }
         self.in_flight.fetch_add(out.len(), Ordering::AcqRel);
-        let oldest = rows.values().map(|r| r.since).min();
+        let oldest = oldest_since(&rows);
         crate::metrics::space_outbox_gauges(rows.len(), oldest.map_or(0.0, |s| now.duration_since(s).as_secs_f64()));
         (out, next)
     }
@@ -254,6 +271,7 @@ impl Outbox {
             Outcome::Wait => ("wait", false),
         };
         crate::metrics::space_notify("out", result);
+        r.waiting = matches!(outcome, Outcome::Wait) && !newer;
         if newer {
             r.attempts = 0;
             r.next_at = now;
@@ -261,7 +279,7 @@ impl Outbox {
             if !matches!(outcome, Outcome::Wait) {
                 r.attempts += 1;
             }
-            r.next_at = now + backoff(r.attempts.max(1));
+            r.next_at = now + backoff(self.retry_base(), r.attempts.max(1));
         }
         if drop_row {
             let r = rows.remove(&key).expect("present");
@@ -316,9 +334,13 @@ impl Outbox {
     }
 }
 
-/// 1 min doubling to 1 h, then 50-100% of that.
-pub fn backoff(attempts: u32) -> Duration {
-    let base = RETRY_BASE.saturating_mul(1 << attempts.saturating_sub(1).min(6)).min(RETRY_MAX);
+fn oldest_since(rows: &HashMap<Key, Row>) -> Option<Instant> {
+    rows.values().filter(|r| !r.waiting).map(|r| r.since).min()
+}
+
+/// `base` (1 min) doubling to 1 h, then 50-100% of that.
+pub fn backoff(base: Duration, attempts: u32) -> Duration {
+    let base = base.saturating_mul(1 << attempts.saturating_sub(1).min(6)).min(RETRY_MAX);
     base.mul_f64(0.5 + rand::random::<f64>() / 2.0)
 }
 
@@ -403,9 +425,23 @@ mod tests {
         o.finish(&s[0], &Outcome::Retry("503".into()));
         assert!(o.is_empty());
         for a in 1..10 {
-            let d = backoff(a);
+            let d = backoff(RETRY_BASE, a);
             assert!(d >= RETRY_BASE / 2 && d <= RETRY_MAX, "{a}: {d:?}");
         }
-        assert!(backoff(1) <= RETRY_BASE);
+        assert!(backoff(RETRY_BASE, 1) <= RETRY_BASE);
+    }
+
+    #[test]
+    fn waiting_rows_leave_the_age_gauge() {
+        let o = Outbox::default();
+        let sid = [3; 16];
+        o.enqueue("did:w", sid, "at://s", Tid::from_parts(crate::tid::now_micros(), 0), [0; 32], true);
+        let s = send(&o);
+        assert!(oldest_since(&o.rows.lock()).is_some());
+        o.finish(&s[0], &Outcome::Wait);
+        assert!(oldest_since(&o.rows.lock()).is_none(), "an inactive writer's row isn't a backlog");
+        assert_eq!(o.len(), 1);
+        o.resume("did:w");
+        assert!(oldest_since(&o.rows.lock()).is_some());
     }
 }

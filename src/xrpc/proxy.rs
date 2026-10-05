@@ -545,6 +545,9 @@ async fn cached_account_counted(app: &App, did: &str, count: bool) -> XResult<Ca
         status: Option<std::borrow::Cow<'a, str>>,
     }
     let gen = ACCTS.generation(did);
+    if let Some(sp) = &app.spaces {
+        sp.cache_fills.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let raw = part
         .db
         .get(state::account_key(did))

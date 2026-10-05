@@ -40,7 +40,6 @@ fn create_body(skey: &str) -> J {
 
 /// lifecycle: "creates a space anchored on the caller own DID"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn creates_a_space_anchored_on_the_caller() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -52,7 +51,6 @@ async fn creates_a_space_anchored_on_the_caller() {
 
 /// lifecycle: "refuses a duplicate space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_a_duplicate_space() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -65,7 +63,6 @@ async fn refuses_a_duplicate_space() {
 
 /// lifecycle: "refuses a space key that is not a valid record key"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn refuses_a_space_key_that_is_not_a_record_key() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -75,7 +72,6 @@ async fn refuses_a_space_key_that_is_not_a_record_key() {
 
 /// lifecycle: "filters spaces by spaceType"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn filters_spaces_by_space_type() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -89,7 +85,6 @@ async fn filters_spaces_by_space_type() {
 
 /// lifecycle: "governs a space written to before createSpace"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn governs_a_space_written_to_before_create_space() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -112,7 +107,6 @@ async fn governs_a_space_written_to_before_create_space() {
 
 /// members: "adds and removes members, and the owner is not one of them"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn adds_and_removes_members() {
     let net = Net::new(1).await;
     let (alice, dan, bob) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("bob", 1).await);
@@ -133,7 +127,6 @@ async fn adds_and_removes_members() {
 
 /// members: "refuses membership changes from a non-owner member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_membership_changes_from_a_non_owner() {
     let net = Net::new(2).await;
     let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
@@ -145,7 +138,6 @@ async fn refuses_membership_changes_from_a_non_owner() {
 /// members: "refuses listMembers to a space credential and to a non-owner
 /// member"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_list_members_to_a_credential_and_a_non_owner() {
     let net = Net::new(2).await;
     let (alice, dan, carol) = (net.actor("alice", 0).await, net.actor("dan", 0).await, net.actor("carol", 2).await);
@@ -157,7 +149,6 @@ async fn refuses_list_members_to_a_credential_and_a_non_owner() {
 
 /// members: "putMember replaces both access values"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn put_member_replaces_both_access_values() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -178,7 +169,6 @@ const FORUM: &str = "did:web:example.com#forum";
 
 /// config: "persists what createSpace was given"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn persists_what_create_space_was_given() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -203,7 +193,6 @@ async fn persists_what_create_space_was_given() {
 
 /// config: "defaults to a member-list, open space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn defaults_to_a_member_list_open_space() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -216,7 +205,6 @@ async fn defaults_to_a_member_list_open_space() {
 
 /// config: "patches readPolicy, writePolicy, and appAccess independently"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn patches_policies_and_app_access_independently() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -232,7 +220,6 @@ async fn patches_policies_and_app_access_independently() {
 
 /// config: "drops managingApp by switching policy"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn drops_managing_app_by_switching_policy() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -245,7 +232,6 @@ async fn drops_managing_app_by_switching_policy() {
 /// config: "refuses an update from a non-owner" (bob's token, presented to
 /// the authority's PDS)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_update_from_a_non_owner() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -259,7 +245,6 @@ async fn refuses_an_update_from_a_non_owner() {
 /// config: "refuses an unrecognized appAccess variant rather than widening
 /// the space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_unrecognized_app_access_variant() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -274,7 +259,6 @@ async fn refuses_an_unrecognized_app_access_variant() {
 
 /// config: "refuses an unrecognized policy variant"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_an_unrecognized_policy_variant() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -286,7 +270,6 @@ async fn refuses_an_unrecognized_policy_variant() {
 
 /// config: "refuses a managingApp that does not name a service"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_managing_app_that_is_not_a_did() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -297,7 +280,6 @@ async fn refuses_a_managing_app_that_is_not_a_did() {
 
 /// config: "serves the config to a member with a space credential"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn serves_the_config_to_a_member_credential() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -309,7 +291,6 @@ async fn serves_the_config_to_a_member_credential() {
 
 /// config: "refuses the config to a credential for another space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_the_config_to_a_credential_for_another_space() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -324,7 +305,6 @@ async fn refuses_the_config_to_a_credential_for_another_space() {
 
 /// config: "refuses the config to another account on an account credential"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_the_config_to_another_account_on_its_own_token() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);
@@ -339,7 +319,6 @@ async fn refuses_the_config_to_another_account_on_its_own_token() {
 
 /// config: "refuses to answer for a space this host does not govern"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_to_answer_for_a_space_this_host_does_not_govern() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -356,7 +335,6 @@ async fn refuses_to_answer_for_a_space_this_host_does_not_govern() {
 /// credential mint gates: "mints for a non-member when the read policy is
 /// public"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn mints_for_a_non_member_under_a_public_read_policy() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -367,7 +345,6 @@ async fn mints_for_a_non_member_under_a_public_read_policy() {
 /// credential mint gates: "refuses a non-member under member-list read
 /// policy"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_a_non_member_under_member_list() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -378,7 +355,6 @@ async fn refuses_a_non_member_under_member_list() {
 
 /// credential mint gates: "refuses a member without read access"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_member_without_read_access() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -391,7 +367,6 @@ async fn refuses_a_member_without_read_access() {
 /// credential mint gates: "always admits the authority, whatever the read
 /// policy"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn always_admits_the_authority() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;
@@ -407,7 +382,6 @@ async fn always_admits_the_authority() {
 /// credential mint gates: "refuses when appAccess is an allowList and no
 /// attestation is presented"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn refuses_an_allow_list_space_without_an_attestation() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -448,7 +422,6 @@ async fn managed_space(net: &Net, alice: &SpaceClient, app: &str) -> String {
 
 /// managing-app policy: "admits a user the managing app authorizes"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn managing_app_admits_a_user_it_authorizes() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -469,7 +442,6 @@ async fn managing_app_admits_a_user_it_authorizes() {
 
 /// managing-app policy: "refuses a user the managing app declines"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn managing_app_refuses_a_user_it_declines() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -481,7 +453,6 @@ async fn managing_app_refuses_a_user_it_declines() {
 
 /// managing-app policy: "denies when the managing app errors"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn managing_app_denies_when_it_errors() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -493,7 +464,6 @@ async fn managing_app_denies_when_it_errors() {
 
 /// managing-app policy: "denies when the managing app cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn managing_app_denies_when_unresolvable() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -504,7 +474,6 @@ async fn managing_app_denies_when_unresolvable() {
 
 /// managing-app policy: "records a writer the managing app admits"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn managing_app_admits_a_writer() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -526,7 +495,6 @@ const NOTIFY_WRITE: &str = "com.atproto.space.notifyWrite";
 /// notify registration: "registers, forwards writes, and stops once
 /// withdrawn"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn registers_forwards_writes_and_stops_once_withdrawn() {
     let net = Net::new(2).await;
     let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
@@ -553,7 +521,6 @@ async fn registers_forwards_writes_and_stops_once_withdrawn() {
 
 /// notify registration: "refuses a service that cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn refuses_a_service_that_cannot_be_resolved() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -574,7 +541,6 @@ async fn delete_space(owner: &SpaceClient, space: &str) -> Resp {
 /// deletion: "purges the authority own repo and keeps a tombstone" (the
 /// blob is gone once space.getBlob no longer serves it)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5"]
 async fn delete_purges_the_authority_repo_and_keeps_a_tombstone() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -602,7 +568,6 @@ async fn delete_purges_the_authority_repo_and_keeps_a_tombstone() {
 
 /// deletion: "answers SpaceDeleted on credential renewal"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn answers_space_deleted_on_credential_renewal() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -614,7 +579,6 @@ async fn answers_space_deleted_on_credential_renewal() {
 
 /// deletion: "notifies registered syncers"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn delete_notifies_registered_syncers() {
     let net = Net::new(2).await;
     let (alice, carol) = (net.actor("alice", 0).await, net.actor("carol", 2).await);
@@ -635,7 +599,6 @@ async fn delete_notifies_registered_syncers() {
 
 /// deletion: "leaves a member repo untouched"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn delete_leaves_a_member_repo_untouched() {
     let net = Net::new(1).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 1).await);
@@ -649,7 +612,6 @@ async fn delete_leaves_a_member_repo_untouched() {
 
 /// deletion: "allows re-creating a deleted space, with fresh config"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn allows_re_creating_a_deleted_space_with_fresh_config() {
     let net = Net::new(0).await;
     let alice = net.actor("alice", 0).await;

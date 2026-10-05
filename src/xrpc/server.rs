@@ -511,6 +511,9 @@ async fn load_ctl(app: &App, e: &Ext, did: &str, gen0: u64, cached: Option<Arc<C
             }
         };
         let local = app.partitions.for_key(did).map(|p| (p.id, p.epoch));
+        if let Some(sp) = &app.spaces {
+            sp.cache_fills.fetch_add(1, Ordering::Relaxed);
+        }
         match load_sets(app, did, local).await {
             Ok(c) => {
                 e.ctl_loads.reachable(shard, probe);

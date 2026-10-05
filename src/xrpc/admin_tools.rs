@@ -395,3 +395,37 @@ async fn rebuild_repo(State(app): AppState, Auth(creds): Auth, Json(inp): Json<R
     out["after"] = inspect(&app, &did).await?.report;
     Ok(Json(out))
 }
+
+pub fn space_routes() -> Router<Arc<App>> {
+    Router::new().route("/xrpc/vlpds.admin.checkSpace", get(check_space))
+}
+
+#[derive(Deserialize)]
+struct SpaceQ {
+    did: String,
+    space: String,
+}
+
+/// check-space from one snapshot taken under the apply lock, as checkRepo's.
+async fn check_space(State(app): AppState, Auth(creds): Auth, Query(q): Query<SpaceQ>) -> XResult<Json<J>> {
+    use crate::space::check;
+    require_admin(&creds)?;
+    if check::authority(&q.space).is_none() {
+        return Err(invalid(format!("not a space URI: {}", q.space)));
+    }
+    let p = app.partition(&q.did)?;
+    let snap = {
+        let _g = p.apply_lock.read().await;
+        p.db.snapshot().await.map_err(XrpcError::from_err)?
+    };
+    let rows = check::load(snap.as_ref(), &q.did, &q.space).await.map_err(XrpcError::from_err)?;
+    if rows.is_empty() {
+        return Err(XrpcError::bad("RepoNotFound", format!("{} has no rows in {}", q.did, q.space)));
+    }
+    let report = check::check(&q.did, &q.space, &rows, crate::tid::now_micros(), app.config.space_oplog_retention);
+    if report.pointer("/records/matchesHead") == Some(&J::Bool(false)) {
+        tracing::warn!(did = %q.did, space = %q.space, "check-space: records don't hash to the space head");
+        crate::metrics::space_digest_mismatch();
+    }
+    Ok(Json(report))
+}

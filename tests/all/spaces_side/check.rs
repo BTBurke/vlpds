@@ -43,7 +43,6 @@ async fn check_space_is_unknown_with_spaces_off() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn check_space_finds_damaged_rows() {
     let s = TestServer::spawn_with(|c| c.spaces = true).await;
     let (st, coll) = ("com.example.chk.space", "com.example.chk.note");

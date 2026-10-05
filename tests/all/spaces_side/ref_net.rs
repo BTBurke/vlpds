@@ -162,7 +162,8 @@ impl Net {
 
     /// `createActor(name, pds)`, signed in over OAuth with [`FULL_SCOPE`].
     pub async fn actor(&self, name: &str, pds: usize) -> SpaceClient {
-        let a = SpaceClient::new(&self.pds[pds], &unique_name(name), FULL_SCOPE).await;
+        // unique_name adds up to 7 characters and createAccount 5 digits, under an 18-character limit
+        let a = SpaceClient::new(&self.pds[pds], &unique_name(&name[..name.len().min(6)]), FULL_SCOPE).await;
         self.hosts.lock().insert(a.did.clone(), pds);
         a
     }
@@ -217,14 +218,20 @@ impl Net {
         (exchange(&reqwest::Client::new(), &holder, &host, space, token, attestation).await, holder)
     }
 
-    /// The authority's writer set as `listRepos` publishes it (the
-    /// reference's `writerDids` reads storage; no endpoint but this one
-    /// exposes it here). `owner` is the authority's account.
+    /// The authority's writer set as its storage holds it (`sW`), as the
+    /// reference's `writerDids` reads it: no credential, so an allowList
+    /// space's app perimeter doesn't stand in the way. `owner` is the
+    /// authority's account.
     pub async fn writer_dids(&self, owner: &SpaceClient, space: &str) -> Vec<String> {
-        let cred = self.credential_for(owner, space).await;
-        let r = cred.get(&self.host_of(&owner.did), "com.atproto.space.listRepos", &[("space", space)]).await;
-        let mut dids: Vec<String> =
-            r.ok()["repos"].as_array().unwrap().iter().map(|x| x["did"].as_str().unwrap().to_string()).collect();
+        use vlpds::state;
+        let i = *self.hosts.lock().get(&owner.did).expect("a Net account");
+        let p = self.pds[i].app.partitions.for_key(&owner.did).expect("the authority's shard");
+        let prefix = state::space_prefix(state::SPACE_WRITER_FAMILY, &owner.did, &state::space_id(space));
+        let mut it = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.unwrap();
+        let mut dids = Vec::new();
+        while let Some(kv) = it.next().await.unwrap() {
+            dids.push(String::from_utf8_lossy(&kv.key[prefix.len()..]).into_owned());
+        }
         dids.sort();
         dids
     }
@@ -800,9 +807,9 @@ impl MockClientApp {
         let jwk = p256_jwk(&key, &kid);
         let keys = Arc::new(Mutex::new(keys));
         let metadata_ok = Arc::new(AtomicBool::new(true));
-        let (k, m, cid, ju, b) = (keys.clone(), metadata_ok.clone(), client_id.clone(), jwks_uri.clone(), base.clone());
+        let (k, m, cid, ju) = (keys.clone(), metadata_ok.clone(), client_id.clone(), jwks_uri.clone());
         let router = axum::Router::new().fallback(move |req: axum::extract::Request| {
-            let (k, m, cid, ju, b, jwk) = (k.clone(), m.clone(), cid.clone(), ju.clone(), b.clone(), jwk.clone());
+            let (k, m, cid, ju, jwk) = (k.clone(), m.clone(), cid.clone(), ju.clone(), jwk.clone());
             async move {
                 let keys = *k.lock();
                 match req.uri().path() {
@@ -810,7 +817,8 @@ impl MockClientApp {
                         let mut md = json!({
                             "client_id": cid,
                             "client_name": "Mock Space App",
-                            "redirect_uris": [format!("{b}/cb")],
+                            // a web client may not redirect to a loopback address
+                            "redirect_uris": ["https://app.example.com/cb"],
                             "response_types": ["code"],
                             "grant_types": ["authorization_code"],
                             "scope": "atproto",

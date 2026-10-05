@@ -867,15 +867,17 @@ The reference's space suites at `bluesky-social/atproto` 5b95b2f2 (PR #5187, per
 `tests/all/spaces_side/ref_*.rs`. The harness is `spaces_side::ref_net`, the reference's `tests/_space.ts` over XRPC: a `Net` of
 `--spaces` PDSes on one in-process PLC directory, OAuth accounts, signed credential reads, a did:web `MockService` (managing app,
 syncer, remote space host, or a party whose key a test holds) and a `MockClientApp` serving client metadata and a JWKS. Run them
-with `cargo test --test all spaces_side::ref_ -- --include-ignored`. Each test is `#[ignore = "spaces core: Cn"]` until the
-core slice it needs lands, and each names its reference case in a doc comment.
+with `cargo test --test all spaces_side::ref_`. Each test names its reference case in a doc comment, and the `(Cn)` on a row
+is the core slice that made it pass.
 
 Two things change how a case is ported, so they aren't repeated on every row:
 
 - The reference adds members to most spaces even where a test never reads with a credential. A member's PDS never consults the
   member list on a write (only the authority does, on notifyWrite), so the ports add members only where a credential is minted.
 - The reference reads its stores directly (`repoState`, `writerDids`, `blobExists`, revocation rows). The ports read the same
-  facts over XRPC: the owner's getLatestCommit and listRecords, listRepos with the owner's credential, space.getBlob.
+  facts over XRPC (the owner's getLatestCommit and listRecords, space.getBlob), except `writerDids`, which reads the authority's
+  `sW` rows as the reference does. A credential for listRepos would have to clear an allowList space's app check, and the
+  reference's own read never does.
 
 Divergences, also in DESIGN.md's Spaces section:
 

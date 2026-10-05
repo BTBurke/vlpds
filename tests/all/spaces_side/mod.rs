@@ -3,6 +3,7 @@
 //! tests/all/common/spaces.rs), and the ported reference space suites
 //! (`ref_*`, on the `ref_net` harness).
 
+mod accept;
 mod bench;
 mod check;
 mod durability;

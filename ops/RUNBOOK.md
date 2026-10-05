@@ -1680,13 +1680,12 @@ row that always carries the newest rev. Sends retry from 1 min, doubling to
 restart or a takeover, and the next owner sends it again.
 
 **Causes:** the authority's PDS is down or answering 5xx, its DID doesn't
-resolve to an `#atproto_space_host` or `#atproto_pds` endpoint, or the writer's
-account is deactivated or taken down (its rows wait for a restore, and don't
-count as failures).
+resolve to an `#atproto_space_host` or `#atproto_pds` endpoint. A deactivated
+or taken-down writer's rows wait for a restore. They're left out of the age,
+so they never fire this alert.
 
 **Confirm:** the internals dashboard's Spaces row: `notifyWrite by hop and
-result` shows `out retry` (the authority is failing) or `out wait` (inactive
-writers). The node logs `space notifyWrite retry: <why>` with the DID, space
+result` shows `out retry` (the authority is failing). The node logs `space notifyWrite retry: <why>` with the DID, space
 and rev on every failed send.
 
 **Do:**
@@ -1694,21 +1693,23 @@ and rev on every failed send.
   Once it does, the next retry (at most ~1 h away) delivers the newest rev.
 - Many authorities failing at once: look at this node's outbound path (DNS,
   egress, `http::guarded` refusals in the logs).
-- Inactive writers: expected. Rows resume on reactivation or takedown reversal.
 - A row past 24 h is dropped. The authority's `listRepos` then lags for that
   repo until its next write. Syncers still catch up from `listRepoOps`.
 
 ### VlpdsSpaceDigestMismatch
 
-**Means:** a space repo's stored head (`sH`: set hash, record count, rev)
-didn't match what was recomputed from its records (`sR`)
-(`vlpds_space_digest_mismatch_total`). Syncers check every pull against the
-signed commit's hash, so a wrong head makes them refetch the whole repo with
-`getRepo`, and the mismatch never goes away on its own. This is a bug, not
-load. **(unverified: the counter lands with the phase 1 observability slice)**
+**Means:** check-space found a space repo whose stored head (`sH`: set hash,
+record count, rev) doesn't match what it recomputed from the records (`sR`)
+(`vlpds_space_digest_mismatch_total`). Only check-space counts here. An
+importRepo whose CAR doesn't hash to its commit is the uploader's fault and
+counts in `vlpds_space_imports_total{result="refused"}` instead. Syncers check
+every pull against the signed commit's hash, so a wrong head makes them refetch
+the whole repo with `getRepo`, and the mismatch never goes away on its own.
+This is a bug, not load.
 
-**Confirm:** run `vlpds admin check-space DID SPACE` (`vlpds.admin.checkSpace`)
-for the repo in the log line. It reports the recomputed hash and count against
+**Confirm:** the node logs `check-space: records don't hash to the space head`
+with the DID and space. Run `vlpds admin check-space DID SPACE`
+(`vlpds.admin.checkSpace`) for that repo again. It reports the recomputed hash and count against
 the head, any record newer than the head, and whether the oplog replays onto
 the records.
 
@@ -1733,8 +1734,8 @@ or this node's egress failing.
 
 **Confirm:** the Spaces row's `Fan-out queue depth and drops` and the failure
 ratio by hop. `out` failing at the same time points at egress. The logs name
-the syncer service DID per failure. **(unverified: fan-out hardening lands
-with the phase 1 sync slice)**
+the syncer's service id (`space notify forward failed` or `refused`, with
+`service` and `status`) per failure.
 
 **Do:**
 - One syncer down: nothing to do. Its registrations expire 24 h after their

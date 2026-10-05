@@ -80,6 +80,7 @@ Not run yet.
 |---|---|---|---|---|
 | No-op `listRepoOps`, client | C1 | | | |
 | No-op `listRepoOps`, server histogram | C1 | | | |
+| No-op `listRepoOps`, client, cold signing key (unwrapped before each poll) | C1 | | | |
 | Delta pull, K = 1 / 10 / 100 | C1 | | | |
 | Credential miss (full chain) | C1 | | | |
 | Credential hit (cache) | C2 | | | |

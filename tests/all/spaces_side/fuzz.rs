@@ -143,7 +143,7 @@ impl Account {
         let (nsid, expect, what) = match rng.gen_range(0..100) {
             0..20 => {
                 let path = pick(rng, 0.7);
-                let v = value(&coll, rng);
+                let v = value(path.split_once('/').unwrap().0, rng);
                 fields(&mut body, &path, Some(&v));
                 let expect = match repo.records.contains_key(&path) {
                     true => Err("RecordAlreadyExists"),
@@ -295,10 +295,10 @@ impl Account {
 }
 
 fn uri_path(uri: &str) -> String {
-    // at://{did}/space/{type}/{skey}/{collection}/{rkey}
+    // at://{authority}/space/{type}/{skey}/{author}/{collection}/{rkey}
     let parts: Vec<&str> = uri.trim_start_matches("at://").split('/').collect();
-    assert!(parts.len() == 6 && parts[1] == "space", "not a space record URI: {uri}");
-    format!("{}/{}", parts[4], parts[5])
+    assert!(parts.len() == 7 && parts[1] == "space", "not a space record URI: {uri}");
+    format!("{}/{}", parts[5], parts[6])
 }
 
 pub(super) fn bytes_field(v: &J) -> Vec<u8> {
@@ -560,7 +560,6 @@ fn seeds(default: u64) -> Vec<u64> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn space_op_sequences_replay_to_their_commits() {
     for seed in seeds(2) {
         run(seed, env_or("VLPDS_SPACE_FUZZ_STEPS", 60), Checks::default()).await;
@@ -568,7 +567,6 @@ async fn space_op_sequences_replay_to_their_commits() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C4"]
 async fn space_op_sequences_match_get_repo() {
     for seed in seeds(1) {
         run(1000 + seed, env_or("VLPDS_SPACE_FUZZ_STEPS", 50), Checks { get_repo: true, ..Default::default() }).await;
@@ -576,7 +574,6 @@ async fn space_op_sequences_match_get_repo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2"]
 async fn delete_account_leaves_no_space_rows() {
     for seed in seeds(1) {
         run(2000 + seed, env_or("VLPDS_SPACE_FUZZ_STEPS", 30), Checks { delete_sweep: true, ..Default::default() })

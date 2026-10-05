@@ -19,7 +19,6 @@ async fn setup(net: &Net) -> (crate::common::spaces::SpaceClient, crate::common:
 
 /// "reads the caller's own repo with only read_self"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn reads_own_repo_with_only_read_self() {
     let net = Net::new(0).await;
     let (alice, _, space) = setup(&net).await;
@@ -29,7 +28,6 @@ async fn reads_own_repo_with_only_read_self() {
 
 /// "refuses another repo with only read_self"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_another_repo_with_only_read_self() {
     let net = Net::new(0).await;
     let (alice, dan, space) = setup(&net).await;
@@ -39,7 +37,6 @@ async fn refuses_another_repo_with_only_read_self() {
 
 /// "refuses another repo even with whole-space read"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_another_repo_even_with_whole_space_read() {
     let net = Net::new(0).await;
     let (alice, dan, space) = setup(&net).await;
@@ -51,7 +48,6 @@ async fn refuses_another_repo_even_with_whole_space_read() {
 /// "refuses another repo on a legacy access token". Divergent: OAuth-only,
 /// so a password session doesn't read its own repo either.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn refuses_every_repo_to_a_legacy_access_token() {
     let net = Net::new(0).await;
     let (alice, dan, space) = setup(&net).await;
@@ -65,7 +61,6 @@ async fn refuses_every_repo_to_a_legacy_access_token() {
 
 /// "read_self is not narrowed by collection"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn read_self_is_not_narrowed_by_collection() {
     let net = Net::new(0).await;
     let (alice, _, space) = setup(&net).await;
@@ -83,7 +78,6 @@ async fn read_self_is_not_narrowed_by_collection() {
 
 /// "a space credential reads any repo in its own space"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn a_space_credential_reads_any_repo_in_its_own_space() {
     let net = Net::new(0).await;
     let (alice, dan) = (net.actor("alice", 0).await, net.actor("dan", 0).await);

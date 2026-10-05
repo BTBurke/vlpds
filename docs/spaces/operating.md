@@ -64,7 +64,7 @@ it. With no space traffic, a node with it on makes one conditional GET of the re
 | `vlpds_space_list_repo_ops_total{path}`, `vlpds_space_list_repo_ops_seconds{path}` | `noop` (answered from memory) vs `scan`, and server time for each |
 | `vlpds_space_notify_total{hop,result}` | notify hops: `out` (this node's writes), `in` (as an authority), `fanout` (to syncers) |
 | `vlpds_space_notify_ack_seconds` | a write's ack to the authority's 200 |
-| `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | outbox depth and the age of its oldest row |
+| `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | outbox depth and the age of its oldest row (rows held for an inactive writer don't count toward the age) |
 | `vlpds_space_outbox_overflow_total` | rows left in the bucket because the outbox was full |
 | `vlpds_space_fanout_queue_depth`, `vlpds_space_fanout_dropped_total{reason}`, `vlpds_space_fanout_coalesced_total` | fan-out backlog, drops and replaced forwards |
 | `vlpds_space_credential_cache_total{result}` | credential cache hits and misses |
@@ -87,7 +87,7 @@ the fan-out queue and drops, and revocations held.
 
 | Alert | Fires when | First thing to check |
 |---|---|---|
-| `VlpdsSpaceOutboxBacklog` | a node's oldest outbox row is over 1 h old for 10 min | `notifyWrite by hop and result`: `out retry` means the authority is failing, `out wait` means inactive writers |
+| `VlpdsSpaceOutboxBacklog` | a node's oldest outbox row is over 1 h old for 10 min | `notifyWrite by hop and result`: `out retry` means the authority is failing. Inactive writers' rows wait without aging the outbox |
 | `VlpdsSpaceNotifyFanoutFailing` | over 50% of fan-out sends fail, at over 0.1/s, for 30 min | one syncer down (nothing to do) or this node's egress |
 | `VlpdsSpaceCredentialRejectsHigh` | over 25% of credential reads are refused, at over 0.5/s, for 15 min (expired ones left out) | which `result` dominates. One client stuck on `bad_sig` is that app's bug |
 | `VlpdsSpaceDigestMismatch` | a space repo's head disagrees with its records | run `vlpds admin check-space DID SPACE` |

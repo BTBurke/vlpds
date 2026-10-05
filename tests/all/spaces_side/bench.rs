@@ -453,6 +453,16 @@ async fn bench_noop(s: &TestServer, fx: &Fixture, cfg: &Cfg, out: &mut Report) {
         base_lat.line(),
         cpu - base_cpu
     ));
+    // cold key: the author's signing key out of every cache before each poll
+    let (_, cold) = cpu_loop(n.min(200), |_| {
+        let (rd, space, repo, head, app) = (rd.clone(), fx.space.clone(), repo.clone(), head.clone(), s.app.clone());
+        async move {
+            app.forget_signing_key(&repo);
+            rd.list_repo_ops(&space, &repo, Some(&head), 100).await.2
+        }
+    })
+    .await;
+    out.say(format!("noop listRepoOps client, cold signing key: {}", cold.line()));
 }
 
 async fn bench_delta(fx: &Fixture, cfg: &Cfg, out: &mut Report) {
@@ -952,7 +962,6 @@ async fn spaces_microbench() {
 /// Every section at a tiny size: the harness runs end to end against the
 /// space surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn spaces_microbench_smoke() {
     let out = run(Cfg::tiny()).await;
     for want in [

@@ -163,13 +163,9 @@ async fn consistent(
     }
     let q = [("did", sc.did.as_str()), ("space", space)];
     let chk = s.xrpc.get("vlpds.admin.checkSpace", &q, &Auth::Admin).await;
-    match chk.status {
-        200 => {
-            assert_eq!(chk.json["ok"], json!(true), "{ctx}: checkSpace: {}", chk.json);
-            assert_eq!(chk.json["records"]["count"], json!(recs.len()), "{ctx}: checkSpace count");
-        }
-        _ => eprintln!("{ctx}: checkSpace not available ({}), client-side checks only", chk.status),
-    }
+    assert_eq!(chk.status, 200, "{ctx}: checkSpace: {}", chk.text());
+    assert_eq!(chk.json["ok"], json!(true), "{ctx}: checkSpace: {}", chk.json);
+    assert_eq!(chk.json["records"]["count"], json!(recs.len()), "{ctx}: checkSpace count");
     (recs, c)
 }
 
@@ -328,15 +324,14 @@ async fn kill_around_segment_put(stage: Stage, act: Act) -> (Option<u16>, bool) 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn kill_after_the_segment_put_before_the_ack() {
     let (status, whole) = kill_around_segment_put(Stage::AfterPut, Act::Pause).await;
     assert_eq!(status, None, "the batch was answered while its segment PUT was held");
-    eprintln!("un-acked batch in a landed segment: present after the restart = {whole}");
+    // replay applies every entry of a segment in the bucket, acked or not
+    assert!(whole, "an un-acked batch in a landed segment is gone after the restart");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn kill_before_the_segment_put_loses_the_whole_batch() {
     let (status, whole) = kill_around_segment_put(Stage::BeforePut, Act::Pause).await;
     assert_eq!(status, None, "the batch was answered before its segment was PUT");
@@ -346,7 +341,6 @@ async fn kill_before_the_segment_put_loses_the_whole_batch() {
 /// The segment lands but its PUT answers an error: the retry finds the
 /// object there and acks; a kill right after the ack keeps the batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn a_failed_put_that_landed_acks_and_survives_a_kill() {
     let (status, whole) = kill_around_segment_put(Stage::AfterPut, Act::Fail).await;
     assert_eq!(status, Some(200), "the batch after a retried segment PUT");
@@ -384,14 +378,10 @@ async fn outbox_survives_a_kill(resume: Resume) {
         }
     };
     let entry = survivor.as_ref().map_or(&victim, |(s, _)| s);
+    // a DID lands on the node that creates it
+    front.point(&victim);
+    let mut sc = SpaceClient::new(&front.view(&victim), &unique_name("ob"), &scope(&st, &coll)).await;
     front.point(entry);
-    let mut sc = SpaceClient::new(&front.view(entry), &unique_name("ob"), &scope(&st, &coll)).await;
-    for _ in 0..24 {
-        if survivor.is_none() || std::ptr::eq(owner_of(&[&victim, entry], &sc.did), &victim) {
-            break;
-        }
-        sc = SpaceClient::new(&front.view(entry), &unique_name("ob"), &scope(&st, &coll)).await;
-    }
     assert!(std::ptr::eq(owner_of(&[&victim, entry], &sc.did), &victim), "no writer on the victim");
 
     for i in 0..4 {
@@ -443,13 +433,11 @@ async fn outbox_survives_a_kill(resume: Resume) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1"]
 async fn outbox_redelivers_the_newest_rev_after_a_restart() {
     outbox_survives_a_kill(Resume::Restart).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C1"]
 async fn outbox_redelivers_the_newest_rev_from_the_peer_that_takes_over() {
     outbox_survives_a_kill(Resume::Takeover).await;
 }
@@ -493,26 +481,20 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     let (n1, _) = hooked_node("tb-1", &bucket, SHARDS, &front).await;
     let (n2, s2) = hooked_node("tb-2", &bucket, SHARDS, &front).await;
     balanced(&[&n1, &n2]).await;
-    front.point(&n1);
-    let view = front.view(&n1);
     let (st, coll) = names();
-    let on = |sc: &SpaceClient| std::ptr::eq(owner_of(&[&n1, &n2], &sc.did), &n2);
-    let (mut auth, mut wv, mut ws) = (None, None, None);
-    for _ in 0..30 {
-        let sc = SpaceClient::new(&view, &unique_name("tb"), &scope(&st, &coll)).await;
-        let victim = on(&sc);
-        if auth.is_none() && victim == authority_on_victim {
-            auth = Some(sc);
-        } else if victim && wv.is_none() {
-            wv = Some(sc);
-        } else if !victim && ws.is_none() {
-            ws = Some(sc);
-        }
-        if auth.is_some() && wv.is_some() && ws.is_some() {
-            break;
-        }
+    // a DID lands on the node that creates it
+    let on = |node: &TestServer| {
+        front.point(node);
+        let (view, sc) = (front.view(node), scope(&st, &coll));
+        async move { SpaceClient::new(&view, &unique_name("tb"), &sc).await }
+    };
+    let auth = on(if authority_on_victim { &n2 } else { &n1 }).await;
+    let wv = on(&n2).await;
+    let ws = on(&n1).await;
+    front.point(&n1);
+    for (sc, node) in [(&auth, if authority_on_victim { &n2 } else { &n1 }), (&wv, &n2), (&ws, &n1)] {
+        assert!(std::ptr::eq(owner_of(&[&n1, &n2], &sc.did), node), "{} isn't on its node", sc.did);
     }
-    let (auth, wv, ws) = (auth.expect("authority"), wv.expect("victim writer"), ws.expect("survivor writer"));
     let space = auth.create_space(&st, "tb").await;
     for w in [&wv, &ws] {
         let m = json!({"space": space, "did": w.did, "read": true, "write": true});
@@ -613,7 +595,9 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         }
     }
 
-    // the syncer got the space's updates in spaceRev order, none twice
+    // the syncer got the space's updates in spaceRev order; the only repeat
+    // allowed is the new owner's one catch-up forward after the takeover
+    // (DESIGN.md: a current syncer takes it as a no-op)
     retry("the syncer hears the final writes", || async {
         let got = syncer.accepted();
         heads
@@ -624,7 +608,11 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
     .await;
     let got = syncer.accepted();
     let revs: Vec<&str> = got.iter().map(|n| n.body["spaceRev"].as_str().expect("spaceRev")).collect();
-    assert!(revs.windows(2).all(|w| w[0] < w[1]), "fan-out out of order or repeated: {revs:?}");
+    assert!(revs.windows(2).all(|w| w[0] <= w[1]), "fan-out out of order: {revs:?}");
+    let repeats: Vec<&Notified> =
+        got.windows(2).filter(|w| w[0].body["spaceRev"] == w[1].body["spaceRev"]).map(|w| &w[1]).collect();
+    assert!(repeats.len() <= 1, "fan-out repeated {} spaceRevs: {revs:?}", repeats.len());
+    assert!(repeats.iter().all(|n| n.at > killed_at), "a spaceRev repeated before the takeover: {revs:?}");
     if authority_on_victim {
         assert!(got.iter().any(|n| n.at > killed_at), "fan-out didn't resume on the new owner");
     }
@@ -634,13 +622,11 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3, C4"]
 async fn takeover_mid_burst_with_the_authority_on_the_survivor() {
     takeover_mid_burst(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3, C4"]
 async fn takeover_mid_burst_with_the_authority_on_the_victim() {
     takeover_mid_burst(true).await;
 }
@@ -656,7 +642,6 @@ async fn notify(n: &OneNode, writer: &StubDid, rev: &str, hash: &[u8]) -> Resp {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn inbound_notifies_survive_a_kill_after_their_200() {
     let mut n = OneNode::new("in").await;
     let writer = StubDid::spawn().await;
