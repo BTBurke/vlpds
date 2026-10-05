@@ -1762,16 +1762,20 @@ impl Cluster {
         // landed and carried the same flags would only push validity a few
         // hundred ms further: skipped, and the next tick renews. One that
         // must publish a flag, or follows a failed write, waits out the gap.
+        // Both only while the validity left covers the next tick with room
+        // to spare: a slow write earns validity from its send, so one that
+        // landed late (or failed late) is renewed at once, 429 or not.
         let gap = lease_key_gap(self.cfg.renew_every);
         let last = *self.last_lease_write.lock();
         if let Some((at, landed, joined, draining)) = last {
             let since = at.elapsed();
-            if since < gap {
+            let left = self.valid_until.read().saturating_duration_since(Instant::now());
+            if since < gap && left > self.cfg.renew_every + gap + self.cfg.skew {
                 let same = {
                     let l = self.lease.read();
                     l.joined == joined && l.draining == draining
                 };
-                if landed && same && self.lease_valid() {
+                if landed && same {
                     return;
                 }
                 tokio::time::sleep(gap - since).await;
@@ -3686,6 +3690,8 @@ mod tests {
     /// its precondition. "fail": the next PUT fails (a store error),
     /// "getfail" the next GET. "slowfail": the next PUT fails after
     /// SLOW_FAIL (a write the store throttled until object_store gave up).
+    /// "slowland": the next PUT lands after SLOW_LAND (throttled, then let
+    /// through).
     /// `puts` logs every PUT: (key, sent, answered).
     #[derive(Debug, Default)]
     struct Stalls {
@@ -3696,6 +3702,7 @@ mod tests {
     }
 
     const SLOW_FAIL: Duration = Duration::from_millis(1500);
+    const SLOW_LAND: Duration = Duration::from_millis(3300);
 
     struct PutLog<'a>(&'a Stalls, String, Instant);
 
@@ -3738,6 +3745,9 @@ mod tests {
             if self.take("slowfail", location.as_ref()) {
                 tokio::time::sleep(SLOW_FAIL).await;
                 return Err(object_store::Error::Generic { store: "Stalls", source: "429 Too Many Requests".into() });
+            }
+            if self.take("slowland", location.as_ref()) {
+                tokio::time::sleep(SLOW_LAND).await;
             }
             if self.take("put", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
@@ -4667,63 +4677,81 @@ mod tests {
         assert!(h.lost.load(Ordering::SeqCst) >= 1, "a stalled renewal must still fail-stop");
     }
 
-    /// Sends to our lease key from the renew loop: a tick every
-    /// `renew_every` (a missed one fires when polled, the next a period
-    /// later), `gap` from each renewal's end to the next one's start, `rtt`
-    /// per attempt, and renewal `bad` throttled `retries` times with
-    /// object_store's shortest waits between (each at least the floor).
-    fn lease_sends(renew_every: Duration, gap: Duration, rtt: Duration, bad: usize, retries: u32) -> Vec<Duration> {
-        let floor = crate::throttle::CTL_WRITE_FLOOR;
-        let (mut sends, mut tick, mut last_end) = (Vec::new(), Duration::ZERO, None::<Duration>);
-        for i in 0..20 {
-            let fired = tick.max(last_end.unwrap_or_default());
-            tick = fired + renew_every;
-            let mut at = last_end.map_or(fired, |e| fired.max(e + gap));
-            let tries = if i == bad { retries + 1 } else { 1 };
+    /// Sends to our lease key from the renew loop, as (when, urgent): a tick
+    /// every `renew_every` (a missed one fires when polled, the next a
+    /// period later), `rtt` per attempt, and write number `bad` throttled
+    /// `retries` times (object_store's shortest waits, the floor, between)
+    /// before it lands. `renew_here` within the gap of the last answer
+    /// skips (after a landed write) or waits, unless the validity left is
+    /// short: then it sends at once (urgent). The bool: a tick found the
+    /// lease lapsed.
+    fn lease_sends(ttl_s: u64, rtt: Duration, bad: usize, retries: u32) -> (Vec<(Duration, bool)>, bool) {
+        let ttl = Duration::from_secs(ttl_s);
+        let (renew_every, skew) = (ttl / 5, ttl / 5);
+        let gap = lease_key_gap(renew_every);
+        let floor = crate::throttle::CTL_WRITE_FLOOR.min(renew_every);
+        let (mut sends, mut tick, mut now) = (Vec::new(), Duration::ZERO, Duration::ZERO);
+        let (mut valid_until, mut last_end, mut writes) = (ttl - skew, None::<Duration>, 0);
+        for _ in 0..40 {
+            now = now.max(tick);
+            tick = now + renew_every;
+            if now >= valid_until {
+                return (sends, true);
+            }
+            let left = valid_until - now;
+            let mut urgent = false;
+            if last_end.is_some_and(|e| now - e < gap) {
+                if left > renew_every + gap + skew {
+                    continue;
+                }
+                urgent = true;
+            }
+            let sent = now;
+            let tries = if writes == bad { retries + 1 } else { 1 };
             for t in 0..tries {
-                sends.push(at);
-                at += rtt;
+                sends.push((now, urgent && t == 0));
+                now += rtt;
                 if t + 1 < tries {
-                    at += floor;
+                    now += floor;
                 }
             }
-            last_end = Some(at);
+            writes += 1;
+            if now < sent + ttl - skew {
+                valid_until = sent + ttl - skew;
+            }
+            last_end = Some(now);
         }
-        sends
-    }
-
-    fn min_gap(sends: &[Duration]) -> Duration {
-        sends.windows(2).map(|w| w[1] - w[0]).min().unwrap()
+        (sends, false)
     }
 
     /// R2 takes about one write a second to one key. Renewals go every TTL/5
-    /// (0.5/s at the default 10 s TTL, 1/s at 5 s), and a renewal the store
-    /// throttles retries at least a second apart. Without the loop's gap,
-    /// the tick a slow renewal missed fires as it ends, one RTT after its
-    /// last attempt.
+    /// (0.5/s at the default 10 s TTL, 1/s at 5 s), a throttled one retries
+    /// at least min(1 s, renew_every) apart, and the next renewal keeps
+    /// that gap unless the slow one left too little validity: then it goes
+    /// at once, since a lapse would fail-stop the node.
     #[test]
     fn lease_renewals_stay_under_one_write_a_second_per_key() {
         let rtt = Duration::from_millis(200);
         for ttl_s in [3u64, 5, 10, 60] {
             let renew_every = Duration::from_secs(ttl_s) / 5;
             let gap = lease_key_gap(renew_every);
-            // the gap counts from a renewal's answer: under TTL 10 s on a
-            // 200 ms store it stretches calm renewals by one RTT
-            let calm = lease_sends(renew_every, gap, rtt, usize::MAX, 0);
-            assert_eq!(min_gap(&calm), renew_every.max(gap + rtt), "TTL {ttl_s} s");
+            let (calm, lapsed) = lease_sends(ttl_s, rtt, usize::MAX, 0);
+            assert!(!lapsed);
+            let calm_gap = calm.windows(2).map(|w| w[1].0 - w[0].0).min().unwrap();
+            assert_eq!(calm_gap, renew_every, "TTL {ttl_s} s: calm cadence");
             for retries in 0..=6 {
-                let sends = lease_sends(renew_every, gap, rtt, 3, retries);
-                let least = min_gap(&sends);
-                assert!(least >= gap, "TTL {ttl_s} s, {retries} retries: {least:?} apart");
-                if ttl_s >= 5 {
-                    assert!(least >= Duration::from_secs(1), "TTL {ttl_s} s, {retries} retries: {least:?} apart");
+                let (sends, lapsed) = lease_sends(ttl_s, rtt, 3, retries);
+                let slow = (rtt + gap) * retries + rtt;
+                let ceiling = Duration::from_secs(ttl_s) * 4 / 5;
+                if slow < ceiling - renew_every {
+                    assert!(!lapsed, "TTL {ttl_s} s, {retries} retries: lapsed");
                 }
-            }
-            if ttl_s == 10 {
-                assert_eq!(min_gap(&calm), renew_every, "the default TTL's cadence is unchanged");
-                // retries long enough to miss a tick: back to back without the gap
-                let ungapped = lease_sends(renew_every, Duration::ZERO, rtt, 3, 2);
-                assert_eq!(min_gap(&ungapped), rtt, "TTL {ttl_s} s");
+                for w in sends.windows(2).filter(|w| !w[1].1) {
+                    assert!(w[1].0 - w[0].0 >= gap, "TTL {ttl_s} s, {retries} retries: {:?} apart", w[1].0 - w[0].0);
+                }
+                if ttl_s == 10 && retries <= 2 {
+                    assert!(sends.iter().all(|s| !s.1), "TTL 10 s, {retries} retries: an urgent renewal");
+                }
             }
         }
         assert_eq!(lease_key_gap(Duration::from_secs(2)), Duration::from_secs(1));
@@ -4737,7 +4765,7 @@ mod tests {
         let stalls = Arc::new(Stalls::default());
         let store = Store { raw: stalls.clone(), ..Store::memory(None) };
         let c = ClusterConfig {
-            ttl: Duration::from_secs(6),
+            ttl: Duration::from_secs(8),
             renew_every: Duration::from_secs(1),
             skew: Duration::from_secs(1),
             ..cfg("r")
@@ -4790,5 +4818,37 @@ mod tests {
         assert!(c.read_lease("s").await.unwrap().unwrap().joined, "joined published");
         assert!(c.lease_valid());
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// A renewal the store throttled for most of the validity it earns
+    /// (TTL 10 s scaled by half: sent at S, landed at S + 3.3 s, valid to
+    /// S + 4 s). The missed tick that fires as it lands must renew at once:
+    /// skipping it, or waiting out the gap, left the next tick to find the
+    /// lease lapsed and fail-stop.
+    #[tokio::test]
+    async fn a_renewal_landing_late_in_its_validity_is_renewed_at_once() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = ClusterConfig {
+            ttl: Duration::from_secs(5),
+            renew_every: Duration::from_secs(1),
+            skew: Duration::from_secs(1),
+            ..cfg("late")
+        };
+        let c = lone_join(c, store).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        stalls.arm("slowland", "nodes/late");
+        c.hold_steps.store(true, Ordering::Release);
+        c.spawn(d);
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0, "fail-stopped after a slow renewal that landed");
+        assert!(c.lease_valid());
+        let puts: Vec<(Instant, Instant)> =
+            stalls.puts.lock().iter().filter(|(k, _, _)| k.ends_with("nodes/late")).map(|&(_, s, e)| (s, e)).collect();
+        let slow = puts.iter().position(|(s, e)| *e - *s >= SLOW_LAND).expect("the slow renewal");
+        let next = puts.get(slow + 1).expect("a renewal after it");
+        assert!(next.0 - puts[slow].1 < Duration::from_millis(200), "renewed {:?} after it", next.0 - puts[slow].1);
     }
 }

@@ -58,16 +58,22 @@ impl Store {
         Ok(Store { raw: Arc::new(s3), prefix: prefix.trim_end_matches('/').to_string(), latency })
     }
 
-    /// The control plane's client: its writes back off from a 1 s floor on
-    /// throttling ([`crate::throttle::ctl_write_retry`]), its reads keep the
+    /// The control plane's client: writes to node leases back off from a
+    /// floor of min(1 s, `renew_every`) on throttling
+    /// ([`crate::throttle::ctl_write_retry`]), everything else keeps the
     /// default schedule. Each half pools up to `connections`.
-    pub fn s3_ctl(cfg: &S3Config, prefix: &str, connections: usize) -> anyhow::Result<Store> {
-        let reads = Self::s3_builder(cfg, prefix, connections, false).build()?;
-        let writes = Self::s3_builder(cfg, prefix, connections, false)
-            .with_retry(crate::throttle::ctl_write_retry(rand::random()))
+    pub fn s3_ctl(cfg: &S3Config, prefix: &str, connections: usize, renew_every: Duration) -> anyhow::Result<Store> {
+        let plain = Self::s3_builder(cfg, prefix, connections, false).build()?;
+        let lease = Self::s3_builder(cfg, prefix, connections, false)
+            .with_retry(crate::throttle::ctl_write_retry(rand::random(), renew_every))
             .build()?;
-        let raw = Arc::new(crate::throttle::SplitWrites { reads: Arc::new(reads), writes: Arc::new(writes) });
-        Ok(Store { raw, prefix: prefix.trim_end_matches('/').to_string(), latency: None })
+        let prefix = prefix.trim_end_matches('/').to_string();
+        let raw = Arc::new(crate::throttle::LeaseWrites {
+            plain: Arc::new(plain),
+            lease: Arc::new(lease),
+            prefix: prefix.clone(),
+        });
+        Ok(Store { raw, prefix, latency: None })
     }
 
     fn s3_builder(cfg: &S3Config, prefix: &str, connections: usize, unsigned_payload: bool) -> AmazonS3Builder {

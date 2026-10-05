@@ -2088,6 +2088,15 @@ production default TTL of 10 s (`--lease-ttl-ms`, which warns below 10 s
 outside dev mode), and 1.2 s at the 3 s TTL the HA bench uses. A cluster-wide
 S3 brownout past the ceiling stops every node. Keep the TTL at 10 s or more.
 
+**One write a second per lease key.** R2 throttles a key past about one write a
+second. So a node's writes to its own lease are kept min(1 s, renew interval)
+apart, and a throttled one retries from that floor. A renewal right after a
+write that landed is skipped, and one that must publish `joined` or `draining`
+waits out the gap while holding the renew lock (so those flags can reach peers
+up to 1 s late, a liveness cost only). Neither happens when the validity left is
+under renew interval + gap + skew: then the renewal goes at once. Validity
+accounting and the lapse fail-stop don't change.
+
 **Control-plane reads.** Each step makes one LIST of `nodes/` and one of
 `assign/` (per 1,000 objects), plus a GET only for objects whose ETag
 changed: one per peer renewal, one per moved shard. Every 150 steps (~5 min) it

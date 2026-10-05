@@ -212,10 +212,11 @@ retries failed control-plane reads, and then it retries its first cluster step w
 keeps its usual deadline). On R2 one GET at cluster start once took over 3 s, which used to stop the
 node. Once the node serves, renewals and every other control-plane call keep their deadlines.
 
-R2 takes about one write a second to one key and answers more with 429. Leases and assignments live
-on fixed keys, so control-plane writes retry a throttled answer 1 to 4 s apart (jittered). A node's
-writes to its own lease are at least 1 s apart too. A renewal right after a write that landed is
-skipped (the next tick renews), and one that must publish a flag waits out the second. Every 429 or 503 SlowDown is counted in
+R2 takes about one write a second to one key and answers more with 429. A node renews its lease on
+one key, so those writes retry a throttled answer 1 to 4 s apart (jittered) and stay at least 1 s
+apart. A renewal right after a write that landed is skipped (the next tick renews), and one that
+must publish a flag waits out the second. A renewal whose lease is close to running out goes at
+once anyway. Every 429 or 503 SlowDown is counted in
 `vlpds_object_store_throttled_total` by kind (`lease`, `segment`, `other`), with a panel in the
 internals dashboard and the `VlpdsObjectStoreThrottled` alert.
 

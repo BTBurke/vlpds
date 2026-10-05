@@ -11417,7 +11417,7 @@
      "type": "timeseries",
      "id": 142,
      "title": "Throttled answers/s (429, 503 SlowDown)",
-     "description": "Every 429 or 503 the store answered, retries included (object_store retries them inside its client, so the request counters see only the final result). lease = node leases, assignments, writer claims and the cluster version: R2 takes about one write a second per key, and control-plane writes retry 1-4 s apart. [VlpdsObjectStoreThrottled](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorethrottled).",
+     "description": "Every 429 or 503 SlowDown the store answered, retries included (object_store retries them inside its client, so the request counters see only the final result). lease = node leases, assignments, writer claims and the cluster version (LISTs by prefix; bulk deletes count as other). R2 takes about one write a second per key, and node lease writes retry 1-4 s apart. [VlpdsObjectStoreThrottled](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorethrottled).",
      "datasource": {
       "type": "prometheus",
       "uid": "${ds_prometheus}"
