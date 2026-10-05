@@ -5525,6 +5525,9 @@ the space row, and counts a mismatch in
   doesn't resolve at consent, the screen says so and the token request
   fails, which is what the reference does. A grant that only reads or
   manages skips the lookup, since collections only name write targets.
+  A declaration whose collections aren't all NSIDs (a `*` would widen
+  the grant to every collection) or whose `key` isn't a record-key type
+  doesn't resolve, as the reference refuses it at token time.
 - `space:` scopes also take indigo's `spaceType` parameter for the type
   (`space?spaceType=…`). The reference only knows `type`.
 - The oplog keeps 7 days of ops (`--space-oplog-retention`). The reference

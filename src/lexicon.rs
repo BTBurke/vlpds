@@ -339,11 +339,23 @@ pub fn space_declaration(nsid: &str, doc: &J) -> Result<SpaceDecl, String> {
             .collect::<Result<_, _>>()?,
         Some(_) => return Err(bad(&lang_field)),
     };
+    // a bare grant takes these as its collections, so a `*` or junk here
+    // would widen it or make it unusable after consent
     let collections = main["collections"]
         .as_array()
-        .and_then(|c| c.iter().map(|v| v.as_str().map(String::from)).collect::<Option<Vec<_>>>())
+        .and_then(|c| {
+            c.iter().map(|v| v.as_str().filter(|n| syntax::valid_nsid(n)).map(String::from)).collect::<Option<Vec<_>>>()
+        })
         .ok_or_else(|| bad("collections"))?;
-    Ok(SpaceDecl { name, name_lang, description: opt_str("description")?, key: opt_str("key")?, collections })
+    let key = opt_str("key")?;
+    let key_ok = |k: &str| match k {
+        "tid" | "nsid" | "any" | "record-key" => true,
+        k => k.strip_prefix("literal:").is_some_and(syntax::valid_rkey),
+    };
+    if key.as_deref().is_some_and(|k| !key_ok(k)) {
+        return Err(bad("key"));
+    }
+    Ok(SpaceDecl { name, name_lang, description: opt_str("description")?, key, collections })
 }
 
 /// Lexicon documents compiled into an arena of defs with refs resolved to
@@ -1627,6 +1639,18 @@ mod tests {
         assert!(with(&|d| d["defs"]["main"].as_object_mut().unwrap().remove("collections").map(drop).unwrap()).is_err());
         assert!(with(&|d| d["defs"]["main"]["name:lang"] = serde_json::json!({"not a tag": "x"})).is_err());
         assert!(with(&|d| d["defs"]["main"]["key"] = 1.into()).is_err());
+        for bad in ["*", "com.example.*", "not an nsid", "", "com.example"] {
+            assert!(
+                with(&|d| d["defs"]["main"]["collections"] = serde_json::json!(["com.example.post", bad])).is_err(),
+                "{bad}"
+            );
+        }
+        for key in ["tid", "nsid", "any", "record-key", "literal:self"] {
+            assert!(with(&|d| d["defs"]["main"]["key"] = key.into()).is_ok(), "{key}");
+        }
+        for key in ["*", "uuid", "literal:", "literal:a b"] {
+            assert!(with(&|d| d["defs"]["main"]["key"] = key.into()).is_err(), "{key}");
+        }
         assert!(with(&|d| d["defs"]["main"]["type"] = "record".into()).is_err());
         let titled = with(&|d| {
             let m = d["defs"]["main"].as_object_mut().unwrap();
