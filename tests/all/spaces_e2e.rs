@@ -255,7 +255,17 @@ async fn legacy_auth_and_missing_scopes() {
         s.xrpc.post("com.atproto.space.createRecord", &write, auth).await.err(403, "InsufficientScope");
         let q = [("space", space.as_str())];
         s.xrpc.get("com.atproto.space.getDelegationToken", &q, auth).await.err(403, "InsufficientScope");
+        // nor a service token for a space method, which would carry it
+        for lxm in ["com.atproto.space.notifyWrite", "com.atproto.space.notifyCredentialRevoked"] {
+            let q = [("aud", "did:web:space.example"), ("lxm", lxm)];
+            s.xrpc.get("com.atproto.server.getServiceAuth", &q, auth).await.err(400, "InvalidRequest");
+        }
     }
+    // with --spaces off, getServiceAuth is as it was
+    let off = TestServer::spawn().await;
+    let acct = off.create_account("splo").await;
+    let q = [("aud", "did:web:space.example"), ("lxm", "com.atproto.space.notifyWrite")];
+    off.xrpc.get("com.atproto.server.getServiceAuth", &q, &Auth::Bearer(acct.access)).await.ok();
     // OAuth without the space scope
     let g = SpaceClient::new(&s, "spg", "transition:generic").await;
     let mine = format!("at://{}/space/{TYPE}/main", g.did);

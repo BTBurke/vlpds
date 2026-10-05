@@ -307,13 +307,16 @@ async fn member_list() {
     for d in dids {
         put_member(&owner, &space, d, true, true).await.ok();
     }
+    // the member's random DID sorts anywhere among them
+    let mut all: Vec<&str> = dids.iter().copied().chain([member.did.as_str()]).collect();
+    all.sort();
     let p1 = members(&owner, &space, &[("limit", "2")]).await.ok();
     let got: Vec<&str> = p1["members"].as_array().unwrap().iter().map(|m| m["did"].as_str().unwrap()).collect();
-    assert_eq!(got, &dids[..2]);
+    assert_eq!(got, &all[..2]);
     let cursor = p1["cursor"].as_str().unwrap().to_string();
     let p2 = members(&owner, &space, &[("limit", "2"), ("cursor", &cursor)]).await.ok();
     let got: Vec<&str> = p2["members"].as_array().unwrap().iter().map(|m| m["did"].as_str().unwrap()).collect();
-    assert_eq!(got, vec![dids[2], member.did.as_str()]);
+    assert_eq!(got, &all[2..]);
 
     // a credential doesn't reach the member list
     put_member(&owner, &space, &member.did, true, true).await.ok();
@@ -956,7 +959,8 @@ async fn shard_open_sends_registrations_a_catch_up() {
 
     // as a shard open does: one forward of the newest writer
     let p = s.app.partition(&owner.did).ok().expect("local partition");
-    s.app.spaces.clone().unwrap().spawn_outbox_rescan(vec![(p.id, p.db.clone())]);
+    let table = std::sync::Arc::downgrade(&s.app.partitions);
+    s.app.spaces.clone().unwrap().spawn_outbox_rescan(table, vec![(p.id, p.db.clone())], false);
     assert!(eventually(Duration::from_secs(10), || async { notifies().len() > sent }).await, "no catch-up");
     tokio::time::sleep(Duration::from_millis(200)).await;
     let all = notifies();

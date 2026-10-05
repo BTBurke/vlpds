@@ -446,18 +446,14 @@ pub async fn did_key(s: &TestServer, did: &str) -> String {
     format!("did:key:{}", vm["publicKeyMultibase"].as_str().unwrap())
 }
 
-/// A service JWT signed by the actor's account key (getServiceAuth on its
-/// own PDS, over its password session: a public method).
+/// A service JWT signed by the actor's account key, as its PDS's outbox
+/// signs one (getServiceAuth won't mint a space method's for a password
+/// session).
 pub async fn service_jwt(actor: &SpaceClient, aud: &str, lxm: &str) -> String {
-    let x = Xrpc::new(&actor.srv.base);
-    let r = x
-        .get(
-            "com.atproto.server.getServiceAuth",
-            &[("aud", aud), ("lxm", lxm)],
-            &Auth::Bearer(actor.session_jwt.clone()),
-        )
-        .await;
-    r.ok()["token"].as_str().unwrap().to_string()
+    let app = &actor.srv.app;
+    let acct = app.account(&actor.did).await.ok().expect("account");
+    let key = app.secrets.account_signing_key(&acct).await.unwrap();
+    vlpds::auth::service_auth_jwt(&key, &actor.did, aud, Some(lxm), 60).unwrap()
 }
 
 /// POST `nsid` at `base` with a service JWT.

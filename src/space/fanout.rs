@@ -4,9 +4,12 @@
 //! path; a service that misses one catches up with listRepos.
 //!
 //! Jobs leave the authority's worker in ack order (so spaceRev order) for
-//! one dispatcher, which reads the space's registrations and hands each
-//! (space, service) its own lane. A lane sends one at a time, so a service
-//! sees a space's spaceRevs in order, and a slow one holds up only itself.
+//! a dispatcher (one of [`DISPATCHERS`], by space, so a space's jobs stay in
+//! order and one big space holds up only its share), which reads the
+//! space's registrations and hands each (space, service) its own lane. A
+//! lane sends one at a time, so a service sees a space's spaceRevs in
+//! order, and a slow one holds up only itself. A taken-down space forwards
+//! nothing.
 //!
 //! Only a writer's newest state is worth sending: a forward waiting in a
 //! lane is replaced by a newer one of the same writer, and a failed one is
@@ -17,9 +20,11 @@
 //! leave one: the next send names its true predecessor, and the service
 //! goes to listRepos.
 //!
-//! Bounds: the dispatcher's queue, each lane, and each service host's
-//! queued forwards across its lanes (all drop the oldest and count it), and
-//! a host's sends in flight. Sends go over their own pooled guarded client.
+//! Bounds: the dispatchers' queues, each lane, and each service host's
+//! queued forwards across its lanes (all drop the oldest and count it), a
+//! host's sends in flight and all sends in flight. Registrations per space
+//! are capped where they're made. Sends go over their own pooled guarded
+//! client.
 
 use super::host::Forward;
 use super::repo::Sequenced;
@@ -29,8 +34,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-/// Jobs waiting for the dispatcher.
+/// Jobs waiting for each dispatcher.
 pub const QUEUE: usize = 4096;
+pub const DISPATCHERS: usize = 8;
+/// Sends in flight to all hosts.
+pub const SENDS: usize = 512;
 /// Forwards waiting in one (space, service) lane: one per writer.
 pub const LANE: usize = 256;
 /// Forwards waiting across one service host's lanes.
@@ -101,6 +109,13 @@ impl State {
             .or_insert_with(|| Host { queued: 0, sends: Arc::new(tokio::sync::Semaphore::new(HOST_SENDS)) })
     }
 
+    /// Drops `host`'s entry if nothing of it is queued or in flight.
+    fn unhost(&mut self, host: &str) {
+        if self.hosts.get(host).is_some_and(|h| h.queued == 0 && Arc::strong_count(&h.sends) == 1) {
+            self.hosts.remove(host);
+        }
+    }
+
     fn unqueued(&mut self, host: &str) {
         crate::metrics::space_fanout_depth(-1);
         if let Some(h) = self.hosts.get_mut(host) {
@@ -121,8 +136,9 @@ enum Sent {
 }
 
 pub struct Fanout {
-    tx: tokio::sync::mpsc::Sender<Job>,
-    rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<Job>>>,
+    tx: Vec<tokio::sync::mpsc::Sender<Job>>,
+    rx: parking_lot::Mutex<Option<Vec<tokio::sync::mpsc::Receiver<Job>>>>,
+    sends: Arc<tokio::sync::Semaphore>,
     state: parking_lot::Mutex<State>,
     /// Expired registrations being pruned.
     pruning: parking_lot::Mutex<HashSet<(Arc<str>, String)>>,
@@ -146,10 +162,11 @@ fn backoff(base: Duration, attempts: u32) -> Duration {
 
 impl Fanout {
     pub fn new(queue: usize, retry_base: Duration) -> Fanout {
-        let (tx, rx) = tokio::sync::mpsc::channel(queue);
+        let (tx, rx) = (0..DISPATCHERS).map(|_| tokio::sync::mpsc::channel(queue)).unzip();
         Fanout {
             tx,
             rx: parking_lot::Mutex::new(Some(rx)),
+            sends: Arc::new(tokio::sync::Semaphore::new(SENDS)),
             state: Default::default(),
             pruning: Default::default(),
             retry_base,
@@ -160,7 +177,8 @@ impl Fanout {
     /// up as a gap in its lanes (the next forward's prevSpaceRev isn't the
     /// last one they were handed).
     pub fn notify(&self, job: Job) {
-        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = self.tx.try_send(job) {
+        let tx = &self.tx[job.sid[0] as usize % self.tx.len()];
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) = tx.try_send(job) {
             crate::metrics::space_fanout_dropped("queue_full");
         }
     }
@@ -168,11 +186,29 @@ impl Fanout {
     /// Starts the dispatcher (once). `app` is held weakly: it ends with the
     /// server.
     pub fn start(self: &Arc<Self>, app: Weak<crate::xrpc::App>) {
-        let Some(mut rx) = self.rx.lock().take() else { return };
-        let me = self.clone();
+        let Some(rxs) = self.rx.lock().take() else { return };
+        for rx in rxs {
+            self.clone().dispatch(app.clone(), rx);
+        }
+    }
+
+    fn dispatch(self: Arc<Self>, app: Weak<crate::xrpc::App>, mut rx: tokio::sync::mpsc::Receiver<Job>) {
+        let me = self;
         tokio::spawn(async move {
             while let Some(job) = rx.recv().await {
                 let Some(a) = app.upgrade() else { return };
+                match crate::xrpc::space::space_sid_takendown(&a, &job.authority, &job.sid).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        crate::metrics::space_fanout_dropped("takendown");
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(space = %hex::encode(job.sid), "space takedown unreadable: {}", e.message);
+                        crate::metrics::space_notify("fanout", "error");
+                        continue;
+                    }
+                }
                 let (regs, expired) = match super::host::registrations(&a, &job.authority, &job.sid).await {
                     Ok(r) => r,
                     Err(e) => {
@@ -206,7 +242,7 @@ impl Fanout {
 
     /// Deletes an expired registration of `uri` in the background (one
     /// prune per registration at a time), unless it was renewed meanwhile.
-    fn prune(self: &Arc<Self>, app: &Arc<crate::xrpc::App>, uri: &Arc<str>, service: String) {
+    pub fn prune(self: &Arc<Self>, app: &Arc<crate::xrpc::App>, uri: &Arc<str>, service: String) {
         if !self.pruning.lock().insert((uri.clone(), service.clone())) {
             return;
         }
@@ -242,7 +278,14 @@ impl Fanout {
         if lane.queue.len() >= LANE || host_full {
             crate::metrics::space_fanout_dropped(if host_full { "host_full" } else { "lane_full" });
             let Some(old) = lane.queue.pop_front() else {
-                lane.gap_next = true;
+                // an idle lane keeps nothing worth holding: its next push
+                // starts from the forward's own prevSpaceRev anyway
+                if !lane.running {
+                    st.lanes.remove(&key);
+                    st.unhost(&host);
+                } else {
+                    lane.gap_next = true;
+                }
                 return;
             };
             lane.mark_gap();
@@ -283,7 +326,8 @@ impl Fanout {
             let sent = loop {
                 let Some(a) = app.upgrade() else { return };
                 let result = {
-                    let _send = sends.acquire().await;
+                    let _host = sends.acquire().await;
+                    let _all = self.sends.acquire().await;
                     super::host::forward(&a, &q.f, prev).await
                 };
                 crate::metrics::space_notify("fanout", result);

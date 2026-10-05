@@ -404,15 +404,40 @@ pub fn space_routes() -> Router<Arc<App>> {
 struct SpaceQ {
     did: String,
     space: String,
+    reason: Option<String>,
+    actor: Option<String>,
 }
 
 /// check-space from one snapshot taken under the apply lock, as checkRepo's.
-async fn check_space(State(app): AppState, Auth(creds): Auth, Query(q): Query<SpaceQ>) -> XResult<Json<J>> {
+/// Its report names record paths and the head, so it's an operator read of
+/// space data: audited first, as vlpds.admin.getSpaceRepo is.
+async fn check_space(
+    State(app): AppState,
+    Auth(creds): Auth,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    Query(q): Query<SpaceQ>,
+) -> XResult<Json<J>> {
     use crate::space::check;
     require_admin(&creds)?;
     if check::authority(&q.space).is_none() {
         return Err(invalid(format!("not a space URI: {}", q.space)));
     }
+    let who = super::moderation::Who {
+        actor: q
+            .actor
+            .as_deref()
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .unwrap_or("admin")
+            .chars()
+            .take(64)
+            .collect(),
+        ip: ip.map(|i| i.to_string()),
+    };
+    let subject = super::moderation::SubjectRef::space_repo(&q.space, &q.did);
+    let reason = q.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    let detail = json!({"space": q.space, "repo": q.did, "method": "checkSpace"});
+    super::moderation::audit(&app, &who, "space.read", Some(&subject), reason, None, Some(detail)).await?;
     let p = app.partition(&q.did)?;
     let snap = {
         let _g = p.apply_lock.read().await;

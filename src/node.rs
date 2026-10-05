@@ -338,7 +338,8 @@ impl ShardHost for Node {
             "shards opened"
         );
         if let Some(s) = &self.spaces {
-            s.clone().spawn_outbox_rescan(preload.iter().map(|(shard, db, _)| (*shard, db.clone())).collect());
+            let shards = preload.iter().map(|(shard, db, _)| (*shard, db.clone())).collect();
+            s.clone().spawn_outbox_rescan(Arc::downgrade(&self.table), shards, false);
         }
         crate::worker::spawn_preload(&self.workers, preload);
         results

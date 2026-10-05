@@ -80,7 +80,12 @@ pub struct Spaces {
     /// (account, space) -> the importRepo staging it on this node. Not
     /// with the worker's state, which can be evicted mid-import.
     imports: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), u64>>,
+    /// registerNotify's count-and-write, per space (striped).
+    registering: [tokio::sync::Mutex<()>; 64],
 }
+
+const RESCAN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+const RESCAN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn now_secs() -> i64 {
     crate::tid::now_micros() as i64 / 1_000_000
@@ -93,6 +98,7 @@ impl Spaces {
             peer_notifies: Default::default(),
             cache_fills: Default::default(),
             imports: Default::default(),
+            registering: std::array::from_fn(|_| Default::default()),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
             fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE, fanout::RETRY_BASE)),
@@ -109,12 +115,28 @@ impl Spaces {
         Ok(())
     }
 
-    /// Revokes `jtis` of `space` cluster-wide (durable on return; peers
-    /// learn of it by a nudge or their next re-read).
-    pub async fn revoke(&self, store: &crate::store::Store, space: &str, jtis: &[String]) -> anyhow::Result<()> {
-        let added = self.revocations.revoke(store, space, jtis, now_secs()).await?;
-        self.credentials.invalidate(&added);
-        Ok(())
+    /// Revokes `jtis` of `space` cluster-wide (durable on Ok(Ok); peers
+    /// learn of it by a nudge or their next re-read). One that can't be
+    /// stored blocks the space here instead. Ok(Ok(true)): the object was
+    /// written.
+    pub async fn revoke(
+        &self,
+        store: &crate::store::Store,
+        space: &str,
+        jtis: &[String],
+        staked: bool,
+    ) -> anyhow::Result<Result<bool, revocations::Refused>> {
+        let now = now_secs();
+        match self.revocations.revoke(store, space, jtis, staked, now).await? {
+            Ok(r) => {
+                self.credentials.invalidate(&r.added);
+                Ok(Ok(r.wrote))
+            }
+            Err(refused) => {
+                self.revocations.block(space, now);
+                Ok(Err(refused))
+            }
+        }
     }
 
     /// Loads the revocations (credential reads answer 503 until a load
@@ -147,6 +169,10 @@ impl Spaces {
                 };
             }
         });
+    }
+
+    pub async fn registering(&self, sid: &crate::state::SpaceId) -> tokio::sync::MutexGuard<'_, ()> {
+        self.registering[sid[0] as usize % self.registering.len()].lock().await
     }
 
     /// Claims (did, sid) for import `nonce`; false if another holds it.
@@ -184,25 +210,53 @@ impl Spaces {
     }
 
     /// Enqueues the `sP` rows of shards just opened (a start, a takeover, a
-    /// handback, a split's children): notifies this node now owes. In the
-    /// background; a row found twice is enqueued once.
-    pub fn spawn_outbox_rescan(self: Arc<Self>, shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>)>) {
+    /// handback, a split's children; with `overflow`, the owned shards
+    /// again for rows the full outbox left behind): notifies this node now
+    /// owes. In the background, each shard retried with backoff until it
+    /// scans or isn't this node's any more, since nothing else would ever
+    /// send its rows; a row found twice is enqueued once.
+    pub fn spawn_outbox_rescan(
+        self: Arc<Self>,
+        table: std::sync::Weak<crate::partitions::PartitionTable>,
+        shards: Vec<(crate::slots::ShardId, Arc<slatedb::Db>)>,
+        overflow: bool,
+    ) {
         if shards.is_empty() {
             return;
         }
+        let owned = move |shard: crate::slots::ShardId, db: &Arc<slatedb::Db>| {
+            table.upgrade().and_then(|t| t.get(shard)).is_some_and(|p| Arc::ptr_eq(&p.db, db))
+        };
         tokio::spawn(async move {
             for (shard, db) in shards {
-                match self.rescan_outbox(&db).await {
-                    Ok(n) if n > 0 => tracing::info!(shard = shard.0, rows = n, "space notify outbox resumed"),
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(shard = shard.0, "space notify outbox rescan failed: {e:#}"),
-                }
-                match self.catch_up_registrations(&db).await {
-                    Ok(n) if n > 0 => {
-                        tracing::info!(shard = shard.0, spaces = n, "space syncers sent a catch-up notify")
+                let mut wait = RESCAN_RETRY;
+                loop {
+                    let r = self.rescan_outbox(&db).await;
+                    let r = match r {
+                        Ok(n) if overflow => Ok((n, 0)),
+                        Ok(n) => self.catch_up_registrations(&db).await.map(|c| (n, c)),
+                        Err(e) => Err(e),
+                    };
+                    match r {
+                        Ok((n, c)) => {
+                            if n > 0 {
+                                tracing::info!(shard = shard.0, rows = n, "space notify outbox resumed");
+                            }
+                            if c > 0 {
+                                tracing::info!(shard = shard.0, spaces = c, "space syncers sent a catch-up notify");
+                            }
+                            break;
+                        }
+                        Err(e) if owned(shard, &db) => {
+                            tracing::warn!(shard = shard.0, "space notify outbox rescan failed (retrying): {e:#}");
+                            tokio::time::sleep(wait).await;
+                            wait = (wait * 2).min(RESCAN_RETRY_MAX);
+                        }
+                        Err(e) => {
+                            tracing::info!(shard = shard.0, "space notify outbox rescan stopped (shard gone): {e:#}");
+                            break;
+                        }
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!(shard = shard.0, "space syncer catch-up failed: {e:#}"),
                 }
             }
         });
@@ -260,16 +314,23 @@ impl Spaces {
         Ok(sent)
     }
 
+    /// A row that doesn't decode is skipped (and logged), not the shard.
     async fn rescan_outbox(&self, db: &slatedb::Db) -> anyhow::Result<usize> {
         let opts = slatedb::config::ScanOptions::default();
         let mut scan = crate::state::FamilyScan::new(db, crate::state::SPACE_OUTBOX_FAMILY, None, &opts).await?;
-        let mut n = 0;
+        let (mut n, mut bad) = (0, 0);
         while let Some(kv) = scan.next().await? {
             let Some((did, sid)) = rows::did_sid(&kv.key) else { continue };
-            let row = rows::OutboxRow::decode(&kv.value)?;
-            anyhow::ensure!(crate::state::space_id(&row.uri) == sid, "outbox row of {did} names another space");
-            self.outbox.enqueue(did, sid, &row.uri, row.repo_rev, row.hash, false);
-            n += 1;
+            match rows::OutboxRow::decode(&kv.value) {
+                Ok(row) if crate::state::space_id(&row.uri) == sid => {
+                    self.outbox.enqueue(did, sid, &row.uri, row.repo_rev, row.hash, false);
+                    n += 1;
+                }
+                _ => bad += 1,
+            }
+        }
+        if bad > 0 {
+            tracing::warn!(bad, "space notify outbox rows skipped: undecodable or naming another space");
         }
         Ok(n)
     }

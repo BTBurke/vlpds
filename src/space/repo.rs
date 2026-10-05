@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 pub const MAX_WRITES: usize = 200;
 
+#[derive(Clone, Debug)]
 pub enum SpaceWrite {
     Create {
         collection: String,
@@ -123,9 +124,13 @@ pub enum SpaceOp {
         service: String,
     },
     /// vlpds.space.importRepo: claims the space for an import (`nonce`),
-    /// the account having no repo there; its writes there wait it out.
+    /// the account having no records there; its writes there wait it out.
+    /// An empty repo's head goes (the import's `rev` must be newer), so
+    /// what's staged is never served until the commit. With `rev` None,
+    /// only a repo with no head is claimed: to clear rows left under it.
     ImportBegin {
         nonce: u64,
+        rev: Option<Tid>,
     },
     /// The imported records are durable in `sR`: the head goes in, at the
     /// imported rev, with an empty oplog.
@@ -197,6 +202,9 @@ pub enum SpaceError {
     SpaceDeleted,
     SpaceAlreadyExists,
     NotAuthorized(String),
+    /// The repo has no head but rows of it remain (an import or a sweep
+    /// stopped part way): they're cleared before the write, handed back.
+    Unswept(Vec<SpaceWrite>),
 }
 
 impl From<WriteError> for SpaceError {
@@ -243,6 +251,8 @@ pub struct SpaceHead {
     overlay: HashMap<String, (Option<PathRec>, Arc<AtomicBool>)>,
     /// Read from `sR` for the requests about to run.
     fetched: HashMap<String, Option<PathRec>>,
+    /// No head, yet rows under it: see [`SpaceError::Unswept`].
+    unswept: bool,
 }
 
 impl SpaceHead {
@@ -251,7 +261,7 @@ impl SpaceHead {
             Some(r) => (Some(r.rev), r.hash, r.records, r.created),
             None => (None, LtHash::default(), 0, 0),
         };
-        SpaceHead { uri, rev, hash, records, created, overlay: HashMap::new(), fetched: HashMap::new() }
+        SpaceHead { uri, rev, hash, records, created, overlay: HashMap::new(), fetched: HashMap::new(), unswept: false }
     }
 
     fn known(&self, path: &str) -> Option<&Option<PathRec>> {
@@ -419,6 +429,8 @@ fn authority(uri: &str) -> Option<&str> {
 #[derive(Default)]
 pub struct Fetched {
     heads: Vec<(SpaceId, Arc<str>, Option<HeadRow>)>,
+    /// Heads not found that have rows under them.
+    unswept: Vec<SpaceId>,
     paths: Vec<(SpaceId, String, Option<PathRec>)>,
     hosts: Vec<(SpaceId, Arc<str>, Option<SpaceRow>, Option<Tid>)>,
     writers: Vec<(SpaceId, String, Option<WriterRow>)>,
@@ -434,6 +446,16 @@ pub async fn fetch(db: &slatedb::Db, did: &str, need: SpaceNeed) -> anyhow::Resu
         let row = get(state::space_head_key(did, &sid)).await?.map(|v| HeadRow::decode(&v)).transpose()?;
         if let Some(r) = &row {
             anyhow::ensure!(*r.uri == *uri, "space id collision: {} and {uri}", r.uri);
+        }
+        // only a repo's first write (or import) gets here without a head
+        if row.is_none() {
+            for fam in [state::SPACE_RECORD_FAMILY, state::SPACE_BLOB_FAMILY, state::SPACE_OPLOG_FAMILY] {
+                let prefix = state::space_prefix(fam, did, &sid);
+                if db.scan(prefix.clone()..state::prefix_end(&prefix)).await?.next().await?.is_some() {
+                    f.unswept.push(sid);
+                    break;
+                }
+            }
         }
         f.heads.push((sid, uri, row));
     }
@@ -470,6 +492,11 @@ pub async fn fetch(db: &slatedb::Db, did: &str, need: SpaceNeed) -> anyhow::Resu
 pub fn install(st: &mut SpaceStates, f: Fetched) {
     for (sid, uri, row) in f.heads {
         st.repos.entry(sid).or_insert_with(|| SpaceHead::new(uri, row));
+    }
+    for sid in f.unswept {
+        if let Some(h) = st.repos.get_mut(&sid).filter(|h| h.rev.is_none()) {
+            h.unswept = true;
+        }
     }
     for (sid, path, rec) in f.paths {
         if let Some(h) = st.repos.get_mut(&sid) {
@@ -542,6 +569,9 @@ pub fn write(
     let head = st.repos.get_mut(&sid).ok_or_else(|| internal("space head not loaded"))?;
     if *head.uri != **uri {
         return Err(internal(format!("space id collision: {} and {uri}", head.uri)));
+    }
+    if head.rev.is_none() && head.unswept {
+        return Err(SpaceError::Unswept(writes));
     }
     let mut batch: HashMap<String, Option<PathRec>> = HashMap::new();
     // the blobs each path named before the batch
@@ -769,18 +799,49 @@ pub fn record_writer(
     Ok(sequence(host, authority, sid, writer, repo_rev, hash, clock_id, &mut muts)?.map(|s| (muts, s)))
 }
 
-/// importRepo's claim: only into a space the account holds no repo in.
-pub fn import_begin(st: &SpaceStates, sid: SpaceId, uri: &str) -> Result<(), SpaceError> {
-    let head = st.repos.get(&sid).ok_or_else(|| internal("space head not loaded"))?;
+fn importable(head: &SpaceHead, uri: &str, rev: Option<Tid>) -> Result<(), SpaceError> {
+    let invalid = |m: &str| Err(SpaceError::Write(WriteError::Invalid(m.into())));
     if *head.uri != *uri {
         return Err(internal(format!("space id collision: {} and {uri}", head.uri)));
     }
-    if head.rev.is_some() {
-        return Err(SpaceError::Write(WriteError::Invalid(
-            "this account already has a repo in the space; delete its records first".into(),
-        )));
+    if head.records > 0 {
+        return invalid("this account already has records in the space; delete them first");
     }
-    Ok(())
+    match (head.rev, rev) {
+        (None, _) => Ok(()),
+        (Some(_), None) => invalid("this account has a repo in the space"),
+        // the authority ignores a notify whose rev isn't newer than the last
+        (Some(old), Some(rev)) if rev <= old => {
+            invalid("the imported commit's rev must be newer than the repo's in the space")
+        }
+        (Some(_), Some(_)) => Ok(()),
+    }
+}
+
+/// importRepo's claim: only into a space the account holds no records in.
+/// Some(the head's delete) when an empty repo's head goes.
+pub fn import_begin(
+    st: &mut SpaceStates,
+    did: &str,
+    sid: SpaceId,
+    uri: &str,
+    rev: Option<Tid>,
+) -> Result<Option<Mutation>, SpaceError> {
+    let head = st.repos.get_mut(&sid).ok_or_else(|| internal("space head not loaded"))?;
+    importable(head, uri, rev)?;
+    if head.rev.is_none() {
+        // what's staged lands under it: the next op reads it again (and
+        // looks for leftovers), whether the import commits or stops. With no
+        // rev, nothing of the repo is in flight.
+        st.repos.remove(&sid);
+        return Ok(None);
+    }
+    // its oplog is still there, and the head's delete is in flight: a write
+    // after a failed import clears what's left before it lands
+    let mut empty = SpaceHead::new(head.uri.clone(), None);
+    empty.unswept = true;
+    *head = empty;
+    Ok(Some(del(state::space_head_key(did, &sid))))
 }
 
 /// importRepo's head: the `sH` row at the imported rev, and the notify the
@@ -797,7 +858,7 @@ pub fn import_commit(
     records: u64,
     clock_id: u64,
 ) -> Result<BuiltWrite, SpaceError> {
-    import_begin(st, sid, uri)?;
+    importable(st.repos.get(&sid).ok_or_else(|| internal("space head not loaded"))?, uri, Some(rev))?;
     let created = 0;
     let mut head = SpaceHead::new(uri.clone(), None);
     (head.rev, head.hash, head.records, head.created) = (Some(rev), hash.clone(), records, created);
@@ -1201,6 +1262,41 @@ mod tests {
     /// Members, writers and the sequence of a deleted space never carry
     /// over into its re-creation, and the authority can't write to it in
     /// between.
+    #[test]
+    fn unswept_rows_and_import_claims() {
+        let did = "did:plc:writer";
+        // a head fetched with rows under it refuses a write, handing it back
+        let uri: Arc<str> = URI.into();
+        let sid = state::space_id(URI);
+        let mut st = SpaceStates::default();
+        let mut f = Fetched::default();
+        f.heads.push((sid, uri.clone(), None));
+        f.paths.push((sid, "com.example.post/a".into(), None));
+        f.unswept.push(sid);
+        install(&mut st, f);
+        match go(&mut st, sid, &uri, vec![create("a", 1)]) {
+            Err(SpaceError::Unswept(w)) => assert_eq!(w.len(), 1),
+            r => panic!("{:?}", r.err()),
+        }
+        // a headless repo is claimed and read again afterwards
+        assert!(import_begin(&mut st, did, sid, URI, None).unwrap().is_none());
+        assert!(!st.repos.contains_key(&sid));
+
+        let (mut st, sid, uri) = states_with(&[("com.example.post/a", None)]);
+        go(&mut st, sid, &uri, vec![create("a", 1)]).unwrap();
+        let invalid =
+            |r: Result<Option<Mutation>, SpaceError>| matches!(r, Err(SpaceError::Write(WriteError::Invalid(_))));
+        assert!(invalid(import_begin(&mut st, did, sid, URI, Some(Tid(u64::MAX >> 2)))), "it holds records");
+        let del = SpaceWrite::Delete { collection: "com.example.post".into(), rkey: "a".into(), must_exist: true };
+        let gone = go(&mut st, sid, &uri, vec![del]).unwrap().rev;
+        assert!(invalid(import_begin(&mut st, did, sid, URI, None)), "a sweep never takes a head");
+        assert!(invalid(import_begin(&mut st, did, sid, URI, Some(gone))), "the import's rev must be newer");
+        // an empty repo's head goes, and what's held is headless and unswept
+        let m = import_begin(&mut st, did, sid, URI, Some(Tid(gone.0 + (1 << 20)))).unwrap().unwrap();
+        assert_eq!((m.key.to_vec(), m.val), (state::space_head_key(did, &sid), None));
+        assert!(st.repos[&sid].rev.is_none() && st.repos[&sid].unswept);
+    }
+
     #[test]
     fn delete_and_recreate() {
         let auth = "did:plc:auth";

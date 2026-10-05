@@ -882,17 +882,21 @@ Two things change how a case is ported, so they aren't repeated on every row:
 Divergences, also in DESIGN.md's Spaces section:
 
 - **OAuth-only.** Space data needs an OAuth `space:` grant. App passwords (privileged or not) and password sessions get no space
-  read, write or delegation token. The reference lets both write and read the account's own repo.
+  read, write or delegation token, nor a `getServiceAuth` token for a `com.atproto.space.*` or `com.atproto.simplespace.*`
+  method. The reference lets both write and read the account's own repo.
 - **The durable `sP` outbox replaces the lease-elected retry worker.** A notify's row is written in the write's own log entry,
   sent single-flight per repo and space, retried in memory, and rescanned by whichever node opens the shard. So the reference's
   lease-election and "persists failures before the request" cases become outbox cases (a restart or takeover resends the
   newest rev), and the cases about its retry table, backoff timing and deadline are left to the outbox's own tests.
 - **300 s single-use token cap.** Delegation tokens and client attestations live at most 300 s. The reference takes any lifetime.
 - **sync.getBlob needs a public reference, with `--spaces` on.** That's the reference's rule. With the flag off vlpds keeps
-  serving an uploaded blob before anything references it.
+  serving an uploaded blob before anything references it, except one that only space records name.
 - **Oplog retention.** vlpds keeps 7 days of oplog. A `since` older than that gets ops from the window start, the replay doesn't
   match the commit, and the syncer falls back to getRepo or listRecords (the spec treats the oplog as droppable). The
   reference never prunes.
+- **Bounded revocations and registrations.** Revocations are one cluster-wide object every node reads, so `jti`s are capped at
+  128 characters (a longer credential is refused), live entries per authority and in all are capped, and one that can't be
+  stored blocks its space's credentials. A space holds at most 256 notify registrations. The reference bounds neither.
 
 | | Cases |
 |---|---:|

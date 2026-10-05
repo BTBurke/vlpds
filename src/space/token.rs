@@ -168,6 +168,10 @@ pub fn parse(ty: TokenType, jwt: &str) -> Result<SpaceToken, TokenError> {
         return Err(err("BadJwtCnf", "missing token \"cnf.kid\""));
     }
     let jti = s(&p, "jti").filter(|v| !v.is_empty()).ok_or_else(|| err("BadJwt", "a token requires a \"jti\""))?;
+    // a credential's jti must be one a revocation can name
+    if !super::revocations::valid_jti(&jti) {
+        return Err(err("BadJwt", "a token's \"jti\" must be at most 128 printable ASCII characters"));
+    }
     let iat = finite(p.get("iat"));
     if ty == TokenType::Credential && !iat.is_some_and(|iat| exp > iat && exp - iat <= CREDENTIAL_MAX_AGE_SECS as f64) {
         return Err(err("BadJwt", "invalid space credential lifetime"));

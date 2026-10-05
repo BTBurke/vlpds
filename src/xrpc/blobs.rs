@@ -314,7 +314,16 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
     }
     // Spaces: the reference rule (`hasRecordsForBlob`). Serving an upload
     // before a public record names it would serve one a space record names.
-    if app.config.spaces && !publicly_referenced(&app, &q.did, &cid.to_string()).await? {
+    // Space refs outlive the flag (the blob GC keeps their blobs), so a blob
+    // only space records name stays private with it off too.
+    let cid_s = cid.to_string();
+    if app.config.spaces && !publicly_referenced(&app, &q.did, &cid_s).await? {
+        return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
+    }
+    if !app.config.spaces
+        && space_referenced(&app, &q.did, &cid_s).await?
+        && !publicly_referenced(&app, &q.did, &cid_s).await?
+    {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
     let r = match app.store.raw.get(&blob_path(&app, &q.did, cid)).await {
@@ -370,6 +379,14 @@ async fn publicly_referenced(app: &App, did: &str, cid: &str) -> XResult<bool> {
         }
         gen = now;
     }
+}
+
+/// Whether a space record of `did` names `cid` (an `sc/` row).
+async fn space_referenced(app: &App, did: &str, cid: &str) -> XResult<bool> {
+    let p = app.partition(did)?;
+    let prefix = state::space_blob_cid_prefix(did, cid);
+    let mut iter = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await.map_err(XrpcError::from_err)?;
+    Ok(iter.next().await.map_err(XrpcError::from_err)?.is_some())
 }
 
 /// Distinct (cid, one referencing record path) of `did`, in CID order after

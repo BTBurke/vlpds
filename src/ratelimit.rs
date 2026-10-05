@@ -379,7 +379,15 @@ limit!(
     300
 );
 limit!(SPACE_NOTIFY_IN, 40, "space-notify-in", Did, "space.notifyWrite received, per writer", 5 * MINUTE, 1000);
-limit!(SPACE_REVOKE, 41, "space-revoke", Did, "space.notifyCredentialRevoked received, per space authority", HOUR, 100);
+limit!(
+    SPACE_REVOKE,
+    41,
+    "space-revoke",
+    Did,
+    "credentials newly revoked by space.notifyCredentialRevoked, per space authority",
+    HOUR,
+    1000
+);
 
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 

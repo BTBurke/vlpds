@@ -760,8 +760,8 @@ async fn check_space_credential(app: &App, headers: &HeaderMap) -> XResult<Crede
     let Some(sp) = app.spaces.as_ref() else {
         return Err(space_auth_err("MissingJwt", "missing space credential"));
     };
-    if !sp.revocations.loaded() {
-        return Err(XrpcError::unavailable("Unavailable", "space credential revocations are not loaded yet; retry"));
+    if !sp.revocations.fresh() {
+        return Err(XrpcError::unavailable("Unavailable", "space credential revocations are not loaded; retry"));
     }
     let now = crate::tid::now_micros() as i64 / 1_000_000;
     let key = crate::space::credcache::key(tok);
@@ -794,6 +794,9 @@ async fn check_space_credential(app: &App, headers: &HeaderMap) -> XResult<Crede
     crate::space::httpsig::verify(headers, Some(&v.cnf_kid)).map_err(sig_err)?;
     if sp.revocations.is_revoked(&v.space, &v.jti, now) {
         return Err(space_auth_err("CredentialRevoked", "space credential has been revoked"));
+    }
+    if sp.revocations.is_blocked(&v.space, now) {
+        return Err(XrpcError::unavailable("Unavailable", "this space's credentials are refused for now; retry later"));
     }
     Ok(Credentials::SpaceCredential {
         space: v.space.clone(),

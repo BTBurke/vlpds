@@ -24,7 +24,7 @@ use super::*;
 use crate::oauth::scopes::SpaceAccess;
 use crate::space::commit::{self, CommitCtx, SignedCommit};
 use crate::space::lthash::LtHash;
-use crate::space::repo::{SpaceAck, SpaceOp};
+use crate::space::repo::{SpaceAck, SpaceError, SpaceOp};
 use crate::tid::Tid;
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -224,8 +224,9 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
         return Err(inactive_account_error(&st));
     }
     // before reading the body (the worker checks again)
-    if super::space::load_head(sp, &*app.partition(&did)?, &did, &space).await?.is_some() {
-        return Err(invalid("this account already has a repo in the space; delete its records first"));
+    let held = super::space::load_head(sp, &*app.partition(&did)?, &did, &space).await?;
+    if held.as_ref().is_some_and(|h| h.records > 0) {
+        return Err(invalid("this account already has records in the space; delete them first"));
     }
     let mut car = CarReader::new(body, app.config.max_import_bytes);
     let header = car.section().await?.ok_or_else(|| invalid("invalid CAR: empty"))?;
@@ -254,6 +255,14 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     }
     drop(collections);
     let rev = Tid::parse(&commit.rev).ok_or_else(|| invalid("commit.rev must be a TID"))?;
+    // every later write's rev follows it, and an authority refuses a
+    // notify this far ahead (FutureRev), so the account would go unheard
+    if rev.micros() > crate::tid::now_micros() + super::space::FUTURE_REV.as_micros() as u64 {
+        return Err(bad("FutureRev", "The commit's rev is in the future"));
+    }
+    if held.is_some_and(|h| rev <= h.rev) {
+        return Err(invalid("the imported commit's rev must be newer than the repo's in the space"));
+    }
     let ctx = CommitCtx { space: &space.uri, author: &did, rev: &commit.rev };
     if !commit::verify(&commit, &ctx, &current_key(app, &did).await?) {
         return Err(bad("InvalidCommit", "The commit's signature or MAC does not verify against the account's key"));
@@ -268,11 +277,41 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     }
 
     let nonce = rand::random::<u64>();
-    submit_space(app, &did, &space, SpaceOp::ImportBegin { nonce }).await?;
     let _claim = Claim { sp, did: &did, sid: space.sid, nonce };
+    submit_space(app, &did, &space, SpaceOp::ImportBegin { nonce, rev: Some(rev) }).await?;
     let p = app.partition(&did)?;
     clear_unheaded(&p, &did, &space).await?;
+    let staged = stage(&p, &did, &space, &mut car, index, rev).await;
+    let records = match staged {
+        Ok(n) => n,
+        Err(e) => {
+            // rows staged with no head over them are never served, but
+            // they'd hold blobs and slow the repo's first write (which
+            // clears them) until then
+            if let Err(c) = clear_unheaded(&p, &did, &space).await {
+                tracing::warn!(space = hex::encode(space.sid), "a failed import's rows not cleared: {}", c.message);
+            }
+            return Err(e);
+        }
+    };
+    let op = SpaceOp::ImportCommit { nonce, rev, hash: Box::new(set), records };
+    match submit_space(app, &did, &space, op).await? {
+        SpaceAck::Write { .. } => {}
+        _ => return Err(XrpcError::internal("unexpected space ack")),
+    }
+    Ok(Json(json!({"rev": rev.to_string(), "records": records})))
+}
 
+/// Writes the CAR's records (and their blob refs) as rows with no head
+/// over them yet; Ok(the record count).
+async fn stage(
+    p: &crate::partition::Partition,
+    did: &str,
+    space: &Space,
+    car: &mut CarReader,
+    index: Vec<(String, Cid)>,
+    rev: Tid,
+) -> XResult<u64> {
     // CID -> the index's paths naming it, not yet seen
     let mut want: HashMap<Cid, Vec<String>> = HashMap::with_capacity(index.len());
     for (path, cid) in index.iter() {
@@ -288,16 +327,16 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
         let Some(paths) = want.remove(&cid) else { continue };
         let blobs = imported_record_blobs(&paths[0], &b)?;
         for path in paths {
-            muts.push(put(state::space_record_key(&did, &space.sid, &path), state::record_value(&cid, rev.0, &b)));
+            muts.push(put(state::space_record_key(did, &space.sid, &path), state::record_value(&cid, rev.0, &b)));
             for blob in &blobs {
                 let r = Bytes::copy_from_slice(&rev.0.to_be_bytes());
-                muts.push(put(state::space_blob_key(&did, &space.sid, blob, &path), r));
-                muts.push(put(state::space_blob_cid_key(&did, blob, &space.sid, &path), Bytes::new()));
+                muts.push(put(state::space_blob_key(did, &space.sid, blob, &path), r));
+                muts.push(put(state::space_blob_cid_key(did, blob, &space.sid, &path), Bytes::new()));
             }
             bytes += b.len();
         }
         if muts.len() >= BATCH_ROWS || bytes >= BATCH_BYTES {
-            write_private_local(&p, std::mem::take(&mut muts)).await?;
+            write_private_local(p, std::mem::take(&mut muts)).await?;
             bytes = 0;
         }
     }
@@ -305,18 +344,28 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
         return Err(invalid(format!("the CAR has no block for {} ({cid})", paths[0])));
     }
     if !muts.is_empty() {
-        write_private_local(&p, muts).await?;
+        write_private_local(p, muts).await?;
     }
-    let op = SpaceOp::ImportCommit { nonce, rev, hash: Box::new(set), records };
-    match submit_space(app, &did, &space, op).await? {
-        SpaceAck::Write { .. } => {}
-        _ => return Err(XrpcError::internal("unexpected space ack")),
-    }
-    Ok(Json(json!({"rev": rev.to_string(), "records": records})))
+    Ok(records)
 }
 
 fn put(key: Vec<u8>, val: Bytes) -> crate::segment::Mutation {
     crate::segment::Mutation { key: key.into(), val: Some(val) }
+}
+
+/// Clears the rows of `did`'s headless repo in the space under an import's
+/// claim (so no import stages meanwhile). A head that turned up meanwhile
+/// leaves them be: they're its own.
+pub(super) async fn sweep_unheaded(app: &App, did: &str, space: &Space) -> XResult<()> {
+    let sp = spaces(app)?;
+    let nonce = rand::random::<u64>();
+    let _claim = Claim { sp, did, sid: space.sid, nonce };
+    let op = SpaceOp::ImportBegin { nonce, rev: None };
+    match super::space::submit_space_once(app, did, space, op).await? {
+        Ok(_) => clear_unheaded(&*app.partition(did)?, did, space).await,
+        Err(SpaceError::Write(WriteError::Invalid(_))) => Ok(()),
+        Err(e) => Err(super::space::space_error(e)),
+    }
 }
 
 /// Rows of the account's repo in the space with no head over them (an

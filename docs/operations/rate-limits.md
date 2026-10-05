@@ -110,7 +110,7 @@ the start of the next. The names are what the console, the config and the metric
 | `space-read-account` | DID | 5 min | 3,000 | `com.atproto.space` reads, `listSpaces` and `simplespace.getSpace` by an account's own OAuth session · with `--spaces` | 429 |
 | `space-credential` | DID + authority | 1 h | 300 | `space.getSpaceCredential` per account and space authority, counted on the authority's owner before the delegation token is claimed · with `--spaces` | 429 · the token stays unused |
 | `space-notify-in` | DID | 5 min | 1,000 | `space.notifyWrite` arriving from another host, per writer (each is a durable entry) · with `--spaces` | 429 · the writer's outbox retries |
-| `space-revoke` | DID | 1 h | 100 | `space.notifyCredentialRevoked`, per space authority (each is a write to the cluster-wide revocations object) · with `--spaces` | 429 |
+| `space-revoke` | DID | 1 h | 1000 | Credentials newly revoked by `space.notifyCredentialRevoked`, per space authority (one point per jti not already revoked, each a write to the cluster-wide revocations object · a call naming only revoked ones costs nothing) · with `--spaces` | 429 |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
 

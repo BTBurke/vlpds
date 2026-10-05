@@ -85,6 +85,10 @@ With `--spaces` on, that window closes. The blob GC counts both `b/` and `sc/` r
 lists only `b/`, and quotas stay bytes per account with space blobs included. A blob that only
 taken-down records name is hidden from `space.getBlob` and `listBlobs` too.
 
+Space refs outlive the flag, since the GC keeps their blobs whether it's on or not. So a node that
+comes back without `--spaces` still answers `BlobNotFound` for a blob only space records name.
+Everything else is served as it was without the flag.
+
 ## Operator access
 
 Nothing is encrypted, so whoever runs a PDS can read the space data on it. vlpds makes that an
@@ -104,9 +108,11 @@ and the reason when one is given. A read that fails auth writes nothing. Taken-d
 shown to the operator, flagged.
 
 The console's Look up takes space URIs. A space record shows what it is (its author, whether it
-exists, its CID, its takedown state) but never what it says. Reading the value is a separate
+exists, its takedown state) but never what it says. It leaves out the CID too, which would let an
+operator confirm a guessed value. Reading the value is a separate
 "Read record" step that asks for a reason and goes through `getSpaceRecord`, so every value an
-operator sees has its own audit entry.
+operator sees has its own audit entry. `vlpds admin check-space` reports a repo's head and record
+paths, so it writes an audit entry as well.
 
 ## Takedowns
 
@@ -114,7 +120,7 @@ operator sees has its own audit entry.
 |---|---|
 | Account | Credential reads of its space repos get `RepoTakendown`. Its space writes are refused. Its outbox rows wait and resume if the takedown is reversed. Its OAuth sessions are revoked and stay revoked after a reversal, so apps have to sign in again. |
 | Record | Taken down by its space URI, through the same admin and moderation paths as a public record (`sec/td/space/{sid}/{collection}/{rkey}`). It's hidden from `getRecord`, `listRecords`, `listRepoOps` values and `getRepo`'s blocks. |
-| Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `getSpaceCredential` answers `NotAuthorized`, `listRepos` and `registerNotify` answer `SpaceNotFound`, and members' notifies are acknowledged and dropped. The records stay on their authors' hosts. A vlpds extension. |
+| Space | Taken down at its authority, by its space URI (`updateSubjectStatus` with a `strongRef`, or the console). `getSpaceCredential` answers `NotAuthorized`, `listRepos` and `registerNotify` answer `SpaceNotFound`, and members' notifies are acknowledged and dropped. Registered syncers get no more forwards, the authority's own writes included. The records stay on their authors' hosts. A vlpds extension. |
 
 No credential names a taken-down account either. A taken-down account mints no delegation tokens,
 and `getSpaceCredential` refuses a taken-down member (`AccountTakedown`) and a space whose authority

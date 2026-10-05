@@ -47,12 +47,13 @@ it. With no space traffic, a node with it on makes one conditional GET of the re
 | Space credential lifetime | 10 min minted by vlpds, 3,600 s accepted at most, 5 s of clock skew |
 | Delegation token and client attestation | 60 s minted, 300 s accepted at most, single use |
 | `Signature-Input` and `Signature` headers | 8 KiB each |
-| Revocations | 1–100 `jti`s per call, each held 3,610 s |
+| Revocations | 1–100 `jti`s per call (up to 128 characters each), each held 3,610 s · 2,000 live per authority · 10,000 in all for spaces with no account here, 50,000 for the rest · credential reads 503 after 6 min without a good read |
 | `applyWrites` | 200 ops |
 | `notifyWrite` with a future `repoRev` | refused past 5 min |
-| Outbox | 262,144 rows in memory, 256 sends in flight, retries for 24 h |
-| Fan-out | 4,096 queued, 256 per lane, 4,096 and 16 sends in flight per service host |
-| Notify registrations | 24 h |
+| Outbox | 262,144 rows in memory, 256 sends in flight, 8 per authority and 32 in all to authorities whose last send failed, retries for 24 h |
+| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 512 sends in flight in all |
+| Notify registrations | 24 h · 256 per space · service ids up to 512 bytes |
+| `listRecords` and `listRepoOps` pages | end early with a cursor past 4 MiB of values |
 | Memory | space heads cache 64 MiB, credential cache 50,000 entries |
 
 ## Metrics

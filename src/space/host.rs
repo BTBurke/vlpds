@@ -121,6 +121,11 @@ pub async fn check_user_access(
     }
 }
 
+/// Live notify registrations a space may hold.
+pub const MAX_REGISTRATIONS: usize = 256;
+/// A registered service identifier (a DID and an optional fragment).
+pub const MAX_SERVICE_LEN: usize = 512;
+
 /// A space's registrations (`sN`) from the authority's shard: the live
 /// ones, and the services of expired ones.
 pub async fn registrations(

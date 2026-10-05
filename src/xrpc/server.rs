@@ -2999,6 +2999,16 @@ async fn get_service_auth(State(app): AppState, Auth(creds): Auth, Query(q): Que
     if matches!(creds, Credentials::OAuth { .. }) || creds.app_pass_scopes().is_some() {
         creds.need_rpc(lxm.unwrap_or("*"), &q.aud)?;
     }
+    // space data is OAuth-only: a service token for a space method (a
+    // notifyWrite, a revocation) would carry it to app passwords and
+    // password sessions
+    if app.config.spaces && !matches!(creds, Credentials::OAuth { .. }) {
+        if let Some(l) = lxm.filter(|l| crate::space::is_space_nsid(l)) {
+            return Err(invalid_request(format!(
+                "insufficient access to request a service auth token for the following method: {l} (space methods take OAuth)"
+            )));
+        }
+    }
     let acct = app.account(&did).await?;
     if is_takendown_account(&acct) && lxm != Some("com.atproto.server.createAccount") {
         return Err(bad_scope());

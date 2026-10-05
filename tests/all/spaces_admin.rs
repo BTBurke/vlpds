@@ -143,6 +143,7 @@ async fn console_lookup_takes_space_uris() {
         (json!(true), json!(false))
     );
     assert!(!d.to_string().contains("secret"), "the lookup never shows a space record's value: {d}");
+    assert!(d["spaceRecord"].get("cid").is_none(), "nor its CID: {d}");
 
     let r = s.xrpc.get("vlpds.admin.resolveSubject", &[("q", space.as_str())], &Auth::Admin).await.ok();
     assert_eq!((r["did"].clone(), r["kind"].clone()), (json!(a.did), json!("space")));
@@ -455,6 +456,12 @@ async fn import_repo_round_trip_and_refusals() {
     let ctx = vlpds::space::commit::CommitCtx { space: &space, author: &a.did, rev: &commit.rev };
     let forged = vlpds::space::commit::sign(&set, &ctx, rand::random(), |m| Ok::<_, ()>(other.sign(m))).unwrap();
     import(with_commit(&forged)).await.err(400, "InvalidCommit");
+    // a rev far ahead would hold every later notify past the authority's
+    // FutureRev window
+    let ahead = vlpds::tid::Tid::from_parts(vlpds::tid::now_micros() + 3_600_000_000, 0).to_string();
+    let ctx = vlpds::space::commit::CommitCtx { space: &space, author: &a.did, rev: &ahead };
+    let future = vlpds::space::commit::sign(&set, &ctx, rand::random(), |m| Ok::<_, ()>(other.sign(m))).unwrap();
+    import(with_commit(&future)).await.err(400, "FutureRev");
     // an index that isn't the signed set: a record left out
     let fewer = Value::Map(entries[1..].to_vec());
     let mut ib = Vec::new();
@@ -508,4 +515,40 @@ async fn import_repo_round_trip_and_refusals() {
         y.xrpc.get("vlpds.admin.checkSpace", &[("did", a.did.as_str()), ("space", space.as_str())], &Auth::Admin).await;
     assert_eq!(chk.ok()["ok"], json!(true), "{}", chk.json);
     assert_eq!(chk.json["records"]["count"], json!(3));
+    // its report names paths: an audited operator read
+    let log = y.xrpc.get("vlpds.admin.getAuditLog", &[("did", a.did.as_str())], &Auth::Admin).await.ok();
+    let checks = log["entries"].as_array().unwrap().iter().filter(|e| e["detail"]["method"] == "checkSpace").count();
+    assert_eq!(checks, 1, "{log}");
+}
+
+/// Rows an import staged before it stopped (no head over them) are never
+/// served, and the repo's first write clears them before it lands: it's a
+/// create over nothing, and the repo then holds only what was written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rows_left_by_a_stopped_import_are_cleared_by_the_first_write() {
+    let s = spawn().await;
+    let a = SpaceClient::new(&s, "sun", OWNER).await;
+    let m = SpaceClient::new(&s, "sum", MEMBER).await;
+    let space = a.create_space(TYPE, "main").await;
+    put_member(&a, &space, &m.did).await;
+    let sid = vlpds::state::space_id(&space);
+    let p = s.app.partition(&m.did).ok().unwrap();
+    let bytes = [0xa1, 0x61, 0x61, 0x01];
+    let cid = Cid::dag_cbor(&bytes);
+    for rk in ["x", "y"] {
+        let k = vlpds::state::space_record_key(&m.did, &sid, &format!("{COLL}/{rk}"));
+        p.db.put(k, vlpds::state::record_value(&cid, 1, &bytes).to_vec()).await.unwrap();
+    }
+    let rq = [("space", space.as_str()), ("repo", m.did.as_str())];
+    assert_eq!(m.get("com.atproto.space.listRecords", &rq).await.ok()["records"], json!([]), "no head: nothing served");
+
+    m.create_record(&space, COLL, Some("x"), rec("new")).await.ok();
+    let records = m.get("com.atproto.space.listRecords", &rq).await.ok()["records"].clone();
+    let texts: Vec<&J> = records.as_array().unwrap().iter().map(|r| &r["value"]["text"]).collect();
+    assert_eq!(texts, [&json!("new")], "{records}");
+    let chk =
+        s.xrpc.get("vlpds.admin.checkSpace", &[("did", m.did.as_str()), ("space", space.as_str())], &Auth::Admin).await;
+    assert_eq!(chk.ok()["ok"], json!(true), "{}", chk.json);
+    assert_eq!(chk.json["records"]["count"], json!(1));
+    m.create_record(&space, COLL, Some("y"), rec("another")).await.ok();
 }

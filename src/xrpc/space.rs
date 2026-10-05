@@ -15,6 +15,7 @@ use crate::space::heads::DurableSpaceHead;
 use crate::space::lthash::LtHash;
 use crate::space::outbox::{Outcome, Pending};
 use crate::space::repo::{PutScopes, SpaceAck, SpaceError, SpaceOp, SpaceOutcome, SpaceReq, SpaceWrite, MAX_WRITES};
+use crate::space::revocations;
 use crate::space::rows::{HeadRow, OpRow};
 use crate::space::token::{self, TokenType};
 use crate::space::Spaces;
@@ -92,7 +93,7 @@ impl Space {
     }
 }
 
-fn space_error(e: SpaceError) -> XrpcError {
+pub(super) fn space_error(e: SpaceError) -> XrpcError {
     match e {
         SpaceError::Write(w) => w.into(),
         SpaceError::RecordNotFound(m) => XrpcError::bad("RecordNotFound", m),
@@ -102,6 +103,7 @@ fn space_error(e: SpaceError) -> XrpcError {
         SpaceError::SpaceDeleted => XrpcError::bad("SpaceDeleted", "Space has been deleted"),
         SpaceError::SpaceAlreadyExists => XrpcError::bad("SpaceAlreadyExists", "Space already exists"),
         SpaceError::NotAuthorized(m) => forbidden(m),
+        SpaceError::Unswept(_) => XrpcError::unavailable("Unavailable", "the space repo is being cleared; retry"),
     }
 }
 
@@ -110,8 +112,25 @@ fn forbidden(m: impl Into<String>) -> XrpcError {
 }
 
 /// Queues `op` on `did`'s repo worker, which orders it with the account's
-/// commits and status changes, and waits for its ack (durable, applied).
+/// commits and status changes, and waits for its ack (durable, applied). A
+/// first write over rows an import or a sweep left behind clears them and
+/// runs again.
 pub(super) async fn submit_space(app: &App, did: &str, space: &Space, op: SpaceOp) -> XResult<SpaceAck> {
+    match submit_space_once(app, did, space, op).await? {
+        Err(SpaceError::Unswept(writes)) => {
+            super::space_import::sweep_unheaded(app, did, space).await?;
+            submit_space_once(app, did, space, SpaceOp::Write { writes }).await?.map_err(space_error)
+        }
+        r => r.map_err(space_error),
+    }
+}
+
+pub(super) async fn submit_space_once(
+    app: &App,
+    did: &str,
+    space: &Space,
+    op: SpaceOp,
+) -> XResult<Result<SpaceAck, SpaceError>> {
     let sp = spaces(app)?.clone();
     let Ok(permit) = app.write_permits.clone().try_acquire_owned() else {
         metrics::WRITES_SHED.inc();
@@ -128,7 +147,7 @@ pub(super) async fn submit_space(app: &App, did: &str, space: &Space, op: SpaceO
         permit: Some(permit),
     };
     app.workers.route(did).send(WorkerMsg::Space(req)).map_err(XrpcError::from_err)?;
-    rx.await.map_err(|_| XrpcError::internal("worker dropped request"))?.map_err(space_error)
+    rx.await.map_err(|_| XrpcError::internal("worker dropped request"))
 }
 
 /// Reference: `repo` must be the caller (ForbiddenError).
@@ -437,7 +456,11 @@ pub(super) fn space_takedown_name(sid: &SpaceId) -> String {
 }
 
 pub(super) async fn space_takendown(app: &App, space: &Space) -> XResult<bool> {
-    Ok(super::server::ctl(app, &space.authority).await?.has_takedown(&space_takedown_name(&space.sid)))
+    space_sid_takendown(app, &space.authority, &space.sid).await
+}
+
+pub(crate) async fn space_sid_takendown(app: &App, authority: &str, sid: &SpaceId) -> XResult<bool> {
+    Ok(super::server::ctl(app, authority).await?.has_takedown(&space_takedown_name(sid)))
 }
 
 /// The repo's records taken down in this space, by path. Record takedowns
@@ -637,6 +660,12 @@ struct ListRecordsQ {
     exclude_values: Option<bool>,
 }
 
+/// Values a page of listRecords or listRepoOps holds before it ends early
+/// with a cursor (records run to 1 MB each); rows are read this many at a
+/// time.
+const PAGE_BYTES: usize = 4 << 20;
+const PAGE_BATCH: usize = 32;
+
 /// Newest path first unless `reverse`, as the reference orders by URI; the
 /// cursor is the last record's URI.
 async fn list_records(
@@ -681,13 +710,17 @@ async fn list_records(
     let opts = slatedb::config::ScanOptions::default().with_order(order);
     let takedowns = super::server::ctl(&app, &q.repo).await?;
     let mut iter = p.db.scan_with_options(lo..hi, &opts).await.map_err(XrpcError::from_err)?;
-    let (mut n, mut last) = (0, None);
-    while n < limit {
-        let rows = iter.next_batch(limit - n).await.map_err(XrpcError::from_err)?;
+    let (mut n, mut last, mut full) = (0, None, false);
+    while n < limit && !full {
+        let rows = iter.next_batch((limit - n).min(PAGE_BATCH)).await.map_err(XrpcError::from_err)?;
         if rows.is_empty() {
             break;
         }
         for kv in rows {
+            if out.len() >= PAGE_BYTES {
+                full = true;
+                break;
+            }
             let path = std::str::from_utf8(&kv.key[base.len()..]).map_err(XrpcError::from_err)?;
             if takedowns.has_takedown(&takedown_name(&space.sid, path)) {
                 last = Some(path.to_string());
@@ -715,7 +748,7 @@ async fn list_records(
         }
     }
     out.push(b']');
-    if let (true, Some(path)) = (n == limit, last) {
+    if let (true, Some(path)) = (n == limit || full, last) {
         out.extend_from_slice(b",\"cursor\":");
         serde_json::to_writer(&mut out, &space.record_uri(&q.repo, &path)).map_err(XrpcError::from_err)?;
     }
@@ -893,7 +926,7 @@ async fn list_repo_ops(
     State(app): AppState,
     SpaceAuth(creds): SpaceAuth,
     Query(q): Query<ListRepoOpsQ>,
-) -> XResult<Json<J>> {
+) -> XResult<Response> {
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
@@ -921,14 +954,14 @@ async fn list_repo_ops(
                 out["commit"] = signed_commit(&key, &space, &q.repo, h, None)?;
             }
             metrics::space_list_repo_ops("noop", start.elapsed());
-            return Ok(Json(out));
+            return Ok(Json(out).into_response());
         }
     }
     // one snapshot: the commit describes exactly the ops' end state
     let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
     let head = match snap.get(state::space_head_key(&q.repo, &space.sid)).await.map_err(XrpcError::from_err)? {
         Some(v) => head_of(HeadRow::decode(&v).map_err(XrpcError::from_err)?, &space, &p)?,
-        None => return Ok(Json(json!({"ops": []}))),
+        None => return Ok(Json(json!({"ops": []})).into_response()),
     };
     let prefix = state::space_prefix(state::SPACE_OPLOG_FAMILY, &q.repo, &space.sid);
     let after = |rev: u64, idx: u32| -> Vec<u8> {
@@ -948,18 +981,25 @@ async fn list_repo_ops(
     let opts = slatedb::config::ScanOptions::default();
     let mut iter = snap.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
     let values = !q.exclude_values.unwrap_or(false);
-    let mut ops = Vec::with_capacity(limit.min(256));
+    // values go straight into the page, never through a JSON tree
+    let mut ops = Vec::with_capacity(limit.min(256) * 160);
+    ops.push(b'[');
     let mut last = None;
     // a page is `limit` ops scanned, hidden ones included, so the cursor and
-    // whether the page reaches the head don't depend on what's hidden
-    let mut rows_seen = 0;
-    while rows_seen < limit {
-        let rows = iter.next_batch(limit - rows_seen).await.map_err(XrpcError::from_err)?;
+    // whether the page reaches the head don't depend on what's hidden; it
+    // ends early (with a cursor) past PAGE_BYTES
+    let (mut rows_seen, mut full) = (0, false);
+    'page: while rows_seen < limit {
+        let rows = iter.next_batch((limit - rows_seen).min(PAGE_BATCH)).await.map_err(XrpcError::from_err)?;
         if rows.is_empty() {
             break;
         }
-        rows_seen += rows.len();
         for kv in rows {
+            if ops.len() >= PAGE_BYTES {
+                full = true;
+                break 'page;
+            }
+            rows_seen += 1;
             let (rev, idx) = crate::space::rows::oplog_position(&kv.key)
                 .ok_or_else(|| XrpcError::internal("malformed space oplog key"))?;
             let op = OpRow::decode(&kv.value).map_err(XrpcError::from_err)?;
@@ -968,41 +1008,54 @@ async fn list_repo_ops(
             if hidden.contains(&path) {
                 continue;
             }
-            let mut o = json!({
+            if ops.len() > 1 {
+                ops.push(b',');
+            }
+            let o = json!({
                 "rev": rev.to_string(),
                 "collection": op.collection,
                 "rkey": op.rkey,
                 "cid": op.cid.map(|c| c.to_string()),
                 "prev": op.prev.map(|c| c.to_string()),
             });
+            serde_json::to_writer(&mut ops, &o).map_err(XrpcError::from_err)?;
             if let (true, Some(cid)) = (values, op.cid) {
                 let cur =
                     snap.get(state::space_record_key(&q.repo, &space.sid, &path)).await.map_err(XrpcError::from_err)?;
                 if let Some(v) = cur {
                     let (c, bytes) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
                     if c == cid {
-                        let mut j = Vec::with_capacity(bytes.len() * 2);
-                        crate::cbor::write_json(bytes, &mut j).map_err(XrpcError::from_err)?;
-                        o["value"] = serde_json::from_slice(&j).map_err(XrpcError::from_err)?;
+                        ops.pop();
+                        ops.extend_from_slice(b",\"value\":");
+                        crate::cbor::write_json(bytes, &mut ops).map_err(XrpcError::from_err)?;
+                        ops.push(b'}');
                     }
                 }
             }
-            ops.push(o);
         }
     }
-    let mut out = json!({});
-    if rows_seen < limit {
+    ops.push(b']');
+    let mut out = Vec::with_capacity(ops.len() + 512);
+    out.push(b'{');
+    if rows_seen < limit && !full {
         let set = match hidden.is_empty() {
             true => None,
             false => Some(served_set(&snap, &q.repo, &space.sid, &head.hash, &hidden).await?),
         };
-        out["commit"] = signed_commit(&key, &space, &q.repo, &head, set.as_ref())?;
+        out.extend_from_slice(b"\"commit\":");
+        let commit = signed_commit(&key, &space, &q.repo, &head, set.as_ref())?;
+        serde_json::to_writer(&mut out, &commit).map_err(XrpcError::from_err)?;
+        out.push(b',');
     } else if let Some((rev, idx)) = last {
-        out["cursor"] = json!(format!("{rev}/{idx}"));
+        out.extend_from_slice(b"\"cursor\":");
+        serde_json::to_writer(&mut out, &format!("{rev}/{idx}")).map_err(XrpcError::from_err)?;
+        out.push(b',');
     }
-    out["ops"] = J::Array(ops);
+    out.extend_from_slice(b"\"ops\":");
+    out.extend_from_slice(&ops);
+    out.push(b'}');
     metrics::space_list_repo_ops("scan", start.elapsed());
-    Ok(Json(out))
+    Ok(json_bytes(out))
 }
 
 #[derive(Deserialize)]
@@ -1151,7 +1204,10 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
     super::authn::check_space_read_account(&creds)?;
     let did = creds.user_did()?.to_string();
     let p = app.partition(&did)?;
+    // keyed by space id, not URI: every page reads all of the account's
+    // spaces, holding only the page, and pays for the rows it read
     let mut uris = std::collections::BTreeSet::new();
+    let mut scanned = 0u64;
     for fam in [state::SPACE_HEAD_FAMILY, state::SPACE_FAMILY] {
         let prefix = state::space_did_prefix(fam, &did);
         let opts = slatedb::config::ScanOptions::default();
@@ -1160,6 +1216,7 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
                 .await
                 .map_err(XrpcError::from_err)?;
         while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+            scanned += 1;
             let uri = match fam == state::SPACE_HEAD_FAMILY {
                 true => HeadRow::decode(&kv.value).map_err(XrpcError::from_err)?.uri,
                 false => match crate::space::rows::SpaceRow::decode(&kv.value).map_err(XrpcError::from_err)? {
@@ -1171,18 +1228,30 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
             let keep = q.space_type.as_deref().is_none_or(|t| t == u.space_type)
                 && q.did.as_deref().is_none_or(|d| d == u.authority)
                 && q.cursor.as_deref().is_none_or(|c| uri.as_str() > c);
-            if keep {
+            if keep && (uris.len() < limit || uris.last().is_some_and(|l| uri < *l)) {
                 uris.insert(uri);
+                if uris.len() > limit {
+                    uris.pop_last();
+                }
             }
         }
     }
-    let page: Vec<String> = uris.into_iter().take(limit).collect();
+    let extra = (scanned / LIST_SPACES_ROWS_PER_POINT).min(u32::MAX as u64) as u32;
+    if extra > 0 {
+        // the next call is refused once these are spent
+        let _ = crate::ratelimit::check(&[&crate::ratelimit::SPACE_READ_ACCOUNT], &did, extra);
+    }
+    let page: Vec<String> = uris.into_iter().collect();
     let mut out = json!({"spaces": page.iter().map(|u| json!({"uri": u})).collect::<Vec<_>>()});
     if page.len() == limit {
         out["cursor"] = json!(page.last());
     }
     Ok(Json(out))
 }
+
+/// listSpaces charges a further `space-read-account` point per this many
+/// rows it reads.
+const LIST_SPACES_ROWS_PER_POINT: u64 = 1000;
 
 #[derive(Deserialize)]
 struct RevokedIn {
@@ -1191,13 +1260,22 @@ struct RevokedIn {
 }
 
 const REVOKE_NUDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+/// A peer that missed a nudge is nudged again this many times, backing off
+/// from a second; past that, its own re-read (or [`revocations::STALE_AFTER`])
+/// bounds it.
+const REVOKE_NUDGE_RETRIES: u32 = 6;
 
 /// Reference notifyCredentialRevoked: the space's authority, by service
 /// auth addressed to an account hosted here, revokes credentials of its
 /// space. Enforced cluster-wide: the 200 comes once the revocation is in
 /// the bucket's control object and the live peers were asked to reload it
-/// (each given a second to answer; one that misses it re-reads it within
-/// minutes).
+/// (each given a second to answer; one that misses it is asked again in the
+/// background, and refuses credentials once its set is stale).
+///
+/// The object is read whole by every node, so it's bounded
+/// ([`revocations::SOFT_CAP`] and the rest), and the rate limit counts only
+/// jtis new here. A revocation that can't be stored blocks the space's
+/// credentials instead, on every node: it fails closed.
 async fn notify_credential_revoked(
     State(app): AppState,
     headers: HeaderMap,
@@ -1207,13 +1285,21 @@ async fn notify_credential_revoked(
     let lxm = "com.atproto.space.notifyCredentialRevoked";
     let auth = super::authn::verify_space_service_jwt(&app, &headers, lxm).await?;
     let space = Space::parse(&inp.space)?;
-    if inp.credentials.is_empty() || inp.credentials.len() > 100 || inp.credentials.iter().any(String::is_empty) {
-        return Err(XrpcError::bad("InvalidRequest", "credentials must hold 1 to 100 non-empty jtis"));
+    if inp.credentials.is_empty()
+        || inp.credentials.len() > 100
+        || !inp.credentials.iter().all(|j| revocations::valid_jti(j))
+    {
+        return Err(XrpcError::bad(
+            "InvalidRequest",
+            format!(
+                "credentials must hold 1 to 100 jtis of 1 to {} printable ASCII characters",
+                revocations::MAX_JTI_LEN
+            ),
+        ));
     }
     if auth.iss != space.authority {
         return Err(forbidden("Revocation issuer is not the space authority"));
     }
-    crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, 1)?;
     let hosted = super::syntax::valid_did(&auth.aud)
         && match super::internal::account_anywhere(&app, &auth.aud).await {
             Ok(_) => true,
@@ -1223,38 +1309,107 @@ async fn notify_credential_revoked(
     if !hosted {
         return Err(forbidden("Revocation audience does not match a repo hosted here"));
     }
-    sp.revoke(&app.store, &space.uri, &inp.credentials)
-        .await
-        .map_err(|e| XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}")))?;
-    nudge_revocation_peers(&app).await;
-    Ok(StatusCode::OK)
+    let now = crate::tid::now_micros() as i64 / 1_000_000;
+    let mut new: Vec<String> =
+        inp.credentials.into_iter().filter(|j| !sp.revocations.is_revoked(&space.uri, j, now)).collect();
+    new.sort();
+    new.dedup();
+    if new.is_empty() {
+        return Ok(StatusCode::OK);
+    }
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
+    let staked = revocation_staked(&app, &sp, &space, &auth.aud).await?;
+    match sp.revoke(&app.store, &space.uri, &new, staked).await {
+        Ok(Ok(wrote)) => {
+            if wrote {
+                nudge_revocation_peers(&app, None).await;
+            }
+            Ok(StatusCode::OK)
+        }
+        Ok(Err(refused)) => {
+            nudge_revocation_peers(&app, Some(&space.uri)).await;
+            tracing::warn!(
+                space = hex::encode(space.sid),
+                ?refused,
+                "space revocation not stored: the space is blocked"
+            );
+            Err(XrpcError::unavailable("Unavailable", "revocation not stored: too many revocations held; retry later"))
+        }
+        Err(e) => Err(XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}"))),
+    }
 }
 
-async fn nudge_revocation_peers(app: &Arc<App>) {
+/// Whether an account here has a stake in `space`: it governs it, or the
+/// revocation's audience holds a repo in it.
+async fn revocation_staked(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
+    if let Ok(p) = app.partition(aud) {
+        if load_head(sp, &p, aud, space).await?.is_some() {
+            return Ok(true);
+        }
+    }
+    match super::internal::account_anywhere(app, &space.authority).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.error == "AccountNotFound" => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Asks every live peer to re-read the revocations (and, with `block`, to
+/// refuse that space's credentials); a peer that misses it is asked again in
+/// the background.
+async fn nudge_revocation_peers(app: &Arc<App>, block: Option<&str>) {
     let Some(c) = &app.cluster else { return };
     let me = c.cfg.node_id.clone();
+    let block = block.map(str::to_string);
     let sends = c.peers().into_iter().filter(|l| l.node_id != me).map(|l| {
-        let app = app.clone();
+        let (app, block) = (app.clone(), block.clone());
         async move {
-            let r = app
-                .http
-                .post(format!("{}/internal/v1/space/revocations/reload", l.addr.trim_end_matches('/')))
-                .header(super::internal::HDR, &app.config.internal_token)
-                .timeout(REVOKE_NUDGE_TIMEOUT)
-                .send()
-                .await
-                .and_then(|r| r.error_for_status());
-            if let Err(e) = r {
-                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (it re-reads on its own): {e}");
+            if let Err(e) = nudge_revocation_peer(&app, &l.addr, block.as_deref()).await {
+                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (retrying): {e}");
+                tokio::spawn(async move {
+                    let mut wait = std::time::Duration::from_secs(1);
+                    for _ in 0..REVOKE_NUDGE_RETRIES {
+                        tokio::time::sleep(wait).await;
+                        if nudge_revocation_peer(&app, &l.addr, block.as_deref()).await.is_ok() {
+                            return;
+                        }
+                        wait *= 2;
+                    }
+                    tracing::warn!(peer = %l.node_id, "space revocation nudges failed (it re-reads on its own)");
+                });
             }
         }
     });
     futures::future::join_all(sends).await;
 }
 
-async fn internal_reload_revocations(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
+async fn nudge_revocation_peer(app: &App, addr: &str, block: Option<&str>) -> reqwest::Result<()> {
+    let mut req = app
+        .http
+        .post(format!("{}/internal/v1/space/revocations/reload", addr.trim_end_matches('/')))
+        .header(super::internal::HDR, &app.config.internal_token)
+        .timeout(REVOKE_NUDGE_TIMEOUT);
+    if let Some(b) = block {
+        req = req.query(&[("block", b)]);
+    }
+    req.send().await.and_then(|r| r.error_for_status()).map(|_| ())
+}
+
+#[derive(Deserialize)]
+struct ReloadQ {
+    block: Option<String>,
+}
+
+async fn internal_reload_revocations(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<ReloadQ>,
+) -> XResult<Json<J>> {
     super::internal::check(&app, &headers)?;
     let sp = spaces(&app)?;
+    if let Some(space) = &q.block {
+        sp.revocations.block(space, crate::tid::now_micros() as i64 / 1_000_000);
+    }
     sp.refresh_revocations(&app.store)
         .await
         .map_err(|e| XrpcError::unavailable("Unavailable", format!("revocations unreadable: {e:#}")))?;
@@ -1607,7 +1762,7 @@ async fn flush_chunk(
 }
 
 /// How far ahead of this host's clock a notified repoRev may be.
-const FUTURE_REV: std::time::Duration = std::time::Duration::from_secs(300);
+pub(super) const FUTURE_REV: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Reference `processNotifyWrite` at the space's authority: the space must
 /// be live here, the writer admitted by the write policy (the authority
@@ -1799,12 +1954,31 @@ struct RegisterIn {
 /// with an optional fragment) to the space's write notifications for a
 /// day. Registering again replaces the endpoint and extends the expiry.
 async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Json<RegisterIn>) -> XResult<Json<J>> {
-    spaces(&app)?;
+    let sp = spaces(&app)?.clone();
     let space = Space::parse(&inp.space)?;
     host_credential(&app, &headers, &space).await?;
     super::simplespace::assert_space_host(&app, &space).await?;
     if space_takendown(&app, &space).await? {
         return Err(super::simplespace::space_not_found());
+    }
+    use crate::space::host::{MAX_REGISTRATIONS, MAX_SERVICE_LEN};
+    if inp.service.len() > MAX_SERVICE_LEN {
+        return Err(XrpcError::bad("InvalidRequest", format!("service must be at most {MAX_SERVICE_LEN} bytes")));
+    }
+    // every write of the space is forwarded to each registration: one
+    // member mustn't make that unbounded. Counted and made under the
+    // space's lock, so concurrent registrations can't pass the cap together.
+    let _registering = sp.registering(&space.sid).await;
+    let (live, expired) =
+        crate::space::host::registrations(&app, &space.authority, &space.sid).await.map_err(XrpcError::from_err)?;
+    for service in expired {
+        sp.fanout.prune(&app, &space.uri.as_str().into(), service);
+    }
+    if live.iter().filter(|(s, _)| *s != inp.service).count() >= MAX_REGISTRATIONS {
+        return Err(XrpcError::bad(
+            "InvalidRequest",
+            format!("this space has {MAX_REGISTRATIONS} notify registrations; unregister one first"),
+        ));
     }
     let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
         return Err(XrpcError::bad(

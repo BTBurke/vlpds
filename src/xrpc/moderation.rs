@@ -780,19 +780,15 @@ async fn get_subject(State(app): AppState, Auth(creds): Auth, Query(q): Query<Su
         let space = super::space::Space::parse(&format!("at://{}/space/{}/{}", u.authority, u.space_type, u.skey))?;
         let p = app.partition(&q.did)?;
         match u.record {
-            // what a space record is, never what it says: reading it is
+            // what a space record is, never what it says (nor its CID, which
+            // would confirm a guessed value): reading it is
             // vlpds.admin.getSpaceRecord, with a reason and an audit entry
             Some((_, c, r)) => {
                 let name = super::admin::record_takedown_name(uri, &q.did)?;
                 let path = format!("{c}/{r}");
                 let v =
                     p.db.get(state::space_record_key(&q.did, &space.sid, &path)).await.map_err(XrpcError::from_err)?;
-                let mut rec = json!({"uri": uri, "space": space.uri, "takendown": ctl.has_takedown(&name), "exists": v.is_some()});
-                if let Some(v) = v {
-                    let (cid, _) = state::record_value_parts(&v).map_err(XrpcError::from_err)?;
-                    rec["cid"] = json!(cid.to_string());
-                }
-                out["spaceRecord"] = rec;
+                out["spaceRecord"] = json!({"uri": uri, "space": space.uri, "takendown": ctl.has_takedown(&name), "exists": v.is_some()});
             }
             None => {
                 if space.authority != q.did {

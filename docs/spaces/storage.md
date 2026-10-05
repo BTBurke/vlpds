@@ -107,6 +107,8 @@ can read any repo the cluster hosts.
 
 - It's appended with a CAS on its ETag, and pruned of entries past `until` whenever it's rewritten.
 - It's written only when something is revoked, so it costs nothing when idle.
+- It's capped at 2,000 live entries per authority and 50,000 in all (see
+  [Revocation](reading.md#revocation)), so a read stays under ~7 MB.
 - Every node loads it before serving a credential read, then re-reads it every 5 min with a
   conditional GET, and at once when nudged.
 

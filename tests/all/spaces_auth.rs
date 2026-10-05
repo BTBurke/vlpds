@@ -633,3 +633,98 @@ async fn list_records_paging() {
     let bare = page(vec![("excludeValues", "true".into())]).await;
     assert!(bare["records"].as_array().unwrap().iter().all(|r| r.get("value").is_none() && r["cid"].is_string()));
 }
+
+/// The revocations object stays bounded whoever notifies: jtis are checked,
+/// a space with no stake here is taken only up to the soft cap and any up
+/// to the hard cap, and one past a cap blocks its space's credentials on
+/// this node rather than leaving them readable. A jti already revoked costs
+/// no rate-limit point. A node whose set has gone stale refuses credentials
+/// until a read succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn revocations_are_bounded_and_fail_closed() {
+    let stub = Stub::new().await;
+    let s = TestServer::spawn_with(|c| {
+        c.spaces = true;
+        c.rate_limits_enabled = true;
+    })
+    .await;
+    let m = SpaceClient::new(&s, "scb", ANY_SCOPE).await;
+    let (staked, loose, other) = (stub.space("staked"), stub.space("loose"), stub.space("other"));
+    m.create_record(&staked, COLL, Some("r"), rec("x")).await.ok();
+    m.create_record(&other, COLL, Some("r"), rec("y")).await.ok();
+    let holder = Holder::new();
+    let read = |space: &str, jti: &str| {
+        let (url, http, holder) = (s.url.clone(), m.srv.http.clone(), &holder);
+        let cred = stub.credential(space, holder, jti, 0, 600);
+        let (space, did) = (space.to_string(), m.did.clone());
+        async move {
+            let q = record_q(&space, &did, "r");
+            signed_get_as(&http, holder, &url, "com.atproto.space.getRecord", &q, &cred, &did).await
+        }
+    };
+    let jwt = || stub.service_jwt(&m.did, REVOKE);
+    let long = "a".repeat(vlpds::space::revocations::MAX_JTI_LEN + 1);
+    for bad in ["a b", "", long.as_str()] {
+        revoke(&s, &jwt(), &staked, &[bad]).await.err(400, "InvalidRequest");
+    }
+    // a credential whose jti no revocation could name is refused
+    read(&staked, &long).await.err(401, "BadJwt");
+
+    spaces(&s).revocations.set_caps(2, 4, 10);
+    revoke(&s, &jwt(), &loose, &["a", "b"]).await.ok();
+    revoke(&s, &jwt(), &loose, &["c"]).await.err(503, "Unavailable");
+    read(&loose, "z").await.err(503, "Unavailable");
+    revoke(&s, &jwt(), &staked, &["c", "d"]).await.ok();
+    read(&staked, "e").await.ok();
+    revoke(&s, &jwt(), &staked, &["e"]).await.err(503, "Unavailable");
+    read(&staked, "e").await.err(503, "Unavailable");
+    assert_eq!(spaces(&s).revocations.len(), 4);
+    read(&other, "q").await.ok();
+
+    // only new jtis are charged: one point buys one, then repeats are free
+    // (another authority, whose bucket nothing has spent yet)
+    let limits = json!({"config": {"limiters": {"space-revoke": {"points": 1}}}, "ifVersion": 0, "actor": "it-test"});
+    s.xrpc.post("vlpds.admin.updateRateLimits", &limits, &Auth::Admin).await.ok();
+    spaces(&s).revocations.set_caps(100, 100, 100);
+    let second = Stub::new().await;
+    let (sp2, jwt2) = (second.space("main"), || second.service_jwt(&m.did, REVOKE));
+    for _ in 0..3 {
+        revoke(&s, &jwt2(), &sp2, &["n1"]).await.ok();
+    }
+    revoke(&s, &jwt2(), &sp2, &["n2"]).await.err(429, "RateLimitExceeded");
+
+    // stale: refused until a read succeeds
+    spaces(&s).revocations.age_last_read(vlpds::space::revocations::STALE_AFTER);
+    read(&other, "q").await.err(503, "Unavailable");
+    spaces(&s).refresh_revocations(&s.app.store).await.unwrap();
+    read(&other, "q").await.ok();
+}
+
+/// A shard's `sP` rescan (what a takeover or a restart runs) sends what's
+/// owed even past rows that don't decode: those are skipped, not the shard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbox_rescan_skips_bad_rows() {
+    let stub = Stub::new().await;
+    *stub.status.lock() = 503;
+    let s = spawn().await;
+    let m = SpaceClient::new(&s, "svr", ANY_SCOPE).await;
+    let space = stub.space("main");
+    m.create_record(&space, COLL, Some("r"), rec("x")).await.ok();
+    assert!(eventually(Duration::from_secs(10), || (!stub.notifies.lock().is_empty()).then_some(())).await.is_some());
+    // as if the node that sent it went away: only the bucket remembers
+    spaces(&s).outbox.drop_did(&m.did);
+    let p = s.app.partition(&m.did).ok().expect("local partition");
+    for sid in [[0u8; 16], [0xff; 16]] {
+        p.db.put(vlpds::state::space_outbox_key(&m.did, &sid), b"not a row".to_vec()).await.unwrap();
+    }
+    *stub.status.lock() = 200;
+    let sent = stub.notifies.lock().len();
+    let table = Arc::downgrade(&s.app.partitions);
+    s.app.spaces.clone().unwrap().spawn_outbox_rescan(table, vec![(p.id, p.db.clone())], false);
+    assert!(
+        eventually(Duration::from_secs(5), || (stub.notifies.lock().len() > sent).then_some(())).await.is_some(),
+        "the owed notify wasn't resent"
+    );
+    let last = stub.notifies.lock().last().cloned().unwrap();
+    assert_eq!(last["repo"], json!(m.did));
+}

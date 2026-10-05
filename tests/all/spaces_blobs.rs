@@ -8,6 +8,7 @@
 use crate::common::spaces::SpaceClient;
 use crate::common::*;
 use object_store::ObjectStoreExt;
+use std::sync::Arc;
 use std::time::Duration;
 
 const TYPE: &str = "com.example.group";
@@ -257,4 +258,32 @@ async fn sync_get_blob_rule_follows_the_flag() {
         s.create_record(&a, "app.bsky.feed.post", image_post("x", &blob)).await;
         assert_eq!(s.get_blob(&a.did, &cid(&blob)).await.status, 200);
     }
+}
+
+/// A blob only space records name stays private when a node comes back
+/// without `--spaces` (its space refs, which keep it from the GC, outlive
+/// the flag); one a public record names, or an upload nothing names, is as
+/// it was without the flag.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn space_only_blob_stays_private_with_the_flag_off() {
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let on = cluster_node("sbx", store.clone(), 8, |c| c.spaces = true).await;
+    let owner = SpaceClient::new(&on, "sbx", OWNER).await;
+    let space = owner.create_space(TYPE, "main").await;
+    let (private, _) = upload(&on, &owner, 1).await;
+    let (shared, _) = upload(&on, &owner, 2).await;
+    let (stray, _) = upload(&on, &owner, 3).await;
+    owner.create_record(&space, COLL, Some("a"), rec("a", &[&private, &shared])).await.ok();
+    on.create_record(&legacy(&owner), "app.bsky.feed.post", image_post("public", &shared)).await;
+    on.get_blob(&owner.did, &cid(&private)).await.err(400, "BlobNotFound");
+    vlpds::server::shutdown(&on.app).await;
+
+    let off = cluster_node("sbx", store.clone(), 8, |c| c.spaces = false).await;
+    off.get_blob(&owner.did, &cid(&private)).await.err(400, "BlobNotFound");
+    assert_eq!(off.get_blob(&owner.did, &cid(&shared)).await.status, 200);
+    assert_eq!(off.get_blob(&owner.did, &cid(&stray)).await.status, 200, "serve-before-reference, as without spaces");
+    let session = off.create_session(&owner.handle, crate::oauth::PASSWORD).await.ok();
+    let acct = TestAccount { access: session["accessJwt"].as_str().unwrap().into(), ..legacy(&owner) };
+    off.create_record(&acct, "app.bsky.feed.post", image_post("now public", &private)).await;
+    assert_eq!(off.get_blob(&owner.did, &cid(&private)).await.status, 200);
 }

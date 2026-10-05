@@ -111,13 +111,25 @@ edges:
 ```
 
 - The authority calls `notifyCredentialRevoked` with service auth addressed to an account this
-  cluster hosts, naming 1 to 100 `jti`s.
+  cluster hosts, naming 1 to 100 `jti`s of up to 128 printable ASCII characters. vlpds refuses a
+  credential whose `jti` is longer, so it can revoke every credential it accepts.
 - The node appends them to `spaces/revocations.json` with a CAS on its ETag. Each entry is kept
   3,610 s (the longest credential plus skew at both ends), and expired ones are pruned on the next
   write.
 - The 200 goes out once the object is durable and each live peer has been asked to reload it, with
-  a second for each to answer. A peer that misses the nudge picks it up within 5 min.
+  a second for each to answer. A peer that misses the nudge is asked again in the background for
+  about a minute.
+- A node that hasn't read the object for 6 min (its re-reads failing) answers 503 to credential
+  reads until a read succeeds. So a missed nudge can't leave a revoked credential readable for long.
 - Reloading drops any cached credential the new entries revoke.
+
+Every node reads the object whole, so anyone with a DID could grow it if nothing bounded it. It
+holds at most 2,000 live entries per authority, and 10,000 in all for spaces nobody here has a
+stake in. Past that, only a space where an account here holds a repo or that it governs gets in,
+up to 50,000 entries (~7 MB). A revocation that can't be stored gets a 503, and that space's
+credentials are refused on every node for as long as the revocation would have lasted. The rate
+limit counts only `jti`s that aren't revoked yet, so an authority telling every member's host about
+the same credential pays once per host.
 
 On a three-node cluster a revoked credential was refused on every node within 0.5–3 ms, and still
 after restarts, missed nudges and joins (the phase 2 cluster test). Details on the object:

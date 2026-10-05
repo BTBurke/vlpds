@@ -2455,6 +2455,10 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             let max = spaces.limits.max_records;
             let mut b = match sr::write(&mut st.spaces, &did, sid, &uri, writes, clock_id, &applied, delivered, max) {
                 Err(e) => {
+                    // fetched again (and its rows looked for) next time
+                    if matches!(e, SpaceError::Unswept(_)) {
+                        st.spaces.repos.remove(&sid);
+                    }
                     let _ = reply.send(Err(e));
                     return Ok(());
                 }
@@ -2521,17 +2525,29 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             let _ = reply.send(Err(WriteError::RepoInactive(status.unwrap_or_default()).into()));
             return Ok(());
         }
-        SpaceOp::ImportBegin { nonce } => {
-            if let Err(e) = sr::import_begin(&st.spaces, sid, &uri) {
-                let _ = reply.send(Err(e));
-                return Ok(());
-            }
+        // the caller ends the claim if this fails
+        SpaceOp::ImportBegin { nonce, rev } => {
             if !spaces.begin_import(&did, sid, nonce) {
                 let m = "an import of this space repo is in progress";
                 let _ = reply.send(Err(WriteError::Invalid(m.into()).into()));
                 return Ok(());
             }
-            return space_noop(st, reply, SpaceAck::Host);
+            match sr::import_begin(&mut st.spaces, &did, sid, &uri, rev) {
+                Err(e) => {
+                    spaces.end_import(&did, sid, nonce);
+                    let _ = reply.send(Err(e));
+                    return Ok(());
+                }
+                Ok(None) => return space_noop(st, reply, SpaceAck::Host),
+                Ok(Some(m)) => {
+                    let (sp, d) = (spaces.clone(), did.clone());
+                    let ack = move || {
+                        sp.forget_space(&d, &sid);
+                        SpaceAck::Host
+                    };
+                    (vec![m], Box::new(ack))
+                }
+            }
         }
         SpaceOp::ImportCommit { nonce, rev, hash, records } => {
             if spaces.import_nonce(&did, sid) != Some(nonce) {
