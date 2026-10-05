@@ -378,9 +378,15 @@ pub fn init_counters() {
             }
             UPSTREAM_DURATION.with_label_values(&[service]);
         }
-        for purpose in
-            ["reset_password", "delete_account", "confirm_email", "update_email", "plc_operation", "auth_factor"]
-        {
+        for purpose in [
+            "reset_password",
+            "delete_account",
+            "confirm_email",
+            "update_email",
+            "plc_operation",
+            "auth_factor",
+            "sign_in_alert",
+        ] {
             for r in ["sent", "failed", "dropped"] {
                 crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
             }
