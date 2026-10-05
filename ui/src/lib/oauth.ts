@@ -538,11 +538,13 @@ async function drop(s: Stored) {
   await delKey(s.keyId)
 }
 
-/** Drops (and revokes) the named sessions this tab holds, and any pending sign-in. */
+/** Drops (and revokes) the named sessions this tab holds, and a pending sign-in for one of them. */
 export async function forgetAll(names: string[]) {
   const pending = ssGet<Pending>(PKEY)
-  ssSet(PKEY, null)
-  if (pending) await delKey(pending.keyId)
+  if (pending && names.includes(pending.name)) {
+    ssSet(PKEY, null)
+    await delKey(pending.keyId)
+  }
   for (const n of names) {
     const s = ssGet<Stored>(SKEY(n))
     if (s) await drop(s)

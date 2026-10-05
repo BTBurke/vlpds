@@ -8,7 +8,7 @@ import { acall } from '../../lib/xrpc'
 
 const base = '/account/repo'
 
-function Nsid({ nsid }: { nsid: string }) {
+export function Nsid({ nsid }: { nsid: string }) {
   const i = nsid.lastIndexOf('.')
   return (
     <span className="nsid">
@@ -62,7 +62,7 @@ export function Collections() {
 
 type Rec = { uri: string; cid: string; value: any }
 
-function preview(v: any): string {
+export function preview(v: any): string {
   if (!v || typeof v !== 'object') return ''
   if (typeof v.text === 'string' && v.text) return v.text
   if (typeof v.displayName === 'string') return v.displayName
