@@ -258,10 +258,20 @@ export async function runConfig(rep, cfg, env) {
       }
       const g = await S.W1.client.com.atproto.space.getRecord({ space: S.space, repo: S.W1.did, collection: COLL, rkey: srk })
       check(String(g.data.cid) === String(b.data.cid) && g.data.value?.text === 'sentinel rkey', 'getRecord (read_self) returns the value')
-      const ls = await S.W1.client.com.atproto.space.listSpaces({})
+      // An OAuth caller's filters are the scope target (ref listSpaces.ts:19-26): a
+      // grant for one space type lists only with spaceType set, and is refused
+      // unfiltered or for another type. A password session (the ref) skips the check.
+      const oauth = !!S.W1.oauth
+      const ls = await S.W1.client.com.atproto.space.listSpaces(oauth ? { spaceType: SPACE_TYPE } : {})
       check(ls.data.spaces.some((s) => s.uri === S.space), 'listSpaces of a writer includes the space', JSON.stringify(ls.data.spaces.map((s) => s.uri)))
-      const lsOther = await S.W1.client.com.atproto.space.listSpaces({ spaceType: 'com.example.otherType' })
-      check(!lsOther.data.spaces.some((s) => s.uri === S.space), 'listSpaces filters by spaceType')
+      const lsOther = await attempt(() => S.W1.client.com.atproto.space.listSpaces({ spaceType: 'com.example.otherType' }))
+      if (oauth) {
+        check(!lsOther.ok && lsOther.error === 'ScopeMissingError', 'listSpaces for a type the grant lacks is refused', errName(lsOther))
+        const lsAll = await attempt(() => S.W1.client.com.atproto.space.listSpaces({}))
+        check(!lsAll.ok && lsAll.error === 'ScopeMissingError', 'unfiltered listSpaces needs a wildcard grant', errName(lsAll))
+      } else {
+        check(lsOther.ok && !lsOther.data.spaces.some((s) => s.uri === S.space), 'listSpaces filters by spaceType', errName(lsOther))
+      }
     },
     { needs: ['members'] },
   )
