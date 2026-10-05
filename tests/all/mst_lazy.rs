@@ -1777,6 +1777,8 @@ async fn reshard_carries_nodes() {
         admin("vlpds.admin.splitShard", json!({"shard": target.id, "at": (target.lo + target.hi) / 2, "wait": true}))
             .await;
     assert_eq!(r["done"], json!(true), "{r}");
+    // `wait` returns at the flip; the children are taken after it
+    balanced(&[&s]).await;
     vlpds::mst_store::NODE_CACHE.clear();
     for a in &accts {
         check_stored_nodes(&s, &a.did).await;
@@ -1792,6 +1794,7 @@ async fn reshard_carries_nodes() {
         .collect();
     let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await;
     assert_eq!(r["done"], json!(true), "{r}");
+    balanced(&[&s]).await;
     vlpds::mst_store::NODE_CACHE.clear();
     for st in random_steps(&mut rng, accts.len(), 150) {
         run_step(&s, &accts, &st).await;

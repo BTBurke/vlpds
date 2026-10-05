@@ -399,6 +399,8 @@ async fn reshard_carries_the_index() {
             .await
             .ok();
     assert_eq!(r["done"], json!(true), "{r}");
+    // `wait` returns at the flip; the children are taken after it
+    balanced(&[&s]).await;
     for (x, want) in accts.iter().zip(&before) {
         assert_eq!(&scan_backlinks(&s, &x.did).await, want, "{}: after the split", x.did);
         check_backlinks(&s, &x.did).await;
@@ -415,6 +417,7 @@ async fn reshard_carries_the_index() {
     }
     let r = admin("vlpds.admin.mergeShards", json!({"left": kids[0], "right": kids[1], "wait": true})).await.ok();
     assert_eq!(r["done"], json!(true), "{r}");
+    balanced(&[&s]).await;
     for x in &accts {
         check_backlinks(&s, &x.did).await;
         let one = create(&s, x, FOLLOW, rec(FOLLOW, 1), None).await;

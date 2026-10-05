@@ -611,12 +611,21 @@ async fn one_slow_syncer_holds_up_nobody() {
         lat.sort();
         let p99 = lat[(lat.len() * 99).div_ceil(100) - 1];
         assert!(p99 < Duration::from_millis(200), "a fast syncer waited {p99:?} (p99)");
-        // in spaceRev order, each naming the last one it was sent
+        // in spaceRev order, each naming the last one it was sent: within
+        // one lease, since a new lease's first forward names the true
+        // predecessor
         let a = sy.arrivals();
         let chain: Vec<_> = a.iter().map(|x| (x.body["prevSpaceRev"].clone(), x.body["spaceRev"].clone())).collect();
+        let epoch = s.app.partition(&owner.did).ok().map(|q| q.epoch);
+        let one_lease = epoch == Some(p.epoch);
         for w in a.windows(2) {
             assert!(w[1].body["spaceRev"].as_str() > w[0].body["spaceRev"].as_str(), "out of order: {chain:?}");
-            assert_eq!(w[1].body["prevSpaceRev"], w[0].body["spaceRev"], "no gap: {chain:?}");
+            if one_lease {
+                assert_eq!(w[1].body["prevSpaceRev"], w[0].body["spaceRev"], "no gap: {chain:?}");
+            }
+        }
+        if !one_lease {
+            eprintln!("the shard's lease moved mid-run (epoch {} -> {epoch:?}): gaps allowed", p.epoch);
         }
     }
     assert!(eventually(Duration::from_secs(15), || async { slow.learned(&newest).is_some() }).await);

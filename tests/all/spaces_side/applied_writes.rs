@@ -232,8 +232,7 @@ async fn no_write_is_applied_and_refused_through_restarts() {
     front.point(&live[0]);
     let (mut acked, mut refused, mut unknown) = (0, 0, std::collections::BTreeMap::<String, usize>::new());
     let mut bad = Vec::new();
-    for ((c, _), ws) in clients.iter_mut().zip(&writes) {
-        c.srv.http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    for ((c, _), ws) in clients.iter().zip(&writes) {
         for w in ws {
             let there = present(c, &live[0], w).await;
             match &w.outcome {
