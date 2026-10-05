@@ -2097,10 +2097,12 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
 
 /// A request the space host answers for a credential holder only: the
 /// credential is this space's and addressed to the authority.
-async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<()> {
-    match super::authn::verify_space_credential(app, headers).await? {
+/// The verified credential.
+async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<Credentials> {
+    let cred = super::authn::verify_space_credential(app, headers).await?;
+    match &cred {
         Credentials::SpaceCredential { audience, space: s, .. } => {
-            assert_credential_space(&audience, &s, space, &space.authority)?
+            assert_credential_space(audience, s, space, &space.authority)?
         }
         _ => return Err(XrpcError::internal("not a space credential")),
     }
@@ -2112,7 +2114,7 @@ async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResu
             return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
         }
     }
-    Ok(())
+    Ok(cred)
 }
 
 #[derive(Deserialize)]
@@ -2211,7 +2213,7 @@ struct RegisterIn {
 async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Json<RegisterIn>) -> XResult<Json<J>> {
     let sp = spaces(&app)?.clone();
     let space = Space::parse(&inp.space)?;
-    host_credential(&app, &headers, &space).await?;
+    let cred = host_credential(&app, &headers, &space).await?;
     super::simplespace::assert_space_host(&app, &space).await?;
     if space_takendown(&app, &space).await? {
         return Err(super::simplespace::space_not_found());
@@ -2219,6 +2221,10 @@ async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Js
     use crate::space::host::{MAX_REGISTRATIONS, MAX_SERVICE_LEN};
     if inp.service.len() > MAX_SERVICE_LEN {
         return Err(XrpcError::bad("InvalidRequest", format!("service must be at most {MAX_SERVICE_LEN} bytes")));
+    }
+    if let Credentials::SpaceCredential { iss, jti, .. } = &cred {
+        let key = super::authn::private_limit_key(&app, &format!("{iss} {jti}"));
+        crate::ratelimit::check(&[&crate::ratelimit::SPACE_REGISTER], &key, 1)?;
     }
     // every write of the space is forwarded to each registration: one
     // member mustn't make that unbounded. Counted and made under the
@@ -2229,11 +2235,24 @@ async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Js
     for service in expired {
         sp.fanout.prune(&app, &space.uri.as_str().into(), service);
     }
+    let renewal = live.iter().any(|(s, _)| *s == inp.service);
     if live.iter().filter(|(s, _)| *s != inp.service).count() >= MAX_REGISTRATIONS {
         return Err(XrpcError::bad(
             "InvalidRequest",
             format!("this space has {MAX_REGISTRATIONS} notify registrations; unregister one first"),
         ));
+    }
+    if !renewal {
+        let (_, cap) = sp.account_caps();
+        let n = crate::space::host::authority_registrations(&app, &space.authority, cap)
+            .await
+            .map_err(XrpcError::from_err)?;
+        if n >= cap {
+            return Err(XrpcError::bad(
+                "InvalidRequest",
+                format!("this space's authority has {cap} notify registrations across its spaces"),
+            ));
+        }
     }
     let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
         return Err(XrpcError::bad(

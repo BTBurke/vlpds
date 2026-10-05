@@ -126,6 +126,28 @@ pub const MAX_REGISTRATIONS: usize = 256;
 /// A registered service identifier (a DID and an optional fragment).
 pub const MAX_SERVICE_LEN: usize = 512;
 
+/// Live notify registrations across one authority's spaces: each space's
+/// cap alone would let one account's spaces register without end.
+pub const MAX_REGISTRATIONS_PER_AUTHORITY: usize = 1024;
+
+/// Live registrations across `authority`'s spaces, counted up to `stop_at`.
+pub async fn authority_registrations(app: &App, authority: &str, stop_at: usize) -> anyhow::Result<usize> {
+    let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let prefix = state::space_did_prefix(state::SPACE_NOTIFY_FAMILY, authority);
+    let mut it = p.db.scan(prefix.clone()..state::prefix_end(&prefix)).await?;
+    let now = crate::tid::now_micros();
+    let mut n = 0;
+    while let Some(kv) = it.next().await? {
+        if NotifyRow::decode(&kv.value)?.expires > now {
+            n += 1;
+            if n >= stop_at {
+                break;
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// A space's registrations (`sN`) from the authority's shard: the live
 /// ones, and the services of expired ones.
 pub async fn registrations(

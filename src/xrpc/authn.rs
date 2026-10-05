@@ -725,7 +725,7 @@ async fn verify_space_token(app: &App, t: &token::SpaceToken) -> XResult<()> {
 /// A rate-limit key the console can show without naming who talks to which
 /// space authority: keyed by the server secret, so it can't be matched
 /// against a list of DIDs.
-fn private_limit_key(app: &App, key: &str) -> String {
+pub(super) fn private_limit_key(app: &App, key: &str) -> String {
     let k = crate::oauth::util::derive_secret(&app.config.jwt_secret, "space-rate-limit-key");
     hex::encode(&crate::prims::hmac_sha256(&k, &[key.as_bytes()])[..16])
 }

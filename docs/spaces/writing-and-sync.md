@@ -144,7 +144,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 ## Fan-out
 
 ```diagram
-caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each) and 512 sends in flight in all."
+caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each), 65,536 queued and 16,384 lanes in all, and 512 sends in flight in all."
 nodes:
   - { id: hw, label: Authority's worker, sub: acks in spaceRev order, at: [0, 4], size: [9, 3], tone: violet }
   - { id: d, label: Dispatcher, sub: reads `sN` registrations, at: [12.5, 4], size: [9, 3], tone: violet }
@@ -175,7 +175,7 @@ edges:
   memory from before a takeover could do that. The takeover tests check no syncer ever sees one.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
-- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
+- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most, one authority's spaces 1,024 together, and one credential makes 60 an hour. An account governs 1,000 live spaces at most and creates 100 a day. A did:web can point each of its fragments at its own address, so only these and the global queue and lane caps keep slow endpoints from growing the fan-out's memory: past them a lane's oldest forward goes, marked as a gap, and a syncer catches up with `listRepos`. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
 - Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
   registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
   syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.

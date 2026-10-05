@@ -103,6 +103,9 @@ pub struct Spaces {
     /// importRepo calls running on this node, per account, from before the
     /// body is read ([`Spaces::import_slot`]).
     importing: parking_lot::Mutex<std::collections::HashMap<String, usize>>,
+    /// (live spaces per authority account, live notify registrations per
+    /// authority account); tests lower them.
+    account_caps: parking_lot::Mutex<(usize, usize)>,
     /// registerNotify's count-and-write, per space (striped).
     registering: [tokio::sync::Mutex<()>; 64],
     /// Authorities whose shard's owner (another node) said the cluster
@@ -116,6 +119,10 @@ pub struct Spaces {
     exports: Arc<tokio::sync::Semaphore>,
     export_kib: u32,
 }
+
+/// Live spaces one account governs. Each fans out to its own registrations,
+/// so their number bounds what one account's writes send.
+pub const MAX_SPACES_PER_ACCOUNT: usize = 1000;
 
 /// importRepo calls one account runs at once on a node: a move brings its
 /// spaces in one after another.
@@ -175,6 +182,7 @@ impl Spaces {
             cache_fills: Default::default(),
             imports: Default::default(),
             importing: Default::default(),
+            account_caps: parking_lot::Mutex::new((MAX_SPACES_PER_ACCOUNT, host::MAX_REGISTRATIONS_PER_AUTHORITY)),
             registering: std::array::from_fn(|_| Default::default()),
             not_hosted: Default::default(),
             same_rev: Default::default(),
@@ -200,6 +208,17 @@ impl Spaces {
         }
         *m.entry(did.to_string()).or_default() += 1;
         Ok(ImportSlot { sp: self, did: did.to_string() })
+    }
+
+    /// (live spaces per authority account, live notify registrations per
+    /// authority account).
+    pub fn account_caps(&self) -> (usize, usize) {
+        *self.account_caps.lock()
+    }
+
+    #[doc(hidden)]
+    pub fn set_account_caps(&self, spaces: usize, registrations: usize) {
+        *self.account_caps.lock() = (spaces, registrations);
     }
 
     /// Room for `bytes` of a space export, waited for up to 10 s.

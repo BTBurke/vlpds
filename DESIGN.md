@@ -5418,8 +5418,15 @@ before a takeover could name a `prevSpaceRev` the old owner already sent
 with another successor, a fork. A failed
 send is retried with jittered backoff from 1 s only while nothing newer
 from its writer waits. Bounds: 256 per lane, 4,096 queued and 16 in flight
-per service host, 4,096 per dispatcher, 512 sends in flight in all, and
-256 registrations per space. A "host" is the endpoint's registrable domain
+per service host, 4,096 per dispatcher, 512 sends in flight in all,
+65,536 queued and 16,384 lanes in all, 256 registrations per space and
+1,024 per authority account, 1,000 live spaces per account, and the
+`space-create` and `space-register` buckets. Hosts are many (one did:web
+can name a /64 per fragment, in many spaces), so the per-host bounds alone
+let tarpit endpoints grow lanes without end; past the global ones a lane's
+oldest forward goes with its successor marked as after a gap, and no new
+lane is made (a dropped forward leaves no lane memory, so the next one
+names its true predecessor: a gap, never a fork). A "host" is the endpoint's registrable domain
 (the last two labels, three under a `co.uk`-style suffix), IPv4 address
 or IPv6 /64, ports ignored, so a DID document listing many hostnames under
 one domain can't multiply what a write sends one machine. Sends go through the pooled, SSRF-guarded

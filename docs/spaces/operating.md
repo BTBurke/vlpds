@@ -150,8 +150,9 @@ also takes that much room from the memory plan's space exports. The room fits 4 
 | `applyWrites` | 200 ops |
 | `notifyWrite` with a future `repoRev` | refused past 5 min |
 | Outbox | 262,144 rows in memory, 256 sends in flight, 8 per authority and 32 in all to authorities whose last send failed, retries for 24 h |
-| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 512 sends in flight in all |
-| Notify registrations | 24 h · 256 per space · service ids up to 512 bytes |
+| Fan-out | 4,096 queued for each of 8 dispatchers, 256 per lane, 4,096 and 16 sends in flight per service host, 65,536 queued and 16,384 lanes in all (past those, drops marked as gaps: syncers catch up with `listRepos`), 512 sends in flight in all |
+| Notify registrations | 24 h · 256 per space, 1,024 across one authority's spaces · 60 an hour per credential (`space-register`) · service ids up to 512 bytes |
+| Spaces | 1,000 live per account · 100 created a day per account (`space-create`) |
 | `listRecords` and `listRepoOps` pages | end early with a cursor past 4 MiB of values |
 | Memory | space heads cache 64 MiB, credential cache 50,000 entries |
 
