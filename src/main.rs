@@ -397,6 +397,12 @@ struct Args {
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
     dev_mode: bool,
+    /// Dev mode only, repeatable: `<authority>=<did>` resolves lexicons of
+    /// that NSID authority (`example.com` for `com.example.*`) from the DID's
+    /// repo without the DNS `_lexicon` TXT lookup (permission sets, space
+    /// type declarations). Refused at startup without --dev-mode.
+    #[arg(long, env = "VLPDS_LEXICON_AUTHORITY_OVERRIDE", value_delimiter = ',')]
+    lexicon_authority_override: Vec<String>,
     /// The built web UI (`just ui`'s ui/dist; the image's is
     /// /usr/share/vlpds/ui). Startup fails if it is set but incomplete.
     /// Unset: this source tree's ui/dist, or a placeholder page.
@@ -1308,6 +1314,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     if args.wrap_plc_rotation_key {
         return wrap_plc_rotation_key(&args).await;
     }
+    vlpds::oauth::lexicon::apply_authority_overrides(&args.lexicon_authority_override, args.dev_mode)?;
     vlpds::partition::set_sst_compression(args.sst_compression.parse()?);
     vlpds::partition::set_compaction_polling(args.compaction_polling.parse()?);
     vlpds::partition::set_compaction_poll_interval(vlpds::retention::parse_duration(&args.compaction_poll)?);

@@ -276,4 +276,4 @@ has the flags the sections above don't cover.
 | Blobs | `--max-blob-mb`, `--blob-gc-grace-secs` (6 h), `--blob-quota-gb`, `--blob-uploads-per-day`, `--blob-quarantine-days` |
 | Web UI | `--ui-dir` (the image's `/usr/share/vlpds/ui`). Startup fails if it isn't a complete build. |
 | Logging | `--log-format` (`text`, `json`), `RUST_LOG` (`info,slatedb=warn`), `--exit-state-file`, `--pyroscope-url` (profiling builds) |
-| Development | `--dev-mode`, `--memory` (in-memory store), `--allow-bulk-create`, `--no-rate-limits`, `--inject-put-ms` |
+| Development | `--dev-mode`, `--memory` (in-memory store), `--allow-bulk-create`, `--no-rate-limits`, `--inject-put-ms`, `--lexicon-authority-override <authority>=<did>` (repeatable, `--dev-mode` only: lexicons of that NSID authority come from the DID's repo with no DNS lookup) |

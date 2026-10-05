@@ -595,3 +595,52 @@ async fn flag_off_grants_no_space_permissions() {
             .await;
     assert_eq!(t.scope, "repo:com.c6off.thing atproto");
 }
+
+/// `--lexicon-authority-override` (dev mode only): refused without
+/// --dev-mode, by the binary at startup and by the setting itself; with
+/// it, a bare grant's type declaration resolves from the overriding DID's
+/// repo, the consent screen names it and the grant takes its collections.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lexicon_authority_override_is_dev_only_and_resolves_declarations() {
+    use vlpds::oauth::lexicon::apply_authority_overrides;
+    let o = tokio::process::Command::new(env!("CARGO_BIN_EXE_vlpds"))
+        .args(["--lexicon-authority-override", "c6ovr.example=did:web:c6ovr.example"])
+        .env_remove("VLPDS_DEV_MODE")
+        .output()
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success() && stderr.contains("--dev-mode"), "{stderr}");
+    let e =
+        |v: &[&str], dev: bool| apply_authority_overrides(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>(), dev);
+    assert!(e(&["c6ovr.example=did:web:c6ovr.example"], false).is_err(), "without dev mode");
+    assert!(e(&["c6ovr.example"], true).is_err(), "no DID");
+    assert!(e(&["not a domain=did:web:c6ovr.example"], true).is_err(), "not a domain");
+    assert!(e(&["c6ovr.example=did:key:z6Mk"], true).is_err(), "not an atproto DID");
+    assert!(e(&[], false).is_ok(), "no overrides needs nothing");
+
+    let s = spawn().await;
+    let ty = "com.c6ovr.forum";
+    let publisher = s.create_account("c6ovrpub").await;
+    let lex = json!({"$type": "com.atproto.lexicon.schema", "lexicon": 1, "id": ty, "defs": {"main": {"type": "space", "name": "Override Forum", "collections": ["com.c6ovr.thread"]}}});
+    s.xrpc
+        .post(
+            "com.atproto.repo.createRecord",
+            &json!({"repo": publisher.did, "collection": "com.atproto.lexicon.schema", "rkey": ty, "record": lex, "validate": false}),
+            &publisher.auth(),
+        )
+        .await
+        .ok();
+    apply_authority_overrides(&[format!("C6OVR.com={}", publisher.did)], true).unwrap();
+
+    let srv = srv(&s);
+    let acct = oauth::create_account(&srv, "c6ovr").await;
+    let scope = format!("atproto space:{ty}?manage=create");
+    let key = DpopKey::new();
+    let page = consent_page(&srv, &acct, &scope, &key).await;
+    consent_html_has(&page.3, &["Override Forum spaces on your account"]);
+    let r = approve_and_exchange(&srv, &acct, &scope, &key, page).await;
+    let t = oauth::tokens(&r);
+    let want = format!("space:{ty}?authority={}&collection=com.c6ovr.thread&manage=create", acct.did);
+    assert!(t.scope.split(' ').any(|x| x == want), "{}", t.scope);
+}

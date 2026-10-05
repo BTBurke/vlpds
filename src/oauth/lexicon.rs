@@ -44,6 +44,39 @@ pub fn override_authority(authority: &str, did: &str) {
     OVERRIDES.lock().insert(authority.to_ascii_lowercase(), did.to_string());
 }
 
+/// `--lexicon-authority-override <authority>=<did>` (dev mode only): each
+/// NSID authority (`example.com` for `com.example.*`) resolves to its DID
+/// without the DNS `_lexicon` lookup, so a local app can publish lexicons
+/// from a repo on this server. Every entry is checked before any is used.
+pub fn apply_authority_overrides(entries: &[String], dev_mode: bool) -> anyhow::Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    anyhow::ensure!(dev_mode, "--lexicon-authority-override is for development: it needs --dev-mode");
+    let mut parsed = Vec::with_capacity(entries.len());
+    for e in entries {
+        let Some((authority, did)) = e.split_once('=') else {
+            anyhow::bail!("--lexicon-authority-override {e:?}: expected <authority>=<did>");
+        };
+        let authority = authority.trim().to_ascii_lowercase();
+        let did = did.trim();
+        anyhow::ensure!(
+            crate::xrpc::syntax::valid_handle(&authority),
+            "--lexicon-authority-override {e:?}: {authority:?} isn't a domain"
+        );
+        anyhow::ensure!(
+            super::scopes::is_atproto_did(did),
+            "--lexicon-authority-override {e:?}: {did:?} isn't a did:plc or did:web"
+        );
+        parsed.push((authority, did.to_string()));
+    }
+    for (authority, did) in parsed {
+        tracing::warn!(%authority, %did, "lexicon authority overridden (--lexicon-authority-override, dev mode)");
+        override_authority(&authority, &did);
+    }
+    Ok(())
+}
+
 /// Tests: drops `nsid`'s in-memory copy, so its next use looks it up again.
 pub fn forget_cached(nsid: &str) {
     CACHE.lock().remove(nsid);
