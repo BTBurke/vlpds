@@ -736,14 +736,21 @@ pub fn set_after_node_hook(h: Option<NodeHook>) {
     *AFTER_NODE.lock() = h;
 }
 
-/// Rounds of rerunning shards no answer covered on their current owners.
-const COVERAGE_ROUNDS: usize = 3;
+/// How long missing shards are rerun on their owners before the command
+/// fails: long enough for a handoff, or a dead node's lease to expire and a
+/// peer to take its shards over.
+const COVERAGE_WAIT: Duration = Duration::from_secs(120);
+
+/// Rounds in a row a live owner may answer a rerun with an error (not a
+/// handoff: waiting would not help) before the command fails.
+const COVERAGE_ERROR_ROUNDS: usize = 3;
 
 /// Prints a table of `cols` per node and the totals. Each node scans the
 /// shards it owns when called and lists them (`scanned`); a shard that moved
 /// between two nodes' calls is in neither list, so the union is checked
 /// against the current layout and missing shards are rerun on their owners
-/// (`shards` in the body). Shards still missing after that fail the command.
+/// (`shards` in the body), until covered or for `COVERAGE_WAIT`; shards
+/// still missing then fail the command.
 async fn per_node(
     c: &Client,
     node_only: bool,
@@ -778,7 +785,14 @@ async fn per_node(
     let mut missing = Vec::new();
     // in a cluster, a node's error leaves its shards missing (rerun below)
     let mut coverage_checked = false;
-    for round in 0..=COVERAGE_ROUNDS {
+    let deadline = tokio::time::Instant::now() + COVERAGE_WAIT;
+    let mut backoff = Duration::from_millis(100);
+    // Mid-handoff, the table can still name the old owner (answering an
+    // empty scan, or gone), or the new one before it has opened the shard:
+    // those reruns are retried, their rows shown only if the command gives up.
+    let mut pending = Vec::new();
+    let mut error_rounds = 0;
+    loop {
         if node_only {
             break;
         }
@@ -790,6 +804,8 @@ async fn per_node(
         let Some(shards) = st["layout"]["shards"].as_array() else { break };
         coverage_checked = true;
         let owners = st["table"].as_array().cloned().unwrap_or_default();
+        let live: std::collections::HashSet<&str> =
+            st["nodes"].as_array().into_iter().flatten().filter_map(|n| n["node"].as_str()).collect();
         missing = shards
             .iter()
             .enumerate()
@@ -798,21 +814,40 @@ async fn per_node(
                 (!covered.contains(&id)).then(|| (id, owners.get(i).and_then(J::as_str).map(str::to_string)))
             })
             .collect::<Vec<(u64, Option<String>)>>();
-        if missing.is_empty() || round == COVERAGE_ROUNDS {
+        if missing.is_empty() {
             break;
         }
+        if error_rounds >= COVERAGE_ERROR_ROUNDS || tokio::time::Instant::now() >= deadline {
+            results.append(&mut pending);
+            break;
+        }
+        if !pending.is_empty() || missing.iter().all(|(_, o)| o.is_none()) {
+            tokio::time::sleep(backoff.min(deadline.saturating_duration_since(tokio::time::Instant::now()))).await;
+            backoff = (backoff * 2).min(Duration::from_secs(2));
+        }
+        pending.clear();
         let mut by_owner: std::collections::BTreeMap<String, Vec<u64>> = Default::default();
         for (id, owner) in &missing {
             if let Some(o) = owner {
                 by_owner.entry(o.clone()).or_default().push(*id);
             }
         }
+        let mut live_error = false;
         for (owner, ids) in by_owner {
             let mut b = body.clone();
             b["shards"] = json!(ids);
             let url = nodes.iter().find(|n| n.0 == owner).map(|n| n.1.clone()).unwrap_or_default();
-            results.push(call(format!("{owner} (rerun)"), url, Some(owner), b).await);
+            let is_live = live.contains(owner.as_str());
+            let row = call(format!("{owner} (rerun)"), url, Some(owner), b).await;
+            let scanned = row["result"]["scanned"].as_array().is_some_and(|s| !s.is_empty());
+            if scanned || row["result"]["failed"].as_u64().unwrap_or(0) > 0 {
+                results.push(row);
+            } else {
+                live_error |= is_live && row["ok"] != json!(true);
+                pending.push(row);
+            }
         }
+        error_rounds = if live_error { error_rounds + 1 } else { 0 };
     }
     let mut failed: usize = results.iter().map(|r| r["result"]["failed"].as_u64().unwrap_or(0) as usize).sum();
     if !coverage_checked {

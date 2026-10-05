@@ -67,7 +67,9 @@ async fn a_shard_moving_between_node_calls_is_rerun_on_its_owner() {
         |name: &str| rows.iter().find(|r| r["node"] == json!(name)).unwrap_or_else(|| panic!("no {name} row: {j}"));
     assert!(scanned(row(&na)).iter().all(|s| !b_shards.contains(s)), "a scanned only its own shards first: {j}");
     assert!(scanned(row(&nb)).is_empty(), "b had handed its shards away: {j}");
-    let rerun: HashSet<u64> = scanned(row(&format!("{na} (rerun)"))).into_iter().collect();
+    // a may adopt b's shards over more than one rerun round
+    let rerun: HashSet<u64> =
+        rows.iter().filter(|r| r["node"] == json!(format!("{na} (rerun)"))).flat_map(scanned).collect();
     assert_eq!(rerun, b_shards, "b's former shards rerun on a: {j}");
     let all: HashSet<u64> = rows.iter().flat_map(scanned).collect();
     assert_eq!(all.len(), SHARDS as usize, "{j}");
