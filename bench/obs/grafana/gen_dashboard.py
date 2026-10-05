@@ -717,7 +717,8 @@ ts("notifyWrite outbox oldest row", [node_gauge("vlpds_space_outbox_oldest_secon
 ts("notifyWrite by hop and result", [rate(SPACE_NOTIFY, by="hop, result", legend="{{hop}} {{result}}")], "ops", empty="no notifies",
    desc="out = this node's writes to their authorities; in = notifies received as an authority; fanout = forwarded to "
         "registered syncers. ok = 200; retry = backing off; wait = the writer's account is inactive; refused / gone / "
-        "expired = the row was dropped.")
+        "expired = the row was dropped. in same_rev_unverified / same_rev_capped = a remote writer's same-rev, new-hash "
+        "notify (a record takedown) its host didn't confirm, or over 3 per writer and space in 10 min: dropped, left to polls.")
 ts("notifyWrite failure ratio by hop",
    [t(f'sum by (hop) (rate({SPACE_NOTIFY}{{{I}, result!="ok"}}{RI})) / sum by (hop) (rate({SPACE_NOTIFY}{{{I}}}{RI}))', "{{hop}}")],
    "percentunit", max_=1, lines=[(0.5, "orange")], empty="no notifies",

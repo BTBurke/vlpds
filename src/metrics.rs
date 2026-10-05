@@ -749,7 +749,7 @@ pub fn init_space_counters() {
     for hop in ["out", "in", "fanout"] {
         let results: &[&str] = match hop {
             "out" => &["ok", "refused", "gone", "expired", "retry", "wait"],
-            "in" => &["ok", "noop", "refused", "error"],
+            "in" => &["ok", "noop", "refused", "error", "same_rev_capped", "same_rev_unverified"],
             _ => &["ok", "refused", "error"],
         };
         for r in results {

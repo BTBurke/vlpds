@@ -94,6 +94,7 @@ pub enum SpaceOp {
         repo_rev: Tid,
         hash: [u8; 32],
         managing_app: Option<bool>,
+        same_rev: SameRev,
     },
     /// simplespace.createSpace by the worker's account.
     CreateSpace {
@@ -207,6 +208,9 @@ pub enum SpaceError {
     SpaceDeleted,
     SpaceAlreadyExists,
     NotAuthorized(String),
+    /// A notify at the repoRev held for the writer with another hash, under
+    /// [`SameRev::Verify`]: nothing was written.
+    SameRev,
     /// The repo has no head but rows of it remain (an import or a sweep
     /// stopped part way): they're cleared before the write, handed back.
     Unswept(Vec<SpaceWrite>),
@@ -216,6 +220,18 @@ impl From<WriteError> for SpaceError {
     fn from(e: WriteError) -> SpaceError {
         SpaceError::Write(e)
     }
+}
+
+/// A notify at the repoRev the authority holds for the writer, with
+/// another hash: a record takedown or its reversal, or a writer making
+/// every syncer refetch the whole repo for nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SameRev {
+    /// Sequenced again: this cluster's own outbox computed the hash, or the
+    /// caller checked it at the writer's host.
+    Sequence,
+    /// Refused with [`SpaceError::SameRev`] so the caller checks it first.
+    Verify,
 }
 
 fn internal(m: impl Into<String>) -> SpaceError {
@@ -817,6 +833,7 @@ pub fn record_writer(
     repo_rev: Tid,
     hash: [u8; 32],
     managing_app: Option<bool>,
+    same_rev: SameRev,
     clock_id: u64,
 ) -> Result<Option<(Vec<Mutation>, Sequenced)>, SpaceError> {
     let host = st.hosts.get_mut(&sid).ok_or_else(|| internal("space host state not loaded"))?;
@@ -832,6 +849,11 @@ pub fn record_writer(
         };
     if !allowed {
         return Err(SpaceError::NotAuthorized("notifyWrite writer is not authorized".into()));
+    }
+    if same_rev == SameRev::Verify
+        && host.writers.get(writer).copied().flatten().is_some_and(|o| o.repo_rev == repo_rev && o.hash != hash)
+    {
+        return Err(SpaceError::SameRev);
     }
     let mut muts = Vec::with_capacity(3);
     Ok(sequence(host, authority, sid, writer, repo_rev, hash, clock_id, &mut muts)?.map(|s| (muts, s)))
@@ -1292,7 +1314,10 @@ mod tests {
         f.writers.push((sid, "did:plc:x".into(), None));
         f.members.push((sid, "did:plc:x".into(), None));
         install(&mut st, f);
-        let e = record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [1; 32], None, 1).err().unwrap();
+        let e =
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [1; 32], None, SameRev::Sequence, 1)
+                .err()
+                .unwrap();
         assert!(matches!(e, SpaceError::SpaceNotFound));
         create_space(&mut st, "did:plc:auth", sid, SpaceRow::defaults(URI, "t"), 1).unwrap();
         assert!(matches!(
@@ -1300,30 +1325,83 @@ mod tests {
             Err(SpaceError::SpaceAlreadyExists)
         ));
         let (muts, s1) =
-            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [1; 32], None, 1).unwrap().unwrap();
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [1; 32], None, SameRev::Sequence, 1)
+                .unwrap()
+                .unwrap();
         assert_eq!(muts.len(), 2);
         assert!(s1.prev.is_none());
         // not newer: nothing
-        assert!(record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [1; 32], None, 1)
-            .unwrap()
-            .is_none());
+        assert!(record_writer(
+            &mut st,
+            "did:plc:auth",
+            sid,
+            URI,
+            "did:plc:w",
+            Tid(10),
+            [1; 32],
+            None,
+            SameRev::Sequence,
+            1
+        )
+        .unwrap()
+        .is_none());
         let (muts, s2) =
-            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [1; 32], None, 1).unwrap().unwrap();
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [1; 32], None, SameRev::Sequence, 1)
+                .unwrap()
+                .unwrap();
         assert_eq!(muts.len(), 3, "the old sQ entry goes");
         assert!(s2.space_rev > s1.space_rev);
         assert_eq!(s2.prev, Some(s1.space_rev));
         // the same rev with another hash (a takedown's adjusted view): again
         let (_, s3) =
-            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [2; 32], None, 1).unwrap().unwrap();
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [2; 32], None, SameRev::Sequence, 1)
+                .unwrap()
+                .unwrap();
         assert_eq!(s3.prev, Some(s2.space_rev));
-        assert!(record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), [2; 32], None, 1)
-            .unwrap()
-            .is_none());
-        assert!(record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(10), [3; 32], None, 1)
-            .unwrap()
-            .is_none());
+        assert!(record_writer(
+            &mut st,
+            "did:plc:auth",
+            sid,
+            URI,
+            "did:plc:w",
+            Tid(11),
+            [2; 32],
+            None,
+            SameRev::Sequence,
+            1
+        )
+        .unwrap()
+        .is_none());
+        // a remote host's: handed back to be checked, nothing written
+        let verify = |st: &mut SpaceStates, hash| {
+            record_writer(st, "did:plc:auth", sid, URI, "did:plc:w", Tid(11), hash, None, SameRev::Verify, 1)
+        };
+        assert!(matches!(verify(&mut st, [9; 32]), Err(SpaceError::SameRev)));
+        assert!(verify(&mut st, [2; 32]).unwrap().is_none(), "the hash held is a no-op");
+        let (_, s4) =
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:w", Tid(12), [9; 32], None, SameRev::Verify, 1)
+                .unwrap()
+                .unwrap();
+        assert_eq!(s4.prev, Some(s3.space_rev), "a newer rev needs no check");
+        assert!(record_writer(
+            &mut st,
+            "did:plc:auth",
+            sid,
+            URI,
+            "did:plc:w",
+            Tid(10),
+            [3; 32],
+            None,
+            SameRev::Sequence,
+            1
+        )
+        .unwrap()
+        .is_none());
         // not a member
-        let e = record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:x", Tid(10), [1; 32], None, 1).err().unwrap();
+        let e =
+            record_writer(&mut st, "did:plc:auth", sid, URI, "did:plc:x", Tid(10), [1; 32], None, SameRev::Sequence, 1)
+                .err()
+                .unwrap();
         assert!(matches!(e, SpaceError::NotAuthorized(_)));
     }
 
@@ -1392,7 +1470,9 @@ mod tests {
         assert!(matches!(set_member(&mut st, auth, sid, "did:plc:w", None), Err(SpaceError::SpaceNotFound)));
         create_space(&mut st, auth, sid, SpaceRow::defaults(URI, "t"), 1).unwrap();
         set_member(&mut st, auth, sid, "did:plc:w", Some(MemberRow { read: true, write: true })).unwrap();
-        record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(10), [1; 32], None, 1).unwrap().unwrap();
+        record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(10), [1; 32], None, SameRev::Sequence, 1)
+            .unwrap()
+            .unwrap();
         assert!(update_space(&mut st, auth, sid, None, None, None).unwrap().is_none());
         let m = update_space(&mut st, auth, sid, Some(Policy::Public), None, None).unwrap().unwrap();
         assert_eq!(SpaceRow::decode(m.val.as_ref().unwrap()).unwrap().read_policy, Policy::Public);
@@ -1409,7 +1489,9 @@ mod tests {
         );
         assert!(!SpaceRow::decode(muts[0].val.as_ref().unwrap()).unwrap().live());
         assert!(delete_space(&mut st, auth, sid, URI, "t3".into()).unwrap().is_none(), "already a tombstone");
-        let e = record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(11), [1; 32], None, 1).err().unwrap();
+        let e = record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(11), [1; 32], None, SameRev::Sequence, 1)
+            .err()
+            .unwrap();
         assert!(matches!(e, SpaceError::SpaceNotFound));
         // the authority's own writes wait for a live space
         let mut f = Fetched::default();
@@ -1424,7 +1506,9 @@ mod tests {
         assert!(host.members.is_empty() && host.max_space_rev.is_none());
         assert_eq!(host.writers.get(auth), Some(&None));
         // a member must be loaded afresh: nothing is assumed
-        let e = record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(12), [1; 32], None, 1).err().unwrap();
+        let e = record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(12), [1; 32], None, SameRev::Sequence, 1)
+            .err()
+            .unwrap();
         assert!(matches!(e, SpaceError::Write(WriteError::Internal(_))), "{e:?}");
     }
 

@@ -225,3 +225,111 @@ pub async fn notify_space_deleted(app: &App, authority: &str, uri: &str, service
         }
     }
 }
+
+/// How long the authority waits on a writer's host to confirm a same-rev
+/// hash: well inside the writer's own 10 s notify timeout.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ok when `writer`'s host serves `hash` at `rev` in `space` now: its
+/// getLatestCommit, read as a syncer reads it with a credential `authority`
+/// issues itself, signed by `writer`'s #atproto key. A commit's hash is the
+/// author's claim only when it comes from the author's host (see
+/// [`super::commit::verify`]), which is where this asks.
+pub async fn check_served_hash(
+    app: &App,
+    space: &str,
+    authority: &str,
+    writer: &str,
+    rev: Tid,
+    hash: &[u8; 32],
+) -> Result<(), String> {
+    use p256::ecdsa::signature::Signer;
+    let doc = app.did_resolver.resolve(writer).await.map_err(|e| format!("could not resolve the writer: {e:?}"))?;
+    let endpoint = crate::did_resolver::service_endpoint(&doc, "atproto_pds").ok_or("the writer names no PDS")?;
+    let (key, _) = crate::xrpc::proxy::account_key_status(app, authority).await.map_err(|e| e.message)?;
+    let holder = <p256::ecdsa::SigningKey as p256::elliptic_curve::Generate>::generate();
+    let mut mk = vec![0x80, 0x24];
+    mk.extend_from_slice(holder.verifying_key().to_sec1_point(true).as_bytes());
+    let holder_did = format!("did:key:z{}", bs58::encode(mk).into_string());
+    let mint = super::token::Mint {
+        iss: authority,
+        sub: space,
+        key_id: Some(&holder_did),
+        expires_in_secs: Some(60),
+        ..Default::default()
+    };
+    let now = crate::tid::now_micros() as i64 / 1_000_000;
+    let jti = super::token::new_jti();
+    let cred = super::token::encode(super::token::TokenType::Credential, &mint, "ES256K", now, &jti, |b| {
+        Ok::<_, std::convert::Infallible>(key.sign(b))
+    })
+    .map_err(|e| format!("credential: {e:?}"))?;
+    let authorization = format!("{} {cred}", crate::xrpc::authn::SPACE_SCHEME);
+    let input = super::httpsig::signature_input(true, &holder_did);
+    let sig: p256::ecdsa::Signature =
+        holder.sign(&super::httpsig::signature_base(&authorization, &input, Some(writer)));
+    use base64::Engine;
+    let sig = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
+    let url = format!("{}/xrpc/com.atproto.space.getLatestCommit", endpoint.trim_end_matches('/'));
+    let mut r = crate::http::guarded(app.config.dev_mode)
+        .request(reqwest::Method::GET, &url)?
+        .query(&[("space", space), ("repo", writer)])
+        .header(reqwest::header::AUTHORIZATION, authorization)
+        .header(super::httpsig::AUDIENCE_HEADER, writer)
+        .header("signature-input", format!("{}={input}", super::httpsig::LABEL))
+        .header("signature", format!("{}=:{sig}:", super::httpsig::LABEL))
+        .timeout(CHECK_TIMEOUT)
+        .send()
+        .await
+        .map_err(|e| format!("getLatestCommit: {e}"))?;
+    if !r.status().is_success() {
+        return Err(format!("getLatestCommit: {}", r.status()));
+    }
+    let mut buf = Vec::new();
+    while let Some(c) = r.chunk().await.map_err(|e| format!("getLatestCommit: {e}"))? {
+        if buf.len() + c.len() > MAX_RESPONSE {
+            return Err("getLatestCommit: response too large".into());
+        }
+        buf.extend_from_slice(&c);
+    }
+    let body: J = serde_json::from_slice(&buf).map_err(|_| "getLatestCommit: not JSON")?;
+    let c = &body["commit"];
+    let bytes = |k: &str| -> Result<Vec<u8>, String> {
+        let s = c[k]["$bytes"].as_str().ok_or_else(|| format!("commit.{k} isn't bytes"))?;
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(s.trim_end_matches('='))
+            .map_err(|_| format!("commit.{k} isn't base64"))
+    };
+    let commit = super::commit::SignedCommit {
+        ver: c["ver"].as_i64().ok_or("commit.ver isn't an integer")?,
+        hash: bytes("hash")?,
+        ikm: bytes("ikm")?,
+        sig: bytes("sig")?,
+        mac: bytes("mac")?,
+        rev: c["rev"].as_str().ok_or("commit.rev isn't a string")?.to_string(),
+    };
+    let rev = rev.to_string();
+    if commit.rev != rev {
+        return Err(format!("the writer's host is at {}", commit.rev));
+    }
+    if commit.hash[..] != hash[..] {
+        return Err("the writer's host serves another hash".into());
+    }
+    let ctx = super::commit::CommitCtx { space, author: writer, rev: &rev };
+    let signed_by = |doc: &J| {
+        crate::did_resolver::signing_key_multibase(doc)
+            .is_some_and(|mb| super::commit::verify(&commit, &ctx, &format!("did:key:{mb}")))
+    };
+    if signed_by(&doc) {
+        return Ok(());
+    }
+    // a key rotated since the document was cached
+    if app.did_resolver.refresh(writer) {
+        if let Ok(doc) = app.did_resolver.resolve(writer).await {
+            if signed_by(&doc) {
+                return Ok(());
+            }
+        }
+    }
+    Err("the commit doesn't verify against the writer's key".into())
+}

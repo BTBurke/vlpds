@@ -5337,6 +5337,19 @@ pushes that (an outbox renotify, or the authority's own entry when the
 repo is its own), so syncers get a forward with the spec's "same rev,
 new hash" signal and refetch at once. Every outbox send works out the
 served hash when it goes, so a resent row can't put the old one back.
+The renotify isn't logged, so a crash before it goes leaves the change
+to polls. Each of these forwards costs every syncer a full getRepo, and
+a writer's host can sign notifies for its accounts at will, so the
+authority checks one from another host before it sequences it. The
+worker hands it back (`SameRev::Verify`), the handler reads the writer's
+getLatestCommit at its PDS with a credential the authority issues
+itself (an ephemeral P-256 holder key) and sequences it only if the
+commit verifies against the writer's #atproto key at that rev with the
+notified hash. At most 3 checks per (writer, space) in 10 min, held in
+memory (16,384 pairs, a new pair refused when full of live ones), and
+the rest are dropped unchecked. Both drops answer 200 and count as
+`same_rev_unverified` and `same_rev_capped`. The cluster's own notifies
+(the local worker, `/internal/v1/space/notify`) skip the check.
 Otherwise the authority's worker assigns the next
 spaceRev (a TID) and writes `sW` and the `sQ` swap as one private entry
 before the 200. One worker per authority means no lock.

@@ -890,8 +890,9 @@ Divergences, also in DESIGN.md's Spaces section:
   newest rev), and the cases about its retry table, backoff timing and deadline are left to the outbox's own tests.
 - **Record takedowns are pushed.** A space record takedown or its reversal changes the hash the author's repo serves at the
   same rev, and its host notifies the authority with it. So the authority sequences the same repoRev with another hash again
-  and forwards it. The same repoRev with the same hash is a no-op, as in the reference, which ignores every repoRev at or
-  below the last.
+  and forwards it, once the writer's PDS serves a signed commit with that hash at that rev (at most 3 per writer and space in
+  10 min). The same repoRev with the same hash is a no-op, as in the reference, which ignores every repoRev at or below the
+  last.
 - **300 s single-use token cap.** Delegation tokens and client attestations live at most 300 s. The reference takes any lifetime.
 - **sync.getBlob needs a public reference, with `--spaces` on.** That's the reference's rule. With the flag off vlpds keeps
   serving an uploaded blob before anything references it, except one that only space records name.

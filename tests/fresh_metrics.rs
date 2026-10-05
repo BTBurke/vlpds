@@ -129,6 +129,8 @@ const SPACES_AT_ZERO: &[&str] = &[
     r#"vlpds_space_notify_total{hop="out",result="ok"}"#,
     r#"vlpds_space_notify_total{hop="out",result="retry"}"#,
     r#"vlpds_space_notify_total{hop="in",result="ok"}"#,
+    r#"vlpds_space_notify_total{hop="in",result="same_rev_capped"}"#,
+    r#"vlpds_space_notify_total{hop="in",result="same_rev_unverified"}"#,
     r#"vlpds_space_credential_checks_total{result="ok"}"#,
     r#"vlpds_space_credential_checks_total{result="bad_sig"}"#,
     r#"vlpds_space_credential_checks_total{result="expired"}"#,

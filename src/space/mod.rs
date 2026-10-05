@@ -106,6 +106,9 @@ pub struct Spaces {
     /// doesn't host them, and when: their notifies go out over HTTP without
     /// asking it again on every send.
     not_hosted: parking_lot::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    /// (writer, space) -> when its same-rev notifies were checked, within
+    /// [`SAME_REV_WINDOW`].
+    same_rev: parking_lot::Mutex<std::collections::HashMap<(String, crate::state::SpaceId), Vec<std::time::Instant>>>,
     /// [`export_budget_bytes`] in KiB, which space exports reserve from.
     exports: Arc<tokio::sync::Semaphore>,
     export_kib: u32,
@@ -116,6 +119,15 @@ pub struct Spaces {
 /// with one more hop.
 const NOT_HOSTED_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const NOT_HOSTED_MAX: usize = 4096;
+
+/// Same-rev notifies (a record takedown or its reversal at the writer's
+/// host) checked per (writer, space) and window: real ones are a moderator's
+/// actions, a handful a day.
+pub const SAME_REV_PER_WINDOW: usize = 3;
+pub const SAME_REV_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+/// ~200 B each. Full of live budgets, a new pair is refused rather than any
+/// budget forgotten: refusing costs a real one a poll's delay.
+const SAME_REV_MAX: usize = 16_384;
 
 const RESCAN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 const RESCAN_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
@@ -136,6 +148,7 @@ impl Spaces {
             imports: Default::default(),
             registering: std::array::from_fn(|_| Default::default()),
             not_hosted: Default::default(),
+            same_rev: Default::default(),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
             fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE, fanout::RETRY_BASE)),
@@ -170,6 +183,28 @@ impl Spaces {
             }
         }
         m.insert(authority.to_string(), std::time::Instant::now());
+    }
+
+    /// Takes one of `writer`'s same-rev checks in `sid`: false once
+    /// [`SAME_REV_PER_WINDOW`] were taken in the last [`SAME_REV_WINDOW`].
+    pub fn same_rev_budget(&self, writer: &str, sid: crate::state::SpaceId) -> bool {
+        let now = std::time::Instant::now();
+        let live = |at: &std::time::Instant| now.duration_since(*at) < SAME_REV_WINDOW;
+        let mut m = self.same_rev.lock();
+        let key = (writer.to_string(), sid);
+        if m.len() >= SAME_REV_MAX && !m.contains_key(&key) {
+            m.retain(|_, ats| ats.iter().any(live));
+            if m.len() >= SAME_REV_MAX {
+                return false;
+            }
+        }
+        let ats = m.entry(key).or_default();
+        ats.retain(live);
+        if ats.len() >= SAME_REV_PER_WINDOW {
+            return false;
+        }
+        ats.push(now);
+        true
     }
 
     /// Re-reads the revocations object; cached credentials it newly
@@ -475,6 +510,31 @@ mod tests {
         for no in ["com.atproto.repo.getRecord", "com.atproto.spaces.x", "com.atproto.space", "app.bsky.space.x", ""] {
             assert!(!is_space_nsid(no), "{no}");
         }
+    }
+
+    #[test]
+    fn same_rev_budget_per_writer_and_space() {
+        let sp = Spaces::new(Limits::default());
+        let (a, b) = (crate::state::space_id("at://a"), crate::state::space_id("at://b"));
+        for _ in 0..SAME_REV_PER_WINDOW {
+            assert!(sp.same_rev_budget("did:plc:w", a));
+        }
+        assert!(!sp.same_rev_budget("did:plc:w", a));
+        assert!(sp.same_rev_budget("did:plc:w", b), "another space has its own");
+        assert!(sp.same_rev_budget("did:plc:x", a), "another writer has its own");
+        let old = std::time::Instant::now() - SAME_REV_WINDOW;
+        sp.same_rev.lock().get_mut(&("did:plc:w".to_string(), a)).unwrap().iter_mut().for_each(|t| *t = old);
+        assert!(sp.same_rev_budget("did:plc:w", a), "the window passed");
+        // full of live budgets: a new pair is refused, none forgotten
+        let mut m = sp.same_rev.lock();
+        let now = std::time::Instant::now();
+        for i in m.len()..SAME_REV_MAX {
+            m.insert((format!("did:plc:{i}"), a), vec![now]);
+        }
+        drop(m);
+        assert!(!sp.same_rev_budget("did:plc:new", a));
+        assert!(sp.same_rev_budget("did:plc:x", a), "a pair held keeps its budget");
+        assert_eq!(sp.same_rev.lock().len(), SAME_REV_MAX);
     }
 
     #[test]

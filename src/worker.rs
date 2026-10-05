@@ -2505,9 +2505,19 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             };
             (b.muts, Box::new(ack))
         }
-        SpaceOp::RecordWriter { writer, repo_rev, hash, managing_app } => {
-            let r =
-                sr::record_writer(st.spaces_mut(), &did, sid, &uri, &writer, repo_rev, hash, managing_app, clock_id);
+        SpaceOp::RecordWriter { writer, repo_rev, hash, managing_app, same_rev } => {
+            let r = sr::record_writer(
+                st.spaces_mut(),
+                &did,
+                sid,
+                &uri,
+                &writer,
+                repo_rev,
+                hash,
+                managing_app,
+                same_rev,
+                clock_id,
+            );
             match r {
                 Err(e) => {
                     let _ = reply.send(Err(e));

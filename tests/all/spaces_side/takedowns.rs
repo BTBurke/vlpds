@@ -458,3 +458,59 @@ async fn the_authoritys_own_record_takedown_moves_its_listed_hash() {
     restored.insert(path("more"), more);
     authority_lists(&t, &acred, &t.alice.did, &rev2, &set_hash(&restored), "the reversal").await;
 }
+
+/// `vlpds_space_notify_total{hop="in",result}` in this process.
+fn notifies_in(result: &str) -> f64 {
+    let want = format!(r#"vlpds_space_notify_total{{hop="in",result="{result}"}} "#);
+    vlpds::metrics::render().lines().find_map(|l| l.strip_prefix(&want)?.trim().parse().ok()).unwrap_or(0.0)
+}
+
+/// A writer's host can sign notifyWrites for its own accounts, so it could
+/// repeat its current repoRev with made-up hashes, each one sending every
+/// syncer to a full getRepo. The authority asks the writer's host for the
+/// hash it serves first: the fakes are dropped unforwarded, the first few as
+/// unconfirmed, the rest over the per-(writer, space) cap without a check.
+/// Another writer's real takedown still goes through, and nothing forks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_rev_notifies_with_made_up_hashes_are_dropped() {
+    let t = td().await;
+    t.bob_writes("one", "one").await;
+    let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
+    let stub = super::hooks::StubDid::spawn().await;
+    let acred = t.net.credential_for(&t.alice, &t.space).await;
+    let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
+    acred.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    let held = listed(&t.net.pds[1].url, &acred, &t.space, &t.bob.did).await;
+    authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&held), "bob's write").await;
+    let forwards = stub.seen().len();
+    let (unverified, capped) = (notifies_in("same_rev_unverified"), notifies_in("same_rev_capped"));
+
+    let aud = vlpds::space::token::space_host_aud(&t.alice.did);
+    let jwt = service_jwt(&t.bob, &aud, "com.atproto.space.notifyWrite").await;
+    let spam = 10;
+    for _ in 0..spam {
+        let body = json!({"space": t.space, "repo": t.bob.did, "repoRev": rev, "hash": json_bytes(&rand::random::<[u8; 32]>())});
+        post_service(&t.net.pds[0].url, "com.atproto.space.notifyWrite", &jwt, body).await.ok();
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(row_at_authority(&t, &acred, &t.bob.did).await, Some((rev.clone(), set_hash(&held))));
+    assert_eq!(stub.seen().len(), forwards, "no forward for a made-up hash: {:?}", stub.seen());
+    let per = vlpds::space::SAME_REV_PER_WINDOW as f64;
+    assert!(notifies_in("same_rev_unverified") - unverified >= per, "checked and refused");
+    assert!(notifies_in("same_rev_capped") - capped >= spam as f64 - per, "over the cap, not checked");
+
+    // carol's host has its own budget: her record's takedown is pushed
+    let r = write(&t.carol, &t.space, W::new().rkey("gone").text("carol's")).await.ok();
+    let cid = r["cid"].as_str().unwrap().to_string();
+    write(&t.carol, &t.space, W::new().rkey("kept").text("kept")).await.ok();
+    let crev = repo_state(&t.carol, &t.space).await.unwrap().0;
+    let all = listed(&t.net.pds[1].url, &acred, &t.space, &t.carol.did).await;
+    authority_lists(&t, &acred, &t.carol.did, &crev, &set_hash(&all), "carol's writes").await;
+    let uri = record_uri(&t.space, &t.carol.did, TEST_COLLECTION, "gone");
+    takedown_record(&t.net.pds[1], &uri, &cid, true).await;
+    let mut visible = all.clone();
+    visible.remove(&path("gone"));
+    authority_lists(&t, &acred, &t.carol.did, &crev, &set_hash(&visible), "carol's takedown").await;
+    forwarded(&stub, &t.carol.did, &crev, &set_hash(&visible), "carol's takedown").await;
+    stub.assert_no_fork("the syncer");
+}

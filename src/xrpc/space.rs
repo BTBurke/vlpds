@@ -14,7 +14,9 @@ use crate::oauth::scopes::{SpaceAccess, SpaceTarget};
 use crate::space::heads::DurableSpaceHead;
 use crate::space::lthash::LtHash;
 use crate::space::outbox::{Outcome, Pending};
-use crate::space::repo::{PutScopes, SpaceAck, SpaceError, SpaceOp, SpaceOutcome, SpaceReq, SpaceWrite, MAX_WRITES};
+use crate::space::repo::{
+    PutScopes, SameRev, SpaceAck, SpaceError, SpaceOp, SpaceOutcome, SpaceReq, SpaceWrite, MAX_WRITES,
+};
 use crate::space::revocations;
 use crate::space::rows::{HeadRow, OpRow};
 use crate::space::token::{self, TokenType};
@@ -104,6 +106,7 @@ pub(super) fn space_error(e: SpaceError) -> XrpcError {
         SpaceError::SpaceAlreadyExists => XrpcError::bad("SpaceAlreadyExists", "Space already exists"),
         SpaceError::NotAuthorized(m) => forbidden(m),
         SpaceError::Unswept(_) => XrpcError::unavailable("Unavailable", "the space repo is being cleared; retry"),
+        SpaceError::SameRev => XrpcError::internal("an unchecked same-rev notify"),
     }
 }
 
@@ -532,7 +535,13 @@ async fn push_served_hash(app: &App, repo: &str, sid: SpaceId) -> XResult<()> {
         return Ok(());
     }
     let hash = served_digest(app, repo, &space, row.rev).await?.unwrap_or_else(|| row.hash.digest());
-    let op = SpaceOp::RecordWriter { writer: repo.to_string(), repo_rev: row.rev, hash, managing_app: None };
+    let op = SpaceOp::RecordWriter {
+        writer: repo.to_string(),
+        repo_rev: row.rev,
+        hash,
+        managing_app: None,
+        same_rev: SameRev::Sequence,
+    };
     submit_space_once(app, repo, &space, op).await?.map(|_| ()).map_err(space_error)
 }
 
@@ -1619,7 +1628,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     } else if app.partition(&space.authority).is_ok()
         && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some())
     {
-        let r = process_notify_write(app, &space, &p.did, p.repo_rev, hash).await;
+        let r = process_notify_write(app, &space, &p.did, p.repo_rev, hash, SameRev::Sequence).await;
         metrics::space_notify("in", notify_in_result(&r));
         return outcome(r.map(|_| ()));
     }
@@ -1730,7 +1739,7 @@ async fn internal_notify(
     if super::server::account_if_exists(&app, &space.authority).await?.is_none() {
         return Ok(Json(json!({"hosted": false})));
     }
-    let r = process_notify_write(&app, &space, &inp.repo, repo_rev, hash).await;
+    let r = process_notify_write(&app, &space, &inp.repo, repo_rev, hash, SameRev::Sequence).await;
     metrics::space_notify("in", notify_in_result(&r));
     r?;
     Ok(Json(json!({"hosted": true})))
@@ -1942,7 +1951,9 @@ pub(super) const FUTURE_REV: std::time::Duration = std::time::Duration::from_sec
 
 /// Reference `processNotifyWrite` at the space's authority: the space must
 /// be live here, the writer admitted by the write policy (the authority
-/// always), and its repoRev newer than the one recorded (Ok(None) if not).
+/// always), and its repoRev newer than the one recorded, or the same one
+/// with another hash (a record takedown or its reversal; `same_rev` says
+/// whether that hash is trusted or checked at the writer's host first).
 /// Recorded through the authority's worker, which assigns the spaceRev and
 /// queues the forward to registered services once it's durable.
 pub(super) async fn process_notify_write(
@@ -1951,7 +1962,8 @@ pub(super) async fn process_notify_write(
     writer: &str,
     repo_rev: Tid,
     hash: [u8; 32],
-) -> XResult<Option<crate::space::repo::Sequenced>> {
+    same_rev: SameRev,
+) -> XResult<Notified> {
     super::simplespace::assert_space_host(app, space).await?;
     if repo_rev.micros() > crate::tid::now_micros() + FUTURE_REV.as_micros() as u64 {
         return Err(XrpcError::bad("FutureRev", "Repo revision is in the future"));
@@ -1959,7 +1971,7 @@ pub(super) async fn process_notify_write(
     let row = super::simplespace::live_space(app, space).await?;
     if space_takendown(app, space).await? {
         tracing::debug!(space = %hex::encode(space.sid), "notifyWrite to a taken-down space dropped");
-        return Ok(None);
+        return Ok(Notified::Noop);
     }
     let managing_app = match &row.write_policy {
         crate::space::rows::Policy::ManagingApp { .. } if writer != space.authority => {
@@ -1967,17 +1979,52 @@ pub(super) async fn process_notify_write(
         }
         _ => None,
     };
-    let op = SpaceOp::RecordWriter { writer: writer.to_string(), repo_rev, hash, managing_app };
-    match submit_space(app, &space.authority, space, op).await? {
-        SpaceAck::Writer(seq) => Ok(seq),
-        _ => Err(XrpcError::internal("unexpected space ack")),
+    let op = |same_rev| SpaceOp::RecordWriter { writer: writer.to_string(), repo_rev, hash, managing_app, same_rev };
+    match submit_space_once(app, &space.authority, space, op(same_rev)).await? {
+        Ok(SpaceAck::Writer(seq)) => return Ok(if seq.is_some() { Notified::Sequenced } else { Notified::Noop }),
+        Ok(_) => return Err(XrpcError::internal("unexpected space ack")),
+        Err(SpaceError::SameRev) => {}
+        Err(e) => return Err(space_error(e)),
+    }
+    // every same-rev forward sends each syncer to a full getRepo, and a
+    // writer's host could make up hashes for free: the cap bounds even the
+    // checks, and only a hash the writer's host signs is sequenced
+    let log_id = hex::encode(space.sid);
+    if !spaces(app)?.same_rev_budget(writer, space.sid) {
+        tracing::info!(space = %log_id, "same-rev notify over the cap dropped");
+        return Ok(Notified::SameRevCapped);
+    }
+    if let Err(e) =
+        crate::space::host::check_served_hash(app, &space.uri, &space.authority, writer, repo_rev, &hash).await
+    {
+        tracing::info!(space = %log_id, "same-rev notify not confirmed by the writer's host, dropped: {e}");
+        return Ok(Notified::SameRevUnverified);
+    }
+    match submit_space_once(app, &space.authority, space, op(SameRev::Sequence)).await? {
+        Ok(SpaceAck::Writer(seq)) => Ok(if seq.is_some() { Notified::Sequenced } else { Notified::Noop }),
+        Ok(_) => Err(XrpcError::internal("unexpected space ack")),
+        Err(e) => Err(space_error(e)),
     }
 }
 
-fn notify_in_result(r: &XResult<Option<crate::space::repo::Sequenced>>) -> &'static str {
+/// What an inbound notifyWrite did.
+pub(super) enum Notified {
+    Sequenced,
+    /// Not newer, or the space is taken down.
+    Noop,
+    /// The same repoRev with another hash, over [`crate::space::Spaces::same_rev_budget`].
+    SameRevCapped,
+    /// The same repoRev with another hash that the writer's host didn't
+    /// serve, or couldn't be asked about. Polls catch a real one up.
+    SameRevUnverified,
+}
+
+fn notify_in_result(r: &XResult<Notified>) -> &'static str {
     match r {
-        Ok(Some(_)) => "ok",
-        Ok(None) => "noop",
+        Ok(Notified::Sequenced) => "ok",
+        Ok(Notified::Noop) => "noop",
+        Ok(Notified::SameRevCapped) => "same_rev_capped",
+        Ok(Notified::SameRevUnverified) => "same_rev_unverified",
         Err(e) if e.status.is_server_error() => "error",
         Err(_) => "refused",
     }
@@ -2001,7 +2048,7 @@ async fn notify_write(State(app): AppState, headers: HeaderMap, Json(inp): Json<
     r.map(|_| StatusCode::OK)
 }
 
-async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<Option<crate::space::repo::Sequenced>> {
+async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<Notified> {
     let field = |k: &str| inp.get(k).and_then(|v| v.as_str());
     let repo_rev = field("repoRev")
         .and_then(Tid::parse)
@@ -2022,7 +2069,7 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
     if auth.aud != space.authority && auth.aud != token::space_host_aud(&space.authority) {
         return Err(forbidden("notifyWrite aud does not match the space authority"));
     }
-    process_notify_write(app, &space, repo, repo_rev, hash).await
+    process_notify_write(app, &space, repo, repo_rev, hash, SameRev::Verify).await
 }
 
 /// A request the space host answers for a credential holder only: the

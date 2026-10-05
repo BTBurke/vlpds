@@ -107,7 +107,7 @@ also takes that much room from the memory plan's space exports. The room fits 4 
 | `vlpds_space_writes_total{op,result}` | space writes by method and result |
 | `vlpds_space_reads_total{method,auth}` | reads by method and auth (`credential` or `oauth`) |
 | `vlpds_space_list_repo_ops_total{path}`, `vlpds_space_list_repo_ops_seconds{path}` | `noop` (answered from memory) vs `scan`, and server time for each |
-| `vlpds_space_notify_total{hop,result}` | notify hops: `out` (this node's writes), `in` (as an authority), `fanout` (to syncers) |
+| `vlpds_space_notify_total{hop,result}` | notify hops: `out` (this node's writes), `in` (as an authority), `fanout` (to syncers). `in` counts `same_rev_unverified` and `same_rev_capped` for a same-rev notify from another host that its PDS didn't confirm or that came over the cap ([Privacy](privacy.md#takedowns)) |
 | `vlpds_space_notify_ack_seconds` | a write's ack to the authority's 200 |
 | `vlpds_space_outbox_rows`, `vlpds_space_outbox_oldest_seconds` | outbox depth and the age of its oldest row (rows held for an inactive writer don't count toward the age) |
 | `vlpds_space_outbox_overflow_total` | rows left in the bucket because the outbox was full |

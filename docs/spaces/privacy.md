@@ -179,3 +179,16 @@ since nothing was written. The push isn't logged, so if the author's host crashe
 syncers find out on their next poll instead. Every notify works out the served hash when it's sent,
 so a resent row never puts the old hash back at the authority. An authority's own records work the
 same way, and so do its writes while one of its records is down.
+
+Every such forward sends each syncer to a full `getRepo`, and any writer's host can sign a notify for
+its own accounts. So a host could repeat its current rev with made-up hashes and make every syncer
+of the space refetch the whole repo, again and again. An authority checks a same-rev notify from
+another host before it sequences one. It reads the writer's `getLatestCommit` from the writer's PDS
+with a credential it issues itself, and sequences the notify only if that commit verifies against
+the writer's key at that rev with the notified hash. A notify it can't confirm (a made-up hash, or a
+host that doesn't answer within 5 s) is acknowledged and dropped, and polls catch a real one up. It
+also checks at most 3 of them per writer and space in 10 min and drops the rest unchecked, so a
+host can't make it fetch at will either. Both show up in `vlpds_space_notify_total{hop="in"}` as
+`same_rev_unverified` and `same_rev_capped`. A moderator's takedown and its reversal take two of the
+3. Notifies from this cluster's own nodes need no check, since the cluster worked out the hash
+itself.
