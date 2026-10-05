@@ -191,7 +191,13 @@ async fn dpop_send(
         if let Some(t) = token {
             rb = rb.header("authorization", format!("DPoP {t}"));
         }
-        let r = rb.send().await.unwrap();
+        let r = match rb.send().await {
+            Ok(r) => r,
+            // a pooled connection the server closed after refusing a large
+            // body early (importRepo over its caps): a GET goes again
+            Err(e) if attempt == 0 && method == reqwest::Method::GET && e.is_request() => continue,
+            Err(e) => panic!("{url}: {e:?}"),
+        };
         let (status, headers) = (r.status().as_u16(), r.headers().clone());
         key.update_nonce(&headers);
         let body: J = r.json().await.unwrap_or(J::Null);
