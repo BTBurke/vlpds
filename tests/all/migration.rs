@@ -81,7 +81,13 @@ async fn migrate_account_with_records_and_blobs() {
 
     let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("moved"));
     let email = format!("{}@example.com", unique_name("moved"));
-    let body = json!({"handle": handle, "email": email, "password": PASSWORD, "did": did});
+    // a code given when not required is still checked and its use recorded
+    let code = new.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": 2}), &Auth::Admin).await.ok()
+        ["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let body = json!({"handle": handle, "email": email, "password": PASSWORD, "did": did, "inviteCode": code});
 
     // bringing a DID requires service auth from it, for this method and PDS
     let r = new.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
@@ -117,6 +123,11 @@ async fn migrate_account_with_records_and_blobs() {
     assert_eq!((st["indexedRecords"].clone(), st["expectedBlobs"].clone()), (json!(0), json!(0)), "{st}");
     let rs = new.repo_status(&did).await.ok();
     assert_eq!((rs["active"].clone(), rs["status"].clone()), (json!(false), json!("deactivated")), "{rs}");
+    let codes = new.xrpc.get("com.atproto.admin.getInviteCodes", &[], &Auth::Admin).await.ok();
+    let v = codes["codes"].as_array().unwrap().iter().find(|c| c["code"] == code.as_str()).unwrap().clone();
+    assert_eq!(v["available"], json!(2), "{v}");
+    let used: Vec<&J> = v["uses"].as_array().unwrap().iter().map(|u| &u["usedBy"]).collect();
+    assert_eq!(used, vec![&json!(did)], "one use, by the migrated DID: {v}");
     // the dashboard's totals count it as deactivated (created so, migration in)
     assert_eq!(vlpds::xrpc::totals(&new.app).accounts, [0, 1, 0, 0, 0]);
 

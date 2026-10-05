@@ -170,3 +170,51 @@ async fn admin_listings_single_node_complete() {
         .await
         .err(400, "InvalidRequest");
 }
+
+/// Signups using one code race on every node, each recording its use from
+/// the node owning its new account: every use shows in every node's
+/// listing (a node-local lock around the code's read-modify-write lost some).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn invite_uses_recorded_on_any_node_all_show() {
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let a = Arc::new(node("inv-a", &store).await);
+    let b = Arc::new(node("inv-b", &store).await);
+    let c = Arc::new(node("inv-c", &store).await);
+    balanced(&[&a, &b, &c]).await;
+    const USES: usize = 18;
+    let r = a.xrpc.post("com.atproto.server.createInviteCode", &json!({"useCount": USES}), &Auth::Admin).await.ok();
+    let code = r["code"].as_str().unwrap().to_string();
+    let tag = unique_name("ir");
+    let hs: Vec<_> = (0..USES)
+        .map(|i| {
+            let n = [&a, &b, &c][i % 3].clone();
+            let handle = format!("{tag}x{i}.{HANDLE_DOMAIN}");
+            let email = format!("{}@example.com", handle.replace('.', "-"));
+            let body = json!({"handle": handle, "password": PASSWORD, "email": email, "inviteCode": code});
+            tokio::spawn(async move {
+                let t = std::time::Instant::now();
+                loop {
+                    let r = n.xrpc.post("com.atproto.server.createAccount", &body, &Auth::None).await;
+                    if r.status != 503 || t.elapsed() > Duration::from_secs(60) {
+                        return r.ok()["did"].as_str().unwrap().to_string();
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+        })
+        .collect();
+    let mut dids = HashSet::new();
+    for h in hs {
+        dids.insert(h.await.unwrap());
+    }
+    let owners: HashSet<String> = dids.iter().map(|d| owner_of(&[&a, &b, &c], d).url.clone()).collect();
+    assert!(owners.len() > 1, "uses recorded from more than one node");
+    for s in [&a, &b, &c] {
+        let r = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
+        let v = r["codes"].as_array().unwrap().iter().find(|v| v["code"] == code.as_str()).unwrap().clone();
+        let used: HashSet<String> =
+            v["uses"].as_array().unwrap().iter().map(|u| u["usedBy"].as_str().unwrap().to_string()).collect();
+        assert_eq!(used, dids, "every use listed on {}: {v}", s.url);
+        assert_eq!(v["available"], json!(USES), "available is the total, as the reference: {v}");
+    }
+}
