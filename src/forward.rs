@@ -661,6 +661,8 @@ fn ttfb_for(req: &Request) -> Duration {
             | "com.atproto.sync.getBlob"
             | "com.atproto.sync.getBlocks"
             | "com.atproto.server.createAccount"
+            // a DNS lookup and an HTTPS fetch, 3 s deadline each
+            | "vlpds.identity.checkHandle"
     ) || nsid.starts_with("com.atproto.server.request");
     let fast = ["com.atproto.repo.", "com.atproto.sync.", "com.atproto.server.", "com.atproto.admin.", "vlpds."]
         .iter()

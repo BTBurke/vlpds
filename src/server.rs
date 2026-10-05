@@ -106,6 +106,8 @@ pub struct Config {
     pub mod_service_did: Option<String>,
     /// None: the system resolver; tests inject a stub.
     pub txt_resolver: Option<crate::handle_resolver::TxtResolverRef>,
+    /// None: the SSRF-guarded HTTPS fetch; tests inject a stub.
+    pub well_known_fetcher: Option<crate::handle_resolver::WellKnownRef>,
     /// None: node id "single", addr = public_url.
     pub cluster: Option<ClusterConfig>,
     pub rate_limits_enabled: bool,
@@ -291,6 +293,7 @@ impl Default for Config {
             invite_epoch_ms: 0,
             mod_service_did: None,
             txt_resolver: None,
+            well_known_fetcher: None,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
             peer_connections: crate::http::DEFAULT_PEER_CONNECTIONS,

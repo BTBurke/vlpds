@@ -56,8 +56,32 @@ pub fn resolver(configured: Option<&TxtResolverRef>) -> Arc<dyn TxtResolver> {
     configured.map(|r| r.0.clone()).unwrap_or_else(|| DEFAULT.clone())
 }
 
-/// Reference `parseDnsResult`: zero or several `did=` records is no answer.
-fn parse_dns_result(records: &[String]) -> Option<String> {
+/// `https://<handle>/.well-known/atproto-did`'s first line, trimmed. The
+/// default is `xrpc::identity`'s SSRF-guarded fetch; tests inject a stub.
+pub trait WellKnownFetcher: Send + Sync {
+    fn fetch<'a>(&'a self, handle: &'a str) -> BoxFuture<'a, Result<String, String>>;
+}
+
+#[derive(Clone)]
+pub struct WellKnownRef(pub Arc<dyn WellKnownFetcher>);
+
+impl std::fmt::Debug for WellKnownRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WellKnownFetcher")
+    }
+}
+
+/// What `_atproto.<handle>` holds (the account page's handle check).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsAnswer {
+    One(String),
+    /// Several `did=` records, which prove nothing.
+    Several,
+    /// No `did=` record, no such name, or no answer in time.
+    Nothing,
+}
+
+fn dns_answer(records: &[String]) -> DnsAnswer {
     let found: Vec<&str> = records
         .iter()
         .take(MAX_TXT_RECORDS)
@@ -65,15 +89,26 @@ fn parse_dns_result(records: &[String]) -> Option<String> {
         .filter_map(|r| r.strip_prefix(PREFIX))
         .collect();
     match found.as_slice() {
-        [did] => Some(did.to_string()),
-        _ => None,
+        [did] => DnsAnswer::One(did.to_string()),
+        [] => DnsAnswer::Nothing,
+        _ => DnsAnswer::Several,
     }
 }
 
-async fn resolve_dns(r: &dyn TxtResolver, handle: &str) -> Option<String> {
+pub async fn lookup_dns(r: &dyn TxtResolver, handle: &str) -> DnsAnswer {
     let name = format!("{SUBDOMAIN}.{handle}.");
-    let records = tokio::time::timeout(TIMEOUT, r.txt(&name)).await.ok()?.ok()?;
-    parse_dns_result(&records)
+    match tokio::time::timeout(TIMEOUT, r.txt(&name)).await {
+        Ok(Ok(records)) => dns_answer(&records),
+        _ => DnsAnswer::Nothing,
+    }
+}
+
+/// Reference `parseDnsResult`: zero or several `did=` records is no answer.
+async fn resolve_dns(r: &dyn TxtResolver, handle: &str) -> Option<String> {
+    match lookup_dns(r, handle).await {
+        DnsAnswer::One(did) => Some(did),
+        _ => None,
+    }
 }
 
 pub async fn resolve<H>(r: &dyn TxtResolver, handle: &str, http: H) -> Option<String>
@@ -123,13 +158,14 @@ mod tests {
 
     #[test]
     fn parses_exactly_one_did_record() {
-        assert_eq!(parse_dns_result(&s(&["did=did:plc:abc"])), Some("did:plc:abc".into()));
-        assert_eq!(parse_dns_result(&s(&["v=spf1 -all", "did=did:plc:abc"])), Some("did:plc:abc".into()));
-        assert_eq!(parse_dns_result(&s(&["did=did:plc:a", "did=did:plc:b"])), None);
-        assert_eq!(parse_dns_result(&s(&["foo"])), None);
-        assert_eq!(parse_dns_result(&[]), None);
+        let one = |d: &str| DnsAnswer::One(d.into());
+        assert_eq!(dns_answer(&s(&["did=did:plc:abc"])), one("did:plc:abc"));
+        assert_eq!(dns_answer(&s(&["v=spf1 -all", "did=did:plc:abc"])), one("did:plc:abc"));
+        assert_eq!(dns_answer(&s(&["did=did:plc:a", "did=did:plc:b"])), DnsAnswer::Several);
+        assert_eq!(dns_answer(&s(&["foo"])), DnsAnswer::Nothing);
+        assert_eq!(dns_answer(&[]), DnsAnswer::Nothing);
         let long = format!("did={}", "x".repeat(MAX_TXT_BYTES));
-        assert_eq!(parse_dns_result(&[long, "did=did:plc:abc".into()]), Some("did:plc:abc".into()));
+        assert_eq!(dns_answer(&[long, "did=did:plc:abc".into()]), one("did:plc:abc"));
     }
 
     #[tokio::test]
