@@ -54,6 +54,7 @@ pub async fn resolve_service_endpoint(app: &App, service: &str) -> Option<String
 #[allow(clippy::too_many_arguments)]
 async fn call(
     app: &App,
+    client: crate::http::Guarded,
     iss: &str,
     service: &str,
     endpoint: &str,
@@ -65,8 +66,7 @@ async fn call(
     let (key, _) = crate::xrpc::proxy::account_key_status(app, iss).await.map_err(|e| e.message)?;
     let jwt = crate::auth::service_auth_jwt(&key, iss, service, Some(lxm), 60).map_err(|e| e.to_string())?;
     let url = format!("{}/xrpc/{lxm}", endpoint.trim_end_matches('/'));
-    let mut rb =
-        crate::http::guarded(app.config.dev_mode).request(method, &url)?.bearer_auth(jwt).timeout(CALL_TIMEOUT);
+    let mut rb = client.request(method, &url)?.bearer_auth(jwt).timeout(CALL_TIMEOUT);
     if !query.is_empty() {
         rb = rb.query(query);
     }
@@ -107,7 +107,8 @@ pub async fn check_user_access(
     if let Some(c) = client_id {
         q.push(("clientId", c));
     }
-    match call(app, authority, managing_app, &endpoint, lxm, reqwest::Method::GET, &q, None).await {
+    let client = crate::http::guarded(app.config.dev_mode);
+    match call(app, client, authority, managing_app, &endpoint, lxm, reqwest::Method::GET, &q, None).await {
         Ok((200, body)) => body["authorized"] == J::Bool(true),
         Ok((status, _)) => {
             tracing::info!(space, managing_app, user, status, "managing app check failed");
@@ -120,23 +121,28 @@ pub async fn check_user_access(
     }
 }
 
-/// A space's live registrations (`sN`, unexpired), from the authority's
-/// shard.
-pub async fn registrations(app: &App, authority: &str, sid: &SpaceId) -> anyhow::Result<Vec<(String, NotifyRow)>> {
+/// A space's registrations (`sN`) from the authority's shard: the live
+/// ones, and the services of expired ones.
+pub async fn registrations(
+    app: &App,
+    authority: &str,
+    sid: &SpaceId,
+) -> anyhow::Result<(Vec<(String, NotifyRow)>, Vec<String>)> {
     let p = app.partition(authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
     let prefix = state::space_prefix(state::SPACE_NOTIFY_FAMILY, authority, sid);
     let opts = slatedb::config::ScanOptions::default();
     let mut it = p.db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await?;
     let now = crate::tid::now_micros();
-    let mut out = Vec::new();
+    let (mut live, mut expired) = (Vec::new(), Vec::new());
     while let Some(kv) = it.next().await? {
         let service = std::str::from_utf8(&kv.key[prefix.len()..])?.to_string();
         let row = NotifyRow::decode(&kv.value)?;
-        if row.expires > now {
-            out.push((service, row));
+        match row.expires > now {
+            true => live.push((service, row)),
+            false => expired.push(service),
         }
     }
-    Ok(out)
+    Ok((live, expired))
 }
 
 /// One forward of a sequenced write to a registered service.
@@ -150,6 +156,8 @@ pub struct Forward {
     pub hash: [u8; 32],
     pub space_rev: Tid,
     pub prev_space_rev: Option<Tid>,
+    /// The registration's expiry (unix µs).
+    pub expires: u64,
 }
 
 fn b64(b: &[u8]) -> J {
@@ -158,8 +166,9 @@ fn b64(b: &[u8]) -> J {
 }
 
 /// notifyWrite to a registered service, as the reference forwards it (the
-/// writer's notify plus the spaceRevs). The result for the metrics.
-pub async fn forward(app: &App, f: &Forward) -> &'static str {
+/// writer's notify plus the spaceRevs), naming `prev` as the spaceRev
+/// before it: "ok", "refused" (a status not worth retrying) or "error".
+pub async fn forward(app: &App, f: &Forward, prev: Option<Tid>) -> &'static str {
     let lxm = "com.atproto.space.notifyWrite";
     let mut body = json!({
         "space": &*f.uri,
@@ -168,11 +177,17 @@ pub async fn forward(app: &App, f: &Forward) -> &'static str {
         "hash": b64(&f.hash),
         "spaceRev": f.space_rev.to_string(),
     });
-    if let Some(p) = f.prev_space_rev {
+    if let Some(p) = prev {
         body["prevSpaceRev"] = json!(p.to_string());
     }
-    match call(app, &f.authority, &f.service, &f.endpoint, lxm, reqwest::Method::POST, &[], Some(&body)).await {
+    let client = crate::http::guarded_fanout(app.config.dev_mode);
+    let post = reqwest::Method::POST;
+    match call(app, client, &f.authority, &f.service, &f.endpoint, lxm, post, &[], Some(&body)).await {
         Ok((s, _)) if (200..300).contains(&s) => "ok",
+        Ok((s, _)) if crate::xrpc::space::retryable_status(s) => {
+            tracing::info!(space = %f.uri, service = f.service, status = s, "space notify forward failed");
+            "error"
+        }
         Ok((s, _)) => {
             tracing::info!(space = %f.uri, service = f.service, status = s, "space notify forward refused");
             "refused"
@@ -191,7 +206,9 @@ pub async fn notify_space_deleted(app: &App, authority: &str, uri: &str, service
     let lxm = "com.atproto.space.notifySpaceDeleted";
     let body = json!({"space": uri});
     for (service, row) in services {
-        let r = call(app, authority, &service, &row.endpoint, lxm, reqwest::Method::POST, &[], Some(&body)).await;
+        let client = crate::http::guarded_fanout(app.config.dev_mode);
+        let r =
+            call(app, client, authority, &service, &row.endpoint, lxm, reqwest::Method::POST, &[], Some(&body)).await;
         match r {
             Ok((s, _)) if (200..300).contains(&s) => {}
             Ok((s, _)) => tracing::info!(space = uri, service, status = s, "notifySpaceDeleted refused"),

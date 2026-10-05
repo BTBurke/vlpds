@@ -478,6 +478,7 @@ pub fn write(
     clock_id: u64,
     applied: &Arc<AtomicBool>,
     delivered: Vec<(SpaceId, Tid)>,
+    max_records: u64,
 ) -> Result<Result<BuiltWrite, Vec<SpaceOutcome>>, SpaceError> {
     if writes.len() > MAX_WRITES {
         return Err(SpaceError::Write(WriteError::Invalid(format!("Too many writes. Max: {MAX_WRITES}"))));
@@ -539,6 +540,14 @@ pub fn write(
     }
     if ops.is_empty() {
         return Ok(Err(results));
+    }
+    let added = ops.iter().map(|(o, _)| o.cid.is_some() as i64 - o.prev.is_some() as i64).sum::<i64>();
+    // a write that doesn't grow the repo is let through over the cap (a
+    // lowered flag), so it can be trimmed
+    if added > 0 && head.records.saturating_add(added as u64) > max_records {
+        return Err(SpaceError::Write(WriteError::Invalid(format!(
+            "Space repo record limit reached: at most {max_records} records"
+        ))));
     }
     let rev = tid::next_rev(head.rev, clock_id);
     let mut muts = Vec::with_capacity(2 * ops.len() + 6);
@@ -847,7 +856,8 @@ mod tests {
 
     fn go(st: &mut SpaceStates, sid: SpaceId, uri: &Arc<str>, w: Vec<SpaceWrite>) -> Result<BuiltWrite, SpaceError> {
         let applied = Arc::new(AtomicBool::new(false));
-        write(st, "did:plc:writer", sid, uri, w, 1, &applied, Vec::new()).map(|r| r.expect("something written"))
+        write(st, "did:plc:writer", sid, uri, w, 1, &applied, Vec::new(), u64::MAX)
+            .map(|r| r.expect("something written"))
     }
 
     #[test]
@@ -871,12 +881,34 @@ mod tests {
         // deleteRecord of a missing record writes nothing
         let applied = Arc::new(AtomicBool::new(false));
         let w = vec![SpaceWrite::Delete { collection: "com.example.post".into(), rkey: "b".into(), must_exist: false }];
-        assert!(write(&mut st, "did:plc:writer", sid, &uri, w, 1, &applied, Vec::new()).unwrap().is_err());
+        assert!(write(&mut st, "did:plc:writer", sid, &uri, w, 1, &applied, Vec::new(), u64::MAX).unwrap().is_err());
         // the head's hash is the set's
         let mut want = LtHash::default();
         let c = Cid::dag_cbor(&[0xa1, 0x61, 0x61, 2]);
         want.add(&super::super::commit::element("com.example.post", "a", &c.to_string()));
         assert_eq!(st.repos[&sid].hash, want);
+    }
+
+    #[test]
+    fn record_cap() {
+        let paths: Vec<(String, Option<Cid>)> =
+            ["a", "b", "c"].iter().map(|r| (format!("com.example.post/{r}"), None)).collect();
+        let refs: Vec<(&str, Option<Cid>)> = paths.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        let (mut st, sid, uri) = states_with(&refs);
+        let applied = Arc::new(AtomicBool::new(false));
+        let w = |st: &mut SpaceStates, ws: Vec<SpaceWrite>, cap: u64| {
+            write(st, "did:plc:writer", sid, &uri, ws, 1, &applied, Vec::new(), cap).map(|r| r.is_ok())
+        };
+        assert!(w(&mut st, vec![create("a", 1), create("b", 1)], 2).unwrap());
+        let e = w(&mut st, vec![create("c", 1)], 2).err().unwrap();
+        assert!(matches!(e, SpaceError::Write(WriteError::Invalid(_))), "{e:?}");
+        // a batch that nets out at the cap, an update, and a delete are fine
+        let del =
+            |r: &str| SpaceWrite::Delete { collection: "com.example.post".into(), rkey: r.into(), must_exist: true };
+        assert!(w(&mut st, vec![del("a"), create("c", 1)], 2).unwrap());
+        assert!(w(&mut st, vec![update("b", 2, true)], 1).unwrap(), "over a lowered cap, no growth");
+        assert!(w(&mut st, vec![del("b")], 1).unwrap());
+        assert_eq!(st.repos[&sid].records, 1);
     }
 
     /// A value read from `sR` before an entry applied is never used once
@@ -885,7 +917,7 @@ mod tests {
     fn overlay_survives_a_fetch_racing_an_apply() {
         let (mut st, sid, uri) = states_with(&[("com.example.post/a", None)]);
         let applied = Arc::new(AtomicBool::new(false));
-        let b = write(&mut st, "did:plc:writer", sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new())
+        let b = write(&mut st, "did:plc:writer", sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new(), u64::MAX)
             .unwrap()
             .ok()
             .unwrap();
@@ -982,7 +1014,7 @@ mod tests {
         f.paths.push((sid, "com.example.post/a".into(), None));
         install(&mut st, f);
         let applied = Arc::new(AtomicBool::new(false));
-        let e = write(&mut st, auth, sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new()).err().unwrap();
+        let e = write(&mut st, auth, sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new(), u64::MAX).err().unwrap();
         assert!(matches!(e, SpaceError::SpaceDeleted));
         create_space(&mut st, auth, sid, SpaceRow::defaults(URI, "t4"), 1).unwrap();
         let host = &st.hosts[&sid];
@@ -1008,7 +1040,10 @@ mod tests {
         f.writers.push((sid, auth.into(), None));
         install(&mut st, f);
         let applied = Arc::new(AtomicBool::new(false));
-        let b = write(&mut st, auth, sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new()).unwrap().ok().unwrap();
+        let b = write(&mut st, auth, sid, &uri, vec![create("a", 1)], 1, &applied, Vec::new(), u64::MAX)
+            .unwrap()
+            .ok()
+            .unwrap();
         assert!(b.sequenced.is_none() && b.notify.is_none(), "not created yet: nothing to sequence");
         let muts = create_space(&mut st, auth, sid, SpaceRow::defaults(URI, "t"), 1).unwrap();
         assert_eq!(muts.len(), 3, "sS, sQ, sW");

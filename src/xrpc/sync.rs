@@ -198,7 +198,7 @@ const EXPORT_BATCH: usize = 512;
 const EXPORT_BATCH_BYTES: usize = 256 << 10;
 const EXPORT_FEED: usize = 16;
 
-const EXPORT_CHUNK: usize = 1 << 20;
+pub(super) const EXPORT_CHUNK: usize = 1 << 20;
 
 /// Feeds every record to the MST walk (`tx`) in key order: its key and CID
 /// (the walk rebuilds the leaves from them) and, unless `since` excludes
@@ -257,7 +257,7 @@ async fn feed_records(
     Ok(())
 }
 
-struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
+pub(super) struct ExportSlot(#[allow(dead_code)] tokio::sync::OwnedSemaphorePermit);
 
 impl Drop for ExportSlot {
     fn drop(&mut self) {
@@ -273,7 +273,7 @@ impl Drop for GaugeGuard {
     }
 }
 
-async fn export_slot(app: &App) -> XResult<ExportSlot> {
+pub(super) async fn export_slot(app: &App) -> XResult<ExportSlot> {
     let p = match app.exports.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
@@ -340,11 +340,11 @@ pub(crate) async fn prefetch_nodes(
 }
 
 pub type ExportChunkTx = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
-type ChunkTx = ExportChunkTx;
+pub(super) type ChunkTx = ExportChunkTx;
 
 /// Err: the client is gone, or took nothing for `stall` (e.g. an h2 stream
 /// at a zero window).
-async fn send_chunk(tx: &ChunkTx, chunk: Vec<u8>, stall: std::time::Duration) -> Result<(), &'static str> {
+pub(super) async fn send_chunk(tx: &ChunkTx, chunk: Vec<u8>, stall: std::time::Duration) -> Result<(), &'static str> {
     match tokio::time::timeout(stall, tx.send(Ok(Bytes::from(chunk)))).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err("client_gone"),
@@ -435,18 +435,35 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
     drop(view);
     let did: Arc<str> = did.into();
     let stall = app.config.export_stall;
+    Ok(export_body(slot, "application/vnd.ipld.car", move |tx| async move {
+        let r = stream_export(snap, did.clone(), gen, head, since, &tx, stall).await;
+        if let Err(reason) = r {
+            if reason != "client_gone" {
+                tracing::debug!(%did, reason, "getRepo export ended early");
+            }
+        }
+        r
+    }))
+}
+
+/// A response streaming what `produce` sends, holding `slot` until it ends.
+/// A producer that gives up (other than for a client gone) aborts the body.
+pub(super) fn export_body<F, Fut>(slot: ExportSlot, content_type: &'static str, produce: F) -> Response
+where
+    F: FnOnce(ChunkTx) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), &'static str>> + Send + 'static,
+{
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(EXPORT_QUEUE);
     let body = Arc::new(ExportBody { rx: parking_lot::Mutex::new(rx), aborted: Default::default() });
     let ours = body.clone();
     tokio::spawn(async move {
         let _slot = slot;
-        let reason = match stream_export(snap, did.clone(), gen, head, since, &tx, stall).await {
+        let reason = match produce(tx).await {
             Ok(()) => "done",
             Err(r) => r,
         };
         metrics::SYNC_EXPORTS_ENDED.with_label_values(&[reason]).inc();
         if reason != "done" && reason != "client_gone" {
-            tracing::debug!(%did, reason, "getRepo export ended early");
             ours.abort();
         }
     });
@@ -457,7 +474,7 @@ async fn export_repo(app: &App, did: &str, since: Option<u64>) -> XResult<Respon
         }
         r => r,
     }));
-    Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], Body::from_stream(stream)).into_response())
+    ([(header::CONTENT_TYPE, content_type)], Body::from_stream(stream)).into_response()
 }
 
 /// Err: why it ended early (`client_gone`, `stalled`, `error`). Also the

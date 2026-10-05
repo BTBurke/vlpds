@@ -12,6 +12,10 @@
 //! write (see `take_delivered`), so delivery costs no extra PUT; a row left
 //! behind is resent once by the next owner, which the authority ignores as
 //! not newer.
+//!
+//! Bounded: at most [`MAX_ROWS`] rows are held (a row past that stays in
+//! the bucket, and the owned shards' `sP` rows are scanned again once the
+//! outbox has drained to half) and [`MAX_SENDS`] sends are in flight.
 
 use crate::state::SpaceId;
 use crate::tid::Tid;
@@ -23,6 +27,8 @@ use std::time::{Duration, Instant};
 pub const RETRY_BASE: Duration = Duration::from_secs(60);
 pub const RETRY_MAX: Duration = Duration::from_secs(3600);
 pub const DEADLINE: Duration = Duration::from_secs(24 * 3600);
+pub const MAX_ROWS: usize = 1 << 18;
+pub const MAX_SENDS: usize = 256;
 
 /// What a send came to.
 #[derive(Debug)]
@@ -62,16 +68,37 @@ pub struct Pending {
     pub hash: [u8; 32],
 }
 
-#[derive(Default)]
 pub struct Outbox {
     rows: parking_lot::Mutex<HashMap<Key, Row>>,
     /// Delivered revs whose `sP` rows are still in the bucket, by author.
     delivered: parking_lot::Mutex<HashMap<Arc<str>, Vec<(SpaceId, Tid)>>>,
     wake: tokio::sync::Notify,
     started: AtomicBool,
+    /// A row was left in the bucket for want of room.
+    overflowed: AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    max_rows: usize,
+}
+
+impl Default for Outbox {
+    fn default() -> Outbox {
+        Outbox::new(MAX_ROWS)
+    }
 }
 
 impl Outbox {
+    pub fn new(max_rows: usize) -> Outbox {
+        Outbox {
+            rows: Default::default(),
+            delivered: Default::default(),
+            wake: Default::default(),
+            started: AtomicBool::new(false),
+            overflowed: AtomicBool::new(false),
+            in_flight: Default::default(),
+            max_rows,
+        }
+    }
+
     /// A write of (did, space) at `repo_rev` is durable; `acked`: it was
     /// just acked (not a row found on open).
     pub fn enqueue(&self, did: &str, sid: SpaceId, uri: &str, repo_rev: Tid, hash: [u8; 32], acked: bool) {
@@ -86,6 +113,7 @@ impl Outbox {
             }
         }
         let mut rows = self.rows.lock();
+        let full = rows.len() >= self.max_rows;
         match rows.get_mut(&(did.into(), sid)) {
             Some(r) if r.repo_rev >= repo_rev => return,
             Some(r) => {
@@ -94,6 +122,11 @@ impl Outbox {
                 r.attempts = 0;
                 r.next_at = now;
                 r.acked = acked.then_some(now);
+            }
+            None if full => {
+                self.overflowed.store(true, Ordering::Release);
+                crate::metrics::space_outbox_overflow();
+                return;
             }
             None => {
                 rows.insert(
@@ -155,16 +188,29 @@ impl Outbox {
         self.len() == 0
     }
 
-    /// Rows due now, marked in flight.
+    /// Whether the rows left in the bucket should be scanned for again:
+    /// some were, and there's room for them now.
+    fn take_overflow(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
+            && self.rows.lock().len() <= self.max_rows / 2
+            && self.overflowed.swap(false, Ordering::AcqRel)
+    }
+
+    /// Rows due now (as many as may be in flight), marked in flight.
     fn due(&self, now: Instant) -> (Vec<Pending>, Option<Instant>) {
         let mut rows = self.rows.lock();
         let mut out = Vec::new();
         let mut next: Option<Instant> = None;
+        let room = MAX_SENDS.saturating_sub(self.in_flight.load(Ordering::Acquire));
         for ((did, sid), r) in rows.iter_mut() {
             if r.in_flight {
                 continue;
             }
             if r.next_at <= now {
+                // a row past the room waits for a send to finish
+                if out.len() == room {
+                    continue;
+                }
                 r.in_flight = true;
                 out.push(Pending {
                     did: did.clone(),
@@ -177,12 +223,16 @@ impl Outbox {
                 next = Some(next.map_or(r.next_at, |n| n.min(r.next_at)));
             }
         }
+        self.in_flight.fetch_add(out.len(), Ordering::AcqRel);
         let oldest = rows.values().map(|r| r.since).min();
         crate::metrics::space_outbox_gauges(rows.len(), oldest.map_or(0.0, |s| now.duration_since(s).as_secs_f64()));
         (out, next)
     }
 
     fn finish(&self, s: &Pending, outcome: &Outcome) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) >= MAX_SENDS {
+            self.wake.notify_one();
+        }
         let key: Key = (s.did.clone(), s.sid);
         let now = Instant::now();
         let mut rows = self.rows.lock();
@@ -248,6 +298,13 @@ impl Outbox {
                         me.finish(&s, &outcome);
                     });
                 }
+                if me.take_overflow() {
+                    let Some(app) = app.upgrade() else { return };
+                    if let Some(sp) = app.spaces.clone() {
+                        let shards = app.partitions.owned().into_iter().map(|p| (p.id, p.db.clone())).collect();
+                        sp.spawn_outbox_rescan(shards);
+                    }
+                }
                 if app.strong_count() == 0 {
                     return;
                 }
@@ -295,6 +352,34 @@ mod tests {
         o.enqueue("did:a", sid, "at://s", Tid(5), [0; 32], false);
         o.enqueue("did:a", sid, "at://s", Tid(4), [0; 32], false);
         assert_eq!(send(&o)[0].repo_rev, Tid(5));
+    }
+
+    #[test]
+    fn bounded() {
+        let o = Outbox::new(2);
+        for i in 0..3u8 {
+            o.enqueue("did:a", [i; 16], "at://s", Tid(1), [0; 32], true);
+        }
+        assert_eq!(o.len(), 2);
+        assert!(!o.take_overflow(), "no room yet");
+        let s = send(&o);
+        for p in &s {
+            o.finish(p, &Outcome::Delivered);
+        }
+        assert!(o.take_overflow(), "drained: rescan");
+        assert!(!o.take_overflow(), "once");
+        // sends in flight are capped
+        let o = Outbox::default();
+        for i in 0..(MAX_SENDS + 10) {
+            let mut sid = [0; 16];
+            sid[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            o.enqueue("did:a", sid, "at://s", Tid(1), [0; 32], true);
+        }
+        let first = send(&o);
+        assert_eq!(first.len(), MAX_SENDS);
+        assert!(send(&o).is_empty());
+        o.finish(&first[0], &Outcome::Delivered);
+        assert_eq!(send(&o).len(), 1);
     }
 
     #[test]

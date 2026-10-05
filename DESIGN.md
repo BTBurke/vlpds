@@ -5255,6 +5255,23 @@ Deliberate divergences from the reference:
   in the repo's LtHash, the way a taken-down public record stays in the
   signed repo. A syncer that compares hashes then sees a mismatch and
   falls back to getRepo. The reference has no space record takedowns.
+- The oplog keeps 7 days of ops (`--space-oplog-retention`). The reference
+  keeps every op, and the spec only says a host may drop them. A node
+  sweeps its shards' oplogs every ~6 h in frameless entries, never per
+  write. A `since` older than the oldest op kept gets the ops from the
+  window's start, so the syncer's replayed hash won't match the commit and
+  it falls back to getRepo. There's no explicit error for it, since the
+  reference consumer recovers from a mismatch already.
+- A space repo holds at most `--space-repo-max-records` records (100k). The
+  2-root CAR has one index block, ~6 MB at 100k records, and getRepo holds
+  every path and CID for its first pass. A write that would grow a repo
+  past the cap gets InvalidRequest. The reference has no cap.
+- Forwards to registered services go out in spaceRev order per service, one
+  at a time, and a writer's queued forward is replaced by its newer one.
+  The reference sends each one as it's sequenced, unordered. The
+  `prevSpaceRev` vlpds sends is the last spaceRev that service was sent,
+  so a replaced forward leaves no gap. A lost one does, and the service
+  catches up with listRepos as it would with the reference.
 
 ## Reference test divergences (`tests/REFERENCE_COVERAGE.md`)
 

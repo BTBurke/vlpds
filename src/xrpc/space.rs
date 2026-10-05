@@ -43,7 +43,9 @@ pub fn routes() -> Router<Arc<App>> {
 }
 
 pub fn internal_routes() -> Router<Arc<App>> {
-    Router::new().route("/internal/v1/space/revocations/reload", post(internal_reload_revocations))
+    Router::new()
+        .route("/internal/v1/space/revocations/reload", post(internal_reload_revocations))
+        .route("/internal/v1/space/notify", post(internal_notify))
 }
 
 pub(super) fn spaces(app: &App) -> XResult<&Arc<Spaces>> {
@@ -1060,7 +1062,7 @@ pub(super) async fn delete_account_rows(app: &App, did: &str) -> XResult<()> {
 
 /// Whether `outcome` is worth another try: the reference retries network
 /// failures and these statuses (`@atproto/lex` RETRYABLE_HTTP_STATUS_CODES).
-fn retryable_status(status: u16) -> bool {
+pub(crate) fn retryable_status(status: u16) -> bool {
     matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504 | 522 | 524)
 }
 
@@ -1085,17 +1087,25 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         None => {}
     }
     let Ok(space) = Space::parse(&p.uri) else { return Outcome::Refused("not a space uri".into()) };
-    let local = app.partition(&space.authority).is_ok()
-        && app.remote_owner(&space.authority).is_none()
-        && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some());
-    if local {
+    let outcome = |r: XResult<()>| match r {
+        Ok(()) => Outcome::Delivered,
+        Err(e) if e.status.is_server_error() => Outcome::Retry(format!("{}: {}", e.error, e.message)),
+        Err(e) => Outcome::Refused(format!("{}: {}", e.error, e.message)),
+    };
+    // an authority hosted by this cluster is told without HTTP or service
+    // auth: here, or at its shard's owner
+    if let Some(owner) = app.remote_owner(&space.authority) {
+        match notify_owner(app, &owner, &space, p).await {
+            Ok(Some(r)) => return outcome(r),
+            Ok(None) => {}
+            Err(e) => return Outcome::Retry(format!("{}: {}", e.error, e.message)),
+        }
+    } else if app.partition(&space.authority).is_ok()
+        && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some())
+    {
         let r = process_notify_write(app, &space, &p.did, p.repo_rev, p.hash).await;
         metrics::space_notify("in", notify_in_result(&r));
-        return match r {
-            Ok(_) => Outcome::Delivered,
-            Err(e) if e.status.is_server_error() => Outcome::Retry(format!("{}: {}", e.error, e.message)),
-            Err(e) => Outcome::Refused(format!("{}: {}", e.error, e.message)),
-        };
+        return outcome(r.map(|_| ()));
     }
     let endpoint = match app.did_resolver.resolve(&space.authority).await {
         Ok(doc) => crate::did_resolver::service_endpoint(&doc, "atproto_space_host")
@@ -1129,6 +1139,98 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
     }
 }
 
+#[derive(serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InternalNotify {
+    space: String,
+    repo: String,
+    repo_rev: String,
+    hash: String,
+}
+
+/// An outbox send to the owner of the authority's shard, another node of
+/// this cluster. Ok(None): the authority isn't an account of the cluster;
+/// Ok(Some(the authority's answer)); Err: the owner couldn't be asked.
+async fn notify_owner(app: &App, owner: &str, space: &Space, p: &Pending) -> XResult<Option<XResult<()>>> {
+    let body = InternalNotify {
+        space: space.uri.clone(),
+        repo: p.did.to_string(),
+        repo_rev: p.repo_rev.to_string(),
+        hash: base64::engine::general_purpose::STANDARD_NO_PAD.encode(p.hash),
+    };
+    let r = app
+        .http
+        .post(format!("{}/internal/v1/space/notify", owner.trim_end_matches('/')))
+        .header(super::internal::HDR, &app.config.internal_token)
+        .timeout(NOTIFY_TIMEOUT)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| XrpcError::unavailable("PartitionUnavailable", format!("partition owner: {e}")))?;
+    let status = r.status();
+    let v: J = r.json().await.unwrap_or_default();
+    if status.is_success() {
+        return Ok(v["hosted"].as_bool().unwrap_or(false).then_some(Ok(())));
+    }
+    let e = XrpcError {
+        status,
+        error: v["error"].as_str().unwrap_or("InternalServerError").into(),
+        message: v["message"].as_str().unwrap_or_default().into(),
+    };
+    match status.is_server_error() {
+        true => Err(e),
+        false => Ok(Some(Err(e))),
+    }
+}
+
+/// [`notify_owner`] at the owner: notifyWrite from a writer on another node
+/// of the cluster, trusted as the cluster's own outbox (no service auth).
+async fn internal_notify(
+    State(app): AppState,
+    headers: HeaderMap,
+    Json(inp): Json<InternalNotify>,
+) -> XResult<Json<J>> {
+    super::internal::check(&app, &headers)?;
+    let sp = spaces(&app)?;
+    sp.peer_notifies.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let space = Space::parse(&inp.space)?;
+    let bad = |m: &str| XrpcError::bad("InvalidRequest", m.to_string());
+    let repo_rev = Tid::parse(&inp.repo_rev).ok_or_else(|| bad("repoRev must be a valid TID"))?;
+    let hash: [u8; 32] = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(&inp.hash)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| bad("hash must be 32 bytes"))?;
+    if app.remote_owner(&space.authority).is_some() {
+        return Err(XrpcError::unavailable(crate::forward::SHARD_MOVED, "the authority's shard moved"));
+    }
+    app.partition(&space.authority)?;
+    if super::server::account_if_exists(&app, &space.authority).await?.is_none() {
+        return Ok(Json(json!({"hosted": false})));
+    }
+    let r = process_notify_write(&app, &space, &inp.repo, repo_rev, hash).await;
+    metrics::space_notify("in", notify_in_result(&r));
+    r?;
+    Ok(Json(json!({"hosted": true})))
+}
+
+/// Deletes `service`'s registration for the space `uri` at its authority
+/// (whose shard is this node's), if it's still expired: renewed since, it
+/// stays.
+pub async fn prune_registration(app: &App, uri: &str, service: &str) -> anyhow::Result<()> {
+    let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let p = app.partition(&space.authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let Some(v) = p.db.get(state::space_notify_key(&space.authority, &space.sid, service)).await? else {
+        return Ok(());
+    };
+    if crate::space::rows::NotifyRow::decode(&v)?.expires > crate::tid::now_micros() {
+        return Ok(());
+    }
+    let op = SpaceOp::UnregisterNotify { service: service.to_string() };
+    submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GetRepoQ {
@@ -1158,20 +1260,22 @@ fn commit_block(c: &crate::space::commit::SignedCommit) -> Vec<u8> {
     b
 }
 
-/// Reference getRepo (`serializeRepo`): a CAR whose two roots are the
-/// signed commit and the index (path -> CID, in dag-cbor key order), then
-/// one block per record in the index's order; with `excludeValues` only
-/// the roots. Built in memory from one snapshot (bounded by the space repo
-/// record cap); a record taken down keeps its index entry (the commit's
-/// hash covers it) but not its block.
+/// Reference getRepo (`serializeRepo`), streamed in two passes over one
+/// snapshot (src/space/car.rs) under an export slot (`--max-exports`), and
+/// ended for a client that reads nothing for `--export-stall-secs`. Pass 1
+/// holds the paths and CIDs only: at most `--space-repo-max-records` of
+/// them. A record taken down keeps its index entry (the commit's hash
+/// covers it) but not its block; with `excludeValues` only the roots go.
 async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Query<GetRepoQ>) -> XResult<Response> {
+    use crate::space::car::{Car, Entries, RepoEncoder};
     spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
     let key = available(&app, &q.repo, self_read).await?;
     metrics::space_read("getRepo", auth_label(&creds));
+    let slot = super::sync::export_slot(&app).await?;
     let p = app.partition(&q.repo)?;
-    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let snap = Arc::new(p.db.snapshot().await.map_err(XrpcError::from_err)?);
     let not_found = || XrpcError::bad("RepoNotFound", format!("Could not find repo for space: {}", space.uri));
     let v = snap.get(state::space_head_key(&q.repo, &space.sid)).await.map_err(XrpcError::from_err)?;
     let head = head_of(HeadRow::decode(&v.ok_or_else(not_found)?).map_err(XrpcError::from_err)?, &space, &p)?;
@@ -1181,54 +1285,91 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
         false => None,
     };
     let prefix = state::space_prefix(state::SPACE_RECORD_FAMILY, &q.repo, &space.sid);
-    let opts = slatedb::config::ScanOptions::default();
-    let mut iter =
-        snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
-    let mut records: Vec<(String, Cid, Option<Bytes>)> = Vec::new();
+    let opts = slatedb::config::ScanOptions { read_ahead_bytes: 4 << 20, cache_blocks: true, ..Default::default() };
+    let mut iter = state::BatchedScan::new(
+        snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?,
+    );
+    let mut entries = Entries::default();
     while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-        let path = std::str::from_utf8(&kv.key[prefix.len()..]).map_err(XrpcError::from_err)?.to_string();
-        let (cid, bytes) = state::record_value_parts(&kv.value).map_err(XrpcError::from_err)?;
-        let keep = takedowns.as_ref().is_some_and(|td| !td.has_takedown(&takedown_name(&space.sid, &path)));
-        let bytes = keep.then(|| kv.value.slice_ref(bytes));
-        records.push((path, cid, bytes));
+        let path = std::str::from_utf8(&kv.key[prefix.len()..]).map_err(XrpcError::from_err)?;
+        let (cid, _) = state::record_value_parts(&kv.value).map_err(XrpcError::from_err)?;
+        entries.push(path, cid);
     }
-    records.sort_by(|a, b| crate::cbor::key_cmp(&a.0, &b.0));
-    let mut index = Vec::with_capacity(records.len() * 96 + 8);
-    crate::cbor::write_map_head(&mut index, records.len());
-    for (path, cid, _) in &records {
-        crate::cbor::write_text(&mut index, path);
-        crate::cbor::write_cid(&mut index, cid);
-    }
+    drop(iter);
     let rev = head.rev.to_string();
     let ctx = crate::space::commit::CommitCtx { space: &space.uri, author: &q.repo, rev: &rev };
     let commit = crate::space::commit::sign(&head.hash, &ctx, rand::random(), |b| {
         Ok::<_, std::convert::Infallible>(key.sign(b))
     })
     .map_err(|_| XrpcError::internal("space commit context too long"))?;
-    let commit = commit_block(&commit);
-    let (commit_cid, index_cid) = (Cid::dag_cbor(&commit), Cid::dag_cbor(&index));
-    let body_len: usize = records.iter().filter_map(|r| r.2.as_ref()).map(|b| b.len() + 48).sum();
-    let mut out = Vec::with_capacity(commit.len() + index.len() + body_len + 256);
-    let mut h = Vec::with_capacity(96);
-    crate::cbor::write_map_head(&mut h, 2);
-    crate::cbor::write_text(&mut h, "roots");
-    crate::cbor::write_array_head(&mut h, 2);
-    crate::cbor::write_cid(&mut h, &commit_cid);
-    crate::cbor::write_cid(&mut h, &index_cid);
-    crate::cbor::write_text(&mut h, "version");
-    crate::cbor::write_uint(&mut h, 1);
-    crate::car::write_varint(&mut out, h.len() as u64);
-    out.extend_from_slice(&h);
-    crate::car::write_block(&mut out, &commit_cid, &commit);
-    crate::car::write_block(&mut out, &index_cid, &index);
-    if values {
-        for (_, cid, bytes) in &records {
-            if let Some(b) = bytes {
-                crate::car::write_block(&mut out, cid, b);
+    let (stall, repo, sid) = (app.config.export_stall, q.repo.clone(), space.sid);
+    Ok(super::sync::export_body(slot, "application/vnd.ipld.car", move |tx| async move {
+        const CHUNK: usize = super::sync::EXPORT_CHUNK;
+        let mut car = Car::new(commit_block(&commit));
+        let order = car.order(&entries);
+        car.begin(&entries, &order);
+        let held = entries.heap_bytes() + order.capacity() * std::mem::size_of::<std::ops::Range<usize>>();
+        // what an export holds: pass 1's paths and CIDs and the chunk being
+        // filled (the body queue is the sync exports' budget)
+        metrics::space_export_bytes(held + CHUNK);
+        let mut buf = Vec::with_capacity(CHUNK + 4096);
+        while car.prelude(&mut buf, CHUNK) {
+            flush_chunk(&tx, &mut buf, stall).await?;
+        }
+        if values {
+            let td = takedowns.as_ref().expect("read with values");
+            for run in &order {
+                let (first, last) = (entries.path(run.start), entries.path(run.end - 1));
+                let lo = [&prefix[..], first.as_bytes()].concat();
+                let hi = [&prefix[..], last.as_bytes(), &[0]].concat();
+                let mut it = match snap.scan_with_options(lo..hi, &opts).await {
+                    Ok(it) => state::BatchedScan::new(it),
+                    Err(e) => {
+                        tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
+                        return Err("error");
+                    }
+                };
+                for i in run.clone() {
+                    let kv = match it.next().await {
+                        Ok(Some(kv)) => kv,
+                        Ok(None) => return Err("error"),
+                        Err(e) => {
+                            tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
+                            return Err("error");
+                        }
+                    };
+                    let path = entries.path(i);
+                    let (cid, bytes) = match state::record_value_parts(&kv.value) {
+                        Ok(v) if &kv.key[prefix.len()..] == path.as_bytes() && v.0 == *entries.cid(i) => v,
+                        _ => {
+                            tracing::warn!(%repo, path, "space getRepo: the snapshot changed between passes");
+                            return Err("error");
+                        }
+                    };
+                    if td.has_takedown(&takedown_name(&sid, path)) {
+                        continue;
+                    }
+                    car.record(&cid, bytes, &mut buf);
+                    if buf.len() >= CHUNK {
+                        flush_chunk(&tx, &mut buf, stall).await?;
+                    }
+                }
             }
         }
-    }
-    Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], out).into_response())
+        if !buf.is_empty() {
+            flush_chunk(&tx, &mut buf, stall).await?;
+        }
+        Ok(())
+    }))
+}
+
+async fn flush_chunk(
+    tx: &super::sync::ChunkTx,
+    buf: &mut Vec<u8>,
+    stall: std::time::Duration,
+) -> Result<(), &'static str> {
+    let chunk = std::mem::replace(buf, Vec::with_capacity(super::sync::EXPORT_CHUNK + 4096));
+    super::sync::send_chunk(tx, chunk, stall).await
 }
 
 /// How far ahead of this host's clock a notified repoRev may be.

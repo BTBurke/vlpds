@@ -137,6 +137,10 @@ pub struct Config {
     /// AT Protocol Spaces (`--spaces`; src/space). Their NSIDs are never
     /// proxied: one without a handler answers 501.
     pub spaces: bool,
+    /// Most records an account's repo in one space holds.
+    pub space_repo_max_records: u64,
+    /// How long space oplog rows are kept. None: forever.
+    pub space_oplog_retention: Option<Duration>,
     /// Largest importRepo body.
     pub max_import_bytes: usize,
     /// The import budget (`xrpc::import_budget`). None: the memory plan's
@@ -324,6 +328,8 @@ impl Default for Config {
             trusted_device_days: crate::xrpc::DEFAULT_TRUST_DAYS,
             resolve_lexicons: None,
             spaces: false,
+            space_repo_max_records: crate::space::DEFAULT_MAX_RECORDS,
+            space_oplog_retention: Some(crate::space::retention::DEFAULT_RETENTION),
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             import_memory_bytes: None,
             import_wait: crate::xrpc::import_budget::ADMIT_WAIT,
@@ -491,7 +497,12 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         }
         None => crate::http::PeerClient::lone(),
     };
-    let spaces = cfg.spaces.then(|| Arc::new(crate::space::Spaces::new()));
+    let spaces = cfg.spaces.then(|| {
+        Arc::new(crate::space::Spaces::new(crate::space::Limits {
+            max_records: cfg.space_repo_max_records,
+            oplog_retention: cfg.space_oplog_retention,
+        }))
+    });
     let node = Arc::new(crate::node::Node {
         cluster: cluster.clone(),
         log: log.clone(),
@@ -579,6 +590,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     if let Some(s) = &app.spaces {
         s.outbox.start(Arc::downgrade(&app));
         s.fanout.start(Arc::downgrade(&app));
+        crate::space::retention::start(&app);
         s.start_revocations(app.store.clone()).await;
     }
     Ok(app)

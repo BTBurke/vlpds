@@ -148,6 +148,7 @@ mod spaces;
 mod spaces_auth;
 mod spaces_e2e;
 mod spaces_host;
+mod spaces_sync;
 mod staged_import;
 mod subscribe_repos;
 mod sync;

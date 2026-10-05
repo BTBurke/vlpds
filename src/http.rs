@@ -700,17 +700,29 @@ pub mod stall {
 #[derive(Clone, Copy, Debug)]
 pub struct Guarded {
     dev_mode: bool,
+    fanout: bool,
 }
 
 pub fn guarded(dev_mode: bool) -> Guarded {
-    Guarded { dev_mode }
+    Guarded { dev_mode, fanout: false }
+}
+
+/// [`guarded`] on a pool of its own for Spaces write notifications to
+/// registered services: kept-alive connections to the same few syncers
+/// (HTTP/2 where their ALPN offers it), apart from the one-off fetches.
+pub fn guarded_fanout(dev_mode: bool) -> Guarded {
+    Guarded { dev_mode, fanout: true }
 }
 
 impl Guarded {
     pub fn request(&self, method: reqwest::Method, url: &str) -> Result<reqwest::RequestBuilder, String> {
         let u = reqwest::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
         crate::did_resolver::check_outbound_url(&u, self.dev_mode)?;
-        Ok(guarded_client(self.dev_mode).request(method, u))
+        let client = match self.fanout {
+            true => fanout_client(self.dev_mode),
+            false => guarded_client(self.dev_mode),
+        };
+        Ok(client.request(method, u))
     }
 
     pub fn get(&self, url: &str) -> Result<reqwest::RequestBuilder, String> {
@@ -724,6 +736,23 @@ fn guarded_client(dev_mode: bool) -> &'static reqwest::Client {
     });
     static DEV: LazyLock<reqwest::Client> =
         LazyLock::new(|| outbound("guarded", 32).no_proxy().build().expect("reqwest client"));
+    if dev_mode {
+        &DEV
+    } else {
+        &STRICT
+    }
+}
+
+fn fanout_client(dev_mode: bool) -> &'static reqwest::Client {
+    static STRICT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        outbound("space_fanout", 64)
+            .no_proxy()
+            .dns_resolver(Arc::new(PublicOnlyResolver))
+            .build()
+            .expect("reqwest client")
+    });
+    static DEV: LazyLock<reqwest::Client> =
+        LazyLock::new(|| outbound("space_fanout", 64).no_proxy().build().expect("reqwest client"));
     if dev_mode {
         &DEV
     } else {

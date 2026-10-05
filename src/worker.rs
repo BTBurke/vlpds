@@ -2447,7 +2447,8 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             }
             let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let delivered = spaces.outbox.take_delivered(&did);
-            let mut b = match sr::write(&mut st.spaces, &did, sid, &uri, writes, clock_id, &applied, delivered) {
+            let max = spaces.limits.max_records;
+            let mut b = match sr::write(&mut st.spaces, &did, sid, &uri, writes, clock_id, &applied, delivered, max) {
                 Err(e) => {
                     let _ = reply.send(Err(e));
                     return Ok(());

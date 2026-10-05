@@ -283,7 +283,7 @@ async fn delete_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
         submit_space(&app, &did, &space, SpaceOp::DeleteSpace { deleted_at: crate::events::now_rfc3339() }).await?;
     if let SpaceAck::Deleted { already: false } = ack {
         match crate::space::host::registrations(&app, &did, &space.sid).await {
-            Ok(regs) if !regs.is_empty() => {
+            Ok((regs, _)) if !regs.is_empty() => {
                 let (app, uri) = (app.clone(), space.uri.clone());
                 tokio::spawn(async move { crate::space::host::notify_space_deleted(&app, &did, &uri, regs).await });
             }

@@ -640,7 +640,11 @@ lazy!(SPACE_CREDENTIAL_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_s
 lazy!(SPACE_CREDENTIAL_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_checks_total", "Space credential checks by result (ok, bad_sig, expired, revoked, audience, space)", &["result"]));
 lazy!(SPACE_REVOCATIONS: IntGauge = register_int_gauge!("vlpds_space_revocations", "Revoked space credentials this node enforces (until they would have expired)"));
 lazy!(SPACE_FANOUT_DEPTH: IntGauge = register_int_gauge!("vlpds_space_fanout_queue_depth", "Write notifications waiting to be forwarded to registered services, across lanes"));
-lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a service's lane)", &["reason"]));
+lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a (space, service) lane; host_full: the service host's queue; gave_up: retries ran out; expired: the registration expired while failing). The service sees a prevSpaceRev gap and catches up with listRepos", &["reason"]));
+lazy!(SPACE_FANOUT_COALESCED: IntCounter = register_int_counter!("vlpds_space_fanout_coalesced_total", "Write notifications replaced before they were sent by a newer one of the same writer to the same service"));
+lazy!(SPACE_OUTBOX_OVERFLOW: IntCounter = register_int_counter!("vlpds_space_outbox_overflow_total", "notifyWrite outbox rows left in the bucket because the in-memory outbox was full (picked up by a rescan once it drains)"));
+lazy!(SPACE_EXPORT_BYTES: Histogram = register_histogram!("vlpds_space_export_bytes", "Memory a space getRepo export holds: its paths and CIDs (pass 1) and the chunk it fills", exponential_buckets(65536.0, 2.0, 16).unwrap()));
+lazy!(SPACE_OPLOG_PRUNED: IntCounter = register_int_counter!("vlpds_space_oplog_pruned_total", "Space oplog ops deleted past --space-oplog-retention"));
 lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "getSpaceCredential answers as a space authority, by result", &["result"]));
 
 pub fn space_write(op: &str, result: &str) {
@@ -691,6 +695,22 @@ pub fn space_fanout_depth(delta: i64) {
 
 pub fn space_fanout_dropped(reason: &str) {
     SPACE_FANOUT_DROPPED.with_label_values(&[reason]).inc();
+}
+
+pub fn space_fanout_coalesced() {
+    SPACE_FANOUT_COALESCED.inc();
+}
+
+pub fn space_outbox_overflow() {
+    SPACE_OUTBOX_OVERFLOW.inc();
+}
+
+pub fn space_export_bytes(n: usize) {
+    SPACE_EXPORT_BYTES.observe(n as f64);
+}
+
+pub fn space_oplog_pruned(n: usize) {
+    SPACE_OPLOG_PRUNED.inc_by(n as u64);
 }
 
 pub fn space_credential_issued(result: &str) {

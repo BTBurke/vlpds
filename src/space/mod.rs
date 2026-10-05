@@ -19,11 +19,14 @@
 //! - [`outbox`]: delivery of notifyWrite to space authorities.
 //! - [`host`]: the space host role (simplespace policies, notifyWrite).
 //! - [`fanout`]: forwarding of sequenced writes to registered services.
+//! - [`car`]: getRepo's streamed export.
+//! - [`retention`]: pruning of oplogs past the retention window.
 //! - [`attestation`]: client attestations for `appAccess` allow lists.
 //! - [`revocations`]: revoked credentials.
 //! - [`credcache`]: verified credentials, until they expire.
 
 pub mod attestation;
+pub mod car;
 pub mod commit;
 pub mod credcache;
 pub mod fanout;
@@ -33,12 +36,30 @@ pub mod httpsig;
 pub mod lthash;
 pub mod outbox;
 pub mod repo;
+pub mod retention;
 pub mod revocations;
 pub mod rows;
 mod sfv;
 pub mod token;
 
 use std::sync::Arc;
+
+/// `--space-repo-max-records`: a 100k-record repo's index block is ~6 MB.
+pub const DEFAULT_MAX_RECORDS: u64 = 100_000;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Records an account's repo in one space may hold.
+    pub max_records: u64,
+    /// How long oplog rows are kept (None: forever).
+    pub oplog_retention: Option<std::time::Duration>,
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits { max_records: DEFAULT_MAX_RECORDS, oplog_retention: Some(retention::DEFAULT_RETENTION) }
+    }
+}
 
 /// A node's Spaces state (`App::spaces`, `Node::spaces`), with `--spaces`.
 pub struct Spaces {
@@ -47,6 +68,9 @@ pub struct Spaces {
     pub fanout: Arc<fanout::Fanout>,
     pub revocations: revocations::Revocations,
     pub credentials: credcache::CredCache,
+    pub limits: Limits,
+    /// notifyWrites received from the cluster's other nodes' outboxes.
+    pub peer_notifies: std::sync::atomic::AtomicU64,
 }
 
 fn now_secs() -> i64 {
@@ -54,11 +78,13 @@ fn now_secs() -> i64 {
 }
 
 impl Spaces {
-    pub fn new() -> Spaces {
+    pub fn new(limits: Limits) -> Spaces {
         Spaces {
+            limits,
+            peer_notifies: Default::default(),
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
-            fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE)),
+            fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE, fanout::RETRY_BASE)),
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
@@ -158,7 +184,7 @@ impl Spaces {
 
 impl Default for Spaces {
     fn default() -> Self {
-        Spaces::new()
+        Spaces::new(Limits::default())
     }
 }
 

@@ -654,11 +654,22 @@ struct Args {
     #[arg(long, env = "VLPDS_RESOLVE_LEXICONS")]
     resolve_lexicons: bool,
     /// AT Protocol Spaces (permissioned data; the reference's alpha, which
-    /// changes weekly). No methods are served yet: com.atproto.space.* and
-    /// com.atproto.simplespace.* answer 501 MethodNotImplemented here
-    /// rather than being proxied.
+    /// changes weekly): com.atproto.space.* and com.atproto.simplespace.*
+    /// are served here, never proxied; one not implemented yet answers 501
+    /// MethodNotImplemented.
     #[arg(long, env = "VLPDS_SPACES")]
     spaces: bool,
+    /// Most records one account's repo in one space may hold (--spaces).
+    /// getRepo exports a space repo as a CAR with one index block, about
+    /// 60 bytes per record.
+    #[arg(long, env = "VLPDS_SPACE_REPO_MAX_RECORDS", default_value_t = vlpds::space::DEFAULT_MAX_RECORDS)]
+    space_repo_max_records: u64,
+    /// How long a space repo's ops stay in its oplog for listRepoOps
+    /// (--spaces; "off" keeps them all). A syncer further behind gets the
+    /// ops from the window's start, finds its hash doesn't match, and
+    /// falls back to getRepo.
+    #[arg(long, env = "VLPDS_SPACE_OPLOG_RETENTION", default_value = "7d")]
+    space_oplog_retention: String,
     /// Largest CAR importRepo accepts, in MiB.
     #[arg(long, env = "VLPDS_MAX_IMPORT_MB", default_value_t = 1024)]
     max_import_mb: usize,
@@ -1445,6 +1456,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         spaces: args.spaces,
+        space_repo_max_records: args.space_repo_max_records.max(1),
+        space_oplog_retention: match args.space_oplog_retention.as_str() {
+            "off" | "none" => None,
+            v => Some(vlpds::retention::parse_duration(v)?),
+        },
         max_import_bytes: args.max_import_mb << 20,
         import_memory_bytes: args.import_memory_mb.map(|m| m << 20),
         import_wait: vlpds::xrpc::import_budget::ADMIT_WAIT,
