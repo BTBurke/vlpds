@@ -161,7 +161,7 @@ async fn unresolved_declaration_fails_the_token_request() {
     consent_html_has(
         &page.3,
         &[&format!(
-            "com.c6nodecl.forum spaces on your account: read everything and manage the space and its members. It also asks to create, update and delete records of the kinds {missing} declares, which could not be looked up, so approving this will fail"
+            "com.c6nodecl.forum spaces on your account: read what members share with you and create spaces. It also asks to write records in the collections {missing} declares, which could not be looked up, so approving this will fail"
         )],
     );
     let r = approve_and_exchange(&srv, &acct, &scope, &key, page).await;
@@ -405,9 +405,9 @@ fn consent_html_has(html: &str, needles: &[&str]) {
     }
 }
 
-/// The consent page names a space type by its declaration, an authority by
-/// its verified handle (else its DID), and warns about every space on the
-/// network.
+/// The consent page names a space type by its declaration and an
+/// authority by its verified handle (else its DID). A grant on every space
+/// that only reads your own space repos gets no warning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn consent_names_and_warning() {
     let s = spawn().await;
@@ -423,36 +423,53 @@ async fn consent_names_and_warning() {
         owner.did
     );
     let key = DpopKey::new();
-    let f = Flow::loopback(&scope, &key);
-    let mut b = Browser::default();
-    let ru = f.request_uri(&srv, &oauth::pkce(), "c6").await;
-    let csrf = oauth::csrf_of(&b.authorize(&srv, &f, &ru).await.2);
-    let (st, _, html) = b.sign_in(&srv, &ru, &csrf, &user.handle, oauth::PASSWORD).await;
-    assert_eq!(st, 200, "{html}");
+    let html = consent_page(&srv, &user, &scope, &key).await.3;
     consent_html_has(
         &html,
         &[
             // the declaration's name and the bare grant's declared collections
             &format!(
-                "Book Club spaces on @{}: read everything and create, update and delete records (com.c6ui.thread)",
+                "Book Club spaces on @{}: read what members share with you and write records in com.c6ui.thread",
                 owner.handle
             ),
-            &format!("Book Club spaces on {stranger}: read only your own data"),
-            "com.c6ui.nodecl spaces on your account: read everything",
-            "All spaces on the network: read only your own data",
-            "every space on the network",
+            &format!("Book Club spaces on {stranger}: read your own space repos"),
+            "com.c6ui.nodecl spaces on your account: read what members share with you",
+            "All spaces on the network: read your own space repos",
         ],
     );
-    assert_eq!(html.matches("class=\"warn\"").count(), 1, "one warning, on the universal grant: {html}");
+    assert!(!html.contains("class=\"warn\""), "reading your own space repos is no warning: {html}");
 
-    // a narrower grant gets no warning
-    let f2 = Flow::loopback(&format!("atproto space:*?authority={}&action=read", owner.did), &key);
-    let ru = f2.request_uri(&srv, &oauth::pkce(), "c6b").await;
-    let mut b = Browser::default();
-    let csrf = oauth::csrf_of(&b.authorize(&srv, &f2, &ru).await.2);
-    let (_, _, html) = b.sign_in(&srv, &ru, &csrf, &user.handle, oauth::PASSWORD).await;
-    consent_html_has(&html, &[&format!("All spaces on @{}: read everything", owner.handle)]);
-    assert!(!html.contains("every space on the network"), "{html}");
+    // writes on every space warn, even without reading others' data
+    let scope = "atproto space:*?authority=*&collection=*&action=create&action=read_self";
+    let html = consent_page(&srv, &user, scope, &key).await.3;
+    consent_html_has(
+        &html,
+        &[
+            "All spaces on the network: read your own space repos and create records in any collection",
+            "asking to write in every space on the network",
+        ],
+    );
+    assert_eq!(html.matches("class=\"warn\"").count(), 1, "{html}");
+
+    // reading what anyone shares, anywhere, gets the loud one
+    let html = consent_page(&srv, &user, "atproto space:*?authority=*&action=read", &key).await.3;
+    consent_html_has(
+        &html,
+        &[
+            "All spaces on the network: read what members share with you",
+            "asking to read every space on the network: whatever anyone shares with you",
+        ],
+    );
+    assert_eq!(html.matches("class=\"warn\"").count(), 1, "{html}");
+
+    // a narrower read gets no warning
+    let html =
+        consent_page(&srv, &user, &format!("atproto space:{ty}?authority={}&action=read", owner.did), &key).await.3;
+    consent_html_has(&html, &[&format!("Book Club spaces on @{}: read what members share with you", owner.handle)]);
+    assert!(!html.contains("class=\"warn\""), "{html}");
+    let html = consent_page(&srv, &user, &format!("atproto space:*?authority={}&action=read", owner.did), &key).await.3;
+    consent_html_has(&html, &[&format!("All spaces on @{}: read what members share with you", owner.handle)]);
+    assert!(!html.contains("class=\"warn\""), "{html}");
 }
 
 async fn set_limits(s: &TestServer, limiters: J) {

@@ -69,7 +69,9 @@ password or password session can't get a service token for a `com.atproto.space.
 `com.atproto.simplespace.*` method and send it somewhere else. `vlpds.space.importRepo` is OAuth
 too, so an account moving in imports after it's activated ([Moving a repo in](storage.md#moving-a-repo-in)). The consent screen names a space type by its
 declaration, an authority by its handle when the handle resolves back to it (else the DID), and
-warns on `space:*?authority=*`.
+says which actions a grant allows. It warns on a `space:*?authority=*` grant that reads what members
+share (`read`) or writes anything. One that only reads your own space repos (`read_self`, as the
+`/migrate` page asks for) gets a plain description and no warning.
 
 A bare grant that writes (`space:<type>` with no `collection`) gets the collections its type
 declares. vlpds looks those up once, while it shows the consent screen, and the token carries

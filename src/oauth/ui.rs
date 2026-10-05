@@ -483,8 +483,29 @@ and it can't be narrowed. Untick it to refuse it entirely.";
 const CHAT_WARNING: &str =
     "A broad grant covering all of your private messages. It only works together with full access to your account.";
 
-const SPACE_UNIVERSAL_WARNING: &str = "This app is asking for every space on the network: whatever anyone \
+const SPACE_UNIVERSAL_READ_WARNING: &str = "This app is asking to read every space on the network: whatever anyone \
 shares with you in a space, anywhere. That's a very broad grant. Only allow it for an app you trust completely.";
+const SPACE_UNIVERSAL_WRITE_WARNING: &str = "This app is asking to write in every space on the network you're a \
+member of, as you. That's a very broad grant. Only allow it for an app you trust completely.";
+const SPACE_UNIVERSAL_READ_WRITE_WARNING: &str = "This app is asking to read whatever anyone shares with you in a \
+space, anywhere on the network, and to write in every space you're a member of, as you. That's a very broad grant. \
+Only allow it for an app you trust completely.";
+
+/// A `space:*?authority=*` grant that reads what others share or writes
+/// anything. One that only reads your own space repos gets no warning.
+fn space_warning(p: &SpacePermission) -> Option<&'static str> {
+    if p.space_type != "*" || p.authority != "*" {
+        return None;
+    }
+    let reads = p.action.iter().any(|a| a == "read");
+    let writes = p.writes() || p.manage.as_ref().is_some_and(|m| !m.is_empty());
+    match (reads, writes) {
+        (true, true) => Some(SPACE_UNIVERSAL_READ_WRITE_WARNING),
+        (true, false) => Some(SPACE_UNIVERSAL_READ_WARNING),
+        (false, true) => Some(SPACE_UNIVERSAL_WRITE_WARNING),
+        (false, false) => None,
+    }
+}
 
 /// Names for `space:` grants on the consent screen (`--spaces`): type
 /// declarations by NSID and the handles of authority DIDs that resolve back
@@ -517,8 +538,7 @@ pub fn describe_scopes(scope: &str, sets: &[(IncludeScope, J)], names: Option<&S
             "transition:email" => out.push(row("Read your email address", None)),
             _ => {
                 if let (Some(Permission::Space(p)), Some(names)) = (Permission::parse(s), names) {
-                    let universal = p.space_type == "*" && p.authority == "*";
-                    out.push(row(&describe_space(&p, names), universal.then_some(SPACE_UNIVERSAL_WARNING)));
+                    out.push(row(&describe_space(&p, names), space_warning(&p)));
                 } else if let Some(p) = Permission::parse(s) {
                     out.push(row(&describe_permission(&p), None));
                 } else if let Some(inc) = IncludeScope::parse(s) {
@@ -668,33 +688,42 @@ pub fn describe_space(p: &SpacePermission, names: &SpaceNames) -> String {
     };
     let mut parts: Vec<String> = Vec::new();
     if p.action.iter().any(|a| a == "read") {
-        parts.push("read everything".into());
+        parts.push("read what members share with you".into());
     } else if p.action.iter().any(|a| a == "read_self") {
-        parts.push("read only your own data".into());
+        parts.push("read your own space repos".into());
     }
     let verbs: Vec<&str> =
         p.action.iter().map(String::as_str).filter(|a| ["create", "update", "delete"].contains(a)).collect();
-    match &p.collection {
-        Some(c) if !verbs.is_empty() => {
-            let colls = match c.iter().any(|c| c == "*") {
-                true => "of any kind".to_string(),
-                false => format!("({})", c.join(", ")),
-            };
-            parts.push(format!("{} records {colls}", join_and(&verbs)));
-        }
-        _ => {}
+    let write = match verbs.len() {
+        3 => "write".to_string(),
+        _ => join_and(&verbs),
+    };
+    if let Some(c) = p.collection.as_ref().filter(|_| !verbs.is_empty()) {
+        let colls = match c.iter().any(|c| c == "*") {
+            true => "any collection".to_string(),
+            false => join_and(&c.iter().map(String::as_str).collect::<Vec<_>>()),
+        };
+        parts.push(format!("{write} records in {colls}"));
     }
     // the token request fails rather than guess at what was meant
     let unresolved =
         (p.collection.is_none() && !verbs.is_empty() && decl.is_none() && p.space_type != "*").then(|| {
             format!(
-                "{} records of the kinds {} declares, which could not be looked up, so approving this will fail",
-                join_and(&verbs),
+                "{write} records in the collections {} declares, which could not be looked up, so approving this will fail",
                 p.space_type
             )
         });
-    if p.manage.is_some() {
-        parts.push("manage the space and its members".into());
+    if let Some(m) = p.manage.as_ref().filter(|m| !m.is_empty()) {
+        let ops: Vec<&str> = m
+            .iter()
+            .map(|op| match op.as_str() {
+                "create" => "create",
+                "update" => "change",
+                _ => "delete",
+            })
+            .collect();
+        let members = if m.iter().any(|op| op == "update") { " and their members" } else { "" };
+        parts.push(format!("{} spaces{members}", join_and(&ops)));
     }
     let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     match (parts.is_empty(), unresolved) {
