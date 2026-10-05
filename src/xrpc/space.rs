@@ -1462,7 +1462,19 @@ async fn notify_credential_revoked(
         return Ok(StatusCode::OK);
     }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
-    crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE_AUD], &auth.aud, new.len() as u32)?;
+    // anyone with a DID can spend an account's bucket, so an exhausted one
+    // is a revocation not stored: the space is blocked, never left open
+    if let Err(e) = crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE_AUD], &auth.aud, new.len() as u32) {
+        let now = crate::tid::now_micros() as i64 / 1_000_000;
+        sp.revocations.block(&space.uri, local_authority, now);
+        nudge_revocation_peers(&app, Some(&space.uri)).await;
+        tracing::warn!(
+            space = hex::encode(space.sid),
+            refused = "aud_rate",
+            "space revocation not stored: the space is blocked"
+        );
+        return Err(e);
+    }
     match sp.revoke(&app.store, &space.uri, &auth.aud, &new, local_authority).await {
         Ok(Ok(wrote)) => {
             if wrote {
@@ -1479,7 +1491,11 @@ async fn notify_credential_revoked(
             );
             Err(XrpcError::unavailable("Unavailable", "revocation not stored: too many revocations held; retry later"))
         }
-        Err(e) => Err(XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}"))),
+        Err(e) => {
+            // blocked here by Spaces::revoke; the peers too
+            nudge_revocation_peers(&app, Some(&space.uri)).await;
+            Err(XrpcError::unavailable("Unavailable", format!("revocation not stored: {e:#}")))
+        }
     }
 }
 

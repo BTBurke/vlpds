@@ -283,7 +283,9 @@ impl Spaces {
     /// learn of it by a nudge or their next re-read), on the stake of `aud`,
     /// an account here. One that can't be stored blocks the space in the
     /// object, or here alone when it wasn't written (Err((refused, false)):
-    /// peers need telling). Ok(Ok(true)): the object was written.
+    /// peers need telling). On Err (the store failed, or CAS ran out) the
+    /// space is blocked here too, and the caller tells the peers.
+    /// Ok(Ok(true)): the object was written.
     pub async fn revoke(
         &self,
         store: &crate::store::Store,
@@ -293,7 +295,13 @@ impl Spaces {
         local_authority: bool,
     ) -> anyhow::Result<Result<bool, (revocations::Refused, bool)>> {
         let now = now_secs();
-        let r = self.revocations.revoke(store, space, aud, jtis, local_authority, now).await?;
+        let r = match self.revocations.revoke(store, space, aud, jtis, local_authority, now).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.revocations.block(space, local_authority, now);
+                return Err(e);
+            }
+        };
         self.credentials.invalidate(&r.added);
         match r.refused {
             None => Ok(Ok(r.wrote)),
@@ -568,6 +576,24 @@ pub(crate) mod vectors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A revoke the store can't take (here an unreadable object) blocks the
+    /// space here rather than leaving its credentials readable.
+    #[tokio::test]
+    async fn a_failed_revoke_blocks_the_space() {
+        let store = crate::store::Store {
+            raw: Arc::new(object_store::memory::InMemory::new()),
+            prefix: "t".into(),
+            latency: None,
+        };
+        let bad = object_store::PutPayload::from(b"not json".to_vec());
+        store.raw.put_opts(&revocations::path(&store), bad, Default::default()).await.unwrap();
+        let sp = Spaces::new(Limits::default());
+        let space = "at://did:web:a.example/space/t.t/k";
+        assert!(sp.revoke(&store, space, "did:aud", &["j".into()], false).await.is_err());
+        assert!(sp.revocations.is_blocked(space, now_secs()));
+        assert!(!sp.revocations.is_blocked("at://did:web:a.example/space/t.t/other", now_secs()));
+    }
 
     /// Two importRepo slots per account and eight per node, given back on
     /// drop.

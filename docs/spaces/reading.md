@@ -155,6 +155,8 @@ Every node reads the object whole, so anyone with a DID could grow it if nothing
   - Every block ends 3,610 s after it was made (an authority's, after the latest one it folded
     in). A block stands for revocations of credentials that existed when it was made, and each of
     those has expired by then. A credential issued later isn't one of them.
+- A revocation refused by the `space-revoke-aud` bucket (anyone can spend an account's), or one the
+  store couldn't take, blocks its space the same way: nothing about a revocation fails open.
 - A node runs one append at a time and refuses a ninth waiting one (blocking its space). Re-reads
   don't wait behind appends, so a flood can't make the set go stale.
 

@@ -803,7 +803,14 @@ async fn revocations_are_bounded_and_fail_closed() {
     let fifth = Stub::new().await;
     let sp5 = fifth.space("main");
     m.create_record(&sp5, COLL, Some("r"), rec("z")).await.ok();
-    revoke(&s, &fifth.service_jwt(&m.did, REVOKE), &sp5, &["a8", "a9"]).await.err(429, "RateLimitExceeded");
+    revoke(&s, &fifth.service_jwt(&m.did, REVOKE), &sp5, &["a8"]).await.ok();
+    let sixth = Stub::new().await;
+    let sp6 = sixth.space("main");
+    m.create_record(&sp6, COLL, Some("r"), rec("z")).await.ok();
+    revoke(&s, &sixth.service_jwt(&m.did, REVOKE), &sp6, &["a9"]).await.err(429, "RateLimitExceeded");
+    // an exhausted stake bucket is a revocation not stored: the space is
+    // blocked, not left readable
+    assert!(spaces(&s).revocations.is_blocked(&sp6, crate::common::now_secs()));
 
     // stale: refused until a read succeeds
     spaces(&s).revocations.age_last_read(vlpds::space::revocations::STALE_AFTER);
