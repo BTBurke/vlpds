@@ -249,9 +249,12 @@ lazy!(SCHEDULED_DELETION_ACCOUNTS: IntCounterVec = register_int_counter_vec!("vl
 lazy!(SCHEDULED_DELETION_STATE: IntGaugeVec = register_int_gauge_vec!("vlpds_scheduled_deletion_accounts", "Accounts with a deleteAfter on this node's shards as of its last sweep, by state: scheduled (all of them), held (due but taken down or suspended: never deleted while so), deferred (left for the next sweep by its per-pass cap); sum over nodes", &["state"]));
 lazy!(OAUTH_CONSENTS: IntCounterVec = register_int_counter_vec!("vlpds_oauth_consents_total", "OAuth consent page answers by result: full (every requested scope granted), narrowed (the user unticked some), denied (the user refused), refused (a required scope was unticked: access_denied)", &["result"]));
 lazy!(SCOPE_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_scope_rejections_total", "Requests refused 403 ScopeMissingError, by credential (oauth: an OAuth token; app_password: a scoped app password) and the missing scope's kind (repo, rpc, blob, account, identity)", &["credential", "kind"]));
-lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth) and second factor (none, totp, email, trusted: a trusted browser skipped it)", &["method", "factor"]));
+lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth, passkey: passwordless with a passkey, on the OAuth page or the account page) and second factor (none, totp, email, passkey, trusted: a trusted browser skipped it; a passwordless sign-in counts as passkey)", &["method", "factor"]));
 lazy!(SIGN_IN_ALERTS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_alerts_total", "Sign-ins from a new device, by what became of their alert mail: mailed (handed to the mailer), budget (a mail budget refused it: vlpds_mail_suppressed_total{purpose=\"sign_in_alert\"}), account_limit (the account's 3 alerts a day are spent), muted (the owner turned alerts off), no_email, email_code (an emailed code just went to the same inbox), baseline (the account's first recorded sign-in)", &["result"]));
 lazy!(SIGN_IN_SETTINGS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_settings_total", "Sign-in security settings changed by account owners, by setting (oauth_only, block_app_passwords, password_alerts, app_password_alerts) and new value (on, off)", &["setting", "value"]));
+lazy!(PASSKEYS: IntCounterVec = register_int_counter_vec!("vlpds_passkeys_total", "Passkey changes by event: registered (an owner added one on the Security page), removed (an owner removed one), reset (the operator's resetSecondFactors removed them; counts accounts)", &["event"]));
+lazy!(PASSKEY_FAILURES: IntCounterVec = register_int_counter_vec!("vlpds_passkey_failures_total", "Passkey registrations and assertions refused, by the check that failed: malformed, too_large, type, challenge (wrong, expired or bound to another flow), origin, cross_origin, rp_id, user_present, user_verified (passwordless without a PIN or biometric), algorithm, key, signature, credential_id, counter (a hardware key's counter went backwards, or it was flagged for that), unknown_credential (not one of the account's), replay (its challenge was already used)", &["reason"]));
+lazy!(PASSKEY_COUNTER_REGRESSIONS: IntCounterVec = register_int_counter_vec!("vlpds_passkey_counter_regressions_total", "Passkey sign-ins whose signature counter went backwards, by result: refused (a key that can't be synced: flagged and the owner mailed), accepted (a synced passkey, whose copies are expected)", &["result"]));
 lazy!(TRUSTED_BROWSERS: IntCounterVec = register_int_counter_vec!("vlpds_trusted_browsers_total", "Trusted browsers (skip the second factor for --trusted-device-days): granted (\"trust this browser\" after a code), revoked (one, or all, from the account page)", &["event"]));
 lazy!(HANDLE_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_handle_checks_total", "vlpds.identity.checkHandle answers by kind (service: a name under the handle domain; external: the caller's own domain) and status (invalid, reserved, current, taken, available, verified, unverified)", &["kind", "status"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
@@ -377,13 +380,13 @@ pub fn init_counters() {
         LazyLock::force(&IMPORT_RESERVED_BYTES);
         LazyLock::force(&BLOB_UPLOAD_BYTES);
         CPU_CORES.set(std::thread::available_parallelism().map_or(0, |n| n.get()) as f64);
-        for method in ["password", "app_password", "oauth"] {
+        for method in ["password", "app_password", "oauth", "passkey"] {
             for r in LOGIN_RESULTS {
                 LOGINS.with_label_values(&[method, r]);
             }
         }
-        for method in ["password", "app_password", "oauth"] {
-            for factor in ["none", "totp", "email", "trusted"] {
+        for method in ["password", "app_password", "oauth", "passkey"] {
+            for factor in ["none", "totp", "email", "passkey", "trusted"] {
                 SIGN_IN_FACTORS.with_label_values(&[method, factor]);
             }
         }
@@ -422,6 +425,7 @@ pub fn init_counters() {
             "plc_operation",
             "auth_factor",
             "sign_in_alert",
+            "security_change",
         ] {
             for r in ["sent", "failed", "dropped"] {
                 crate::mail::MAIL_MESSAGES.with_label_values(&[r, purpose]);
@@ -557,6 +561,29 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&OAUTH_CONSENTS, &["full", "narrowed", "denied", "refused"]),
     (&SIGN_IN_ALERTS, &["mailed", "budget", "account_limit", "muted", "no_email", "email_code", "baseline"]),
     (&TRUSTED_BROWSERS, &["granted", "revoked"]),
+    (&PASSKEYS, &["registered", "removed", "reset"]),
+    (
+        &PASSKEY_FAILURES,
+        &[
+            "malformed",
+            "too_large",
+            "type",
+            "challenge",
+            "origin",
+            "cross_origin",
+            "rp_id",
+            "user_present",
+            "user_verified",
+            "algorithm",
+            "key",
+            "signature",
+            "credential_id",
+            "counter",
+            "unknown_credential",
+            "replay",
+        ],
+    ),
+    (&PASSKEY_COUNTER_REGRESSIONS, &["refused", "accepted"]),
     (&PASSWORD_RESETS, &["requested", "unknown_email", "completed"]),
     (&INVITE_CODES, &["created", "used"]),
     (&BLOB_UPLOADS, &["image", "video", "other"]),

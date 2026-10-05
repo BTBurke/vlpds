@@ -117,7 +117,19 @@ pub enum Email<'a> {
         method: &'a str,
         at: &'a str,
     },
+    /// A change to how the account signs in that its owner should hear of:
+    /// a passkey added, removed or refused as a copy, or the second factors
+    /// reset by the operator (vlpds's own). No token.
+    SecurityChange {
+        handle: &'a str,
+        /// One sentence, written for the owner.
+        what: &'a str,
+        at: &'a str,
+    },
 }
+
+/// [`Email::SecurityChange`]'s purpose (mail budgets, metrics).
+pub const SECURITY_PURPOSE: &str = "security_change";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rendered {
@@ -137,6 +149,7 @@ impl Email<'_> {
             Email::PlcOperation { .. } => "plc_operation",
             Email::SignInAuthFactor { .. } => "auth_factor",
             Email::SignInAlert { .. } => "sign_in_alert",
+            Email::SecurityChange { .. } => SECURITY_PURPOSE,
         }
     }
 
@@ -148,7 +161,7 @@ impl Email<'_> {
             | Email::UpdateEmail { token }
             | Email::PlcOperation { token }
             | Email::SignInAuthFactor { token, .. } => token,
-            Email::SignInAlert { .. } => "",
+            Email::SignInAlert { .. } | Email::SecurityChange { .. } => "",
         }
     }
 
@@ -162,6 +175,7 @@ impl Email<'_> {
             Email::PlcOperation { .. } => "PLC Update Operation Requested",
             Email::SignInAuthFactor { .. } => "Sign-in Confirmation",
             Email::SignInAlert { .. } => "New Sign-in to Your Account",
+            Email::SecurityChange { .. } => "Your Account's Sign-in Settings Changed",
         }
     }
 
@@ -283,6 +297,23 @@ impl Email<'_> {
                     outro_style: "",
                     intro_txt: format!("Your account @{handle} was just signed in to from a device or browser it hasn't used before."),
                     outro_txt: format!("If this was you, there's nothing to do. If it wasn't, change your password right away: {change_pw}\n\nYou can see your recent sign-ins, or turn these emails off, on your account's Security page: {security}"),
+                }
+            }
+            Email::SecurityChange { handle, what, at } => {
+                details = Some(vec![what.to_string(), at.to_string()]);
+                Slots {
+                    title: "Sign-in settings changed",
+                    preheader: format!("How your account @{handle} signs in has changed."),
+                    intro: format!("How your account<!-- -->\n                      {}<!-- -->\n                      signs in has changed:", at_handle(handle)),
+                    intro_style: PAD_RIGHT,
+                    outro: format!(
+                        "If this was you, there&#x27;s nothing to do. If it wasn&#x27;t,<!-- -->\n                      <a\n                        href='{}'\n                        style='{LINK_STYLE}'\n                        target='_blank'\n                      >change your password</a>\n                      <!-- -->right away and check your account&#x27;s<!-- -->\n                      <a\n                        href='{}'\n                        style='{LINK_STYLE}'\n                        target='_blank'\n                      >Security page.</a>",
+                        esc(&change_pw),
+                        esc(&security)
+                    ),
+                    outro_style: "",
+                    intro_txt: format!("How your account @{handle} signs in has changed:"),
+                    outro_txt: format!("If this was you, there's nothing to do. If it wasn't, change your password right away: {change_pw}\n\nThen check your account's Security page: {security}"),
                 }
             }
         };
@@ -587,6 +618,26 @@ mod tests {
         assert!(r.text.contains(
             "\n\nFirefox on <macOS>\nSigned in with your password\nFrom 203.0.113.7\n2026-10-04 12:00 UTC\n\n"
         ));
+        assert!(r.text.contains("Security page: https://pds.example.com/account/security"), "{}", r.text);
+    }
+
+    #[test]
+    fn security_change() {
+        let e = Email::SecurityChange {
+            handle: "alice.test",
+            what: "A passkey \u{201c}<YubiKey>\u{201d} was added.",
+            at: "2026-10-04 12:00 UTC",
+        };
+        assert_eq!((e.purpose(), e.token()), ("security_change", ""));
+        let r = e.render(&Branding::default(), URL);
+        assert_eq!(r.subject, "Your Account's Sign-in Settings Changed");
+        assert!(!r.html.contains("{{") && !r.html.contains("<code"), "{}", r.html);
+        assert!(r.html.contains("&lt;YubiKey&gt;"), "{}", r.html);
+        assert!(
+            r.text.contains("\n\nA passkey \u{201c}<YubiKey>\u{201d} was added.\n2026-10-04 12:00 UTC\n\n"),
+            "{}",
+            r.text
+        );
         assert!(r.text.contains("Security page: https://pds.example.com/account/security"), "{}", r.text);
     }
 

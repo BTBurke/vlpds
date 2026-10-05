@@ -264,6 +264,7 @@ mod tests {
             refresh_salt: "s".into(),
             device_id: None,
             request_id: None,
+            auth_cred: None,
         };
         assert!(!session_expired(&s, now));
         assert!(session_expired(&s, now + REFRESH_LIFETIME + 1));

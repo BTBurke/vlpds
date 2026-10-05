@@ -410,6 +410,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
         code_hash: None,
         consumed: None,
         auth_epoch: String::new(),
+        auth_cred: None,
     };
     store::put_request(app, &id, Some(&req)).await?;
     Ok(json!({"request_uri": store::request_uri(&id), "expires_in": PAR_EXPIRES_IN - 1}))
@@ -1307,7 +1308,8 @@ async fn sign_in_inner(
     device.pending_2fa = None;
     device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
-    device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch });
+    let auth_cred = None;
+    device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch, auth_cred });
     device.last_seen_at = now;
     store::put_device(app, device).await?;
     Ok(SignIn::Ok(did))
@@ -1449,7 +1451,12 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         Err(e) => return server_error_page(&app, "Sign-up failed", &e.message),
     };
     flow.device.accounts.retain(|a| a.did != acct.did);
-    flow.device.accounts.push(DeviceAccount { did: acct.did.clone(), authenticated_at: now, auth_epoch: epoch });
+    flow.device.accounts.push(DeviceAccount {
+        did: acct.did.clone(),
+        authenticated_at: now,
+        auth_epoch: epoch,
+        auth_cred: None,
+    });
     flow.device.last_seen_at = now;
     if let Err(e) = store::put_device(&app, &flow.device).await {
         return server_error_page(&app, "Sign-up failed", &e.description);
@@ -1648,6 +1655,7 @@ async fn code_grant(
         refresh_salt: ou::random_id("", 16),
         device_id: req.device_id.clone(),
         request_id: Some(rid.clone()),
+        auth_cred: req.auth_cred.clone(),
     };
     req.consumed = Some((did.clone(), s.id.clone()));
     store::put_request(app, &rid, Some(&req)).await?;

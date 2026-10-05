@@ -94,6 +94,10 @@ pub struct RequestData {
     /// approval voids the code.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_epoch: String,
+    /// The passkey that signed this in (`xrpc::passkeys::auth_ref`):
+    /// removing it ends what it signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_cred: Option<String>,
 }
 
 pub fn req_routing(id: &str) -> String {
@@ -198,6 +202,10 @@ pub struct Session {
     pub device_id: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+    /// The passkey that signed this in (`xrpc::passkeys::auth_ref`):
+    /// removing it ends what it signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_cred: Option<String>,
 }
 
 pub fn session_key(id: &str) -> String {
@@ -305,6 +313,10 @@ pub struct DeviceAccount {
     /// device out.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub auth_epoch: String,
+    /// The passkey that signed this in (`xrpc::passkeys::auth_ref`):
+    /// removing it ends what it signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_cred: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -410,6 +422,7 @@ mod tests {
             refresh_salt: "salt".into(),
             device_id: None,
             request_id: None,
+            auth_cred: None,
         };
         let key = [7u8; 32];
         let t = refresh_token(&key, &s);

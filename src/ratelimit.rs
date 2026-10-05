@@ -322,10 +322,29 @@ limit!(
 // new record, which is 20 per 5 min.
 limit!(CHECK_HANDLE_5MIN, 33, "vlpds.identity.checkHandle-0", Did, "vlpds.identity.checkHandle", 5 * MINUTE, 60);
 limit!(CHECK_HANDLE_DAY, 34, "vlpds.identity.checkHandle-1", Did, "vlpds.identity.checkHandle", DAY, 1000);
+// Each registration rewrites the account's passkeys row and mails its owner.
+limit!(
+    PASSKEY_REGISTER_ACCOUNT,
+    35,
+    "passkey-register-account",
+    Did,
+    "vlpds.server.startPasskeyRegistration (passkeys added to one account)",
+    DAY,
+    10
+);
+limit!(
+    PASSKEY_SIGN_IN_IP,
+    36,
+    "passkey-sign-in-ip",
+    Ip,
+    "the account page's passkey sign-in (startPasskeySignIn, createPasskeySession)",
+    5 * MINUTE,
+    100
+);
 
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 35] = [
+pub const BUILTIN: [&Limit; 37] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -361,6 +380,8 @@ pub const BUILTIN: [&Limit; 35] = [
     &MAIL_CLUSTER_DAY,
     &CHECK_HANDLE_5MIN,
     &CHECK_HANDLE_DAY,
+    &PASSKEY_REGISTER_ACCOUNT,
+    &PASSKEY_SIGN_IN_IP,
 ];
 
 /// A confidential client's backend calls these for all of its users from

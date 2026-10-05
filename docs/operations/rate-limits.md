@@ -88,6 +88,8 @@ the start of the next. The names are what the console, the config and the metric
 | `mail-cluster-day` | cluster | 1 day | 900 (`--mail-daily-budget`) | every account mail the cluster sends (a UTC day) | 429 · password reset: 200, no mail |
 | `vlpds.identity.checkHandle-0` | DID | 5 min | 60 | `vlpds.identity.checkHandle` (the account page re-checks a new domain every 15 s) | 429 · the account page stops checking |
 | `vlpds.identity.checkHandle-1` | DID | 1 day | 1,000 | the same | 429 · the account page stops checking |
+| `passkey-register-account` | DID | 1 day | 10 | `vlpds.server.startPasskeyRegistration`, so passkeys added to one account (each rewrites its passkeys row and mails the owner) | 429 · the Security page shows an error |
+| `passkey-sign-in-ip` | IP | 5 min | 100 | the account page's passkey sign-in (`vlpds.server.startPasskeySignIn`, `vlpds.server.createPasskeySession`) · OAuth page passkey posts count against `oauth-sign-in-ip` instead | 429 · the account page shows an error |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
 

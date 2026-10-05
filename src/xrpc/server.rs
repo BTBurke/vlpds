@@ -973,6 +973,9 @@ struct RefreshState {
     /// Set once rotated: reuse within the grace period re-issues this id.
     #[serde(default)]
     next_id: Option<String>,
+    /// The passkey that signed this in (`super::passkeys::auth_ref`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_cred: Option<String>,
 }
 
 fn access_scope(ap: &Option<AppPassRef>) -> &'static str {
@@ -1039,6 +1042,7 @@ async fn create_session_tokens(
     ap: Option<AppPassRef>,
     takendown: bool,
     epoch: Option<&str>,
+    auth_cred: Option<String>,
 ) -> XResult<(String, String)> {
     use super::cas::{Cond, Op};
     let family = new_family_id();
@@ -1050,6 +1054,7 @@ async fn create_session_tokens(
         app_password: ap,
         created_at: now_secs(),
         next_id: None,
+        auth_cred,
     };
     let name = format!("sess/{rid}");
     let mut conds = vec![Cond::eq(&name, None)];
@@ -1285,7 +1290,7 @@ async fn create_account(
     // service of the DID, never the account holder, so it can't bring the DID.
     let requester = requester.filter(|r| !r.iss.contains('#'));
     let acct = create_account_inner(&app, inp, requester.as_ref().map(|r| r.iss.as_str())).await?;
-    let (access, refresh) = create_session_tokens(&app, &acct.did, None, false, None).await?;
+    let (access, refresh) = create_session_tokens(&app, &acct.did, None, false, None, None).await?;
     let mut out = json!({"handle": acct.handle, "did": acct.did, "accessJwt": access, "refreshJwt": refresh});
     if let Some(doc) = account_did_doc(&app, &acct).await {
         out["didDoc"] = doc;
@@ -1779,7 +1784,8 @@ async fn create_session_inner(
         None => super::signin::Method::Password,
     };
     let include_email = shows_email(app_pass.as_ref());
-    let (access, refresh) = create_session_tokens(app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
+    let (access, refresh) =
+        create_session_tokens(app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str()), None).await?;
     let ua = super::signin::user_agent(headers);
     // a new browser gets its device cookie here, as on the OAuth pages
     let mut set_cookie = None;
@@ -3168,6 +3174,7 @@ pub(super) fn scoped_app_password_fixture_rows(did: &str) -> Vec<super::private_
         app_password: Some(AppPassRef { name: "bot".into(), privileged: false, scopes: Some(scopes.into()) }),
         created_at: 1_790_000_000,
         next_id: None,
+        auth_cred: None,
     };
     let hash = "5e2d1cf1".repeat(8);
     let meta = json!({"name": "bot", "createdAt": "2026-10-01T00:00:00.000Z", "privileged": false, "hash": hash, "scopes": scopes});
@@ -3177,6 +3184,19 @@ pub(super) fn scoped_app_password_fixture_rows(did: &str) -> Vec<super::private_
         r("apppass/bot".into(), enc(&meta)),
         r(format!("apphash/{hash}"), b"bot".to_vec()),
     ]
+}
+
+/// A legacy session signed in with a passkey (`super::private_rows`).
+pub(super) fn passkey_session_fixture_rows(did: &str, cred: &str) -> Vec<super::private_rows::PrivateRow> {
+    let st = RefreshState {
+        family: "0006439b2a1c0000aabbccddeeff0033".into(),
+        exp: 1_797_776_000,
+        app_password: None,
+        created_at: 1_790_000_000,
+        next_id: None,
+        auth_cred: Some(cred.into()),
+    };
+    vec![(did.into(), "sess/00112233445566778899aabbccddeeff0011223344556622".into(), super::private_rows::enc(&st))]
 }
 
 /// Golden fixtures (`super::private_rows`); the `json!` rows repeat their
@@ -3190,6 +3210,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
         app_password: Some(AppPassRef { name: "ci".into(), privileged: true, scopes: None }),
         created_at: 1_790_000_000,
         next_id: Some("00112233445566778899aabbccddeeff0011223344556677".into()),
+        auth_cred: None,
     };
     let hash = "4f1c0de0".repeat(8);
     let et = EmailToken { token_hash: "ab".repeat(32), requested_at: 1_790_000_000_000 };

@@ -34,18 +34,66 @@ pub fn sign_in_row_fixtures(did: &str) -> Vec<PrivateRow> {
     super::signin::fixture_rows(did)
 }
 
+/// Passkeys, and the session rows that record which passkey signed them in
+/// (`private/passkeys.json`), added after that.
+pub fn passkey_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    use crate::oauth::client::ClientAuth;
+    use crate::oauth::store as o;
+    let cred = super::passkeys::auth_ref("AAEC");
+    let mut rows = super::passkeys::fixture_rows(did);
+    rows.extend(super::server::passkey_session_fixture_rows(did, &cred));
+    let ses = o::Session {
+        id: "ses-passkey".into(),
+        did: did.into(),
+        client_id: "https://app.example/client-metadata.json".into(),
+        client_auth: ClientAuth::None,
+        dpop_jkt: "jkt".into(),
+        scope: "atproto".into(),
+        token_scope: "atproto".into(),
+        created_at: 1_790_000_000,
+        updated_at: 1_790_000_100,
+        expires_at: 1_790_003_700,
+        token_id: "tok-2".into(),
+        refresh_gen: 0,
+        refresh_salt: "salt".into(),
+        device_id: Some("dev-passkey".into()),
+        request_id: Some("req-passkey".into()),
+        auth_cred: Some(cred.clone()),
+    };
+    let dev = o::Device {
+        id: "dev-passkey".into(),
+        created_at: 1_790_000_000,
+        last_seen_at: 1_790_000_100,
+        user_agent: None,
+        accounts: vec![o::DeviceAccount {
+            did: did.into(),
+            authenticated_at: 1_790_000_050,
+            auth_epoch: "00ff".into(),
+            auth_cred: Some(cred),
+        }],
+        pending_2fa: None,
+        pending_2fa_failures: 0,
+        pending_2fa_epoch: String::new(),
+        trusted_until: 0,
+    };
+    rows.push((did.into(), o::session_key("ses-passkey"), enc(&ses)));
+    rows.push(("oauth:dev:dev-passkey".into(), "oauth/dev".into(), enc(&dev)));
+    rows
+}
+
 /// Decodes a private row the way its readers do: Ok(the row's kind), Err if
 /// it doesn't decode, lacks a field its readers use, or doesn't re-encode to
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 7] = [
+    let checks: [Check; 8] = [
         super::server::check_row,
         super::admin::check_row,
         super::email2fa::check_row,
         super::proxy::check_row,
         super::blob_quota::check_row,
         super::signin::check_row,
+        super::passkeys::check_row,
         check_shared_row,
     ];
     for check in checks {
@@ -127,6 +175,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         code_hash: Some("aGFzaA".into()),
         consumed: Some(("ses-fixture".into(), "tok-1".into())),
         auth_epoch: String::new(),
+        auth_cred: None,
     };
     let ses = o::Session {
         id: "ses-fixture".into(),
@@ -144,6 +193,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         refresh_salt: "salt".into(),
         device_id: Some("dev-fixture".into()),
         request_id: Some("req-fixture".into()),
+        auth_cred: None,
     };
     let dev = o::Device {
         id: "dev-fixture".into(),
@@ -154,6 +204,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
             did: did.into(),
             authenticated_at: 1_790_000_050,
             auth_epoch: String::new(),
+            auth_cred: None,
         }],
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,

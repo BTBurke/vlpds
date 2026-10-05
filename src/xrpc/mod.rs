@@ -21,6 +21,7 @@ pub mod internal;
 pub mod key_rotation;
 pub mod moderation;
 pub mod oauth;
+pub mod passkeys;
 #[doc(hidden)]
 pub mod private_rows;
 pub(crate) mod proxy;

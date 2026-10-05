@@ -6,7 +6,7 @@
 
 mod templates;
 
-pub use templates::{html_to_text, Branding, Email};
+pub use templates::{html_to_text, Branding, Email, SECURITY_PURPOSE};
 
 use crate::xrpc::{Mail, Mailer};
 use lettre::message::{header::ContentType, Mailbox, MultiPart};
