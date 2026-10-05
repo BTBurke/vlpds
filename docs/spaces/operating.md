@@ -57,8 +57,8 @@ guard this. Spaces shipped inside level 1 (vlpds hadn't been released), so no cl
 A few rules decide what your users and their apps can do:
 
 - Space data is OAuth only. An app needs a `space:` scope, and app passwords and password sessions
-  get no space reads, writes or delegation tokens. `getServiceAuth` won't mint them a token for a
-  space method either ([Reading a space](reading.md#oauth-only)).
+  get no space reads, writes or delegation tokens. `getServiceAuth` won't mint anyone a token for a
+  space method, OAuth apps included ([Reading a space](reading.md#oauth-only)).
 - That includes `vlpds.space.importRepo`, so an account moving in imports its space repos after it's
   activated here, with OAuth. Syncers see none of its space data for that short gap
   ([Moving a repo in](storage.md#moving-a-repo-in)).

@@ -273,11 +273,38 @@ async fn legacy_auth_and_missing_scopes() {
             s.xrpc.get("com.atproto.server.getServiceAuth", &q, auth).await.err(400, "InvalidRequest");
         }
     }
-    // with --spaces off, getServiceAuth is as it was
+    // the PDS mints space-method tokens itself, so no credential gets one,
+    // OAuth included (an app could forge the account's writer state or
+    // revoke credentials in its spaces), and with --spaces off too
+    let lxms = [
+        "com.atproto.space.notifyWrite",
+        "com.atproto.space.notifyCredentialRevoked",
+        "com.atproto.space.getRecord",
+        "com.atproto.simplespace.getSpace",
+        "COM.ATPROTO.SPACE.notifyWrite",
+    ];
+    let generic = SpaceClient::new(&s, "spgs", "transition:generic").await;
+    let rpc = SpaceClient::new(&s, "spgr", "rpc:*?aud=did:web:space.example%23svc").await;
+    for sc in [&generic, &rpc, &a] {
+        for lxm in lxms {
+            let q = [("aud", "did:web:space.example#svc"), ("lxm", lxm)];
+            sc.get("com.atproto.server.getServiceAuth", &q).await.err(400, "InvalidRequest");
+        }
+    }
+    // other methods still get one where the grant allows it
+    for sc in [&generic, &rpc] {
+        let q = [("aud", "did:web:space.example#svc"), ("lxm", "app.bsky.feed.getTimeline")];
+        sc.get("com.atproto.server.getServiceAuth", &q).await.ok();
+    }
     let off = TestServer::spawn().await;
     let acct = off.create_account("splo").await;
-    let q = [("aud", "did:web:space.example"), ("lxm", "com.atproto.space.notifyWrite")];
-    off.xrpc.get("com.atproto.server.getServiceAuth", &q, &Auth::Bearer(acct.access)).await.ok();
+    for lxm in lxms {
+        let q = [("aud", "did:web:space.example#svc"), ("lxm", lxm)];
+        off.xrpc
+            .get("com.atproto.server.getServiceAuth", &q, &Auth::Bearer(acct.access.clone()))
+            .await
+            .err(400, "InvalidRequest");
+    }
     // OAuth without the space scope
     let g = SpaceClient::new(&s, "spg", "transition:generic").await;
     let mine = format!("at://{}/space/{TYPE}/main", g.did);
