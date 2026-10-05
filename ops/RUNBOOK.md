@@ -2272,8 +2272,8 @@ The Security tab's OAuth-only switch makes `createSession` refuse the main
 password, and "Block app passwords too" refuses app passwords (docs
 `oauth-2fa.md` "OAuth only").
 - The app shows 401 `OAuthRequired` (main password) or `AppPasswordsBlocked`
-  (app password). Both count as `vlpds_logins_total{result="blocked"}`, which
-  takedowns also use.
+  (app password), counted as `vlpds_logins_total{result="oauth_required"}` and
+  `{result="app_passwords_blocked"}` (takedowns are `{result="inactive"}`).
 - Not an outage. Sign in through the app's OAuth option (this server's sign-in
   page, with the second factor), or with an app password if they aren't
   blocked.
@@ -2299,6 +2299,10 @@ Alerts go out for a sign-in from a device the account hasn't used in 180 days
   the account.
 - the account already got 3 that UTC day.
 - a mail budget is spent: `vlpds_mail_suppressed_total{purpose="sign_in_alert"}`.
+
+`vlpds_sign_in_alerts_total{result}` counts every new-device sign-in by which
+of these applied (`mailed`, `baseline`, `muted`, `no_email`, `email_code`,
+`account_limit`, `budget`).
   Delivery failures: `vlpds_mail_messages_total{purpose="sign_in_alert",result="failed"}`.
 
 Ask the user to check Recent sign-ins on the Security tab. A sign-in marked
