@@ -92,6 +92,18 @@ async fn spawn() -> TestServer {
 
 const SCOPE: &str = "space:com.example.group?collection=com.example.post&action=read&action=create&manage=create";
 
+/// The account UI shows its space-repos backup notice only when describeServer
+/// says the server runs Spaces; without --spaces the field is absent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn describe_server_says_whether_spaces_run() {
+    let on = spawn().await;
+    let j = on.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok();
+    assert_eq!(j["vlpds"], json!({"spaces": true}), "{j}");
+    let off = TestServer::spawn().await;
+    let j = off.xrpc.get("com.atproto.server.describeServer", &[], &Auth::None).await.ok();
+    assert!(j.get("vlpds").is_none(), "{j}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn spaces_e2e_single_node() {
     let s = spawn().await;

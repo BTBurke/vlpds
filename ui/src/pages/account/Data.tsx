@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ErrorNotice, Loading, Notice, PageHead, Panel, Spinner, saveBlob } from '../../components/ui'
 import { Download } from '../../components/icons'
 import { BackupBox } from '../../components/Backup'
-import { canStreamToDisk, type BackupSource } from '../../lib/backup'
+import { canStreamToDisk, serverRunsSpaces, type BackupSource } from '../../lib/backup'
 import { fmtBytes } from '../../lib/format'
 import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { acall } from '../../lib/xrpc'
@@ -48,6 +48,7 @@ async function serverExtras(): Promise<Record<string, unknown>> {
 function FullBackup() {
   const s = useSession()!
   const source = useMemo<BackupSource>(() => ({ base: '', did: s.did, handle: s.handle, call: acall }), [s.did, s.handle])
+  const spaces = useLoad(() => serverRunsSpaces(acall), []).data
   return (
     <Panel
       title="Download my data"
@@ -59,10 +60,12 @@ function FullBackup() {
         </>
       }
     >
-      <Notice>
-        Space repos (what you've written in spaces, and their media) aren't included yet. Space data is only readable through an app you've
-        connected with OAuth, and this backup signs in with your password.
-      </Notice>
+      {spaces && (
+        <Notice>
+          Space repos (what you've written in spaces, and their media) aren't included yet. Space data is only readable through an app you've
+          connected with OAuth, and this backup signs in with your password.
+        </Notice>
+      )}
       <BackupBox source={source} extras={serverExtras} />
     </Panel>
   )

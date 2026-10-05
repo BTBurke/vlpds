@@ -1281,14 +1281,20 @@ async fn describe_server(State(app): AppState) -> Json<J> {
     if let Some(e) = &app.config.contact_email_address {
         contact.insert("email".into(), json!(e));
     }
-    Json(json!({
+    let mut out = json!({
         "did": app.jwt.service_did,
         "availableUserDomains": [format!(".{}", app.handle_domain)],
         "inviteCodeRequired": app.config.invite_required,
         "blobUploadLimit": app.config.max_blob_size,
         "links": links,
         "contact": contact,
-    }))
+    });
+    // Under a vlpds key so other clients don't read it as protocol; absent
+    // without --spaces, so that response stays the reference's shape.
+    if app.config.spaces {
+        out["vlpds"] = json!({"spaces": true});
+    }
+    Json(out)
 }
 
 #[derive(Deserialize, Default)]

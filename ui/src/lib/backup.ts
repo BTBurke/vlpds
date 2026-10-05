@@ -142,8 +142,9 @@ async function* entries(o: BackupOptions, sum: BackupSummary, report: (p?: Parti
     : undefined
   const extras = o.extras ? await opt('server extras', o.extras) : undefined
   const head = await opt('latest commit', () => src.call('com.atproto.sync.getLatestCommit', { params: { did }, signal }))
+  const spaces = await serverRunsSpaces(src.call, signal)
 
-  yield file('README.txt', enc.encode(readme(src, session.handle ?? src.handle, origin, lastModified, !!o.recoveryKey, Object.keys(extras ?? {}))))
+  yield file('README.txt', enc.encode(readme(src, session.handle ?? src.handle, origin, lastModified, !!o.recoveryKey, Object.keys(extras ?? {}), spaces)))
   if (prefs) yield file('preferences.json', json(prefs))
   if (doc) yield file('identity/did.json', json(doc))
   if (audit) yield file('identity/plc-audit-log.json', json(audit))
@@ -312,13 +313,28 @@ const equal = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every
 
 // ---------------------------------------------------------------- README
 
+/** vlpds says so in describeServer; any other server, or an error, is no. */
+export async function serverRunsSpaces(c: BackupSource['call'], signal?: AbortSignal): Promise<boolean> {
+  try {
+    return (await c('com.atproto.server.describeServer', { signal }))?.vlpds?.spaces === true
+  } catch {
+    return false
+  }
+}
+
+const SPACES_NOT_INCLUDED = `Not included: space repos (records you wrote in spaces, and their blobs).
+This backup signs in with your password, and space data is only readable
+through an app you've connected with OAuth. Apps that use spaces keep their
+own copy, and the new server can import them once you've moved.
+`
+
 const EXTRAS: Record<string, string> = {
   'vlpds/app-passwords.json': 'App password names and dates (no secrets).',
   'vlpds/connected-apps.json': 'Apps signed in with OAuth: client and scope.',
   'vlpds/rotation-keys.json': 'Your PLC rotation keys (public did:keys).',
 }
 
-function readme(src: BackupSource, handle: string, origin: string, at: Date, withKey: boolean, extras: string[]) {
+function readme(src: BackupSource, handle: string, origin: string, at: Date, withKey: boolean, extras: string[], spaces: boolean) {
   const host = new URL(origin).host
   return `Backup of @${handle} (${src.did})
 Taken from ${host} on ${at.toISOString()}.
@@ -346,11 +362,7 @@ identity/plc-audit-log.json  (did:plc only) The PLC directory's full history
                              of your identity.
 account.json                 Handle, email, server, dates and counts.
 ${extras.map((e) => `${e.padEnd(29)}${EXTRAS[e] ?? 'Details only this server keeps.'}\n`).join('')}${withKey ? 'keys/recovery-key.txt        The recovery (rotation) private key you made in\n                             your browser. Anyone with it can take over your\n                             identity: keep this archive offline.\n' : ''}
-Not included: space repos (records you wrote in spaces, and their blobs).
-This backup signs in with your password, and space data is only readable
-through an app you've connected with OAuth. Apps that use spaces keep their
-own copy, and the new server can import them once you've moved.
-
+${spaces ? SPACES_NOT_INCLUDED : ''}
 Restoring on a new server
 -------------------------
 1. Create the account on the new server with your existing DID
