@@ -16,7 +16,7 @@ mod feature_level;
 pub mod firehose_subs;
 mod identity;
 pub mod import_budget;
-mod import_stream;
+pub mod import_stream;
 pub mod internal;
 pub mod key_rotation;
 pub mod mfa;

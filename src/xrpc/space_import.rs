@@ -36,7 +36,6 @@ use crate::space::commit::{self, CommitCtx, SignedCommit};
 use crate::space::lthash::LtHash;
 use crate::space::repo::{SpaceAck, SpaceError, SpaceOp};
 use crate::tid::Tid;
-use futures::StreamExt;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new().route("/xrpc/vlpds.space.importRepo", post(import_repo))
@@ -89,7 +88,7 @@ fn invalid(m: impl Into<String>) -> XrpcError {
 
 /// A CAR read section by section as the body arrives.
 struct CarReader {
-    body: axum::body::BodyDataStream,
+    body: super::import_stream::TimedBody,
     buf: Vec<u8>,
     pos: usize,
     total: usize,
@@ -98,8 +97,8 @@ struct CarReader {
 }
 
 impl CarReader {
-    fn new(body: Body, max: usize) -> CarReader {
-        CarReader { body: body.into_data_stream(), buf: Vec::new(), pos: 0, total: 0, max, eof: false }
+    fn new(body: super::import_stream::TimedBody, max: usize) -> CarReader {
+        CarReader { body, buf: Vec::new(), pos: 0, total: 0, max, eof: false }
     }
 
     /// Whether `n` unread bytes are buffered, reading more as needed.
@@ -120,7 +119,7 @@ impl CarReader {
                     }
                     self.buf.extend_from_slice(&chunk);
                 }
-                Some(Err(e)) => return Err(invalid(format!("reading the CAR: {e}"))),
+                Some(Err(e)) => return Err(e),
                 None => self.eof = true,
             }
         }
@@ -355,6 +354,7 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, headers: &Head
     let _room = app.imports.admit_working_set(working_set(sp.limits.max_records, declared)).await?;
     // (the worker checks again)
     let held = super::space::load_head(sp, &*app.partition(&did)?, &did, &space).await?;
+    let body = super::import_stream::TimedBody::new(body, app.config.import_body_idle, app.config.import_body_deadline);
     let mut car = CarReader::new(body, max);
     let header = car.section(MAX_HEADER, "header").await?.ok_or_else(|| invalid("invalid CAR: empty"))?;
     let roots = crate::car::read_header(&header).map_err(|e| invalid(format!("invalid CAR: {e}")))?;

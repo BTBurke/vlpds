@@ -3260,6 +3260,11 @@ plan), but real repos are mostly tiny, so a migration wave queued behind 4
 slots while the budget sat unused. Now each import reserves its *estimated
 working set* from one byte budget, and as many run as fit.
 
+A reservation is only as good as the body that holds it, so every
+importRepo body (public and space) fails after 30 s without a byte or an
+hour in all (`import_stream::TimedBody`): a slowloris can't hold a slot and
+its room while migrations queue behind it.
+
 **The distribution** (`real_dist.rs`: ClickHouse crawl, 39.0 M repos; CAR
 bytes at the 326 B/record `tests/all/import_burst.rs` measures for
 real-shaped records):

@@ -149,6 +149,10 @@ pub struct Config {
     /// How long an import waits for the budget to admit it (then 503); a
     /// running one waits at most 10 s of it to grow.
     pub import_wait: Duration,
+    /// How long an importRepo body (public or space) may go without a byte,
+    /// and how long it may take in all; then it fails.
+    pub import_body_idle: Duration,
+    pub import_body_deadline: Duration,
     /// With `s3: None`: share this store so several in-process nodes form
     /// one cluster (tests).
     pub memory_store: Option<Arc<dyn object_store::ObjectStore>>,
@@ -337,6 +341,8 @@ impl Default for Config {
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             import_memory_bytes: None,
             import_wait: crate::xrpc::import_budget::ADMIT_WAIT,
+            import_body_idle: crate::xrpc::import_stream::BODY_IDLE,
+            import_body_deadline: crate::xrpc::import_stream::BODY_DEADLINE,
             memory_store: None,
             metrics_listen: None,
             log_retention: Some(crate::retention::Config::default()),

@@ -359,3 +359,25 @@ async fn concurrent_chunked_imports_fit_the_budget() {
         }
     }
 }
+
+/// A space import whose body stalls fails once it's been idle too long,
+/// giving back its slot and reservation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_space_import_body_fails() {
+    let o = one_with(|_, c| c.import_body_idle = Duration::from_millis(500)).await;
+    let s = &o.net.pds[0];
+    let built = records(RepoBuilder::new(&o.space, &o.bob.did, &rev_ago(Duration::from_secs(60))), 3)
+        .build(&*account_key(s, &o.bob.did).await);
+    let car = bytes::Bytes::from(built.car());
+    let t = Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        import_body(&o.bob, &o.space, || counted(car.slice(..car.len() / 2), Arc::default())),
+    )
+    .await
+    .expect("the import waited forever");
+    refused_mentioning(&r, &["stalled"]);
+    assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+    assert_eq!(s.app.imports.reserved(), 0);
+    import_repo(&o.bob, &o.space, &built.car()).await.ok();
+}

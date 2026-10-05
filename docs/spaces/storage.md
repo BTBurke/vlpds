@@ -120,6 +120,8 @@ memory first:
 - The import reserves what it can hold from the import budget, as `com.atproto.repo.importRepo`
   does, and waits up to 30 s for room (then 503 `Overloaded`). That's ~75 MB at the default record
   limit for a chunked body; a body that declares its length reserves less.
+- A body that sends nothing for 30 s, or takes over an hour, fails and gives its slot and room
+  back (as `com.atproto.repo.importRepo`'s does).
 - Every block is refused from its length, before it's read. The commit gets 1 KiB (a real one is
   ~200 bytes), the index `--space-repo-max-records` × 128 bytes (12.8 MB at the default, and never
   less than 1 MiB), and each record 1 MB, as a space write does. The index's entry count is checked
