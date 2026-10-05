@@ -79,7 +79,7 @@ from it. vlpds has no back-compat for Spaces data yet, so a format change replac
 | Space blobs (`space.getBlob`, `listBlobs`, the `sync.getBlob` rule) | built |
 | The OAuth consent screen for `space:` scopes | built |
 | Audited operator access to space records, `vlpds.space.importRepo`, space takedowns | built |
-| Concurrent space writes to one repo sharing log segments | not built yet |
+| Concurrent space writes to one repo sharing log segments, as public commits do | built |
 
 ## Pages
 

@@ -31,13 +31,46 @@ Spaces is an alpha that changes every week upstream, so leave it off unless you'
 it. With no space traffic, a node with it on makes one conditional GET of the revocations object every
 5 min and runs an oplog sweep about every 6 h, which skips repos younger than the window.
 
+## What you get with `--spaces`
+
+A node with the flag serves every Spaces method a PDS serves at the `5b95b2f2` pin, in both roles.
+As a repo host it holds your accounts' space repos. As a simplespace host it runs the spaces your
+accounts govern. Nothing is proxied to another host.
+
+| Area | What's served |
+|---|---|
+| Space records | `space.createRecord`, `putRecord`, `deleteRecord`, `applyWrites`, `getRecord`, `listRecords`, `listSpaces` |
+| Sync | `space.getLatestCommit`, `listRepoOps`, `getRepo`, `listBlobs`, `getBlob` |
+| Credentials | `space.getDelegationToken`, `getSpaceCredential`, `notifyCredentialRevoked` |
+| simplespace host | `simplespace.createSpace`, `getSpace`, `updateSpace`, `deleteSpace`, `putMember`, `removeMember`, `listMembers`, and `space.notifyWrite`, `listRepos`, `registerNotify`, `unregisterNotify` |
+| vlpds only | `vlpds.space.importRepo`, operator reads (`vlpds.admin.getSpaceRepo`, `listSpaceRecords`, `getSpaceRecord`), `vlpds.admin.checkSpace`, space takedowns |
+
+A method under `com.atproto.space.*` or `com.atproto.simplespace.*` that a PDS doesn't serve
+(`notifySpaceDeleted` and `checkUserAccess` go to syncers and managing apps) answers 501 here.
+
+A few rules decide what your users and their apps can do:
+
+- Space data is OAuth only. An app needs a `space:` scope, and app passwords and password sessions
+  get no space reads, writes or delegation tokens. `getServiceAuth` won't mint them a token for a
+  space method either ([Reading a space](reading.md#oauth-only)).
+- The one exception is `vlpds.space.importRepo` for an account that's moving in. It's still
+  deactivated, so it can't sign in with OAuth, and its own password session may import until it's
+  activated ([Moving a repo in](storage.md#moving-a-repo-in)).
+- `sync.getBlob` serves a blob only once a public record names it. A blob only space records name
+  is served by `space.getBlob` to a credential for that space ([Blobs](privacy.md#blobs)).
+- The oplog keeps 7 days. A syncer further behind falls back to `getRepo`, which the reference
+  consumer already does on a hash mismatch ([Retention](storage.md#retention-caps-and-deletion)).
+- Moderators and admins can read space records for terms-of-service work, and every read is
+  audited ([Operator access](privacy.md#operator-access)).
+
 ## Flags
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--spaces` (`VLPDS_SPACES`) | off | serves `com.atproto.space.*` and `com.atproto.simplespace.*` here. An unbuilt one answers 501 |
+| `--spaces` (`VLPDS_SPACES`) | off | serves `com.atproto.space.*` and `com.atproto.simplespace.*` here |
 | `--space-repo-max-records` | 100000 | the most records one account's repo in one space may hold. A write past it gets `InvalidRequest` |
 | `--space-oplog-retention` | `7d` | how long ops stay for `listRepoOps`. `off` keeps them all |
+| `--max-import-mb` | 1024 | the largest CAR `vlpds.space.importRepo` takes, as for `com.atproto.repo.importRepo` |
 | `--max-exports`, `--export-stall-secs` | as for `sync.getRepo` | `space.getRepo` takes the same export slots and stall timeout |
 
 ## Fixed limits
@@ -122,9 +155,9 @@ vlpds node on MinIO. All of these are client-side.
   of it the segment PUT. Waiting for a segment and applying take ~0.01 ms each.
 - Server time for a no-op poll averages 0.12 ms, and 0.17 ms for a delta pull.
 - Public commit p99 held up with the spaces load running, but p50 went from 1.3 to 3.1 ms.
-- Sequential writes cost one bucket PUT each, the same as public writes. Concurrent space writes to
-  one repo don't share segments yet. At a concurrency of 4 they cost 1.0 PUT per write against 0.68
-  for public writes. That's the likely cause of the public p50 rise, and the fix isn't built yet.
+- Sequential writes cost one bucket PUT each, the same as public writes. At a concurrency of 4 on
+  one repo, the harness measured 1.0 PUT per space write against 0.68 for public writes. The
+  in-tree bench below doesn't reproduce that, so the harness number needs a second look.
 
 ### Server cost on one node
 

@@ -51,7 +51,7 @@ filters as the scope target, so an unfiltered listing needs a wildcard grant.
 
 | | Reference PDS | vlpds |
 |---|---|---|
-| Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes or delegation tokens |
+| Auth | legacy app passwords and password sessions can read and write the account's own space records | OAuth only (final). App passwords (scoped or not) and password sessions get no space reads, writes, delegation tokens or `getServiceAuth` tokens for space methods. A deactivated account moving in may call `vlpds.space.importRepo` with its password session |
 | Fan-out to syncers | each forward goes out as it's sequenced, unordered | one lane per (space, service), in spaceRev order, a writer's waiting forward replaced by its newer one |
 | notifyWrite delivery | a retry row written only after a send fails, so an acked write's notify can be lost in a crash | the `sP` row is in the write's own log entry |
 | Delegation tokens and client attestations | any lifetime (it mints 60 s) | refused past 300 s, since their `jti`s are held until `exp` |

@@ -87,9 +87,9 @@ edges:
   grow a space repo past `--space-repo-max-records` (100k) gets `InvalidRequest`.
 - The 200 goes out once the segment is in the bucket, applied, and the lease re-checked. That's the
   same path as a public commit ([The path of a commit](../the-path-of-a-commit.md)).
-- Concurrent space writes to one repo don't share segments yet. At a concurrency of 4, space writes
-  cost 1.0 segment PUT each where public writes cost 0.68, because public commits pipeline into
-  shared segments and space writes don't. The fix isn't built yet.
+- Space writes share segments the way public commits do. The in-tree bench measured 0.50 segment
+  PUTs per write with 4 writers on one repo and 0.125 with 16, the same for space and public writes
+  ([Operating](operating.md#server-cost-on-one-node)).
 
 ## The outbox
 
@@ -126,7 +126,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 | Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was written. A permanent refusal drops the row |
 | Inactive writers | a taken-down or deactivated account's rows wait and resume on reactivation |
 | Cleanup | a delivered row's `sP` delete rides the author's next space write, so delivery costs no PUT |
-| Bounds | 262,144 rows held in memory (the rest are rescanned once it drains to half) and 256 sends in flight |
+| Bounds | 262,144 rows held in memory (the rest are rescanned once it drains to half) and 256 sends in flight. One authority gets 8 at most, and authorities whose last send failed share 32, so a slow one can't hold up the rest |
 
 ## At the authority
 
@@ -144,7 +144,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 ## Fan-out
 
 ```diagram
-caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight) and for the dispatcher (4,096)."
+caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight), per dispatcher (8 of them, 4,096 queued each) and 512 sends in flight in all."
 nodes:
   - { id: hw, label: Authority's worker, sub: acks in spaceRev order, at: [0, 4], size: [9, 3], tone: violet }
   - { id: d, label: Dispatcher, sub: reads `sN` registrations, at: [12.5, 4], size: [9, 3], tone: violet }
@@ -171,7 +171,11 @@ edges:
   up with `listRepos`.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
-- Registrations (`registerNotify`) last 24 h. Expired ones are pruned.
+- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned.
+- Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
+  registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
+  syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.
+- A taken-down space forwards nothing, catch-ups included.
 
 The reference sends each forward as it's sequenced, with no order. Its syncers see about 3–5
 `prevSpaceRev` gaps per ~80 forwards, and each one costs a `listRepos` call.
@@ -225,7 +229,7 @@ marks:
 | 1 | before the segment is durable | no 200 | Nothing to replay. The app retries. |
 | 2 | durable, before the 200 | no 200 | The next owner replays the entry, `sP` row included, so the notify still goes out. A blind retry is a second write. |
 | 3 | after the 200, before the authority's 200 | the 200 | The `sP` row is in the bucket. Whichever node opens the shard next rescans `sP` and sends the newest rev. |
-| 4 | at the authority, after its entry is durable | the 200 | The authority keeps the spaceRev. The fan-out was only in memory, so a syncer sees a `prevSpaceRev` gap and catches up with `listRepos`. |
+| 4 | at the authority, after its entry is durable | the 200 | The authority keeps the spaceRev. The fan-out was only in memory, so the next owner sends each registration one catch-up forward, and a syncer that missed one catches up with `listRepos`. |
 | 5 | delivered, before the `sP` delete lands | the 200 | The row is resent once. The authority ignores a `repoRev` it has already seen. |
 
 The reference stores a notify for retry only after a send fails, so an acked write's notify can be

@@ -897,6 +897,20 @@ Divergences, also in DESIGN.md's Spaces section:
 - **Bounded revocations and registrations.** Revocations are one cluster-wide object every node reads, so `jti`s are capped at
   128 characters (a longer credential is refused), live entries per authority and in all are capped, and one that can't be
   stored blocks its space's credentials. A space holds at most 256 notify registrations. The reference bounds neither.
+- **Account takedowns revoke OAuth sessions for good.** As for every vlpds account, a takedown revokes the account's OAuth
+  sessions and a reversal doesn't bring them back, so an app signs in again. The reference's sessions work again.
+- **Takedowns reach space data.** A taken-down account mints no delegation token, and getSpaceCredential refuses a taken-down
+  member (`AccountTakedown`) or authority (`RepoTakendown`). Record takedowns (a takedown-adjusted, consistently signed view)
+  and space takedowns are vlpds extensions. The reference has neither, so its suites have no cases for them. They're tested in
+  `spaces_admin`, `spaces_sync::record_takedown_serves_a_consistent_view` and `spaces_blobs`.
+- **vlpds-only methods.** `vlpds.space.importRepo` and the audited operator reads (`vlpds.admin.getSpaceRepo`,
+  `listSpaceRecords`, `getSpaceRecord`, `checkSpace`) have no upstream counterpart (`spaces_admin`). importRepo takes a
+  deactivated account's own password session, the one exception to OAuth-only, which is still an open decision.
+
+Some N/A rows below are N/A only because a test can't wait out a real timer or backdate a row: the notification retry rows
+(1 min retry base) and the registration expiry row. `Outbox::set_retry_base` and `space::retention::prune_before` now exist as
+test hooks, so the retry rows could be ported. Registration expiry still needs a hook (the tests age `sN` rows with a direct
+`db.put`). Until then those rows are covered by the outbox's and fan-out's own unit tests.
 
 | | Cases |
 |---|---:|

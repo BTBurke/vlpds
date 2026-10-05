@@ -12,7 +12,7 @@ diagram:
   nodes:
     - { id: api, label: Apps · syncers, sub: "space.* · simplespace.*", at: [0, 5.5], size: [9, 3], tone: ink }
     - { id: fwd, label: Any node, sub: routes the call, at: [12, 5.5], size: [9, 3], tone: accent }
-    - { id: as, label: Author's shard, sub: "sH · sR · sO · sP", at: [25, 1], size: [11, 3], tone: accent }
+    - { id: as, label: Author's shard, sub: "sH · sR · sO · sP · sb · sc", at: [25, 1], size: [11, 3], tone: accent }
     - { id: hs, label: Authority's shard, sub: "sS · sM · sW · sQ · sN", at: [25, 10], size: [11, 3], tone: accent }
     - { id: fh, label: Firehose, sub: "merger · peers · backfill", at: [40, 0], size: [11, 2.6], tone: blue }
     - { id: log, label: "`log/` segments", sub: "private entries", at: [40, 5.2], size: [11, 3.2], shape: store, tone: amber }
@@ -24,7 +24,7 @@ diagram:
     - { from: hs.r, to: log.l70, label: one entry }
     - { from: log.t, to: fh.b, label: empty frame · skipped, dash: true, tone: blue }
 facts:
-  - { value: "9", unit: families, label: of space rows, note: "four per author · five per authority" }
+  - { value: "11", unit: families, label: of space rows, note: "six per author · five per authority" }
   - { value: "0", unit: frames, label: per space entry, note: "a debug assertion refuses a space row with a frame", tone: blue }
   - { value: "2,048 B", label: LtHash state, note: "in every write's `sH` row · random, so it doesn't compress", tone: amber }
   - { value: "1", unit: control object, label: cluster-wide, note: "the revocations · written only when something is revoked", tone: violet }
@@ -52,10 +52,12 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 | `sW/{auth}\0{sid}{writer}` | the authority | writer state: repoRev, hash, spaceRev |
 | `sQ/{auth}\0{sid}{spaceRev}` | the authority | the writer's DID, in `listRepos` order. It holds each writer's latest state only |
 | `sN/{auth}\0{sid}{service}` | the authority | a notify registration: endpoint and expiry (24 h) |
+| `sb/{did}\0{sid}{cid}\0{path}` | the author | a space record's blob ref, at the rev that wrote it. `space.listBlobs` scans it in CID order |
+| `sc/{did}\0{cid}\0{sid}{path}` | the author | the same ref, CID first, so the blob GC and `sync.getBlob` find a blob's space refs in one scan |
 
 A deleted space keeps its `sS` tombstone so `getSpaceCredential` can answer `SpaceDeleted`. Its
-other host rows are swept, and a space created again at the same URI starts fresh. Space blob refs
-(`sb/`) aren't built yet.
+other host rows are swept, and a space created again at the same URI starts fresh. `deleteSpace`
+and `deleteAccount` drop the `sb/` and `sc/` refs with the records.
 
 ## Private log entries
 
@@ -92,9 +94,18 @@ and MAC must verify against the DID's current `#atproto` key, and the set hash r
 index must be the commit's. The records then stream in, each block checked against its CID, in
 frameless entries of at most 1,000 rows or 4 MiB. One last entry on the repo's worker puts the head
 in at the CAR's rev with an empty oplog, and the authority is owed a notify like after any write.
-The account's writes to that space are refused while it imports. An import that stops part way
-leaves rows no head names, which nothing serves, and the next import of the space deletes them
-first.
+The account's writes to that space are refused while it imports.
+
+- A rev more than 5 min in the future gets `FutureRev`.
+- An import that fails clears what it staged. If the node dies part way, the rows it left have no
+  head over them, so nothing serves them. The next import or the repo's first write clears them
+  before it lands.
+- An import over a repo with records is refused. One over a repo that's been emptied works if the
+  CAR's rev is newer, and the old head goes in the same entry.
+
+It takes an OAuth session that may create records in the space, or the account's own password
+session while the account is still deactivated (an account moving in can't sign in with OAuth
+until it's active). App passwords can't import.
 
 ## Revocations
 
@@ -121,7 +132,8 @@ can read any repo the cluster hosts.
 | Crash and takeover | the next owner replays the log, private entries included | dropped | rescanned on open, newest rev sent |
 
 Fan-out queues live only in memory on the authority's node. A forward still queued when the shard
-moves can be lost, and the syncer catches up with `listRepos`.
+moves can be lost, so the new owner sends each live registration one catch-up forward when the shard
+opens ([Fan-out](writing-and-sync.md#fan-out)).
 
 The phase 2 cluster tests cover each row. Split and merge keep every `s*` row under writes, and a
 kill -9 mid-burst on three nodes loses no acked write and keeps spaceRevs moving forward. The heads
