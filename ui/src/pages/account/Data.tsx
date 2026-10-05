@@ -59,6 +59,10 @@ function FullBackup() {
         </>
       }
     >
+      <Notice>
+        Space repos (what you've written in spaces, and their media) aren't included yet. Space data is only readable through an app you've
+        connected with OAuth, and this backup signs in with your password.
+      </Notice>
       <BackupBox source={source} extras={serverExtras} />
     </Panel>
   )

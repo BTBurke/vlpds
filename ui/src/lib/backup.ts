@@ -346,6 +346,11 @@ identity/plc-audit-log.json  (did:plc only) The PLC directory's full history
                              of your identity.
 account.json                 Handle, email, server, dates and counts.
 ${extras.map((e) => `${e.padEnd(29)}${EXTRAS[e] ?? 'Details only this server keeps.'}\n`).join('')}${withKey ? 'keys/recovery-key.txt        The recovery (rotation) private key you made in\n                             your browser. Anyone with it can take over your\n                             identity: keep this archive offline.\n' : ''}
+Not included: space repos (records you wrote in spaces, and their blobs).
+This backup signs in with your password, and space data is only readable
+through an app you've connected with OAuth. Apps that use spaces keep their
+own copy, and the new server can import them once you've moved.
+
 Restoring on a new server
 -------------------------
 1. Create the account on the new server with your existing DID
