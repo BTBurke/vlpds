@@ -88,7 +88,8 @@ edges:
 ### What is mailed
 
 vlpds sends the reference's six account mails with its subjects and wording, each as plain text
-plus HTML (`multipart/alternative`), and admin `sendEmail` from a moderator. `purpose` is the
+plus HTML (`multipart/alternative`), its own new-sign-in alert in the same layout, and admin
+`sendEmail` from a moderator. `purpose` is the
 metrics label.
 
 | Mail | Subject | `purpose` | Sent by |
@@ -99,6 +100,7 @@ metrics label.
 | Sign-in code | Sign-in Confirmation | `auth_factor` | signing in to an account with email 2FA on |
 | Account deletion | Account Deletion Requested | `delete_account` | `requestAccountDelete` |
 | PLC operation | PLC Update Operation Requested | `plc_operation` | `requestPlcOperationSignature` |
+| New sign-in alert | New Sign-in to Your Account | `sign_in_alert` | a sign-in from a new device (vlpds's own, see [Sign-in alerts](../oauth-2fa.md#sign-in-alerts-and-recent-sign-ins)) |
 | Moderation | the moderator's subject | `admin` | admin `sendEmail` |
 
 ### Mail budgets
@@ -118,6 +120,7 @@ everything else. Admin `sendEmail` is exempt from all three.
 | `password-reset-account-hour` / `-day` | 5 / hour, 15 / day | the account, from any IP | answered OK but not mailed (no account probing) · `reason="account_limit"` |
 | `requestPlcOperationSignature` | 5 / hour, 15 / day | DID | 429 (the reference has no limit here) |
 | sign-in code de-dup | one new code per 60 s | DID | no new mail (the live code still works) · `reason="dedup"` |
+| new-sign-in alerts | 3 / UTC day, once per device | the account, in its private state | not mailed, the sign-in still works. The alerts also spend the three budgets above, and a spent one drops the alert |
 
 The other mailing endpoints keep the reference's limits. `requestEmailConfirmation`,
 `requestEmailUpdate` and `requestAccountDelete` allow 5 / hour and 15 / day per DID, and

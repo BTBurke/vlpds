@@ -7,12 +7,15 @@ import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { acall, call, setSession } from '../../lib/xrpc'
 import { RecoveryKeys } from './RecoveryKeys'
+import { SignInSecurity } from './SignIns'
 
 export function Security() {
+  const [ver, setVer] = useState(0)
   return (
     <>
-      <PageHead title="Security" desc="Two-factor sign-in, your recovery key, passwords for apps, and the apps you've connected." />
-      <Totp />
+      <PageHead title="Security" desc="Two-factor sign-in, where you've signed in, your recovery key, passwords for apps, and the apps you've connected." />
+      <Totp onChange={() => setVer((v) => v + 1)} />
+      <SignInSecurity ver={ver} />
       <RecoveryKeys />
       <AppPasswords />
       <ConnectedApps />
@@ -25,7 +28,7 @@ export function Security() {
 
 type TotpStatus = { enabled: boolean; pending: boolean; recoveryCodesRemaining: number; enabledAt?: string }
 
-function Totp() {
+function Totp({ onChange }: { onChange: () => void }) {
   const st = useLoad<TotpStatus>(() => acall('vlpds.server.getTotpStatus'), [])
   const s = useSession()!
   const [setup, setSetup] = useState<{ secret: string; uri: string }>()
@@ -42,6 +45,7 @@ function Totp() {
     setSetup(undefined)
     setCode('')
     st.reload()
+    onChange()
   })
   const disable = useAction(async () => {
     const c = dcode.replace(/\s/g, '')
@@ -50,6 +54,7 @@ function Totp() {
     setPw('')
     setDcode('')
     st.reload()
+    onChange()
   })
 
   const desc = 'Ask for a code from an authenticator app whenever someone signs in with your password. App passwords are not affected.'
@@ -483,7 +488,7 @@ function ChangePassword() {
     setSession(null)
   })
   return (
-    <Panel title="Password" desc="Changing your password signs out every session and app password session on this account." id="password">
+    <Panel title="Password" desc="Changing your password signs out every session and app password session on this account, and removes every trusted browser." id="password">
       <ErrorNotice error={request.error || reset.error} />
       {!sent ? (
         <div className="row">

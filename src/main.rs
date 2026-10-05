@@ -695,6 +695,11 @@ struct Args {
     /// counted.
     #[arg(long, env = "VLPDS_MAIL_DAILY_BUDGET", default_value_t = vlpds::ratelimit::DEFAULT_MAIL_DAILY_BUDGET, value_parser = clap::value_parser!(u32).range(1..))]
     mail_daily_budget: u32,
+    /// Days a browser the user chose to trust skips the second factor on
+    /// sign-in (0: the choice isn't offered). Any password change,
+    /// revoke-all or 2FA change ends every trust early.
+    #[arg(long, env = "VLPDS_TRUSTED_DEVICE_DAYS", default_value_t = vlpds::xrpc::DEFAULT_TRUST_DAYS, value_parser = clap::value_parser!(u32).range(0..=365))]
+    trusted_device_days: u32,
     /// Memory budget of the in-memory caches (verified tokens, proxy
     /// accounts and service JWTs, DID documents, lexicons, OAuth clients),
     /// split between them by weight (MiB). Default: 10% of the memory
@@ -1426,6 +1431,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         peer_tls,
         rate_limit_bypass_key: args.rate_limit_bypass_key.clone(),
         mail_daily_budget: args.mail_daily_budget,
+        trusted_device_days: args.trusted_device_days,
         cluster: Some(vlpds::cluster::ClusterConfig {
             node_id,
             addr: advertise_url,

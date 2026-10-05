@@ -122,6 +122,8 @@ pub struct Config {
     pub rate_limit_bypass_key: Option<String>,
     /// `mail-cluster-day`'s default points.
     pub mail_daily_budget: u32,
+    /// How long "trust this browser" skips the second factor; 0: not offered.
+    pub trusted_device_days: u32,
     /// How long a write waits for a lexicon resolution. None: off.
     pub resolve_lexicons: Option<Duration>,
     /// Largest importRepo body.
@@ -305,6 +307,7 @@ impl Default for Config {
             peer_tls: None,
             rate_limit_bypass_key: None,
             mail_daily_budget: crate::ratelimit::DEFAULT_MAIL_DAILY_BUDGET,
+            trusted_device_days: crate::xrpc::DEFAULT_TRUST_DAYS,
             resolve_lexicons: None,
             max_import_bytes: crate::xrpc::DEFAULT_MAX_IMPORT_BYTES,
             import_memory_bytes: None,

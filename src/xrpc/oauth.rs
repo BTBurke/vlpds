@@ -621,8 +621,13 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+/// The browser's device id, when its cookie is well-formed.
+pub(crate) fn device_cookie_id(headers: &HeaderMap) -> Option<String> {
+    cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i))
+}
+
 /// Loads or starts the browser device session; true: a cookie must be set.
-async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OAuthError> {
+pub(crate) async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OAuthError> {
     let ua =
         headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()).map(|s| s.chars().take(256).collect::<String>());
     if let Some(id) = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i)) {
@@ -645,12 +650,13 @@ async fn device_for(app: &App, headers: &HeaderMap) -> Result<(Device, bool), OA
         pending_2fa: None,
         pending_2fa_failures: 0,
         pending_2fa_epoch: String::new(),
+        trusted_until: 0,
     };
     store::put_device(app, &d).await?;
     Ok((d, true))
 }
 
-fn device_cookie(app: &App, d: &Device) -> HeaderValue {
+pub(crate) fn device_cookie(app: &App, d: &Device) -> HeaderValue {
     let secure = if is_https(app) { "; Secure" } else { "" };
     HeaderValue::from_str(&format!(
         "{DEVICE_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}",
@@ -919,7 +925,7 @@ fn login_page(
     let name = server_name(app);
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, totp, email_hint: None },
+        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, totp, email_hint: None, trust_days: 0 },
         "",
     );
     let mut r = flow.page(app, body);
@@ -1146,8 +1152,13 @@ impl LoginError {
 /// Records the login on the device. Wrong codes count against the account's
 /// TOTP lockout and, past [`PENDING_2FA_MAX_FAILURES`], drop the pending
 /// sign-in.
-async fn sign_in(app: &App, device: &mut Device, f: &HashMap<String, String>) -> Result<SignIn, OAuthError> {
-    let r = sign_in_inner(app, device, f).await;
+async fn sign_in(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+    req: &SignInReq<'_>,
+) -> Result<SignIn, OAuthError> {
+    let r = sign_in_inner(app, device, f, req).await;
     let result = match &r {
         Ok(SignIn::Ok(_)) => "success",
         Ok(SignIn::NeedTotp(..)) => "second_factor_required",
@@ -1163,7 +1174,20 @@ async fn sign_in(app: &App, device: &mut Device, f: &HashMap<String, String>) ->
     r
 }
 
-async fn sign_in_inner(app: &App, device: &mut Device, f: &HashMap<String, String>) -> Result<SignIn, OAuthError> {
+/// Where a sign-in form post came from, for the sign-in log.
+struct SignInReq<'a> {
+    ip: Option<std::net::IpAddr>,
+    user_agent: Option<&'a str>,
+    /// None: `/oauth/account`.
+    client_id: Option<&'a str>,
+}
+
+async fn sign_in_inner(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+    req: &SignInReq<'_>,
+) -> Result<SignIn, OAuthError> {
     use crate::ratelimit as rl;
     let now = now_secs();
     let code = f.get("code").map(|c| c.trim()).filter(|c| !c.is_empty());
@@ -1224,8 +1248,11 @@ async fn sign_in_inner(app: &App, device: &mut Device, f: &HashMap<String, Strin
         };
         (acct, ident, epoch)
     };
+    // a trusted browser skips every factor, whichever are set up
+    let trusted = password_step && super::signin::trusted(app, &acct, &epoch, &device.id).await?;
     // TOTP, else the email factor (which mails the code on the password step)
-    match super::email2fa::check_second_factor(app, &acct, code, false).await {
+    let checked = if trusted { Ok(()) } else { super::email2fa::check_second_factor(app, &acct, code, false).await };
+    match checked {
         Ok(()) => {}
         Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
             device.pending_2fa = Some((acct.did.clone(), now));
@@ -1258,6 +1285,24 @@ async fn sign_in_inner(app: &App, device: &mut Device, f: &HashMap<String, Strin
             return Ok(SignIn::NeedTotpErr(acct.handle, hint));
         }
     }
+    let factor = if trusted {
+        Some("trusted")
+    } else if password_step {
+        None
+    } else if crate::totp::enabled_for(app, &acct).await? {
+        Some("totp")
+    } else {
+        Some("email")
+    };
+    let device_id = device.id.clone();
+    let ctx = super::signin::Ctx { ip: req.ip, user_agent: req.user_agent, device_id: Some(&device_id) };
+    if !password_step && matches!(f.get("trust").map(String::as_str), Some("1" | "on")) {
+        if let Some(until) = super::signin::trust(app, &acct, &epoch, &device_id, &ctx).await? {
+            device.trusted_until = device.trusted_until.max(until as i64);
+        }
+    }
+    let method = super::signin::Method::OAuth(req.client_id.map(String::from));
+    super::signin::record(app, &acct, method, factor, &ctx).await;
     let did = acct.did;
     device.pending_2fa = None;
     device.pending_2fa_failures = 0;
@@ -1285,7 +1330,14 @@ fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad
     });
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier: handle, error, totp: true, email_hint },
+        &ui::LoginForm {
+            action: "/oauth/authorize/sign-in",
+            identifier: handle,
+            error,
+            totp: true,
+            email_hint,
+            trust_days: super::signin::trust_days(app),
+        },
         "",
     );
     let mut r = flow.page(app, body);
@@ -1295,7 +1347,12 @@ fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad
     r
 }
 
-async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+async fn authorize_sign_in(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+    body: AxBytes,
+) -> Response {
     let (mut flow, f) = match form_flow(&app, &headers, &body).await {
         Ok(x) => x,
         Err(r) => return r,
@@ -1304,7 +1361,9 @@ async fn authorize_sign_in(State(app): AppState, headers: HeaderMap, body: AxByt
         let _ = store::put_request(&app, &flow.id, None).await;
         return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
     }
-    match sign_in(&app, &mut flow.device, &f).await {
+    let client_id = flow.client.id.clone();
+    let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: Some(&client_id) };
+    match sign_in(&app, &mut flow.device, &f, &req).await {
         Ok(SignIn::Ok(did)) => consent_step(&app, flow, &did).await,
         Ok(SignIn::NeedTotp(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), false),
         Ok(SignIn::NeedTotpErr(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), true),
@@ -1926,6 +1985,7 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
                 totp: pending,
                 // the address isn't put in the URL; the page says "your email"
                 email_hint: (pending && q.contains_key("email")).then_some("your email address"),
+                trust_days: super::signin::trust_days(&app),
             },
             &csrf,
         );
@@ -1965,12 +2025,18 @@ async fn account_form(
     Ok((device, f))
 }
 
-async fn account_sign_in(State(app): AppState, headers: HeaderMap, body: AxBytes) -> Response {
+async fn account_sign_in(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+    body: AxBytes,
+) -> Response {
     let (mut device, f) = match account_form(&app, &headers, &body).await {
         Ok(x) => x,
         Err(r) => return r,
     };
-    match sign_in(&app, &mut device, &f).await {
+    let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: None };
+    match sign_in(&app, &mut device, &f, &req).await {
         Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
         Ok(SignIn::NeedTotp(_, hint)) => {
             redirect_to(&format!("/oauth/account?add=1&totp=1{}", if hint.is_some() { "&email=1" } else { "" }))

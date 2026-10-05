@@ -133,6 +133,7 @@ mod server_basics;
 mod service_auth;
 mod shard_ingest;
 mod shrike_adopt;
+mod sign_in_security;
 mod signature_faults;
 mod smtp_mail;
 mod staged_import;

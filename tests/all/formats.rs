@@ -364,6 +364,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("private/rows.json", private_rows()),
         ("private/blob_quota.json", blob_quota_rows()),
         ("private/app_password_scopes.json", app_password_scope_rows()),
+        ("private/sign_in.json", rows_json(vlpds::xrpc::private_rows::sign_in_row_fixtures(DID))),
     ];
     v.extend(frames());
     v
@@ -807,7 +808,7 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             }
             assert!(kinds.len() >= 20, "L{level}/{name}: only {} row kinds: {kinds:?}", kinds.len());
         }
-        "private/blob_quota.json" | "private/app_password_scopes.json" => {
+        "private/blob_quota.json" | "private/app_password_scopes.json" | "private/sign_in.json" => {
             let rows: Vec<serde_json::Value> = serde_json::from_slice(b).unwrap();
             assert!(pretty(&rows) == b, "{name}: re-encode differs");
             for r in &rows {

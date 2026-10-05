@@ -2,7 +2,9 @@
 //! PDS's mailer templates (bluesky-social/atproto,
 //! packages/pds/src/mailer/templates/*.hbs; Copyright (c) 2022-2026 Bluesky
 //! Social PBC, and Contributors; MIT, see `NOTICE` beside this file). The
-//! six share one layout and differ only in a few slots.
+//! six share one layout and differ only in a few slots. vlpds's own
+//! new-sign-in alert uses the same layout, with the sign-in's details where
+//! the others put their code.
 //!
 //! Substitution is single-pass, so a value is never re-scanned for
 //! placeholders. Every value is HTML-escaped except the intro/outro
@@ -20,6 +22,8 @@ const DEFAULT_PRIMARY_COLOR: &str = "#067df7";
 
 const LINK_STYLE: &str = "color:hsl(211, 20%, 53%);text-decoration:none;text-decoration-line:underline;font-family:-apple-system, BlinkMacSystemFont, &#x27;Roboto&#x27;, &#x27;Oxygen&#x27;, &#x27;Ubuntu&#x27;, &#x27;Cantarell&#x27;, &#x27;Fira Sans&#x27;, &#x27;Droid Sans&#x27;, &#x27;Helvetica Neue&#x27;, sans-serif;margin:0px 0px;line-height:1.0;font-size:14px;letter-spacing:0.25px";
 const PAD_RIGHT: &str = ";padding-right:32px";
+const CODE_STYLE: &str = "display:block;padding:16px;border-radius:8px;border-width:1px;border-style:solid;background-color:hsl(211, 20%, 95.3%);border-color:hsl(211, 20%, 85.89999999999999%);font-size:14px;letter-spacing:0.25px;font-family:monospace;text-transform:uppercase";
+const DETAILS_STYLE: &str = "display:block;padding:16px;border-radius:8px;border-width:1px;border-style:solid;background-color:hsl(211, 20%, 95.3%);border-color:hsl(211, 20%, 85.89999999999999%);font-size:14px;line-height:1.6;letter-spacing:0.25px;margin:0px 0px;color:hsl(211, 24%, 34.2%);font-family:-apple-system, BlinkMacSystemFont, &#x27;Roboto&#x27;, &#x27;Oxygen&#x27;, &#x27;Ubuntu&#x27;, &#x27;Cantarell&#x27;, &#x27;Fira Sans&#x27;, &#x27;Droid Sans&#x27;, &#x27;Helvetica Neue&#x27;, sans-serif";
 
 /// The reference's `BrandingConfig`; unset fields take its defaults.
 #[derive(Clone, Debug, Default)]
@@ -102,6 +106,17 @@ pub enum Email<'a> {
         handle: Option<&'a str>,
         token: &'a str,
     },
+    /// A sign-in from a device the account hasn't used before (vlpds's own:
+    /// the reference has none). No token.
+    SignInAlert {
+        handle: &'a str,
+        /// "Firefox on macOS"
+        device: &'a str,
+        ip: &'a str,
+        /// "with your password, for app.example"
+        method: &'a str,
+        at: &'a str,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +136,7 @@ impl Email<'_> {
             Email::UpdateEmail { .. } => "update_email",
             Email::PlcOperation { .. } => "plc_operation",
             Email::SignInAuthFactor { .. } => "auth_factor",
+            Email::SignInAlert { .. } => "sign_in_alert",
         }
     }
 
@@ -132,6 +148,7 @@ impl Email<'_> {
             | Email::UpdateEmail { token }
             | Email::PlcOperation { token }
             | Email::SignInAuthFactor { token, .. } => token,
+            Email::SignInAlert { .. } => "",
         }
     }
 
@@ -144,6 +161,7 @@ impl Email<'_> {
             Email::UpdateEmail { .. } => "Email Update Requested",
             Email::PlcOperation { .. } => "PLC Update Operation Requested",
             Email::SignInAuthFactor { .. } => "Sign-in Confirmation",
+            Email::SignInAlert { .. } => "New Sign-in to Your Account",
         }
     }
 
@@ -158,6 +176,8 @@ impl Email<'_> {
         };
         let change_pw = format!("{}/.well-known/change-password", public_url.trim_end_matches('/'));
         let verify_link = format!("https://bsky.app/intent/verify-email?code={token}");
+        let security = format!("{}/account/security", public_url.trim_end_matches('/'));
+        let mut details: Option<Vec<String>> = None;
 
         let Slots { title, preheader, intro, intro_style, outro, outro_style, intro_txt, outro_txt } = match *self {
             Email::ResetPassword { handle, .. } => Slots {
@@ -248,12 +268,42 @@ impl Email<'_> {
                     outro_txt: format!("If this wasn't you, we recommend taking steps to protect your account by changing your password: {change_pw}"),
                 }
             }
+            Email::SignInAlert { handle, device, ip, method, at } => {
+                details = Some(vec![device.to_string(), format!("Signed in {method}"), format!("From {ip}"), at.to_string()]);
+                Slots {
+                    title: "New sign-in",
+                    preheader: format!("Your account @{handle} was signed in to from a new device."),
+                    intro: format!("Your account<!-- -->\n                      {}<!-- -->\n                      was just signed in to from a device or browser it hasn&#x27;t used before.", at_handle(handle)),
+                    intro_style: PAD_RIGHT,
+                    outro: format!(
+                        "If this was you, there&#x27;s nothing to do. If it wasn&#x27;t,<!-- -->\n                      <a\n                        href='{}'\n                        style='{LINK_STYLE}'\n                        target='_blank'\n                      >change your password</a>\n                      <!-- -->right away. You can see your recent sign-ins, or turn\n                      these emails off, on your account&#x27;s<!-- -->\n                      <a\n                        href='{}'\n                        style='{LINK_STYLE}'\n                        target='_blank'\n                      >Security page.</a>",
+                        esc(&change_pw),
+                        esc(&security)
+                    ),
+                    outro_style: "",
+                    intro_txt: format!("Your account @{handle} was just signed in to from a device or browser it hasn't used before."),
+                    outro_txt: format!("If this was you, there's nothing to do. If it wasn't, change your password right away: {change_pw}\n\nYou can see your recent sign-ins, or turn these emails off, on your account's Security page: {security}"),
+                }
+            }
         };
 
         let name = b.service_name(public_url);
         let home = b.home_url.as_deref().unwrap_or(DEFAULT_HOME_URL);
         let logo = b.logo_url.as_deref().unwrap_or(DEFAULT_LOGO_URL);
         let mark = b.logo_url.as_deref().unwrap_or(DEFAULT_MARK_URL);
+        let (token_block, token_txt) = match &details {
+            Some(lines) => (
+                format!(
+                    "<p\n                      style='{DETAILS_STYLE}'\n                    >{}</p>",
+                    lines.iter().map(|l| esc(l).into_owned()).collect::<Vec<_>>().join("<br />")
+                ),
+                lines.join("\n"),
+            ),
+            None => (
+                format!("<code\n                      style='{CODE_STYLE}'\n                    >{t}</code>"),
+                token.to_string(),
+            ),
+        };
         let html = fill(LAYOUT, |k| match k {
             "title" => Some(esc(title)),
             "preheader" => Some(esc(&preheader)),
@@ -261,14 +311,14 @@ impl Email<'_> {
             "intro_style" => Some(Cow::Borrowed(intro_style)),
             "outro" => Some(Cow::Borrowed(outro.as_str())),
             "outro_style" => Some(Cow::Borrowed(outro_style)),
-            "token" => Some(t.clone()),
+            "token_block" => Some(Cow::Borrowed(token_block.as_str())),
             "service_name" => Some(esc(&name)),
             "home_url" => Some(esc(home)),
             "logo_url" => Some(esc(logo)),
             "mark_url" => Some(esc(mark)),
             _ => None,
         });
-        let text = format!("{title}\n\n{intro_txt}\n\n{token}\n\n{outro_txt}\n\n--\n{name} ({home})\n");
+        let text = format!("{title}\n\n{intro_txt}\n\n{token_txt}\n\n{outro_txt}\n\n--\n{name} ({home})\n");
         Rendered { subject: self.subject().to_string(), text, html }
     }
 }
@@ -512,6 +562,32 @@ mod tests {
             .contains("We received a sign-in request for the account @alice.test. Use the code below to sign in."));
         let r = Email::SignInAuthFactor { handle: None, token: TOKEN }.render(&b, URL);
         assert!(r.text.contains("We received a sign-in request for your account. Use"));
+    }
+
+    #[test]
+    fn sign_in_alert() {
+        let b = Branding::default();
+        let e = Email::SignInAlert {
+            handle: "alice.test",
+            device: "Firefox on <macOS>",
+            ip: "203.0.113.7",
+            method: "with your password",
+            at: "2026-10-04 12:00 UTC",
+        };
+        assert_eq!(e.purpose(), "sign_in_alert");
+        assert_eq!(e.token(), "");
+        let r = e.render(&b, URL);
+        assert_eq!(r.subject, "New Sign-in to Your Account");
+        assert!(!r.html.contains("{{"), "{}", r.html);
+        assert!(!r.html.contains("<code"), "{}", r.html);
+        assert!(r.html.contains("Firefox on &lt;macOS&gt;<br />Signed in with your password<br />From 203.0.113.7"));
+        assert!(r.html.contains("href='https://pds.example.com/account/security'"));
+        assert!(r.html.contains("href='https://pds.example.com/.well-known/change-password'"));
+        assert!(r.text.starts_with("New sign-in\n\nYour account @alice.test was just signed in to"), "{}", r.text);
+        assert!(r.text.contains(
+            "\n\nFirefox on <macOS>\nSigned in with your password\nFrom 203.0.113.7\n2026-10-04 12:00 UTC\n\n"
+        ));
+        assert!(r.text.contains("Security page: https://pds.example.com/account/security"), "{}", r.text);
     }
 
     #[test]

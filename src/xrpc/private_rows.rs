@@ -29,17 +29,23 @@ pub fn app_password_scope_row_fixtures(did: &str) -> Vec<PrivateRow> {
     super::server::scoped_app_password_fixture_rows(did)
 }
 
+/// Sign-in security rows (`private/sign_in.json`), added after that.
+pub fn sign_in_row_fixtures(did: &str) -> Vec<PrivateRow> {
+    super::signin::fixture_rows(did)
+}
+
 /// Decodes a private row the way its readers do: Ok(the row's kind), Err if
 /// it doesn't decode, lacks a field its readers use, or doesn't re-encode to
 /// the same bytes (a field this build would drop).
 pub fn check_private_row(routing: &str, name: &str, val: &[u8]) -> anyhow::Result<&'static str> {
     type Check = fn(&str, &str, &[u8]) -> Option<anyhow::Result<&'static str>>;
-    let checks: [Check; 6] = [
+    let checks: [Check; 7] = [
         super::server::check_row,
         super::admin::check_row,
         super::email2fa::check_row,
         super::proxy::check_row,
         super::blob_quota::check_row,
+        super::signin::check_row,
         check_shared_row,
     ];
     for check in checks {
@@ -152,6 +158,7 @@ fn shared_fixture_rows(did: &str) -> Vec<PrivateRow> {
         pending_2fa: Some((did.into(), 1_790_000_060)),
         pending_2fa_failures: 1,
         pending_2fa_epoch: String::new(),
+        trusted_until: 0,
     };
     let authz =
         o::Authorization { client_id: client.into(), scopes: vec!["atproto".into()], updated_at: 1_790_000_000 };

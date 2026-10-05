@@ -3,7 +3,7 @@ title: OAuth and 2FA
 section: vlPDS
 order: 9
 status: ready
-summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, and how auth state stays correct under concurrency."
+summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, and how auth state stays correct under concurrency."
 ---
 
 ```hero
@@ -56,7 +56,7 @@ edges:
 | Used by | third-party apps | this server's account page, password-login clients, scripts | apps the user doesn't want to give a full login |
 | Access token | ES256 JWT, 15 min, bound to the client's DPoP key | HMAC JWT under `jwt_secret`, 2 h | as legacy, scope `com.atproto.appPass` (or privileged) |
 | Refresh | rotated each use · 14 d (public clients) or 91 d idle and 730 d total (confidential, `private_key_jwt`) | rotated each use · 90 d | as legacy |
-| Second factor | on the sign-in page | `authFactorToken` | skipped, as in the reference |
+| Second factor | on the sign-in page, unless the browser is [trusted](#trusted-browsers) | `authFactorToken`, unless the account page's browser is trusted | skipped, as in the reference |
 | Revoked by | `/oauth/revoke`, the account page, any revoke-all | `deleteSession`, any revoke-all | `revokeAppPassword`, any revoke-all |
 
 App passwords are server-generated (~80 bits) and stored as SHA-256 hashes. They can't change the account's
@@ -163,6 +163,88 @@ enrolling or checking TOTP needs the key service (503 during a KMS outage).
 own, and you can lift the per-account sign-in limit early with a DID override in the
 [admin console](operations/admin-console.md).
 
+## Trusted browsers
+
+```diagram
+caption: "The password step on a browser the account trusts. Its device cookie names a `trust/` row in the account's private state, and the row counts only while the credential epoch and the account's second factors are what they were when it was written."
+nodes:
+  - { id: pw, label: password ok, at: [0, 3], size: [8, 3], tone: accent }
+  - { id: row, label: "`trust/{hash}`", sub: "device cookie · ≤ 30 d", at: [13, 3], size: [10, 3], shape: store, tone: amber }
+  - { id: skip, label: session, sub: no code asked, at: [29, 0], size: [9, 3], tone: solid }
+  - { id: code, label: second factor, sub: TOTP or email code, at: [29, 6], size: [9, 3], tone: violet }
+edges:
+  - pw -> row
+  - "row.r -> skip.l: epoch · factors unchanged"
+  - "row.r -> code.l: missing · expired · changed"
+```
+
+The code step on the OAuth sign-in page and on the account page has a "Trust this browser" box. If the
+user ticks it, that browser skips the second factor for that account for 30 days
+(`--trusted-device-days`, 0 turns the box off). The password is still needed every time. Trust is
+per browser and per account, keyed by the `vlpds-device` cookie the OAuth pages already set (the
+account page's `createSession` sets one too when it needs to). The row's name is a hash of the
+cookie, so a copy of the bucket doesn't give anyone a usable cookie.
+
+A trust only counts while two things are unchanged since it was granted. The first is the
+[credential epoch](#auth-state-under-concurrency), so a password change or reset, a takedown or any
+revoke-all ends it (revoke-all also deletes the rows). The second is the account's set of second
+factors. Turning TOTP or the email factor off or on, or enrolling a new authenticator, ends every
+trust too. The trust is checked before any factor, so it covers whichever factors the account has.
+
+On `createSession` the cookie only counts on this server's own pages (`Sec-Fetch-Site:
+same-origin`), so other apps never skip the factor. The account page sends `trustDevice: true` with
+its code to ask for trust. The Security tab lists trusted browsers (browser and OS from the user
+agent, the address, and when the trust started, was last used and ends) and removes one or all of
+them (`vlpds.server.getSignInSecurity`, `vlpds.server.revokeTrustedBrowser`). A device row the
+account trusts is kept past the 7 day idle sweep until its trust ends, and the sweep deletes trusts
+once they expire.
+
+## Sign-in alerts and recent sign-ins
+
+| | Recent sign-ins | New-device alert |
+|---|---|---|
+| Recorded or sent for | every successful sign-in · OAuth page, `createSession` with the password or an app password | a sign-in from a device the account hasn't used in 180 days |
+| Kept | the last 50, at most 30 days old, in `signin/log` | at most 3 a day per account (`ALERTS_PER_DAY`) |
+| Shows | when, method (app password name, OAuth client), device, address, factor | device, method, address and time · links to change the password and to the Security tab |
+| Skipped when | never | the user turned that kind off · the account has no email · the sign-in used an emailed code · it's the first sign-in vlpds records for the account |
+
+Each sign-in writes one row in the account's private state, at the account's owner, with a
+conditional write. The row holds the log, the devices the account has used and today's alert count,
+so the "new device", the once-per-device rule and the daily cap all hold across nodes. A browser is
+its device cookie. An app has no cookie, so its user agent and address (a v6 address as its /64)
+stand in for the device. That means an app on a phone that changes networks counts as new now and
+then, which the daily cap keeps quiet. Each sign-in carries an id, and a write that finds its id
+already there adds nothing. So a forwarded sign-in is logged once whichever node served it. A
+`createSession` runs at the account's owner, and the OAuth page writes through to it.
+
+Alerts are ordinary account mail (`purpose` `sign_in_alert`, subject "New Sign-in to Your
+Account"), so they spend the [mail budgets](operations/email-and-moderation.md#mail-budgets) like any
+other. The cap of 3 a day keeps them to a tenth of the recipient's 30 a day, so they can't crowd out
+sign-in codes. If a budget is spent the alert is dropped (`vlpds_mail_suppressed_total`) and the
+sign-in still works. The first sign-in vlpds records for an account sets the baseline without an
+alert, so a new account, or an existing one the first time it signs in after an upgrade, doesn't get
+one for the device it already uses. A sign-in that just used an emailed code doesn't alert either, since the code went to
+the same inbox.
+
+Users turn alerts off per kind (password sign-ins and app-password sign-ins) on the Security tab.
+That's `vlpds.server.updateSignInSecurity` with `alerts: {password, appPassword}`.
+
+## OAuth only
+
+Some apps still take a handle and password and call `createSession`. The OAuth-only switch on the
+Security tab makes `createSession` refuse the account's main password with 401 `OAuthRequired`, so
+the password only works on this server's sign-in page. App passwords keep working unless the user
+also blocks them (401 `AppPasswordsBlocked`). The switch is only offered with a second factor on,
+and it only applies while one is. Without a factor there's no second step to get around.
+
+The checks run after the password is verified, so they don't tell a guesser anything, and before a
+code is mailed. The error names aren't the reference's. The Bluesky app turns
+`AuthFactorTokenRequired` into a code prompt, which would leave the user stuck, and it shows any
+message that isn't "Authentication Required" or "Invalid identifier or password" as it is. So the
+messages say what to do instead. This server's account page signs in with `createSession` too, so
+same-origin requests from it still go through, and they still need the second factor (or a trusted
+browser).
+
 ## Auth state under concurrency
 
 ```diagram
@@ -246,8 +328,10 @@ edges:
   every 10 s. The check fails closed. If the owner can't be read and the cached view is more than 300 s old,
   the request gets a 503 instead of a guess.
 - Revoke-all. This happens on a password change or reset, takedown, account deletion and OAuth credential
-  deletion. It deletes every legacy and OAuth session and replaces the credential epoch in one write. Its row
+  deletion. It deletes every legacy and OAuth session and every trusted browser, and replaces the
+  credential epoch, in one write. Its row
   is kept for the refresh-token lifetime (90 d), so a session that somehow survived still fails.
 - Cleanup. A per-node sweep runs every 60 s. It deletes expired OAuth rows (requests, codes, sessions past
-  their lifetime, devices unused for 7 d), and revocation rows once every token they cover has expired. Each
+  their lifetime, devices unused for 7 d and not trusted), expired trusted browsers, and revocation rows once
+  every token they cover has expired. Each
   delete only goes through if the row is unchanged.
