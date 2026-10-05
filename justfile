@@ -92,6 +92,11 @@ bench name rate *args:
 migrate-e2e:
     bench/migrate/run.sh
 
+# Passkeys in headless Chromium (bench/passkeys/README.md): a CDP virtual authenticator registers a passkey and
+# signs in with it (second step, passwordless) on a local in-memory vlpds; screenshots in bench/passkeys/out/shots
+passkeys-e2e:
+    bench/passkeys/run.sh
+
 # Build the Go sync 1.1 firehose checker and run it against a vlpds (extra flags e.g. -cursor 0 -strict)
 checker host="http://127.0.0.1:2620" *args:
     cd checker && go build -o checker . && ./checker -host {{host}} {{args}}

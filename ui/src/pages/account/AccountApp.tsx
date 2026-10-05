@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
 import { useSession } from '../../lib/hooks'
 import { Link, match, navigate, useSearch } from '../../lib/router'
@@ -88,11 +88,13 @@ function SignIn() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
   const canPasskey = passkeysHere()
+  const autofill = useRef<AbortController>()
 
   // autofill: offer this site's passkeys in the identifier field's suggestions
   useEffect(() => {
     if (!canPasskey || step !== 'password') return
     const ctl = new AbortController()
+    autofill.current = ctl
     ;(async () => {
       if (!(await conditionalAvailable())) return
       const opts = await call('vlpds.server.startPasskeySignIn', { body: {} })
@@ -128,6 +130,8 @@ function SignIn() {
   /** The button: passwordless, or after the password the account's passkeys as the second step. */
   const usePasskey = () =>
     run(async () => {
+      // a browser runs one WebAuthn request at a time: the button's replaces autofill's
+      autofill.current?.abort()
       const afterPassword = step !== 'password'
       const opts = await call('vlpds.server.startPasskeySignIn', {
         body: afterPassword ? { identifier: identifier.trim().replace(/^@/, ''), password } : {},

@@ -12,4 +12,5 @@
 !/src/bin/
 __pycache__/
 /bench/migrate/out/
+/bench/passkeys/out/
 .DS_Store
