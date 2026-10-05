@@ -212,6 +212,12 @@ retries failed control-plane reads, and then it retries its first cluster step w
 keeps its usual deadline). On R2 one GET at cluster start once took over 3 s, which used to stop the
 node. Once the node serves, renewals and every other control-plane call keep their deadlines.
 
+R2 takes about one write a second to one key and answers more with 429. Leases and assignments live
+on fixed keys, so control-plane writes retry a throttled answer 1 to 4 s apart (jittered), and a
+renewal starts at least 1 s after the previous one finished. Every 429 or 503 SlowDown is counted in
+`vlpds_object_store_throttled_total` by kind (`lease`, `segment`, `other`), with a panel in the
+internals dashboard and the `VlpdsObjectStoreThrottled` alert.
+
 Don't lower `--lease-ttl-ms` during an incident (it lowers the ceiling), and don't delete anything.
 A store shared with other heavy tenants can slow vlpds' renewals the same way. The alerts are
 `VlpdsObjectStoreBrownout`, `VlpdsSegmentPutLatencyHigh` and the lease alerts, and their steps are in

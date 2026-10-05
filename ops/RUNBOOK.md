@@ -1067,6 +1067,27 @@ and the matching warn/error log lines.
 **Do:** check credentials, permissions, throttling (S3 503 SlowDown) and provider
 status.
 
+### VlpdsObjectStoreThrottled
+
+**Means:** for 10 minutes, over 0.05/s of this node's object-store answers were
+429 Too Many Requests or 503 (S3's SlowDown) on one key kind
+(`vlpds_object_store_throttled_total{kind}`). object_store retries both inside
+its client, so they're counted at the HTTP layer (`src/throttle.rs`), one per
+answer. `lease` is the control plane (node leases, assignments, writer claims,
+the cluster version). R2 takes about one write a second to one key, and those
+writes retry 1-4 s apart, so each one delays a CAS (a renewal too) by a second
+or more. `segment` and `other` are account-wide request rates.
+
+**Confirm:** `sum by (kind) (rate(vlpds_object_store_throttled_total{instance="..."}[5m]))`,
+`vlpds_lease_renew_seconds` against the 0.4 x TTL ceiling, and the provider's
+rate-limit docs and dashboard.
+
+**Do:** on `lease`, look for something else writing the same keys (another
+cluster or a tool on the same `--prefix`) or a node restarting in a loop. Don't
+lower `--lease-ttl-ms` (renewals get more frequent). On `segment` or `other`,
+the bucket is past the provider's request rate: spread the load or ask for a
+higher limit.
+
 ### VlpdsObjectStorePermitsSaturated
 
 **Means:** for 10 minutes, over 1/s of this node's object-store requests found

@@ -11416,6 +11416,67 @@
     {
      "type": "timeseries",
      "id": 142,
+     "title": "Throttled answers/s (429, 503 SlowDown)",
+     "description": "Every 429 or 503 the store answered, retries included (object_store retries them inside its client, so the request counters see only the final result). lease = node leases, assignments, writer claims and the cluster version: R2 takes about one write a second per key, and control-plane writes retry 1-4 s apart. [VlpdsObjectStoreThrottled](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorethrottled).",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 343,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "(sum by (kind) (rate(vlpds_object_store_throttled_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval]))) > 0",
+       "legendFormat": "{{kind}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "reqps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "no throttling"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 143,
      "title": "p99 latency by component",
      "description": "To the response head (GET), first page (LIST); deletes are not timed. [VlpdsObjectStoreLatencyHigh](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorelatencyhigh)",
      "datasource": {
@@ -11423,7 +11484,7 @@
       "uid": "${ds_prometheus}"
      },
      "gridPos": {
-      "x": 0,
+      "x": 8,
       "y": 343,
       "w": 12,
       "h": 8
@@ -11481,7 +11542,7 @@
     },
     {
      "type": "timeseries",
-     "id": 143,
+     "id": 144,
      "title": "Bytes/s by client and direction",
      "description": "",
      "datasource": {
@@ -11489,8 +11550,8 @@
       "uid": "${ds_prometheus}"
      },
      "gridPos": {
-      "x": 12,
-      "y": 343,
+      "x": 0,
+      "y": 351,
       "w": 12,
       "h": 8
      },
@@ -11543,19 +11604,19 @@
   },
   {
    "type": "row",
-   "id": 144,
+   "id": 145,
    "title": "SlateDB (summed over each node's shard DBs)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 351,
+    "y": 359,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 145,
+     "id": 146,
      "title": "Block cache hit rate by entry kind",
      "description": "",
      "datasource": {
@@ -11564,7 +11625,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 352,
+      "y": 360,
       "w": 8,
       "h": 8
      },
@@ -11616,7 +11677,7 @@
     },
     {
      "type": "timeseries",
-     "id": 146,
+     "id": 147,
      "title": "DB requests/s",
      "description": "",
      "datasource": {
@@ -11625,7 +11686,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 352,
+      "y": 360,
       "w": 8,
       "h": 8
      },
@@ -11696,7 +11757,7 @@
     },
     {
      "type": "timeseries",
-     "id": 147,
+     "id": 148,
      "title": "Memtables / L0",
      "description": "",
      "datasource": {
@@ -11705,7 +11766,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 352,
+      "y": 360,
       "w": 8,
       "h": 8
      },
@@ -11783,7 +11844,7 @@
     },
     {
      "type": "timeseries",
-     "id": 148,
+     "id": 149,
      "title": "Flushes, backpressure, stalls",
      "description": "L0 stalls block writes: [VlpdsSlateDbL0Stalls](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsslatedbl0stalls).",
      "datasource": {
@@ -11792,7 +11853,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 360,
+      "y": 368,
       "w": 8,
       "h": 8
      },
@@ -11873,7 +11934,7 @@
     },
     {
      "type": "timeseries",
-     "id": 149,
+     "id": 150,
      "title": "Flush / compaction bytes/s",
      "description": "",
      "datasource": {
@@ -11882,7 +11943,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 360,
+      "y": 368,
       "w": 8,
       "h": 8
      },
@@ -11953,7 +12014,7 @@
     },
     {
      "type": "timeseries",
-     "id": 150,
+     "id": 151,
      "title": "Object store requests/s and errors (SlateDB)",
      "description": "SlateDB's own view of its store calls. Its error count includes normal answers (GETs of objects that don't exist yet, e.g. compactor polls; lost CAS races), so a steady rate here is not trouble by itself: real failures are result=error|timeout in the Object store row, where [VlpdsObjectStoreErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors) counts them for the state_* components (no alert reads this counter).",
      "datasource": {
@@ -11962,7 +12023,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 360,
+      "y": 368,
       "w": 8,
       "h": 8
      },
@@ -12041,19 +12102,19 @@
   },
   {
    "type": "row",
-   "id": 151,
+   "id": 152,
    "title": "Process and runtime",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 368,
+    "y": 376,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 152,
+     "id": 153,
      "title": "CPU by mode",
      "description": "CPU cores, summed over the selected nodes.",
      "datasource": {
@@ -12062,7 +12123,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 369,
+      "y": 377,
       "w": 8,
       "h": 8
      },
@@ -12114,7 +12175,7 @@
     },
     {
      "type": "timeseries",
-     "id": 153,
+     "id": 154,
      "title": "RSS by node",
      "description": "Resident set size. As a share of the node's memory limit: Health \u2192 Memory used / limit.",
      "datasource": {
@@ -12123,7 +12184,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 369,
+      "y": 377,
       "w": 8,
       "h": 8
      },
@@ -12174,7 +12235,7 @@
     },
     {
      "type": "timeseries",
-     "id": 154,
+     "id": 155,
      "title": "jemalloc",
      "description": "allocated = live heap; resident - allocated = fragmentation and retained pages.",
      "datasource": {
@@ -12183,7 +12244,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 369,
+      "y": 377,
       "w": 8,
       "h": 8
      },
@@ -12234,7 +12295,7 @@
     },
     {
      "type": "timeseries",
-     "id": 155,
+     "id": 156,
      "title": "Tokio worker utilization by node",
      "description": "Busy / workers. Dashed: [VlpdsRuntimeSaturated](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimesaturated) (90% for 15 min).",
      "datasource": {
@@ -12243,7 +12304,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 377,
+      "y": 385,
       "w": 8,
       "h": 8
      },
@@ -12311,7 +12372,7 @@
     },
     {
      "type": "timeseries",
-     "id": 156,
+     "id": 157,
      "title": "Runtime lateness by node",
      "description": "Share of time a 10 ms ticker woke late: ready tasks waited for a worker (blocking code on the runtime, or CPU starvation). Dashed: [VlpdsRuntimeStalls](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimestalls) (5%).",
      "datasource": {
@@ -12320,7 +12381,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 377,
+      "y": 385,
       "w": 8,
       "h": 8
      },
@@ -12387,7 +12448,7 @@
     },
     {
      "type": "timeseries",
-     "id": 157,
+     "id": 158,
      "title": "Tasks, injection queue, threads",
      "description": "",
      "datasource": {
@@ -12396,7 +12457,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 377,
+      "y": 385,
       "w": 8,
       "h": 8
      },
@@ -12469,19 +12530,19 @@
   },
   {
    "type": "row",
-   "id": 158,
+   "id": 159,
    "title": "Key service, PLC directory, mail",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 385,
+    "y": 393,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 159,
+     "id": 160,
      "title": "KMS requests/s by result",
      "description": "unavailable: [VlpdsKeyServiceUnavailable](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdskeyserviceunavailable) (page: cold writes fail); unwrap rejected: [VlpdsSecretUnwrapRejected](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssecretunwraprejected).",
      "datasource": {
@@ -12490,7 +12551,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 386,
+      "y": 394,
       "w": 8,
       "h": 8
      },
@@ -12541,7 +12602,7 @@
     },
     {
      "type": "timeseries",
-     "id": 160,
+     "id": 161,
      "title": "KMS latency p99, signing-key cache",
      "description": "",
      "datasource": {
@@ -12550,7 +12611,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 386,
+      "y": 394,
       "w": 8,
       "h": 8
      },
@@ -12629,7 +12690,7 @@
     },
     {
      "type": "timeseries",
-     "id": 161,
+     "id": 162,
      "title": "PLC directory requests/s",
      "description": "Write ops unavailable: [VlpdsPlcDirectoryUnavailable](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcdirectoryunavailable) (page); rejected: [VlpdsPlcOpsRejected](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcopsrejected).",
      "datasource": {
@@ -12638,7 +12699,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 386,
+      "y": 394,
       "w": 8,
       "h": 8
      },
@@ -12732,7 +12793,7 @@
     },
     {
      "type": "timeseries",
-     "id": 162,
+     "id": 163,
      "title": "Mail",
      "description": "",
      "datasource": {
@@ -12741,7 +12802,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 394,
+      "y": 402,
       "w": 8,
       "h": 8
      },
@@ -12815,19 +12876,19 @@
   },
   {
    "type": "row",
-   "id": 163,
+   "id": 164,
    "title": "MinIO (bench only; 5 s scrape)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 402,
+    "y": 410,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 164,
+     "id": 165,
      "title": "S3 requests/s by API",
      "description": "",
      "datasource": {
@@ -12836,7 +12897,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 403,
+      "y": 411,
       "w": 8,
       "h": 8
      },
@@ -12887,7 +12948,7 @@
     },
     {
      "type": "timeseries",
-     "id": 165,
+     "id": 166,
      "title": "S3 TTFB p99 by API",
      "description": "",
      "datasource": {
@@ -12896,7 +12957,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 403,
+      "y": 411,
       "w": 8,
       "h": 8
      },
@@ -12947,7 +13008,7 @@
     },
     {
      "type": "timeseries",
-     "id": 166,
+     "id": 167,
      "title": "S3 traffic",
      "description": "",
      "datasource": {
@@ -12956,7 +13017,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 403,
+      "y": 411,
       "w": 8,
       "h": 8
      },
@@ -13017,7 +13078,7 @@
     },
     {
      "type": "timeseries",
-     "id": 167,
+     "id": 168,
      "title": "S3 errors / in flight",
      "description": "",
      "datasource": {
@@ -13026,7 +13087,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 411,
+      "y": 419,
       "w": 8,
       "h": 8
      },
@@ -13097,7 +13158,7 @@
     },
     {
      "type": "timeseries",
-     "id": 168,
+     "id": 169,
      "title": "Bucket usage",
      "description": "",
      "datasource": {
@@ -13106,7 +13167,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 411,
+      "y": 419,
       "w": 8,
       "h": 8
      },
@@ -13159,19 +13220,19 @@
   },
   {
    "type": "row",
-   "id": 169,
+   "id": 170,
    "title": "CPU profile (Pyroscope; nodes run with --pyroscope-url)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 419,
+    "y": 427,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "flamegraph",
-     "id": 170,
+     "id": 171,
      "title": "CPU flamegraph (dashboard time range, selected nodes)",
      "datasource": {
       "type": "grafana-pyroscope-datasource",
@@ -13179,7 +13240,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 420,
+      "y": 428,
       "w": 24,
       "h": 16
      },

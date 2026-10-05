@@ -384,7 +384,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         Some(s3) => (
             Store::s3(s3, &cfg.prefix, cfg.inject_latency, log_limits.connections())?.counted("log"),
             Store::s3(s3, &cfg.prefix, None, state_limits.connections())?.counted("state"),
-            Store::s3(s3, &cfg.prefix, None, ctl_limits.connections())?.counted("ctl"),
+            Store::s3_ctl(s3, &cfg.prefix, ctl_limits.connections())?.counted("ctl"),
         ),
     };
     let (store, state_store, ctl_store) = (

@@ -5631,6 +5631,9 @@
            "VlpdsObjectStoreRequestErrors": {
             "text": "Storage requests are failing"
            },
+           "VlpdsObjectStoreThrottled": {
+            "text": "Storage is rate-limiting requests"
+           },
            "VlpdsObjectStorePermitsSaturated": {
             "text": "Storage requests are queueing"
            },
