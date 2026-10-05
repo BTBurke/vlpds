@@ -152,6 +152,8 @@ data".
 | `vlpds/*.json` | account page only. App password names, dates and scopes, connected OAuth apps and the PLC rotation keys (all public, no secrets) |
 | `keys/recovery-key.txt` | only if the user generated a recovery key in this tab (advanced mode) and ticked "include my recovery private key" (off by default) |
 
+Space repos aren't in the ZIP yet, and the account page's Export says so.
+
 The backup never contains a password, app password secret or session token. The server's repo
 signing key isn't exportable either, since a new server signs with its own key once the DID points
 to it.
@@ -191,11 +193,68 @@ it, and waits for "I saved it" before moving on. Users can also add or remove on
 account page. Details: [Keys and security](keys-security.md#plc-rotation-key-and-recovery-keys),
 [KEK and key rotation](operations/kek-and-key-rotation.md#operator-recovery-key).
 
+## Spaces
+
+When both servers run Spaces, the switch-over copies the account's space repos too. Space data is
+OAuth-only on vlpds (password sessions and app passwords never touch it), so this step signs in
+again on each side with OAuth. It runs after `activateAccount` here and before `deactivateAccount`
+there, because `vlpds.space.importRepo` needs the account live here and the old server has to serve
+the repos while the account is still active there.
+
+```steps
+- title: Check both servers
+  body: "An unauthenticated `com.atproto.space.listSpaces` on each side. A server that answers it as an unknown method doesn't run Spaces, and then the step is skipped with nothing to sign in to."
+- title: Sign in at the old server
+  body: "OAuth with `atproto space:*?authority=*&action=read_self`, which reads the account's own space repos and nothing else. The page lists the spaces with `listSpaces` and each repo's blobs with `space.listBlobs`."
+- title: Sign in here
+  body: "OAuth with `atproto space:*?authority=*&collection=*&action=create&action=read_self`, what `importRepo` checks, plus `blob:*/*` only when a repo names blobs."
+- title: Copy each space
+  body: "`space.getRepo` there, then `vlpds.space.importRepo` here, then each blob with `space.getBlob` there and `repo.uploadBlob` here (checked against its CID). 429s and dropped connections are retried as in the copy step."
+- title: Show what moved
+  body: "Each space is listed as copied (with its record and blob counts), as having nothing of the account's in it (a space it governs but never wrote in), or as not copied with the reason. The user can retry the failures or go on without them. Then the page revokes both sessions and deactivates the old account."
+```
+
+A retried import of the same rev answers 200 and writes nothing
+([Moving a repo in](spaces/storage.md#moving-a-repo-in)). So a reload, a Retry or a lost answer
+just runs the import again, and the page keeps each space's outcome (no secrets) with the rest of
+its progress so it only redoes what didn't move. Only the member repos move. A space the account
+governs keeps its members and policies on the old server, since nothing moves a simplespace yet.
+
+Syncers see none of the account's space data between activation and the import, so the step runs
+right away. It's seconds for a few spaces. If the user skips it or a space fails, that data stays in
+the deactivated account on the old server.
+
+### The page's OAuth client
+
+The page is its own OAuth client. vlpds serves its metadata at `/oauth/client-metadata.json` as a
+public client (`token_endpoint_auth_method: none`, DPoP-bound tokens, one redirect URI at
+`/migrate/oauth/callback`). On plain `http://127.0.0.1` the page uses a loopback client id instead,
+so a local test works against the reference PDS too.
+
+- The page discovers the authorization server from the PDS's
+  `/.well-known/oauth-protected-resource`, then uses PAR, PKCE (S256) and DPoP (ES256). The code
+  comes back in the URL fragment, so it's never sent to a server or in a `Referer`.
+- The DPoP key is a WebCrypto key made non-extractable and kept in IndexedDB. Script on the page
+  can sign with it while the tab is open, but nothing can read the private key out, so a token
+  copied out of the tab is useless anywhere else.
+- Tokens and the pending sign-in live in sessionStorage, so they die with the tab. The page revokes
+  the tokens and deletes the keys when the step ends. A key a closed tab left behind is deleted on
+  the next visit once it's a day old.
+- Discovery takes https only (plain http just for the loopback client), and the protected-resource
+  metadata has to name the server it came from.
+- The callback checks `state`, the `iss` the server sends (RFC 9207) and that the token's `sub` is
+  the account being moved.
+
+It names the server to sign in at instead of looking it up from the DID document on every token.
+That's on purpose. The old server isn't in the DID document anymore by the time this step runs, so
+a client that insists on it (like `@atproto/oauth-client-browser`) refuses exactly the session the
+copy needs. It's also ~19 kB of the page's bundle instead of ~208 kB.
+
 ## Afterwards
 
 ```steps
 - title: Activate here, deactivate there
-  body: "`activateAccount` on this server checks that the DID now points here, then serves the account and emits `#account`, `#identity` and `#sync`. Then `deactivateAccount` runs on the old one. The old server keeps its copy of the data as of the move."
+  body: "`activateAccount` on this server checks that the DID now points here, then serves the account and emits `#account`, `#identity` and `#sync`. The [Spaces](#spaces) step runs next, then `deactivateAccount` on the old one. The old server keeps its copy of the data as of the move."
 - title: Relays notice
   body: "vlpds asks its `--crawlers` to crawl after new activity, at most once per relay per 20 minutes. For a new server, announce it once by hand with `vlpds admin request-crawl bsky.network`."
 - title: Check it
@@ -227,6 +286,13 @@ recovery keys (generated and pasted). Then it checks both sides. Every record CI
 to match, the preferences have to be equal, and the PLC document has to name this server with the
 right rotation keys. The account has to be active here and deactivated there, and a new post has to
 be accepted. `KEEP=1` leaves the stack running, and the details are in `bench/migrate/README.md`.
+
+`just migrate-spaces-e2e` covers the Spaces step. Two accounts with two spaces each (one record
+with a blob) move here, one from the reference PDS at the Spaces alpha and one from a second vlpds,
+through the real authorization pages on both sides. One import's answer is dropped, so the retry
+re-imports the same rev. Then each space repo has to verify on this server with
+`@atproto/space`'s `verifyRepoCarFull` with the same records at the same rev, a second import has
+to change nothing, the blob has to have the same bytes, and a new write has to verify.
 
 Before migrating real accounts to a new server, migrate one test account and check it from outside
 (the last steps of [Verify](operations/deploy.md#verify)).

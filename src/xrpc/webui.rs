@@ -110,6 +110,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/docs/{*rest}", get(docs_shell))
         .route("/migrate", get(migrate_shell))
         .route("/migrate/", get(migrate_shell))
+        .route(crate::oauth::client::FIRST_PARTY_CALLBACK, get(migrate_shell))
         .route("/assets/{*path}", get(asset))
         .route("/fonts/{*path}", get(asset))
         .route("/og/{*path}", get(asset))

@@ -11,12 +11,14 @@ import { Invites } from './Invites'
 import { CaseDetail, Moderation } from './Moderation'
 import { RateLimits } from './RateLimits'
 import { Relays } from './Relays'
+import { SpaceDetail, Spaces } from './Spaces'
 
 const TABS = [
   { to: '/admin', label: 'Cluster' },
   { to: '/admin/metrics', label: 'Live metrics' },
   { to: '/admin/accounts', label: 'Accounts' },
   { to: '/admin/moderation', label: 'Moderation' },
+  { to: '/admin/spaces', label: 'Spaces' },
   { to: '/admin/invites', label: 'Invite codes' },
   { to: '/admin/ratelimits', label: 'Rate limits' },
   { to: '/admin/relays', label: 'Relays' },
@@ -35,6 +37,8 @@ export function AdminApp({ path }: { path: string }) {
   else if ((m = match('/admin/accounts/:did', p))) page = <AccountDetail did={m.did} />
   else if (p === '/admin/moderation') page = <Moderation />
   else if ((m = match('/admin/moderation/cases/:id', p))) page = <CaseDetail id={m.id} />
+  else if (p === '/admin/spaces') page = <Spaces />
+  else if (p === '/admin/spaces/space') page = <SpaceDetail />
   else if (p === '/admin/invites') page = <Invites />
   else if (p === '/admin/ratelimits') page = <RateLimits />
   else if (p === '/admin/relays') page = <Relays />

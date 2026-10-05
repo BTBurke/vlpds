@@ -944,6 +944,22 @@ async fn list_takedowns(State(app): AppState, Auth(creds): Auth, Query(q): Query
 struct AuditQ {
     limit: Option<usize>,
     did: Option<String>,
+    /// `*`: entries about any space; a space URI: about that space, its
+    /// records and its repos.
+    space: Option<String>,
+}
+
+/// The space an entry is about, if any: its subject's, or the space a read
+/// or a registration removal names.
+fn entry_space(e: &AuditEntry) -> Option<String> {
+    let of = |u: &str| {
+        super::syntax::parse_space_uri(u).map(|s| format!("at://{}/space/{}/{}", s.authority, s.space_type, s.skey))
+    };
+    e.subject
+        .as_ref()
+        .and_then(|s| s.uri.as_deref())
+        .and_then(of)
+        .or_else(|| e.detail.as_ref().and_then(|d| d["space"].as_str()).and_then(of))
 }
 
 /// Newest first.
@@ -960,6 +976,11 @@ async fn get_audit_log(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         if let Some((e, _)) = get_obj::<AuditEntry>(&app, &m.location).await? {
             if q.did.as_deref().is_some_and(|d| e.subject.as_ref().is_none_or(|s| s.did != d)) {
                 continue;
+            }
+            match q.space.as_deref().filter(|s| !s.is_empty()) {
+                Some("*") if entry_space(&e).is_none() => continue,
+                Some(u) if u != "*" && entry_space(&e).as_deref() != Some(u) => continue,
+                _ => {}
             }
             out.push(e);
         }

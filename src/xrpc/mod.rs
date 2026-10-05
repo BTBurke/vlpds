@@ -35,6 +35,7 @@ mod simplespace;
 pub mod space;
 mod space_admin;
 mod space_import;
+mod space_ops;
 pub mod staged_import;
 mod sync;
 pub mod syntax;
@@ -332,6 +333,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(admin::routes())
                 .merge(admin_tools::routes())
                 .merge(crawlers::routes())
+                .merge(space_ops::routes())
                 .merge(match app.config.spaces {
                     true => space::routes()
                         .merge(simplespace::routes())
@@ -344,6 +346,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(proxy::routes())
         .merge(oauth::routes())
         .merge(internal::routes())
+        .merge(space_ops::internal_routes())
         .merge(match app.config.spaces {
             true => space::internal_routes(),
             false => Router::new(),

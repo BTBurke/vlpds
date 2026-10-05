@@ -4,6 +4,7 @@ import { fmtTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { Link, navigate } from '../../lib/router'
 import { admin, call } from '../../lib/xrpc'
+import { AccountSpaces } from './Spaces'
 
 type InviteCode = { code: string; available: number; disabled: boolean; forAccount: string; createdBy: string; createdAt: string; uses: { usedBy: string; usedAt: string }[] }
 
@@ -184,6 +185,7 @@ export function AccountDetail({ did }: { did: string }) {
             </Panel>
             <Takedown did={did} status={subj.data} onDone={reload} />
             <Invites did={did} a={a} onDone={reload} />
+            <AccountSpaces did={did} />
           </div>
           <div>
             <Updates did={did} a={a} onDone={reload} />

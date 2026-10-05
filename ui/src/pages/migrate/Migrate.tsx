@@ -31,6 +31,8 @@ import {
   type StepId,
 } from './flow'
 import type { RecordCounts } from './count'
+import { BLOB_SCOPE, copySpace, NEW_SCOPE, OLD_SCOPE, plan, reasonOf, servesSpaces, spaceLabel, type SpaceMove, type SpacePlan } from './spaces'
+import { beginSignIn, clientInfo, finishSignIn, forgetAll, isCallback, OAuthSession, sweepKeys } from '../../lib/oauth'
 
 type Describe = { did: string; availableUserDomains: string[]; inviteCodeRequired?: boolean }
 
@@ -83,6 +85,19 @@ export function Migrate() {
   // only for "use the same password here"; never stored
   const [oldPassword, setOldPassword] = useState('')
   const [resumeAsked, setResumeAsked] = useState(false)
+  // back from an OAuth sign-in (the Spaces step): redeem the code first
+  const [callback, setCallback] = useState(isCallback)
+  const [oauthError, setOauthError] = useState<unknown>()
+  useEffect(() => {
+    if (!callback) {
+      void sweepKeys(['old', 'new'])
+      return
+    }
+    once('oauth-callback', finishSignIn)
+      .catch(setOauthError)
+      .finally(() => setCallback(false))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
   const [, bump] = useState(0)
 
   const update = useCallback((patch: Partial<Saved>) => {
@@ -101,6 +116,7 @@ export function Migrate() {
   const reset = () => {
     storeSaved(null)
     clearSecrets()
+    void forgetAll(['old', 'new'])
     setSavedRaw(null)
     setOldPassword('')
   }
@@ -118,7 +134,9 @@ export function Migrate() {
   const railStep: StepId = needOld && !saved?.checkedAt ? 'signin' : step
 
   let body: ReactNode
-  if (!describe.data) {
+  if (callback) {
+    body = <Spinner label="Finishing the sign-in" />
+  } else if (!describe.data) {
     body = describe.error ? <Notice kind="err">This server's info is unavailable ({errText(describe.error)}). Reload to try again.</Notice> : <Spinner />
   } else if (!saved) {
     body = <FindStep onFound={begin} invite={invite} />
@@ -154,7 +172,7 @@ export function Migrate() {
   } else if (step === 'identity') {
     body = <IdentityStep saved={saved} oldPds={oldPds!} newPds={newPds!} update={update} />
   } else if (step === 'finish') {
-    body = <FinishStep saved={saved} oldPds={oldPds!} newPds={newPds!} update={update} />
+    body = <FinishStep saved={saved} oldPds={oldPds!} newPds={newPds!} update={update} oauthError={oauthError} />
   } else {
     body = <DoneStep saved={saved} newPds={newPds!} onReset={reset} />
   }
@@ -186,6 +204,7 @@ export function Migrate() {
             <input type="checkbox" name="advanced" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)} />
             <span>I'm familiar with AT Protocol: show the technical details</span>
           </label>
+          {!!oauthError && !(saved?.activated && !saved.spaces) && <Problem error={oauthError} />}
           {body}
         </section>
       </main>
@@ -1656,7 +1675,19 @@ function IdentityStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds:
 
 // ---------------------------------------------------------------- 9. finish
 
-function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: Pds; newPds: Pds; update: (p: Partial<Saved>) => void }) {
+function FinishStep({
+  saved,
+  oldPds,
+  newPds,
+  update,
+  oauthError,
+}: {
+  saved: Saved
+  oldPds: Pds
+  newPds: Pds
+  update: (p: Partial<Saved>) => void
+  oauthError?: unknown
+}) {
   const [error, setError] = useState<unknown>()
   const [running, setRunning] = useState(false)
   const savedRef = useRef(saved)
@@ -1672,6 +1703,9 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
             await newPds.call('com.atproto.server.activateAccount', { method: 'POST' })
             update({ activated: true })
           }
+          // space repos import only once the account is live here, and are
+          // read there before that account goes offline
+          if (!savedRef.current.spaces) return
           if (!savedRef.current.oldDeactivated) {
             await oldPds.call('com.atproto.server.deactivateAccount', { body: {} })
             update({ oldDeactivated: true, finishedAt: Date.now() })
@@ -1687,7 +1721,22 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
   )
   useEffect(() => {
     run()
-  }, [run])
+  }, [run, saved.spaces])
+
+  const spacesLine = saved.spaces === 'none' ? null : (
+    <Checkline
+      state={saved.spaces === 'done' ? (saved.spaceMoves?.some((m) => m.state === 'failed') ? 'warn' : 'ok') : saved.spaces === 'skipped' ? 'warn' : 'wait'}
+      title="Copy your Spaces"
+    >
+      {saved.spaces === 'skipped'
+        ? `Not copied: they stay at ${hostOf(saved.oldPds)}.`
+        : saved.spaces === 'done'
+          ? spacesSummary(saved.spaceMoves ?? [])
+          : saved.activated
+            ? 'Private data you wrote in Spaces, copied from your old server.'
+            : undefined}
+    </Checkline>
+  )
 
   return (
     <Card title="Switching over" sub={<>Turning your account on here, then off at {hostOf(saved.oldPds)}.</>}>
@@ -1695,10 +1744,12 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
         <Checkline state={saved.activated ? 'ok' : error ? 'bad' : 'wait'} title={`Activate your account on ${here}`}>
           {saved.activated ? 'Live: the network now reads your posts from here.' : undefined}
         </Checkline>
-        <Checkline state={saved.oldDeactivated ? 'ok' : error && saved.activated ? 'bad' : 'wait'} title={`Deactivate your old account on ${hostOf(saved.oldPds)}`}>
+        {spacesLine}
+        <Checkline state={saved.oldDeactivated ? 'ok' : error && saved.activated && saved.spaces ? 'bad' : 'wait'} title={`Deactivate your old account on ${hostOf(saved.oldPds)}`}>
           Deactivated, not deleted: it stays there, offline, as a fallback.
         </Checkline>
       </ul>
+      {saved.activated && !saved.spaces && <SpacesBox saved={saved} update={update} oauthError={oauthError} />}
       {!!error && !running && (
         <>
           <Problem error={error} />
@@ -1708,7 +1759,7 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
             </Notice>
           )}
           <div className="row end">
-            {saved.activated && (
+            {saved.activated && saved.spaces && (
               <button type="button" className="btn quiet" onClick={() => update({ oldDeactivated: true, finishedAt: Date.now() })}>
                 Skip, I'll do it later
               </button>
@@ -1721,6 +1772,244 @@ function FinishStep({ saved, oldPds, newPds, update }: { saved: Saved; oldPds: P
       )}
     </Card>
   )
+}
+
+function spacesSummary(moves: SpaceMove[]): string {
+  const moved = moves.filter((m) => m.state === 'moved').length
+  const failed = moves.filter((m) => m.state === 'failed').length
+  if (!moved && !failed) return 'Nothing to copy.'
+  return failed ? `${moved} of ${moved + failed} copied; ${failed} stayed behind.` : `All ${moved} copied.`
+}
+
+// ---------------------------------------------------------------- spaces
+
+type SpacesPhase =
+  | { at: 'probe' }
+  | { at: 'sign-in-old' }
+  | { at: 'plan' }
+  | { at: 'sign-in-new'; plans: SpacePlan[] }
+  | { at: 'copy'; plans: SpacePlan[] }
+  | { at: 'result' }
+
+/** Lists the space repos at the old server and imports each here, with an
+ * OAuth sign-in on each side (space data never rides a password session). */
+function SpacesBox({ saved, update, oauthError }: { saved: Saved; update: (p: Partial<Saved>) => void; oauthError?: unknown }) {
+  const adv = useAdv()
+  const oldHost = hostOf(saved.oldPds)
+  const [phase, setPhase] = useState<SpacesPhase>({ at: 'probe' })
+  const [error, setError] = useState<unknown>(oauthError)
+  const [busy, setBusy] = useState(false)
+  const [moves, setMoves] = useState<SpaceMove[]>(saved.spaceMoves ?? [])
+  const [current, setCurrent] = useState<{ uri: string; blobs: number; total: number } | null>(null)
+  const [pausedUntil, setPausedUntil] = useState(0)
+  const client = clientInfo()
+  const savedRef = useRef(saved)
+  savedRef.current = saved
+
+  const sessions = async () => ({
+    old: await OAuthSession.load('old', saved.did, saved.oldPds),
+    here: await OAuthSession.load('new', saved.did, location.origin),
+  })
+
+  const step = useCallback(
+    () =>
+      once(`spaces:${saved.did}`, async () => {
+        try {
+          const [hereOn, thereOn] = await Promise.all([servesSpaces(''), servesSpaces(saved.oldPds)])
+          if (!hereOn || !thereOn) {
+            update({ spaces: 'none' })
+            return
+          }
+          const { old, here: mine } = await sessions()
+          const narrowed = new Error("That sign-in didn't allow everything the copy needs. Sign in again and leave every permission ticked.")
+          if (!old || !old.grants(OLD_SCOPE)) {
+            if (old) setError(narrowed)
+            return setPhase({ at: 'sign-in-old' })
+          }
+          setPhase({ at: 'plan' })
+          const plans = await plan(old, setPausedUntil)
+          if (!plans.length) {
+            await forgetAll(['old', 'new'])
+            update({ spaces: 'none', spaceMoves: [] })
+            return
+          }
+          const scope = plans.some((p) => p.blobs.length) ? `${NEW_SCOPE} ${BLOB_SCOPE}` : NEW_SCOPE
+          if (!mine || !mine.grants(scope)) {
+            if (mine) setError(narrowed)
+            return setPhase({ at: 'sign-in-new', plans })
+          }
+          setPhase({ at: 'copy', plans })
+          let done = (savedRef.current.spaceMoves ?? []).filter((m) => m.state !== 'failed')
+          for (const p of plans) {
+            if (done.some((m) => m.uri === p.uri)) continue
+            setCurrent({ uri: p.uri, blobs: 0, total: p.blobs.length })
+            let m: SpaceMove
+            try {
+              m = await copySpace(old, mine, p, setPausedUntil, (n) => setCurrent({ uri: p.uri, blobs: n, total: p.blobs.length }))
+            } catch (e) {
+              m = { uri: p.uri, state: 'failed', reason: reasonOf(e) }
+            }
+            done = [...done.filter((x) => x.uri !== p.uri), m]
+            setMoves(done)
+            update({ spaceMoves: done })
+          }
+          setCurrent(null)
+          setPhase({ at: 'result' })
+        } catch (e) {
+          setError(e)
+          setPhase((ph) => (ph.at === 'plan' || ph.at === 'copy' ? { at: 'result' } : ph))
+        }
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [saved.did],
+  )
+  useEffect(() => {
+    step()
+  }, [step])
+
+  const signIn = async (name: 'old' | 'new', pds: string, scope: string) => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      await beginSignIn({ name, pds, did: saved.did, scope })
+    } catch (e) {
+      setError(e)
+      setBusy(false)
+    }
+  }
+  const finish = async (state: 'done' | 'skipped') => {
+    setBusy(true)
+    await forgetAll(['old', 'new'])
+    update({ spaces: state, spaceMoves: state === 'done' ? moves : saved.spaceMoves })
+  }
+  const retryFailed = () => {
+    const kept = moves.filter((m) => m.state !== 'failed')
+    setMoves(kept)
+    update({ spaceMoves: kept })
+    setError(undefined)
+    step()
+  }
+
+  const skip = (
+    <button type="button" className="btn quiet" name="skip-spaces" disabled={busy} onClick={() => finish('skipped')}>
+      Skip: leave them at {oldHost}
+    </button>
+  )
+  const failed = moves.filter((m) => m.state === 'failed')
+  const moved = moves.filter((m) => m.state === 'moved')
+  const paused = pausedUntil > Date.now()
+
+  return (
+    <div className="mig-spaces">
+      {!!error && <Problem error={error} />}
+      {phase.at === 'probe' || phase.at === 'plan' ? (
+        <p className="small muted">
+          <Spinner /> {phase.at === 'probe' ? 'Checking for Spaces…' : `Listing your Spaces at ${oldHost}…`}
+        </p>
+      ) : phase.at === 'sign-in-old' ? (
+        <>
+          <p>
+            Private data you wrote in Spaces only moves with a separate sign-in: first at <b>{oldHost}</b>, to read it, then here, to bring it in.
+            {adv && <> OAuth only, as all space data: the scope asks to read your own space repos there ({OLD_SCOPE.split(' ').slice(1).join(' ')}).</>}
+          </p>
+          {!client && <Notice kind="warn">Signing in with OAuth needs this page on https (or http://127.0.0.1 for development).</Notice>}
+          <div className="row between">
+            {skip}
+            <button type="button" className="btn primary" name="spaces-sign-in-old" disabled={busy || !client} onClick={() => signIn('old', saved.oldPds, OLD_SCOPE)}>
+              {busy && <Spinner />}
+              Sign in at {oldHost}
+            </button>
+          </div>
+        </>
+      ) : phase.at === 'sign-in-new' ? (
+        <>
+          <p>
+            Found {phase.plans.length === 1 ? '1 space' : `${phase.plans.length} spaces`} at {oldHost}. Now sign in here, at <b>{here}</b>, to bring{' '}
+            {phase.plans.length === 1 ? 'it' : 'them'} in.
+            {adv && <> The scope imports space repos{phase.plans.some((p) => p.blobs.length) ? ' and uploads the blobs they name' : ''}.</>}
+          </p>
+          <div className="row between">
+            {skip}
+            <button
+              type="button"
+              className="btn primary"
+              name="spaces-sign-in-new"
+              disabled={busy}
+              onClick={() => signIn('new', location.origin, phase.plans.some((p) => p.blobs.length) ? `${NEW_SCOPE} ${BLOB_SCOPE}` : NEW_SCOPE)}
+            >
+              {busy && <Spinner />}
+              Sign in at {here}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          {phase.at === 'copy' && current && (
+            <>
+              <p className="small">
+                <Spinner /> Copying {spaceName(current.uri, adv)}
+                {current.total > 0 && ` (${current.blobs} of ${current.total} ${adv ? 'blobs' : 'files'})`}…{paused && ' Paused: the server asked us to slow down.'}
+              </p>
+              <Bar value={moves.length} total={phase.plans.length} label="Spaces copied" />
+            </>
+          )}
+          {moves.length > 0 && (
+            <ul className="mig-space-list">
+              {moves.map((m) => (
+                <li key={m.uri} className={m.state}>
+                  <span className="icon">{m.state === 'failed' ? <I.Alert /> : <I.Check />}</span>
+                  <span>
+                    {spaceName(m.uri, adv)}:{' '}
+                    {m.state === 'moved'
+                      ? `copied${m.records !== undefined ? ` (${fmtNum(m.records)} ${m.records === 1 ? 'record' : 'records'}${m.blobs ? `, ${m.blobs} ${adv ? (m.blobs === 1 ? 'blob' : 'blobs') : m.blobs === 1 ? 'file' : 'files'}` : ''})` : ''}`
+                      : m.state === 'empty'
+                        ? 'nothing of yours in it'
+                        : `not copied: ${m.reason}`}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {phase.at === 'result' && (
+            <>
+              {failed.length > 0 ? (
+                <Notice kind="warn">
+                  {failed.length === 1 ? '1 space' : `${failed.length} spaces`} didn't copy. Retry, or go on without {failed.length === 1 ? 'it' : 'them'}: {failed.length === 1 ? 'it stays' : 'they stay'} at {oldHost}, which goes offline next.
+                </Notice>
+              ) : (
+                <Notice kind="ok">
+                  {moved.length ? `All ${moved.length === 1 ? 'of your Spaces' : `${moved.length} Spaces`} copied.` : 'Nothing to copy.'}
+                </Notice>
+              )}
+              <div className="row between">
+                {failed.length > 0 ? (
+                  <button type="button" className="btn quiet" name="spaces-continue" disabled={busy} onClick={() => finish('done')}>
+                    Continue without them
+                  </button>
+                ) : (
+                  <span />
+                )}
+                {failed.length > 0 || error ? (
+                  <button type="button" className="btn primary" name="spaces-retry" disabled={busy} onClick={retryFailed}>
+                    Retry
+                  </button>
+                ) : (
+                  <button type="button" className="btn primary" name="spaces-continue" disabled={busy} onClick={() => finish('done')}>
+                    Continue
+                  </button>
+                )}
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function spaceName(uri: string, adv: boolean): string {
+  const { type, skey } = spaceLabel(uri)
+  return adv ? uri : `${type}${skey && skey !== 'self' ? ` (${skey})` : ''}`
 }
 
 // ---------------------------------------------------------------- done
@@ -1794,6 +2083,13 @@ function DoneStep({ saved, newPds, onReset }: { saved: Saved; newPds: Pds; onRes
           <strong>Check that it worked.</strong>
           Post something; it should show up for your followers within a minute. Apps can take a few minutes to notice the move.
         </li>
+        {!!saved.spaceMoves?.some((m) => m.state === 'failed') && (
+          <li>
+            <strong>Some of your Spaces stayed behind.</strong>
+            {saved.spaceMoves.filter((m) => m.state === 'failed').length} didn't copy. They are still in your old account at {hostOf(saved.oldPds)}, which
+            is now deactivated, not deleted.
+          </li>
+        )}
         <li>
           <strong>Keep your old account for now.</strong>
           It is deactivated at {hostOf(saved.oldPds)}, not deleted. Once you're happy here, you can delete it there.

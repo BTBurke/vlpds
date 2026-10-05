@@ -41,3 +41,27 @@ docker compose -p vlpds-migrate-e2e down -v       # when done
 ```
 
 Other options: `HEADED=1` shows the browser, and `VLPDS_BIN=...` skips the build.
+
+## Spaces
+
+```
+just migrate-spaces-e2e   # or bench/migrate/spaces.sh
+```
+
+This one checks the Spaces step of `/migrate`: after the account goes live here and before the old one goes offline, the page signs in with OAuth at both servers and copies each space repo the account writes. It starts, in docker (project `vlpds-migrate-spaces`), the same PLC directory and Mailpit, plus the reference PDS at the Spaces alpha (`ghcr.io/bluesky-social/atproto:pds-spaces-alpha`, amd64 only; `REF_SPACES_IMAGE` points at a native build such as the one `bench/spaces/refpds.sh` makes) on `localhost:2786`. It runs two vlpds with `--spaces`: the target on `127.0.0.1:2787` and a source on `localhost:2788` (another host name, so the two don't share cookies).
+
+`spaces.mjs` then:
+
+1. **Seeds** two accounts with the same shape. On the reference PDS, `owner` governs a space `club` where **alice** is a member, and alice has a space `notes` of her own. She writes 3 records in `club` and 4 in `notes`, one of them with a PNG blob. **erin** gets the same on the source vlpds; her writes there go through a headless OAuth client (`lib/oauth.mjs`), since vlpds takes space writes only over OAuth. Each repo is read back with `space.getRepo` and verified with `@atproto/space`'s `verifyRepoCarFull` against the old signing key.
+2. **Drives** `/migrate` in headless Chromium: alice in simple mode (checked for jargon), erin in advanced mode. At the switch-over, the page signs in at the old server (the reference's own authorization UI for alice, vlpds's for erin) and then here, through the real authorization and consent pages. For alice, the first `importRepo` lands but its answer is dropped, so the page's retry re-imports the same rev. The harness checks that the page lists both spaces, shows each one copied (with its blob), and leaves no OAuth session, pending sign-in or DPoP key behind. It also checks that a key made the way the client makes them can't be exported.
+3. **Verifies** on vlpds for both accounts:
+   - each space repo verifies with `verifyRepoCarFull`, signed by the key the DID names now, with the same records at the same rev;
+   - importing it again returns the same rev and record count;
+   - the space blob has the same bytes;
+   - a new write verifies;
+   - the old account is deactivated.
+   It also checks that `/oauth/client-metadata.json` lists the scope the UI client asks for.
+
+The reference containers can't reach vlpds here on Linux (only `127.0.0.1`), so the authority's notify after an import isn't part of this run. `bench/spaces` covers notify between hosts.
+
+Screenshots go to `out/spaces/shots/` and the vlpds logs to `out/spaces/`. `KEEP=1`, `HEADED=1` and `VLPDS_BIN` work as above.

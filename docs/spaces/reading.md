@@ -73,7 +73,11 @@ token (an authority's app revoking at member hosts) needs `manage` or the accoun
 app could fake the account's writes to an authority or revoke credentials in spaces it runs. `vlpds.space.importRepo` is OAuth
 too, so an account moving in imports after it's activated ([Moving a repo in](storage.md#moving-a-repo-in)). The consent screen names a space type by its
 declaration, an authority by its handle when the handle resolves back to it (else the DID), and
-warns on `space:*?authority=*`.
+says which actions a grant allows. It warns on a `space:*?authority=*` grant that reads what members
+share (`read`) or writes anything. One that only reads your own space repos (`read_self`, as the
+`/migrate` page asks for) gets a plain description and no warning. Space grants sit in the screen's
+NSID groups by their type's authority, and opening one lists the type and each collection with its
+actions ([The consent screen](../oauth-2fa.md#the-consent-screen)).
 
 A bare grant that writes (`space:<type>` with no `collection`) gets the collections its type
 declares. vlpds looks those up once, while it shows the consent screen, and the token carries

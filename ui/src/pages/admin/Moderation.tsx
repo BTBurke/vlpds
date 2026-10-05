@@ -4,6 +4,7 @@ import { fmtBytes, fmtTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { Link, navigate, useSearch } from '../../lib/router'
 import { admin } from '../../lib/xrpc'
+import { spaceUrl } from './Spaces'
 
 type Kind = 'account' | 'record' | 'blob' | 'space'
 /** `spaceRepo`: an audited operator read of an account's repo in a space (audit entries only). */
@@ -48,7 +49,7 @@ type Case = {
   notes: { at: string; actor: string; ip?: string; text: string }[]
   actions: CaseAction[]
 }
-type AuditEntry = { id: string; at: string; actor: string; ip?: string; node: string; action: string; subject?: SubjectRef; reason?: string; caseId?: string; detail?: any }
+export type AuditEntry = { id: string; at: string; actor: string; ip?: string; node: string; action: string; subject?: SubjectRef; reason?: string; caseId?: string; detail?: any }
 type TakedownEntry = {
   subject: SubjectRef
   reason?: string
@@ -294,7 +295,8 @@ function SpaceRecordCard({ did, rec, onDone }: { did: string; rec: NonNullable<S
             )}
           </div>
           <p className="muted small">
-            Space records are private to the space's members. Reading one here is written to the audit log with your reason.
+            Space records are private to the space's members. Reading one here is written to the audit log with your reason. It's in{' '}
+            <Link to={spaceUrl(rec.space)}>{rec.space.replace(/^at:\/\/[^/]+\/space\//, '')}</Link>.
           </p>
           {asking && (
             <form
@@ -330,7 +332,16 @@ function SpaceCard({ did, sp, onDone }: { did: string; sp: NonNullable<SubjectDe
     <Panel
       title="Space"
       desc={<span className="mono small break">{sp.uri}</span>}
-      actions={<ModerateButton subject={{ kind: 'space', did, uri: sp.uri }} applied={sp.takendown} onDone={onDone} />}
+      actions={
+        <>
+          {sp.exists && (
+            <Link className="btn sm" to={spaceUrl(sp.uri)}>
+              Space page
+            </Link>
+          )}
+          <ModerateButton subject={{ kind: 'space', did, uri: sp.uri }} applied={sp.takendown} onDone={onDone} />
+        </>
+      }
     >
       <div className="row">
         <TakedownBadge on={sp.takendown}>Taken down</TakedownBadge>
@@ -514,7 +525,7 @@ function useOpenCases() {
   }, [])
 }
 
-function ModerateButton({ subject, applied, onDone, caseId }: { subject: SubjectRef; applied: boolean; onDone: () => void; caseId?: string }) {
+export function ModerateButton({ subject, applied, onDone, caseId }: { subject: SubjectRef; applied: boolean; onDone: () => void; caseId?: string }) {
   const [open, setOpen] = useState(false)
   const fromUrl = useSearch().get('case') ?? undefined
   caseId ??= fromUrl
@@ -673,18 +684,45 @@ function Takedowns() {
 }
 
 function AuditLog() {
-  const l = useLoad<{ entries: AuditEntry[] }>(() => admin('vlpds.admin.getAuditLog', { params: { limit: 200 } }), [])
+  const spaces = useSearch().get('scope') === 'spaces'
+  const l = useLoad<{ entries: AuditEntry[] }>(() => admin('vlpds.admin.getAuditLog', { params: { limit: 200, space: spaces ? '*' : undefined } }), [spaces])
+  const scope = (
+    <div className="seg" role="group" aria-label="Entries">
+      <button type="button" aria-pressed={!spaces} onClick={() => navigate('/admin/moderation?tab=audit', { replace: true })}>
+        All
+      </button>
+      <button type="button" aria-pressed={spaces} onClick={() => navigate('/admin/moderation?tab=audit&scope=spaces', { replace: true })}>
+        Spaces
+      </button>
+    </div>
+  )
   return (
     <>
       <ErrorNotice error={l.error} />
-      <Panel flush title="Audit log" desc="Every takedown, restore, purge, case, quota change, second-factor reset and read of space data: who, from where, and why. Newest first." actions={<button className="btn sm" onClick={l.reload}>Refresh</button>}>
+      <Panel
+        flush
+        title="Audit log"
+        desc={
+          spaces
+            ? "Entries about spaces: takedowns and restores of spaces and their records, reads of space data and removed notify registrations. Newest first."
+            : 'Every takedown, restore, purge, case, quota change, second-factor reset, read of space data and removed notify registration: who, from where, and why. Newest first.'
+        }
+        actions={
+          <>
+            {scope}
+            <button className="btn sm" onClick={l.reload}>
+              Refresh
+            </button>
+          </>
+        }
+      >
         {!l.data ? <Loading /> : l.data.entries.length === 0 ? <Empty title="Nothing yet" /> : <AuditTable entries={l.data.entries} />}
       </Panel>
     </>
   )
 }
 
-function AuditTable({ entries }: { entries: AuditEntry[] }) {
+export function AuditTable({ entries }: { entries: AuditEntry[] }) {
   return (
     <div className="table-wrap">
       <table className="data">

@@ -96,6 +96,11 @@ spaces-microbench *args:
 migrate-e2e:
     bench/migrate/run.sh
 
+# The Spaces step of /migrate (bench/migrate/README.md "Spaces"): space repos move from the reference PDS (Spaces
+# alpha) and from a second vlpds, through the page's OAuth sign-ins, and verify on vlpds with @atproto/space
+migrate-spaces-e2e:
+    bench/migrate/spaces.sh
+
 # Passkeys in headless Chromium (bench/passkeys/README.md): a CDP virtual authenticator registers a passkey and
 # signs in with it (second step, passwordless) on a local in-memory vlpds; screenshots in bench/passkeys/out/shots
 passkeys-e2e:

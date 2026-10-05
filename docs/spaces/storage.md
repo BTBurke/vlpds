@@ -162,8 +162,9 @@ So a move has a short gap. Once the DID points here and the account is active, s
 account up find this host, and it has none of the account's space repos until the import runs. They
 see `RepoNotFound` for those spaces until then, and a syncer that missed the gap catches up with
 `getRepo` when the repo turns up. The import should run right after activation to keep the gap
-short. `/migrate` doesn't move space repos yet, so today that's a tool holding an OAuth grant on
-both hosts.
+short, and `/migrate` does that. Its switch-over signs in with OAuth on both hosts and imports each
+space repo before it deactivates the old account ([Spaces](../migration.md#spaces) in the migration
+page).
 
 ## Revocations
 

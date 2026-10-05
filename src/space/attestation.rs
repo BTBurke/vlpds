@@ -21,7 +21,7 @@ fn invalid(m: impl Into<String>) -> XrpcError {
 pub async fn verify(app: &crate::xrpc::App, attestation: &str, aud: &str, routing: &str) -> XResult<String> {
     let t = token::parse(TokenType::ClientAttestation, attestation).map_err(|e| invalid(e.message))?;
     let client_id = t.claims.iss.clone();
-    let client = crate::oauth::client::get_client(&client_id, app.config.dev_mode)
+    let client = crate::oauth::client::get_client(&client_id, app.config.dev_mode, &app.public_url)
         .await
         .map_err(|_| invalid(format!("Could not resolve client metadata for \"{client_id}\"")))?;
     if client.jwks.is_empty() {
