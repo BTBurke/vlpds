@@ -317,10 +317,15 @@ limit!(
     DAY,
     DEFAULT_MAIL_DAILY_BUDGET
 );
+// Each check of a custom domain is a DNS lookup and an HTTPS fetch the
+// caller picks. The account page re-checks every 15 s while it waits for a
+// new record, which is 20 per 5 min.
+limit!(CHECK_HANDLE_5MIN, 33, "vlpds.identity.checkHandle-0", Did, "vlpds.identity.checkHandle", 5 * MINUTE, 60);
+limit!(CHECK_HANDLE_DAY, 34, "vlpds.identity.checkHandle-1", Did, "vlpds.identity.checkHandle", DAY, 1000);
 
 pub const DEFAULT_MAIL_DAILY_BUDGET: u32 = 900;
 
-pub const BUILTIN: [&Limit; 33] = [
+pub const BUILTIN: [&Limit; 35] = [
     &GLOBAL_IP,
     &GET_REPO,
     &CREATE_SESSION_DAY,
@@ -354,6 +359,8 @@ pub const BUILTIN: [&Limit; 33] = [
     &MAIL_RECIPIENT_HOUR,
     &MAIL_NODE_HOUR,
     &MAIL_CLUSTER_DAY,
+    &CHECK_HANDLE_5MIN,
+    &CHECK_HANDLE_DAY,
 ];
 
 /// A confidential client's backend calls these for all of its users from

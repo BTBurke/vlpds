@@ -26,7 +26,7 @@ diagram:
     - "mail -> budget: CAS"
     - { from: config, to: layer, dash: true }
 facts:
-  - { value: "33", unit: buckets, label: built in, note: "keyed by IP, identifier + IP, DID, node or cluster", tone: amber }
+  - { value: "35", unit: buckets, label: built in, note: "keyed by IP, identifier + IP, DID, node or cluster", tone: amber }
   - { value: "3,000", unit: "/ 5 min", label: XRPC calls per IP, note: "`global-ip` · the one most clients hit first" }
   - { value: "10 s", label: for a change to reach every node, note: "peers are nudged at once · 10 s bounds a lost nudge", tone: blue }
   - { value: per node, label: counters, note: "a restart starts them over · only `mail-cluster-day` is cluster-wide", tone: muted }
@@ -41,7 +41,8 @@ Argon2 CPU, so there's a per-IP cap on the OAuth sign-in form and a cross-IP cap
 (`oauth-sign-in-ip`, `sign-in-account`). `reserveSigningKey` is unauthenticated and costs a KMS wrap
 and a stored row per new key, so it has a per-IP and a per-node cap. Account mail has its own
 budgets (`password-reset-account-*`, `mail-*`) and `requestPlcOperationSignature` has a limit
-(the reference has none there).
+(the reference has none there). The account page's handle check (`vlpds.identity.checkHandle`) does a
+DNS lookup and an HTTPS fetch of a domain the caller picks, so it's capped per account too.
 
 ## The buckets
 
@@ -85,6 +86,8 @@ the start of the next. The names are what the console, the config and the metric
 | `mail-recipient-hour` | DID | 1 h | 10 | every account mail to one recipient | 429 · password reset: 200, no mail |
 | `mail-node-hour` | node | 1 h | 200 | every account mail this node sends | 429 · password reset: 200, no mail |
 | `mail-cluster-day` | cluster | 1 day | 900 (`--mail-daily-budget`) | every account mail the cluster sends (a UTC day) | 429 · password reset: 200, no mail |
+| `vlpds.identity.checkHandle-0` | DID | 5 min | 60 | `vlpds.identity.checkHandle` (the account page re-checks a new domain every 15 s) | 429 · the account page stops checking |
+| `vlpds.identity.checkHandle-1` | DID | 1 day | 1,000 | the same | 429 · the account page stops checking |
 
 `npm run check-docs` fails if this table's key, window or points disagree with `src/ratelimit.rs`.
 

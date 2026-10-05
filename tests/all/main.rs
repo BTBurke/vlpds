@@ -23,6 +23,7 @@ mod blobs;
 mod bulk_create;
 mod cache_caps;
 mod cbor_transcode;
+mod check_handle;
 mod checkpoint_stall;
 mod cid_limits;
 mod cold_start;

@@ -1402,6 +1402,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .unwrap_or(0),
         mod_service_did: flag_or_env(&args.mod_service_did, "PDS_MOD_SERVICE_DID"),
         txt_resolver: None,
+        well_known_fetcher: None,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),
         max_import_bytes: args.max_import_mb << 20,

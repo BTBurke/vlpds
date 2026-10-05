@@ -13,6 +13,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.identity.submitPlcOperation", post(submit_plc_operation))
         .route("/xrpc/vlpds.identity.getPlcData", get(get_plc_data))
         .route("/xrpc/vlpds.identity.getPlcAuditLog", get(get_plc_audit_log))
+        .route("/xrpc/vlpds.identity.checkHandle", get(check_handle))
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
         .route("/.well-known/did.json", get(well_known_did_json))
         .route("/tls-check", get(tls_check))
@@ -226,8 +227,16 @@ pub(super) async fn resolve_external_handle(app: &App, handle: &str) -> Option<S
 /// (reference HandleResolver).
 async fn dns_or_https_did(app: &App, handle: &str) -> Option<String> {
     let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
-    let http = async { well_known_did(handle, false).await.ok() };
+    let http = async { fetch_well_known(app, handle).await.ok() };
     crate::handle_resolver::resolve(txt.as_ref(), handle, http).await
+}
+
+/// Guarded whatever `--dev-mode` says: the handle is the caller's input.
+async fn fetch_well_known(app: &App, handle: &str) -> Result<String, String> {
+    match &app.config.well_known_fetcher {
+        Some(f) => f.0.fetch(handle).await,
+        None => well_known_did(handle, false).await,
+    }
 }
 
 /// Ok(None): the AppView answered that the handle doesn't resolve (4xx).
@@ -452,6 +461,135 @@ async fn update_handle(
     // same handle: the reference still re-announces it
     set_handle(&app, &did, &handle, true).await?;
     Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+struct CheckHandleQ {
+    /// Not `handle`: forwarding routes a query by its `handle`, which would
+    /// send the call to whichever node owns the account holding it now.
+    name: String,
+}
+
+/// Why `check_new_handle` would refuse `handle` on syntax or policy, in
+/// words for the account page: (status, message).
+fn handle_problem(app: &App, handle: &str) -> Option<(&'static str, String)> {
+    let invalid = |m: &str| Some(("invalid", m.to_string()));
+    if handle.is_empty() {
+        return invalid("Enter a handle.");
+    }
+    let suffix = format!(".{}", app.handle_domain);
+    if let Some(front) = handle.strip_suffix(&suffix) {
+        if front.contains('.') {
+            return invalid(
+                "A name on this server can't contain dots. To use a domain you own, choose \"Your own domain\".",
+            );
+        }
+        if !front.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return invalid("Use only letters, numbers and hyphens.");
+        }
+        if front.starts_with('-') || front.ends_with('-') {
+            return invalid("A name can't start or end with a hyphen.");
+        }
+        if front.len() < 3 {
+            return invalid("That's too short. Use at least 3 characters.");
+        }
+        if front.len() > 18 {
+            return invalid("That's too long. Use at most 18 characters.");
+        }
+    }
+    if let Err(e) = super::server::normalize_handle(handle) {
+        return if e.message.contains("TLD") {
+            let tld = handle.rsplit('.').next().unwrap_or("");
+            invalid(&format!("Domains ending in .{tld} can't be used as handles."))
+        } else {
+            invalid("That doesn't look like a domain. It should look like alice.com or me.alice.com.")
+        };
+    }
+    if super::server::ensure_no_slur(handle).is_err() {
+        return invalid("That name isn't allowed. Try another.");
+    }
+    if handle.ends_with(&suffix) {
+        if let Err(e) = super::server::ensure_service_handle(app, handle, false) {
+            return Some(match e.error.as_str() {
+                "HandleNotAvailable" => ("reserved", "That name is reserved on this server. Try another.".into()),
+                _ => ("invalid", e.message),
+            });
+        }
+    }
+    None
+}
+
+/// A failed `.well-known` fetch, for people: (result, detail).
+fn well_known_failure(e: &str) -> (&'static str, &'static str) {
+    if e.contains("non-unicast") || e.contains("public unicast address") {
+        ("refused", "That domain points at a private address, so it can't be checked from here.")
+    } else if e.starts_with("status ") {
+        ("none", "The file isn't there yet (the site answered, but not with the file).")
+    } else if e.contains("timed out") {
+        ("none", "The site took too long to answer.")
+    } else {
+        ("none", "We couldn't reach the site over HTTPS.")
+    }
+}
+
+/// The account page's check before updateHandle. A name under the handle
+/// domain: is it free? A domain of the caller's: does DNS or HTTPS prove
+/// the caller's DID, the same way updateHandle will check it (DNS first)?
+async fn check_handle(State(app): AppState, Auth(creds): Auth, Query(q): Query<CheckHandleQ>) -> XResult<Json<J>> {
+    use crate::handle_resolver::DnsAnswer;
+    creds.need_identity("handle")?;
+    let did = creds.user_did()?.to_string();
+    {
+        use crate::ratelimit::*;
+        check(&[&CHECK_HANDLE_5MIN, &CHECK_HANDLE_DAY], &did, 1)?;
+    }
+    let acct = app.account(&did).await?;
+    let handle = q.name.trim().trim_start_matches('@').trim_end_matches('.').to_ascii_lowercase();
+    let service = handle.ends_with(&format!(".{}", app.handle_domain));
+    let kind = if service { "service" } else { "external" };
+    let base = |status: &str, message: Option<String>| json!({"handle": handle, "kind": kind, "status": status, "message": message, "proofRequired": !app.config.dev_mode});
+    if let Some((status, message)) = handle_problem(&app, &handle) {
+        return Ok(Json(base(status, Some(message))));
+    }
+    if handle == acct.handle {
+        return Ok(Json(base("current", Some("That's already your handle.".into()))));
+    }
+    if app.resolve_handle(&handle).await?.is_some_and(|holder| holder != did) {
+        return Ok(Json(base("taken", Some("Another account on this server already has that handle.".into()))));
+    }
+    if service {
+        return Ok(Json(base("available", None)));
+    }
+    let txt = crate::handle_resolver::resolver(app.config.txt_resolver.as_ref());
+    let (dns, http) =
+        tokio::join!(crate::handle_resolver::lookup_dns(txt.as_ref(), &handle), fetch_well_known(&app, &handle));
+    let (dns_result, dns_did) = match &dns {
+        DnsAnswer::One(d) if *d == did => ("match", Some(d.as_str())),
+        DnsAnswer::One(d) => ("other", Some(d.as_str())),
+        DnsAnswer::Several => ("several", None),
+        DnsAnswer::Nothing => ("none", None),
+    };
+    let (http_result, http_did, http_detail) = match &http {
+        Ok(d) if *d == did => ("match", Some(d.as_str()), None),
+        Ok(d) if d.starts_with("did:") => ("other", Some(d.as_str()), None),
+        Ok(_) => ("none", None, Some("The file is there but doesn't hold a DID.")),
+        Err(e) => {
+            let (r, detail) = well_known_failure(e);
+            (r, None, Some(detail))
+        }
+    };
+    // updateHandle takes DNS's answer whenever there is one
+    let method = match (dns_result, http_result) {
+        ("match", _) => Some("dns"),
+        ("other", _) => None,
+        (_, "match") => Some("http"),
+        _ => None,
+    };
+    let mut out = base(if method.is_some() { "verified" } else { "unverified" }, None);
+    out["method"] = json!(method);
+    out["dns"] = json!({"result": dns_result, "did": dns_did});
+    out["http"] = json!({"result": http_result, "did": http_did, "detail": http_detail});
+    Ok(Json(out))
 }
 
 /// Moves the account to the already-validated `handle` and emits #identity.
@@ -811,6 +949,14 @@ mod tests {
         for h in ["localhost", "a.localhost", "127.0.0.1", "169.254.169.254", "2130706433", "[::1]"] {
             let e = well_known_did(h, false).await.unwrap_err();
             assert!(e.contains("non-unicast"), "{h}: {e}");
+            assert_eq!(well_known_failure(&e).0, "refused", "{h}: {e}");
         }
+    }
+
+    #[test]
+    fn well_known_failures_in_words() {
+        assert_eq!(well_known_failure("a.test did not resolve to a public unicast address").0, "refused");
+        assert_eq!(well_known_failure("status 404 Not Found").0, "none");
+        assert_eq!(well_known_failure("timed out").0, "none");
     }
 }

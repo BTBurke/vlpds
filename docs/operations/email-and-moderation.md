@@ -302,6 +302,34 @@ skips the proof.
 Handles under `--handle-domain` resolve over HTTPS through Caddy's certificates for each handle.
 See [Deploy](deploy.md#first-deploy).
 
+### Changing a handle on the account page
+
+```steps
+- title: A name on this server
+  body: "One field with the handle domain after it. The page checks the name as it's typed (about 0.4 s after the last key) and says why one can't be used: too short or long, a character that isn't allowed, reserved, or taken. One button switches."
+- title: Your own domain
+  body: "A four-step wizard. The user enters the domain, adds the proof (the TXT record, recommended, or the `.well-known` file, both with copy buttons), and the page checks it every 15 s for up to 30 minutes. Once it passes, one button switches."
+- title: After the switch
+  body: "The page says what changed. Followers and posts stay, the old handle stops pointing to the account, and apps can take a few minutes to show the new name. After a switch to a domain it offers to switch back to a name on this server."
+```
+
+Both paths ask `vlpds.identity.checkHandle?name=<handle>`, a read-only call for the signed-in account
+(the parameter isn't called `handle` because forwarding would route by it). For a name under
+`--handle-domain` it answers `available`, `taken`, `reserved` or `invalid`, with a message for the
+user. For a domain it looks up the TXT record and fetches the file, with the same 3 s deadlines and
+the same SSRF-guarded client as updateHandle (guarded in `--dev-mode` too). It reports each one
+separately: found with this DID, found with another DID, several `did=` records, or nothing. It
+only answers `verified` when updateHandle would accept the domain. So a TXT record naming another
+DID fails the check even when the file is right, since DNS's answer is the one that counts.
+
+That also makes it the quickest way to see what a user is stuck on. The page shows them which of
+the two it found and what it points to. Each account gets 60 checks per 5 min and 1,000 a day
+(`vlpds.identity.checkHandle-*` on [Rate limits](rate-limits.md#the-buckets)). In `--dev-mode` the
+answer has `proofRequired: false`, and the page offers to switch without the proof.
+
+The page turns updateHandle's errors into plain words. Its limits are 10 changes per 5 min and 50 a
+day per account, and a directory that refuses the PLC update leaves the handle as it was.
+
 ## Invites
 
 ```steps
