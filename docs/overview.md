@@ -71,8 +71,8 @@ edges:
   - req -> worker
   - "worker -> seq: commit"
   - "seq -> seg: segment"
-  - "seg -> slate: durable"
-  - "slate -> ack: then ack"
+  - "seg -> slate: durable, then apply"
+  - "slate -> ack: then 200"
   - { from: seg.b10, to: fh.t, label: sealed segments, tone: blue }
 ```
 
@@ -83,9 +83,16 @@ edges:
   the previous PUT was in flight (up to 8 MiB) becomes the next segment, written with
   `If-None-Match: *`. The log is both the write-ahead log and the firehose, so every write is
   stored once.
+- A write is durable before its 200. The 200 goes out only after the segment holding the commit,
+  and every earlier segment, is in the bucket. One log per node is the write-ahead log for all of
+  that node's shards, so each shard doesn't need a WAL of its own: a node pays one PUT per round
+  trip however many shards it owns.
 - State (records, repo heads, accounts and MST interior nodes) lives in one SlateDB per shard,
-  with SlateDB's own WAL turned off. A durable segment is applied to the memtable before the ack,
-  so a read right after a write sees it. SlateDB flushes SSTs to the bucket on its own schedule.
+  with SlateDB's own WAL off because the node log already does that job. A durable segment is
+  applied to the shard's memtable before the 200, so a read right after a write sees it. SlateDB
+  writes SSTs to the bucket afterwards, and a checkpoint every 10 s records how far each shard has
+  got. If a node dies in between, the shard's next owner replays the log from that checkpoint, so
+  every acknowledged write comes back.
 - The firehose on every node merges the logs from every node. It emits an event once every log's
   durable watermark has passed it, so every node sends events in the same order.
 

@@ -51,7 +51,7 @@ before you run more than one node, or when an ownership alert fires.
 | Partition table | the layout (slot ranges → shard ids), each shard's owner, and the shards open here | `src/partitions.rs`, `src/slots.rs` |
 | Repo workers | one OS thread each, and a DID always hashes to the same worker. Holds active repos' MST paths, builds and signs commits | `src/worker.rs` |
 | Node log | one sequencer and one finalizer per node. Groups commits into segments and PUTs them, then applies, acks and feeds the firehose in ordinal order | `src/nodelog.rs` |
-| Shard DBs | one SlateDB per owned shard, WAL off. Holds heads, records, accounts and indexes | `src/partition.rs`, [State storage](state-storage.md) |
+| Shard DBs | one SlateDB per owned shard. Holds heads, records, accounts and indexes. SlateDB's WAL is off: the node log is the write-ahead log for every shard the node owns, and a write is in it before the 200 | `src/partition.rs`, [State storage](state-storage.md) |
 | Firehose | follows every peer's log, merges them and serves `subscribeRepos` | `src/firehose.rs`, `src/remote.rs` |
 | Cluster loop | lease renewal, membership, acquiring and releasing shards, fencing dead logs, split/merge steps | `src/cluster.rs`, `src/node.rs` |
 | Background passes | log retention, retired-state GC, checkpoints, memory re-planning | `src/retention.rs`, `src/reshard_gc.rs`, `src/memory.rs` |
