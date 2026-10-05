@@ -81,7 +81,8 @@ state client is the usual cause of slow cold loads after a takeover. See
 `VlpdsObjectStorePermitsSaturated` in [Runbook](operations/runbook.md#slow-or-failing-object-store).
 
 The write path itself (coalescing, pipelining, segments) is covered in [Record storage](record-storage.md#write-coalescing-and-pipelining)
-and [Firehose](firehose.md).
+and [Firehose](firehose.md). [The path of a commit](the-path-of-a-commit.md) follows one write
+through every stage, with its latency and what a crash at each stage leaves behind.
 
 ## Request routing and forwarding
 

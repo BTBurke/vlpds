@@ -97,7 +97,8 @@ edges:
 - The firehose on every node merges the logs from every node. It emits an event once every log's
   durable watermark has passed it, so every node sends events in the same order.
 
-Details: [Architecture](architecture.md), [Record storage](record-storage.md),
+Details: [The path of a commit](the-path-of-a-commit.md) (one write, stage by stage, and a crash
+at each stage), [Architecture](architecture.md), [Record storage](record-storage.md),
 [State storage](state-storage.md), [Firehose](firehose.md).
 
 ## Shards, leases and ownership
