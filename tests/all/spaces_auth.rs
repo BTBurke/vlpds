@@ -534,6 +534,48 @@ async fn list_spaces_with_filters() {
     s.xrpc.get("com.atproto.space.listSpaces", &[], &session).await.err(403, "InsufficientScope");
 }
 
+/// listSpaces under a one-type grant at any authority (the e2e harness's
+/// app scope), checked the way the reference does: `spaceType ?? '*'` and
+/// `did ?? '*'` are the target, so the grant's type must be named, and a
+/// type it doesn't cover is refused rather than filtered to nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_spaces_one_type_grant() {
+    let s = spawn().await;
+    let app = "space:com.example.group?authority=*&collection=*&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete";
+    let a = SpaceClient::new(&s, "slt", &format!("{app} blob:*/* repo:*")).await;
+    let space = a.create_space(TYPE, "one").await;
+    let uris = |j: &J| {
+        j["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    let wildcard = |r: Resp| {
+        r.err(403, "ScopeMissingError");
+        assert_eq!(r.json["message"], r#"Missing required scope "space:*?authority=*&action=read_self""#);
+    };
+
+    wildcard(a.get("com.atproto.space.listSpaces", &[]).await);
+    let listed = a.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.ok();
+    assert_eq!(uris(&listed), std::slice::from_ref(&space));
+    let mine = a.get("com.atproto.space.listSpaces", &[("spaceType", TYPE), ("did", &a.did)]).await.ok();
+    assert_eq!(uris(&mine), std::slice::from_ref(&space));
+    let other = a.get("com.atproto.space.listSpaces", &[("spaceType", "com.example.otherType")]).await;
+    other.err(403, "ScopeMissingError");
+    assert_eq!(
+        other.json["message"],
+        r#"Missing required scope "space:com.example.otherType?authority=*&action=read_self""#
+    );
+
+    // a grant for another type covers neither this type nor everything
+    let b = SpaceClient::new(&s, "slu", "space:com.example.board?authority=*&action=read").await;
+    wildcard(b.get("com.atproto.space.listSpaces", &[]).await);
+    b.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.err(403, "ScopeMissingError");
+    assert!(uris(&b.get("com.atproto.space.listSpaces", &[("spaceType", "com.example.board")]).await.ok()).is_empty());
+
+    // no space: grant at all
+    let c = SpaceClient::new(&s, "slv", "blob:*/* repo:*").await;
+    wildcard(c.get("com.atproto.space.listSpaces", &[]).await);
+    c.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.err(403, "ScopeMissingError");
+}
+
 /// listRecords: newest URI first by default, `reverse` oldest first, a
 /// `collection` filter, and a cursor that pages either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
