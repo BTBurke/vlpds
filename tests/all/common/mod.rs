@@ -28,6 +28,7 @@ use vlpds::mst::Tree;
 mod cluster;
 #[allow(unused_imports)]
 pub use cluster::*;
+pub mod spaces;
 pub mod webauthn;
 
 pub const ADMIN_TOKEN: &str = "dev-admin-token";
