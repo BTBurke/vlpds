@@ -533,13 +533,19 @@ impl<T: Clone> Cache<T> {
 static CLIENTS: LazyLock<Arc<Cache<Arc<Client>>>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::OAuthClients, Arc::new(Cache::new())));
 
-/// The web UI's own client (the migration page's OAuth sign-ins): a public
-/// client whose metadata this server serves at [`FIRST_PARTY_PATH`].
+/// The web UI's own client (the migration page's and the account page's
+/// OAuth sign-ins): a public client whose metadata this server serves at
+/// [`FIRST_PARTY_PATH`].
 pub const FIRST_PARTY_PATH: &str = "/oauth/client-metadata.json";
-/// The UI's `CLIENT_SCOPE` (ui/src/lib/oauth.ts) lists the same values.
+/// The UI's `CLIENT_SCOPE` (ui/src/lib/oauth.ts) lists the same values. The
+/// last is the account page's owner grant: `authority` is left at its
+/// default (`self`), so the token can only manage the user's own spaces.
 pub const FIRST_PARTY_SCOPE: &str = "atproto space:*?authority=*&action=read_self \
-space:*?authority=*&collection=*&action=create&action=read_self blob:*/*";
+space:*?authority=*&collection=*&action=create&action=read_self blob:*/* \
+space:*?action=read_self&manage=update&manage=delete";
 pub const FIRST_PARTY_CALLBACK: &str = "/migrate/oauth/callback";
+/// The account page's "Your spaces" sign-in comes back here.
+pub const FIRST_PARTY_ACCOUNT_CALLBACK: &str = "/account/oauth/callback";
 
 pub fn first_party_id(public_url: &str) -> String {
     format!("{}{FIRST_PARTY_PATH}", public_url.trim_end_matches('/'))
@@ -550,9 +556,9 @@ pub fn first_party_metadata(public_url: &str) -> J {
     let host = reqwest::Url::parse(origin).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
     json!({
         "client_id": first_party_id(public_url),
-        "client_name": format!("{host} (moving an account)"),
+        "client_name": format!("{host} (account pages)"),
         "client_uri": origin,
-        "redirect_uris": [format!("{origin}{FIRST_PARTY_CALLBACK}")],
+        "redirect_uris": [format!("{origin}{FIRST_PARTY_CALLBACK}"), format!("{origin}{FIRST_PARTY_ACCOUNT_CALLBACK}")],
         "scope": FIRST_PARTY_SCOPE,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
@@ -889,15 +895,43 @@ mod tests {
         let c = validate_metadata(&id, first_party_metadata(url), false, false).unwrap();
         assert!(!c.is_confidential());
         assert!(c.allows_redirect_uri("https://pds.example.com/migrate/oauth/callback"));
+        assert!(c.allows_redirect_uri("https://pds.example.com/account/oauth/callback"));
         assert!(!c.allows_redirect_uri("https://pds.example.com/migrate"));
+        assert!(!c.allows_redirect_uri("https://pds.example.com/account"));
         for s in [
             "space:*?authority=*&action=read_self",
             "space:*?authority=*&collection=*&action=create&action=read_self",
             "blob:*/*",
+            "space:*?action=read_self&manage=update&manage=delete",
         ] {
             assert!(c.scopes.iter().any(|x| x == s), "{s}");
             assert!(crate::oauth::scopes::Permission::parse(s).is_some(), "{s}");
         }
+    }
+
+    /// The owner grant manages the granting account's spaces and nobody
+    /// else's: `self` becomes the user when the token is issued.
+    #[test]
+    fn first_party_owner_scope_is_self_only() {
+        use crate::oauth::scopes::{Permission, SpaceAccess, SpaceTarget};
+        let Some(Permission::Space(p)) = Permission::parse("space:*?action=read_self&manage=update&manage=delete")
+        else {
+            panic!("not a space scope")
+        };
+        let p = p.with_resolved_authority("did:plc:owner");
+        let mine = SpaceTarget { space_type: "com.example.group", authority: "did:plc:owner", skey: "a" };
+        let theirs = SpaceTarget { space_type: "com.example.group", authority: "did:plc:other", skey: "a" };
+        for op in ["update", "delete"] {
+            assert!(p.matches(&mine, SpaceAccess::Manage(op)), "{op}");
+            assert!(!p.matches(&theirs, SpaceAccess::Manage(op)), "{op}");
+        }
+        assert!(!p.matches(&mine, SpaceAccess::Manage("create")));
+        assert!(p.matches(&mine, SpaceAccess::ReadSelf));
+        assert!(!p.matches(&mine, SpaceAccess::Read));
+        assert_eq!(
+            Permission::Space(p).to_scope_string(),
+            "space:*?authority=did:plc:owner&action=read_self&manage=update&manage=delete"
+        );
     }
 
     #[test]

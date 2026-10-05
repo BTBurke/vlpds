@@ -145,6 +145,7 @@ mod sign_in_security;
 mod signature_faults;
 mod smtp_mail;
 mod spaces;
+mod spaces_account_page;
 mod spaces_admin;
 mod spaces_auth;
 mod spaces_blobs;
