@@ -171,8 +171,9 @@ ticks:
   every 2 ms, so an event can reach a subscriber just before the 200 reaches the client, or just
   after.
 - In a cluster, every node merges every log and emits only up to the lowest watermark. Peers send
-  a heartbeat every 5 ms, so the merge adds ~5 ms p50 at light load (laptop, in-memory store) and
-  ~20 ms p50 with three busy nodes (laptop MinIO). Details: [Firehose](firehose.md#the-merger).
+  a heartbeat every 5 ms. At light load a write reaches a peer's firehose ~5 ms p50 after the
+  client sent it (timed from the write at its owner, laptop, in-memory store, where the PUT costs
+  almost nothing), and the merge adds ~20 ms p50 with three busy nodes (laptop MinIO). Details: [Firehose](firehose.md#the-merger).
 
 ## A crash at each point
 
@@ -255,6 +256,6 @@ ticks:
 | | One node | Cluster |
 |---|---|---|
 | Forwarding hop | none | ~1 ms when the entry node doesn't own the repo |
-| Firehose | own log only, 0–4 ms after the 200 | merged across logs, ~5–20 ms after durable |
+| Firehose | own log only, 0–4 ms after the 200 | merged across logs: ~5 ms p50 from the write at light load, ~20 ms more with busy nodes (laptop) |
 | After a crash | the restarted node waits out its old lease, ~53 s of write downtime on `tiny` (measured), then replays | a peer takes over in ~12 s and replays |
 | Durability | the same: one log per node, acked only once its segment is in the bucket | the same |
