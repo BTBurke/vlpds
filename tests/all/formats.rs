@@ -319,6 +319,17 @@ fn space_writer() -> vlpds::space::rows::WriterRow {
     }
 }
 
+/// A notify registration (`sN`): its key and row.
+fn space_notify() -> Vec<u8> {
+    let sid = vlpds::state::space_id(SPACE);
+    let key = vlpds::state::space_notify_key(DID, &sid, "did:web:syncer.example#atproto_space_syncer");
+    let row =
+        vlpds::space::rows::NotifyRow { endpoint: "https://syncer.example".into(), expires: 1_790_000_000_000_000 };
+    let k: BTreeMap<&str, String> =
+        [("space notify sN/", hex::encode(key)), ("row", hex::encode(row.encode()))].into_iter().collect();
+    pretty(&k)
+}
+
 fn space_space() -> vlpds::space::rows::SpaceRow {
     vlpds::space::rows::SpaceRow::defaults(SPACE, TIME)
 }
@@ -465,6 +476,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/space_outbox.bin", space_outbox().encode().to_vec()),
         ("state/space_writer.bin", space_writer().encode().to_vec()),
         ("state/space_space.json", space_space().encode().to_vec()),
+        ("state/space_notify.json", space_notify()),
         ("control/node_lease.json", compact(&lease())),
         ("control/assignment.json", compact(&assignment())),
         ("control/layout.json", compact(&layout())),
@@ -891,6 +903,16 @@ async fn check(level: u32, name: &str, b: &[u8]) {
         "state/space_writer.bin" => {
             let w = vlpds::space::rows::WriterRow::decode(b).unwrap();
             assert!(w.encode() == b);
+        }
+        "state/space_notify.json" => {
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let key = hex::decode(&k["space notify sN/"]).unwrap();
+            assert_eq!(vlpds::state::key_slot(&key), Some(vlpds::slots::slot_of(DID)));
+            assert!(vlpds::state::is_space_key(&key));
+            let row = hex::decode(&k["row"]).unwrap();
+            let r = vlpds::space::rows::NotifyRow::decode(&row).unwrap();
+            assert!(r.encode() == row);
         }
         "state/space_space.json" => {
             let r = vlpds::space::rows::SpaceRow::decode(b).unwrap();
