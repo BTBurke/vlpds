@@ -77,8 +77,9 @@ edges:
 ```
 
 - Repo workers keep each active repo's MST paths in memory, apply the operations and sign the
-  commit. A worker doesn't wait for the previous commit to be durable before starting the next one,
-  so a single repo can take hundreds of commits a second.
+  commit. A worker can build a repo's next commit while the previous one is still uploading, but
+  nothing is acked early: each 200 waits until that commit and every one before it are durable.
+  That pipelining is how a single repo can take hundreds of commits a second.
 - The log batches the commits for every shard on a node into segments. Whatever queued up while
   the previous PUT was in flight (up to 8 MiB) becomes the next segment, written with
   `If-None-Match: *`. The log is both the write-ahead log and the firehose, so every write is
@@ -181,8 +182,9 @@ Details: [Scaling and clustering](operations/scaling-and-clustering.md),
   commits/s. Instead, vlpds batches the commits from every repo on a node into one segment, so
   request cost grows with the number of nodes instead of with traffic.
 - Commits are pipelined. A repo's next commit builds on the in-memory head while the previous one
-  is still uploading, and acks go out in log order. So waiting on the object store doesn't limit
-  how fast a single repo can write.
+  is still uploading. Acks still wait: each goes out only once its commit is durable, in log order.
+  So the object store's latency adds to each write's latency but doesn't cap how fast a repo can
+  write.
 - The log is both the WAL and the firehose. A write is stored once, and recovery replays the same
   segments that relays receive.
 - vlpds derives what it can. MST leaves are rebuilt from records instead of being stored, and

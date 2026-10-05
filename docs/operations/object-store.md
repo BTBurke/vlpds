@@ -185,8 +185,9 @@ numbers were the same from a VPS and from a home connection in different places,
 and not the distance. On a small single-node deployment, segment PUTs ran ~300 ms p50 / ~650 ms p99
 over a day (`vlpds_segment_put_seconds`). So a write on R2 takes about a third of a second to ack,
 which is fine for a personal PDS. For in-region S3, the latency model estimates ~40–50 ms p50 /
-~150 ms p99 commit acks (modeled, not measured). A repo's next commit doesn't wait for the previous one
-to be durable, so slow PUTs add latency but don't limit throughput.
+~150 ms p99 commit acks (modeled, not measured). A repo's next commit can be built while the
+previous one uploads, though neither is acked until it's durable, so slow PUTs add latency but
+don't limit throughput.
 
 A segment PUT still pending after `--hedge-after-ms` (100 ms) gets one duplicate PUT, and the first to
 land wins. R2's median is above that threshold, so nearly every segment PUT there is hedged. On that
