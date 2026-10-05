@@ -5447,10 +5447,12 @@ oplog replay from one snapshot and counts a mismatch in
   listBlobs.
 - Space takedowns (`sec/td/space/{sid}` on the authority) are a vlpds
   extension: getSpaceCredential answers NotAuthorized, listRepos and
-  registerNotify SpaceNotFound, and members' notifies are acknowledged and
-  dropped. getSpaceCredential also refuses a taken-down member
-  (AccountTakedown) and a taken-down authority (RepoTakendown), which the
-  reference admits.
+  registerNotify SpaceNotFound, credential reads of members' repos on that
+  host SpaceNotFound, and members' notifies are acknowledged and dropped.
+  getSpaceCredential also refuses a taken-down member (AccountTakedown) and
+  a taken-down authority (RepoTakendown), and the authority's host methods
+  refuse credentials it issued before its takedown (RepoTakendown), all of
+  which the reference admits.
 - Operators can read space records (Q6): `vlpds.admin.getSpaceRepo`,
   `listSpaceRecords` and `getSpaceRecord`, admin or the moderation service
   only, each call audited (`space.read`) before it reads.
@@ -5458,7 +5460,9 @@ oplog replay from one snapshot and counts a mismatch in
   space.getRepo's 2-root CAR, checks the signature and MAC against the
   DID's current key and the set hash against the index, stages the records
   in bounded frameless entries and switches the head in at the CAR's rev
-  with an empty oplog. It follows the upstream contract once there is one.
+  with an empty oplog. The CAR's layout is verifyRepoCarFull's (commit,
+  index, one block per entry in index order, nothing else), and an
+  authority on the same node must let the account write. It follows the upstream contract once there is one.
   A rev more than 5 min ahead gets FutureRev, an import over a repo with
   records is refused, and one over an emptied repo works at a newer rev.
   A failed import clears what it staged, and rows a crashed one left with

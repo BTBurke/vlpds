@@ -135,6 +135,6 @@ credentials are refused on every node for as long as the revocation would have l
 limit counts only `jti`s that aren't revoked yet, so an authority telling every member's host about
 the same credential pays once per host.
 
-On a three-node cluster a revoked credential was refused on every node within 0.5–3 ms, and still
-after restarts, missed nudges and joins (the phase 2 cluster test). Details on the object:
-[How vlpds stores it](storage.md#revocations).
+On a three-node cluster a revoked credential was refused on every node within 0.5–5 ms of the
+revoke's 200 (the test allows 1 s), and still after restarts, missed nudges and joins (the phase 2
+cluster test). Details on the object: [How vlpds stores it](storage.md#revocations).

@@ -1140,7 +1140,6 @@ async fn spaces_microbench_smoke() {
 /// The cluster section at a tiny size: notifies cross nodes and reach the
 /// syncer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C3"]
 async fn spaces_microbench_cluster_smoke() {
     let out = run(Cfg { sections: vec!["cluster".into()], ..Cfg::tiny() }).await;
     let text = out.0.join("\n");

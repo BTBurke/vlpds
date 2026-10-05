@@ -27,7 +27,6 @@ use crate::space::lthash::LtHash;
 use crate::space::repo::{SpaceAck, SpaceError, SpaceOp};
 use crate::tid::Tid;
 use futures::StreamExt;
-use std::collections::HashMap;
 
 pub fn routes() -> Router<Arc<App>> {
     Router::new().route("/xrpc/vlpds.space.importRepo", post(import_repo))
@@ -234,17 +233,12 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     let [commit_cid, index_cid] = roots[..] else {
         return Err(invalid("expected two roots: the signed commit and the index"));
     };
-    let (mut commit_block, mut index_block) = (None, None);
-    while commit_block.is_none() || index_block.is_none() {
-        let (cid, b) = car.block().await?.ok_or_else(|| invalid("the CAR ends before its roots"))?;
-        match cid {
-            c if c == commit_cid && commit_block.is_none() => commit_block = Some(b),
-            c if c == index_cid && index_block.is_none() => index_block = Some(b),
-            c => return Err(invalid(format!("block {c} before the roots"))),
-        }
-    }
-    let commit = decode_commit(&commit_block.unwrap_or_default())?;
-    let index = decode_index(&index_block.unwrap_or_default(), sp.limits.max_records)?;
+    // verifyRepoCarFull's layout: the commit, the index, then one block per
+    // index entry in its order, nothing else
+    let commit_block = root_block(&mut car, commit_cid, "commit").await?;
+    let index_block = root_block(&mut car, index_cid, "index").await?;
+    let commit = decode_commit(&commit_block)?;
+    let index = decode_index(&index_block, sp.limits.max_records)?;
     let collections: std::collections::BTreeSet<&str> =
         index.iter().filter_map(|(p, _)| p.split_once('/').map(|(c, _)| c)).collect();
     for c in collections.iter().filter(|_| oauth) {
@@ -254,6 +248,23 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
         creds.need_space(&space.target(), SpaceAccess::ReadSelf)?;
     }
     drop(collections);
+    // an authority hears of the import as of any write and refuses a
+    // non-writer then, but by that time the repo is in; when it's hosted on
+    // this node, refuse up front
+    let authority_here = app.partitions.for_key(&space.authority).is_some()
+        && super::server::account_if_exists(app, &space.authority).await?.is_some();
+    // (no row: the authority moved in without its spaces, which aren't
+    // migrated; its own repos come first)
+    if authority_here {
+        if let Some(row) = super::simplespace::space_row_opt(app, &space).await? {
+            if !row.live() {
+                return Err(super::simplespace::space_not_found());
+            }
+            if !super::simplespace::authorize_user(app, &space, &row, &did, "write", None).await? {
+                return Err(bad("NotAuthorized", "Not a member allowed to write in this space"));
+            }
+        }
+    }
     let rev = Tid::parse(&commit.rev).ok_or_else(|| invalid("commit.rev must be a TID"))?;
     // every later write's rev follows it, and an authority refuses a
     // notify this far ahead (FutureRev), so the account would go unheard
@@ -302,6 +313,14 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     Ok(Json(json!({"rev": rev.to_string(), "records": records})))
 }
 
+async fn root_block(car: &mut CarReader, want: Cid, what: &str) -> XResult<Vec<u8>> {
+    match car.block().await? {
+        Some((c, b)) if c == want => Ok(b),
+        Some((c, _)) => Err(invalid(format!("expected the {what} block {want}, got {c}"))),
+        None => Err(invalid("the CAR ends before its roots")),
+    }
+}
+
 /// Writes the CAR's records (and their blob refs) as rows with no head
 /// over them yet; Ok(the record count).
 async fn stage(
@@ -312,36 +331,32 @@ async fn stage(
     index: Vec<(String, Cid)>,
     rev: Tid,
 ) -> XResult<u64> {
-    // CID -> the index's paths naming it, not yet seen
-    let mut want: HashMap<Cid, Vec<String>> = HashMap::with_capacity(index.len());
-    for (path, cid) in index.iter() {
-        want.entry(*cid).or_default().push(path.clone());
-    }
     let records = index.len() as u64;
-    drop(index);
     let mut muts = Vec::new();
     let mut bytes = 0;
+    let mut want = index.into_iter();
     while let Some((cid, b)) = car.block().await? {
-        // a block the index doesn't name (or names no more) is skipped, as
-        // a repo CAR's extra blocks are
-        let Some(paths) = want.remove(&cid) else { continue };
-        let blobs = imported_record_blobs(&paths[0], &b)?;
-        for path in paths {
-            muts.push(put(state::space_record_key(did, &space.sid, &path), state::record_value(&cid, rev.0, &b)));
-            for blob in &blobs {
-                let r = Bytes::copy_from_slice(&rev.0.to_be_bytes());
-                muts.push(put(state::space_blob_key(did, &space.sid, blob, &path), r));
-                muts.push(put(state::space_blob_cid_key(did, blob, &space.sid, &path), Bytes::new()));
-            }
-            bytes += b.len();
+        let Some((path, expected)) = want.next() else {
+            return Err(invalid(format!("the CAR has a block the index doesn't name ({cid})")));
+        };
+        if cid != expected {
+            return Err(invalid(format!("expected block {expected} for {path}, got {cid}")));
         }
+        let blobs = imported_record_blobs(&path, &b)?;
+        for blob in &blobs {
+            let r = Bytes::copy_from_slice(&rev.0.to_be_bytes());
+            muts.push(put(state::space_blob_key(did, &space.sid, blob, &path), r));
+            muts.push(put(state::space_blob_cid_key(did, blob, &space.sid, &path), Bytes::new()));
+        }
+        muts.push(put(state::space_record_key(did, &space.sid, &path), state::record_value(&cid, rev.0, &b)));
+        bytes += b.len();
         if muts.len() >= BATCH_ROWS || bytes >= BATCH_BYTES {
             write_private_local(p, std::mem::take(&mut muts)).await?;
             bytes = 0;
         }
     }
-    if let Some((cid, paths)) = want.iter().next() {
-        return Err(invalid(format!("the CAR has no block for {} ({cid})", paths[0])));
+    if let Some((path, cid)) = want.next() {
+        return Err(invalid(format!("the CAR has no block for {path} ({cid})")));
     }
     if !muts.is_empty() {
         write_private_local(p, muts).await?;

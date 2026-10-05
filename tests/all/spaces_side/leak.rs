@@ -280,27 +280,21 @@ pub(super) async fn scan_log(s: &TestServer, p: &Planted) -> (usize, bool) {
     (private, seen)
 }
 
-/// `r`'s body, less what was asked for if it's an error: an error naming it
-/// (RecordNotFound's URI, BlockNotFound's CIDs) echoes the request, not
-/// space data.
-fn unechoed(r: &Resp, asked: &[String]) -> Vec<u8> {
-    if r.status == 200 {
-        return r.body.to_vec();
-    }
-    let mut text = String::from_utf8_lossy(&r.body).into_owned();
-    for v in asked {
-        text = text.replace(v.as_str(), "");
-    }
-    text.into_bytes()
-}
-
 /// The author's public sync and repo surface, each response checked for
 /// sentinels; the space collection and records are absent from it.
 pub(super) async fn check_public_surface(s: &TestServer, did: &str, p: &Planted) {
     let get = |nsid: &'static str, q: Vec<(&'static str, String)>| async move {
         let qs: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
-        let r = s.xrpc.get(nsid, &qs, &Auth::None).await;
-        (nsid, r, q.into_iter().map(|(_, v)| v).collect::<Vec<String>>())
+        let mut r = s.xrpc.get(nsid, &qs, &Auth::None).await;
+        // an error message may echo what was asked for: not a leak
+        if r.status >= 400 {
+            let mut body = String::from_utf8_lossy(&r.body).into_owned();
+            for (_, v) in &q {
+                body = body.replace(v.as_str(), "");
+            }
+            r.body = body.into_bytes().into();
+        }
+        (nsid, r)
     };
     let d = || did.to_string();
     let rk = format!("{}-n0", p.rkey);
@@ -332,11 +326,11 @@ pub(super) async fn check_public_surface(s: &TestServer, did: &str, p: &Planted)
             break;
         }
     }
-    for (nsid, r, asked) in &checked {
+    for (nsid, r) in &checked {
         assert!(r.status < 500, "{nsid}: {}", r.text());
-        p.sentinels.assert_clean(nsid, &unechoed(r, asked));
+        p.sentinels.assert_clean(nsid, &r.body);
     }
-    let by_nsid = |n: &str| &checked.iter().find(|(x, ..)| *x == n).unwrap().1;
+    let by_nsid = |n: &str| &checked.iter().find(|(x, _)| *x == n).unwrap().1;
     assert_eq!(by_nsid("com.atproto.sync.getRepo").status, 200);
     let collections = &by_nsid("com.atproto.repo.describeRepo").json["collections"];
     assert!(
@@ -358,7 +352,9 @@ pub(super) async fn check_public_surface(s: &TestServer, did: &str, p: &Planted)
         assert_ne!(r.status, 200, "sync.getBlob served space record {cid}");
         let r = s.get_blocks(did, &[Cid::parse(cid).unwrap()]).await;
         assert_ne!(r.status, 200, "sync.getBlocks served space record {cid}");
-        p.sentinels.assert_clean("sync.getBlocks", &unechoed(&r, std::slice::from_ref(cid)));
+        // the error names the CIDs asked for: not a leak
+        let body = String::from_utf8_lossy(&r.body).replace(cid.as_str(), "");
+        p.sentinels.assert_clean("sync.getBlocks", body.as_bytes());
     }
 }
 

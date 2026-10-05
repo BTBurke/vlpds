@@ -194,23 +194,26 @@ async fn takeover_mid_burst(authority_on_victim: bool) {
         assert!(writers.iter().any(|w| n.claims["iss"] == json!(w.did)), "{n:?}");
     }
 
-    // the syncer got the local space's updates in spaceRev order, none twice
+    // the syncer got the local space's updates in spaceRev order. The new
+    // owner's catch-up forward (docs-draft decision 3) may repeat the head
+    // the old owner already delivered: once, after the kill.
     let got = syncer.accepted();
     let revs: Vec<&str> = got.iter().map(|n| n.body["spaceRev"].as_str().expect("spaceRev")).collect();
-    assert!(revs.windows(2).all(|w| w[0] < w[1]), "fan-out out of order or repeated: {revs:?}");
+    assert!(revs.windows(2).all(|w| w[0] <= w[1]), "fan-out out of order: {revs:?}");
+    let repeats: Vec<usize> = (1..got.len()).filter(|&i| revs[i] == revs[i - 1]).collect();
+    assert!(repeats.len() <= 1, "fan-out repeated more than the one catch-up: {repeats:?} in {revs:?}");
+    assert!(repeats.iter().all(|&i| got[i].at > killed_at), "a repeat before the takeover: {repeats:?} in {revs:?}");
     if authority_on_victim {
         assert!(got.iter().any(|n| n.at > killed_at), "fan-out didn't resume on the new owner");
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn three_node_takeover_mid_burst_with_the_authority_on_a_survivor() {
     takeover_mid_burst(false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn three_node_takeover_mid_burst_with_the_authority_on_the_victim() {
     takeover_mid_burst(true).await;
 }
@@ -221,7 +224,6 @@ async fn three_node_takeover_mid_burst_with_the_authority_on_the_victim() {
 /// within a few seconds, carrying the newest sequenced (repo, repoRev,
 /// spaceRev) as listRepos shows it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces phase 3: takeover catch-up forward"]
 async fn takeover_sends_each_registration_one_catch_up_forward() {
     let (bucket, front, plc) = (Default::default(), Front::new().await, Plc::start().await);
     let mut nodes = Vec::new();

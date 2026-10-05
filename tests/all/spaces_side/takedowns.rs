@@ -63,7 +63,6 @@ fn path(rkey: &str) -> String {
 /// listRepoOps op carries its value, for a credential reader; a reversal
 /// brings it back. The taken-down record's text never appears in a response.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2 (record takedowns; passes on spaces-1)"]
 async fn record_takedown_hides_it_from_records_and_op_values() {
     let t = td().await;
     let (uri, cid) = t.bob_writes("gone", "zqtakendowntext").await;
@@ -93,7 +92,6 @@ async fn record_takedown_hides_it_from_records_and_op_values() {
 /// getBlob answers BlobNotFound and listBlobs leaves it out once every
 /// record of the repo in this space naming it is taken down.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: takedown-aware space getBlob/listBlobs"]
 async fn record_takedown_hides_blobs_only_it_names() {
     let t = td().await;
     let only = upload_blob(&t.bob, format!("\u{89}PNG only {}", unique_name("x")).as_bytes()).await;
@@ -149,7 +147,6 @@ async fn record_takedown_hides_blobs_only_it_names() {
 /// syncer that held the record converges through getRepo, follows later
 /// writes incrementally, and converges back when the takedown is reversed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: takedown-adjusted signed view (option e)"]
 async fn record_takedown_serves_a_consistent_signed_view() {
     let t = td().await;
     let base = t.net.pds[1].url.clone();
@@ -223,7 +220,6 @@ async fn record_takedown_serves_a_consistent_signed_view() {
 /// RepoTakendown, to a credential minted before the takedown; a reversal
 /// restores them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C2/C5 (account availability on space reads; passes on spaces-1)"]
 async fn account_takedown_refuses_every_read_path() {
     let t = td().await;
     let blob = upload_blob(&t.bob, b"\x89PNG account takedown").await;
@@ -272,7 +268,6 @@ async fn account_takedown_refuses_every_read_path() {
 /// reference's checkTakedown refuses it (AccountTakedown), on the grant it
 /// held before the takedown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1 (passes on spaces-1)"]
 async fn taken_down_account_gets_no_delegation_token() {
     let t = td().await;
     t.bob.delegation_token(&t.space).await.ok();
@@ -286,7 +281,6 @@ async fn taken_down_account_gets_no_delegation_token() {
 /// at the authority (AccountTakedown) when the member is hosted with the
 /// authority; restored, the member gets credentials again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: takedown credential gates (C7)"]
 async fn taken_down_member_gets_no_credential() {
     let t = td().await;
     let token = delegation_token(&t.dave, &t.space).await;
@@ -305,7 +299,6 @@ async fn taken_down_member_gets_no_credential() {
 /// members hosted elsewhere, and its host methods refuse credentials it
 /// issued before; restored, it issues again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: takedown credential gates (C7)"]
 async fn taken_down_authority_issues_no_credentials() {
     let t = td().await;
     let before = t.net.credential_for(&t.carol, &t.space).await;
@@ -326,7 +319,6 @@ async fn taken_down_authority_issues_no_credentials() {
 /// reads of member repos on that host are refused; restored, all of it
 /// works again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: space takedowns"]
 async fn space_takedown_closes_the_space_at_its_host() {
     let t = td().await;
     write(&t.dave, &t.space, W::new().rkey("d").text("dave's")).await.ok();

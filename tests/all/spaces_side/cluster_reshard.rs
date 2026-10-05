@@ -296,7 +296,6 @@ struct Snapshot {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn split_and_merge_keep_every_space_row() {
     let w = World::new("rss").await;
     let nodes = w.refs();
@@ -372,7 +371,6 @@ async fn split_and_merge_keep_every_space_row() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn split_and_merge_under_space_writes() {
     let w = World::new("rsw").await;
     let nodes = w.refs();

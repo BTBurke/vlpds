@@ -235,5 +235,5 @@ marks:
 The reference stores a notify for retry only after a send fails, so an acked write's notify can be
 lost if the process dies first. vlpds doesn't have that window, since the row is in the same entry as
 the write. In a kill -9
-test on three nodes (about 33k acked writes), nothing acked was lost and spaceRevs only moved
+test on three nodes (33k–39k acked writes per run), nothing acked was lost and spaceRevs only moved
 forward.

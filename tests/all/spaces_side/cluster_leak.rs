@@ -108,7 +108,6 @@ fn batch_events(m: &[u8]) -> Option<Vec<(i64, &[u8])>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C1"]
 async fn space_writes_stay_off_every_stream_of_a_loaded_cluster() {
     let (bucket, plc) = (Arc::new(object_store::memory::InMemory::new()), Plc::start().await);
     let mut nodes = Vec::new();

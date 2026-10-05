@@ -109,7 +109,6 @@ impl Ops {
 /// Admin and moderator reads answer `{uri, cid, value}` and are each
 /// audited for the author: who, what and when.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: operator space reads (Q6)"]
 async fn admins_and_moderators_read_space_records_audited() {
     let o = ops().await;
     let (s, did) = (o.s(), o.bob.did.as_str());
@@ -139,7 +138,6 @@ async fn admins_and_moderators_read_space_records_audited() {
 /// A taken-down record stays readable to operators (that's when they need
 /// it), audited the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: operator space reads (Q6)"]
 async fn operators_read_taken_down_records() {
     let o = ops().await;
     let (s, did) = (o.s(), o.bob.did.as_str());
@@ -154,7 +152,6 @@ async fn operators_read_taken_down_records() {
 /// service JWT from someone other than the moderation service. Nothing
 /// refused is audited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: operator space reads (Q6)"]
 async fn non_operators_are_refused_and_unaudited() {
     let o = ops().await;
     let (s, did) = (o.s(), o.bob.did.as_str());
@@ -199,7 +196,6 @@ async fn non_operators_are_refused_and_unaudited() {
 /// firehose (live and replayed from cursor 0), the S3 backfill, or the
 /// author's public sync and repo surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: operator space reads (Q6)"]
 async fn operator_reads_never_reach_public_surfaces() {
     let s = TestServer::spawn_with(|c| {
         c.spaces = true;

@@ -420,6 +420,16 @@ pub(super) fn assert_space_read(creds: &Credentials, space: &Space, repo: &str) 
     }
 }
 
+/// A space takedown closes the space to credential readers on its host
+/// too: credentials minted before it would otherwise read on for up to
+/// 300 s. The account's own reads of its repo stay open.
+async fn assert_space_open(app: &App, space: &Space, self_read: bool) -> XResult<()> {
+    if !self_read && space_takendown(app, space).await? {
+        return Err(super::simplespace::space_not_found());
+    }
+    Ok(())
+}
+
 /// Reference `assertCredentialSpace`: the request's audience is the repo
 /// read (the authority for host methods), and the credential is this
 /// space's. The audience header is signed but names no method or URL, so
@@ -620,6 +630,7 @@ async fn get_record(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q):
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     check_path(&q.collection, Some(&q.rkey))?;
     available(&app, &q.repo, self_read).await?;
     metrics::space_read("getRecord", auth_label(&creds));
@@ -676,6 +687,7 @@ async fn list_records(
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     if let Some(c) = &q.collection {
         check_path(c, None)?;
     }
@@ -770,6 +782,7 @@ async fn get_blob(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     let cid = Cid::parse(&q.cid).map_err(|_| XrpcError::bad("InvalidRequest", "Invalid cid"))?;
     available(&app, &q.repo, self_read).await?;
     metrics::space_read("getBlob", auth_label(&creds));
@@ -824,6 +837,7 @@ async fn list_blobs(
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     let since = match q.since.as_deref() {
         Some(s) => Some(Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a TID"))?),
         None => None,
@@ -890,6 +904,7 @@ async fn get_latest_commit(
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     let key = available(&app, &q.repo, self_read).await?;
     metrics::space_read("getLatestCommit", auth_label(&creds));
     let p = app.partition(&q.repo)?;
@@ -930,6 +945,7 @@ async fn list_repo_ops(
     let sp = spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     let since = match q.since.as_deref() {
         Some(s) => Some(Tid::parse(s).ok_or_else(|| XrpcError::bad("InvalidRequest", "since must be a valid tid"))?),
         None => None,
@@ -1656,6 +1672,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
     spaces(&app)?;
     let space = Space::parse(&q.space)?;
     let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    assert_space_open(&app, &space, self_read).await?;
     let key = available(&app, &q.repo, self_read).await?;
     metrics::space_read("getRepo", auth_label(&creds));
     let slot = super::sync::export_slot(&app).await?;
@@ -1854,10 +1871,19 @@ async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<
 async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<()> {
     match super::authn::verify_space_credential(app, headers).await? {
         Credentials::SpaceCredential { audience, space: s, .. } => {
-            assert_credential_space(&audience, &s, space, &space.authority)
+            assert_credential_space(&audience, &s, space, &space.authority)?
         }
-        _ => Err(XrpcError::internal("not a space credential")),
+        _ => return Err(XrpcError::internal("not a space credential")),
     }
+    // a credential minted before the authority's takedown outlives it by up
+    // to its 300 s; getSpaceCredential's gate alone wouldn't stop it. An
+    // authority not hosted here is left to the callers' own checks.
+    if let Ok((_, Some(st))) = super::proxy::account_key_status(app, &space.authority).await {
+        if st == "takendown" || st == "suspended" {
+            return Err(XrpcError::bad("RepoTakendown", "Space authority has been taken down"));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]

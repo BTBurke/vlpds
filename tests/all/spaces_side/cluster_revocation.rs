@@ -115,7 +115,6 @@ async fn refused_within(fx: &Fixture, node: &TestServer, credential: &str, since
 /// Three nodes, the credential warm in every node's cache; revoked at a
 /// node that doesn't hold the member's repo.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn a_revocation_on_one_node_is_refused_on_every_node_within_a_second() {
     let (bucket, plc) = (Bucket::default(), Plc::start().await);
     let node = |id: &'static str| super::cluster::node(id, &bucket, SHARDS, &plc);
@@ -152,7 +151,6 @@ async fn a_revocation_on_one_node_is_refused_on_every_node_within_a_second() {
 /// credential; one that was down when a credential was revoked (no nudge
 /// reached it) and one that joins afterwards refuse it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore = "spaces core: C3"]
 async fn revocations_hold_across_restarts_missed_nudges_and_joins() {
     let (bucket, plc) = (Bucket::default(), Plc::start().await);
     let node = |id: &'static str| super::cluster::node(id, &bucket, SHARDS, &plc);

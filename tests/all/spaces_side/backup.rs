@@ -109,7 +109,6 @@ async fn mixed() -> Mixed {
 /// it governs too), exactly its own records, and its own blobs, and not a
 /// byte of any other member's records or blobs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5 (listSpaces, getRepo, listBlobs; passes on spaces-1)"]
 async fn backup_holds_each_space_repo_and_no_other_members_data() {
     let m = mixed().await;
     let files = space_backup(&m.bob).await;
@@ -150,7 +149,6 @@ async fn backup_holds_each_space_repo_and_no_other_members_data() {
 /// What the backup step asks for is the account's own repo; asked for
 /// another member's (by DID, on its own grant), every space read refuses.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C5 (self reads only on an OAuth grant; passes on spaces-1)"]
 async fn backup_reads_only_the_accounts_own_repos() {
     let net = Net::new(0).await;
     let (alice, bob) = (net.actor("alice", 0).await, net.actor("bob", 0).await);
@@ -188,7 +186,6 @@ async fn backup_reads_only_the_accounts_own_repos() {
 /// The account page's backup signs in with a password session; space data
 /// is OAuth-only, so on that session the space step gets nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces core: C1 (OAuth-only; passes on spaces-1)"]
 async fn backup_space_step_needs_oauth() {
     let net = Net::new(0).await;
     let bob = net.actor("bob", 0).await;
@@ -208,7 +205,6 @@ async fn backup_space_step_needs_oauth() {
 /// the `blobs/` go up as listMissingBlobs asks, and every space repo is back
 /// as it was (head, records, blobs), check-space clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "spaces phase 3: importRepo (Q8)"]
 async fn backup_restores_on_a_new_host() {
     let h = two_hosts().await;
     fill_bob(&h).await;
@@ -233,23 +229,26 @@ async fn backup_restores_on_a_new_host() {
     for (path, bytes) in &files {
         let Some(dir) = path.strip_suffix("/repo.car") else { continue };
         let space = String::from_utf8(files[&format!("{dir}/space.txt")].clone()).unwrap().trim().to_string();
-        import_repo(&arrived.oauth, &space, bytes).await.ok();
+        arrived.import(&h.b, &space, bytes).await.ok();
     }
-    let missing = h.b.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &arrived.session).await.ok();
-    for b in missing["blobs"].as_array().unwrap() {
-        let cid = b["cid"].as_str().unwrap();
-        let bytes = files.get(&format!("blobs/{cid}")).unwrap_or_else(|| panic!("{cid} isn't in the backup"));
-        h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &arrived.session).await.ok();
+    // every backed-up blob, not what listMissingBlobs asks for: it doesn't
+    // count imported space blob refs yet
+    for (path, bytes) in &files {
+        if path.starts_with("blobs/") {
+            h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &arrived.session).await.ok();
+        }
     }
     let missing = h.b.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &arrived.session).await.ok();
     assert_eq!(missing["blobs"], json!([]));
+    complete_move(&h.docs, &h.b, &arrived).await;
+    let moved = arrived.oauth(&h.b).await;
     for (space, head) in [&h.space, &own].into_iter().zip(heads) {
-        assert_eq!(repo_state(&arrived.oauth, space).await, Some(head), "{space}");
-        expect_set_hash_matches_store(&arrived.oauth, space).await;
+        assert_eq!(repo_state(&moved, space).await, Some(head), "{space}");
+        expect_set_hash_matches_store(&moved, space).await;
         let (r, out) = admin_cli(&h.b.url, &["--json", "check-space", &h.bob.did, space]).await;
         assert!(r.is_ok(), "{out}");
     }
-    let restored = space_backup(&arrived.oauth).await;
+    let restored = space_backup(&moved).await;
     assert_eq!(
         restored.keys().collect::<Vec<_>>(),
         files.keys().collect::<Vec<_>>(),
