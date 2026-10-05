@@ -719,8 +719,12 @@ async fn notify_write_from_another_vlpds() {
     let aud = format!("{}#atproto_space_host", owner.did);
     let body =
         |repo: &str, rev: &str| json!({"space": space, "repo": repo, "repoRev": rev, "hash": b64_bytes(&[7; 32])});
-    // the same repoRev, and an older one: no-ops
-    notify(&b, &a, &member.did, &aud, body(&member.did, &rev2)).await.ok();
+    // the same repoRev with the hash held, and an older one: no-ops (the
+    // same rev with another hash is a takedown's adjusted view, sequenced
+    // again: spaces_side::takedowns)
+    let held = repos().await[0]["hash"].clone();
+    let dup = json!({"space": space, "repo": member.did, "repoRev": rev2, "hash": held});
+    notify(&b, &a, &member.did, &aud, dup).await.ok();
     notify(&b, &a, &member.did, &owner.did, body(&member.did, &rev1)).await.ok();
     assert_eq!(repos().await[0]["spaceRev"], json!(space_rev2));
     let future = rev_at(vlpds::tid::now_micros() + 10 * 60 * 1_000_000);
@@ -942,14 +946,22 @@ async fn shard_open_sends_registrations_a_catch_up() {
     let notifies = || syncer.calls("/xrpc/com.atproto.space.notifyWrite");
     owner.create_record(&space, COLL, Some("0"), rec("zero")).await.ok();
     member.create_record(&space, COLL, Some("1"), rec("one")).await.ok();
+    let rev1 = head(&member, &space).await;
+    let heard = |rev: String| async move {
+        eventually(Duration::from_secs(10), || async { notifies().iter().any(|n| n.body["repoRev"] == json!(rev)) })
+            .await
+    };
+    assert!(heard(rev1).await);
+    let list = || async {
+        let q = [("space", space.as_str())];
+        let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &q, &cred, &owner.did).await.ok();
+        r["repos"].as_array().unwrap().clone()
+    };
+    let first = list().await.last().unwrap().clone();
     member.create_record(&space, COLL, Some("2"), rec("two")).await.ok();
     let rev2 = head(&member, &space).await;
-    assert!(
-        eventually(Duration::from_secs(10), || async { notifies().iter().any(|n| n.body["repoRev"] == json!(rev2)) })
-            .await
-    );
-    let r = owner.signed_get(&s.url, "com.atproto.space.listRepos", &[("space", &space)], &cred, &owner.did).await.ok();
-    let repos = r["repos"].as_array().unwrap();
+    assert!(heard(rev2.clone()).await);
+    let repos = list().await;
     let (before, newest) = (repos[repos.len() - 2].clone(), repos[repos.len() - 1].clone());
     let sent = notifies().len();
 
@@ -964,5 +976,9 @@ async fn shard_open_sends_registrations_a_catch_up() {
     let catch_up = &all[sent].body;
     assert_eq!((catch_up["repo"].clone(), catch_up["repoRev"].clone()), (json!(member.did), json!(rev2)));
     assert_eq!(catch_up["spaceRev"], newest["spaceRev"]);
-    assert_eq!(catch_up["prevSpaceRev"], before["spaceRev"], "{catch_up}");
+    // the spaceRev sequenced just before, not the row before it in listRepos
+    // (the member's first write, whose row its second replaced): naming
+    // that one would fork the chain the syncer heard
+    assert_eq!(catch_up["prevSpaceRev"], first["spaceRev"], "{catch_up}");
+    assert_ne!(catch_up["prevSpaceRev"], before["spaceRev"], "{catch_up}");
 }

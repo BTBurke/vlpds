@@ -155,6 +155,33 @@ pub fn seq_rev(key: &[u8]) -> Option<Tid> {
     Some(Tid(u64::from_be_bytes(tail.try_into().ok()?)))
 }
 
+/// `sQ`: a writer in listRepos order, with the spaceRev sequenced just
+/// before it. That one's row may be gone (its writer wrote again), and a
+/// forward naming anything else as its prevSpaceRev could fork the chain a
+/// syncer already heard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeqRow {
+    pub prev: Option<Tid>,
+    pub writer: String,
+}
+
+impl SeqRow {
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(10 + self.writer.len());
+        b.put_u64(self.prev.map_or(0, |t| t.0));
+        put_str(&mut b, &self.writer);
+        b.into()
+    }
+
+    pub fn decode(v: &[u8]) -> anyhow::Result<SeqRow> {
+        let mut r = Reader::new(v);
+        let prev = Some(Tid(r.u64()?)).filter(|t| t.0 != 0);
+        let writer = r.str()?.to_string();
+        r.end()?;
+        Ok(SeqRow { prev, writer })
+    }
+}
+
 /// (CID, path) of an `sb` key after its `{did}\0{sid}` prefix.
 pub fn blob_ref_parts(rest: &[u8]) -> Option<(&str, &str)> {
     std::str::from_utf8(rest).ok()?.split_once('\0')
@@ -382,6 +409,10 @@ mod tests {
         assert_eq!(NotifyRow::decode(&n.encode()).unwrap(), n);
         let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3) };
         assert_eq!(WriterRow::decode(&w.encode()).unwrap(), w);
+        for prev in [None, Some(Tid(4))] {
+            let q = SeqRow { prev, writer: "did:plc:w".into() };
+            assert_eq!(SeqRow::decode(&q.encode()).unwrap(), q);
+        }
         for m in [MemberRow { read: true, write: false }, MemberRow { read: true, write: true }] {
             assert_eq!(MemberRow::decode(&m.encode()).unwrap(), m);
         }

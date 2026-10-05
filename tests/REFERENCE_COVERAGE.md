@@ -888,6 +888,10 @@ Divergences, also in DESIGN.md's Spaces section:
   sent single-flight per repo and space, retried in memory, and rescanned by whichever node opens the shard. So the reference's
   lease-election and "persists failures before the request" cases become outbox cases (a restart or takeover resends the
   newest rev), and the cases about its retry table, backoff timing and deadline are left to the outbox's own tests.
+- **Record takedowns are pushed.** A space record takedown or its reversal changes the hash the author's repo serves at the
+  same rev, and its host notifies the authority with it. So the authority sequences the same repoRev with another hash again
+  and forwards it. The same repoRev with the same hash is a no-op, as in the reference, which ignores every repoRev at or
+  below the last.
 - **300 s single-use token cap.** Delegation tokens and client attestations live at most 300 s. The reference takes any lifetime.
 - **sync.getBlob needs a public reference, with `--spaces` on.** That's the reference's rule. With the flag off vlpds keeps
   serving an uploaded blob before anything references it, except one that only space records name.
@@ -1123,7 +1127,7 @@ The oplog cases have the authority write and read with its own credential (a co-
 | chains forwarded notifications across local and remote writers | ported | `..::chains_forwarded_notifications` (C4). vlpds also sends them in spaceRev order per registration |
 | resolves a dedicated space host and falls back only when it is absent | ported | `..::notify_resolves_the_space_host_and_falls_back_to_the_pds` (C1), observed at the hosts instead of calling the resolver |
 | retries the latest state after delivery failure and worker restart | ported | `..::retries_the_latest_state_after_failure_and_restart` (C1): the outbox row is resent at the newest rev after a restart |
-| ignores duplicate and older revisions without forwarding them | ported | `..::notify_write_ignores_duplicate_and_older_revisions` (C3) |
+| ignores duplicate and older revisions without forwarding them | ported (partly divergent) | `..::notify_write_ignores_duplicate_and_older_revisions` (C3). Divergent: a duplicate is the same repoRev with the same hash. The same repoRev with another hash is sequenced and forwarded again, since a record takedown or its reversal changes the hash a vlpds repo serves at the same rev (`spaces_side::takedowns`). The reference ignores any repoRev at or below the last |
 | keeps the newest repo revision when notifications race | ported | `..::notify_write_keeps_the_newest_revision_when_racing` (C3) |
 | rejects future revisions while allowing a small clock skew | ported | `..::notify_write_rejects_future_revisions` (C3) |
 | rejects one that spoofs the writer | ported | `..::notify_write_rejects_a_spoofed_writer` (C3) |

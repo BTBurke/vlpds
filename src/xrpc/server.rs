@@ -591,8 +591,12 @@ pub(super) fn ctl_changed(app: &App, did: &str) {
 }
 
 pub(super) async fn put_sec(app: &App, did: &str, muts: Vec<Mutation>) -> XResult<()> {
+    let keys: Vec<Mutation> = muts.iter().map(|m| Mutation { key: m.key.clone(), val: None }).collect();
     let r = app.put_private(did, muts).await;
     ctl_changed(app, did);
+    if r.is_ok() {
+        super::space::sec_written(app, did, &keys).await;
+    }
     r
 }
 

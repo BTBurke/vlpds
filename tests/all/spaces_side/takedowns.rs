@@ -21,6 +21,7 @@ use super::ref_net::*;
 use crate::common::spaces::SpaceClient;
 use crate::common::*;
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 struct Td {
     net: Net,
@@ -339,4 +340,121 @@ async fn space_takedown_closes_the_space_at_its_host() {
     let token = delegation_token(&t.carol, &t.space).await;
     t.net.mint_credential(&t.space, &token, None).await.0.ok();
     before.get(&pds0, "com.atproto.space.listRecords", &q).await.ok();
+}
+
+/// The authority's listRepos row for `repo`: (repoRev, hash).
+async fn row_at_authority(t: &Td, cred: &Cred, repo: &str) -> Option<(String, Vec<u8>)> {
+    let r = cred.get(&t.net.pds[0].url, "com.atproto.space.listRepos", &[("space", &t.space)]).await.ok();
+    let row = r["repos"].as_array()?.iter().find(|r| r["did"] == json!(repo))?.clone();
+    Some((row["repoRev"].as_str()?.to_string(), super::fuzz::bytes_field(&row["hash"])))
+}
+
+/// Waits (5 s at most) for the authority to list `repo` at `rev` with `hash`.
+async fn authority_lists(t: &Td, cred: &Cred, repo: &str, rev: &str, hash: &[u8], what: &str) -> Duration {
+    let t0 = std::time::Instant::now();
+    let want = Some((rev.to_string(), hash.to_vec()));
+    for _ in 0..500 {
+        if row_at_authority(t, cred, repo).await == want {
+            return t0.elapsed();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what}: the authority lists {:?}, wants {want:?}", row_at_authority(t, cred, repo).await);
+}
+
+/// Waits for a forward of `repo` at `rev` with `hash` at `syncer`.
+async fn forwarded(syncer: &super::hooks::StubDid, repo: &str, rev: &str, hash: &[u8], what: &str) {
+    let hit = || {
+        syncer.seen().iter().any(|n| {
+            n.body["repo"] == json!(repo)
+                && n.body["repoRev"] == json!(rev)
+                && super::fuzz::bytes_field(&n.body["hash"]) == hash
+        })
+    };
+    for _ in 0..500 {
+        if hit() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("{what}: no forward of {repo} at {rev} with that hash: {:?}", syncer.seen());
+}
+
+/// A record takedown and its reversal are pushed, not left to polls: the
+/// author's host notifies the authority with the hash it now serves at the
+/// same rev, listRepos shows it within milliseconds, and a registered
+/// syncer gets a forward, sees the same rev with another hash and
+/// converges with getRepo. Through all of it, no prevSpaceRev forks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn record_takedown_and_reversal_are_pushed_to_the_authority_and_its_syncers() {
+    let t = td().await;
+    let base = t.net.pds[1].url.clone();
+    let key = did_key(&t.net.pds[1], &t.bob.did).await;
+    let (_, gone) = t.bob_writes("gone", "pushed away").await;
+    t.bob_writes("kept", "kept").await;
+    let rev = repo_state(&t.bob, &t.space).await.unwrap().0;
+    let stub = super::hooks::StubDid::spawn().await;
+    let acred = t.net.credential_for(&t.alice, &t.space).await;
+    let reg = json!({"space": t.space, "service": format!("{}#atproto_space_syncer", stub.did)});
+    acred.post(&t.net.pds[0].url, "com.atproto.space.registerNotify", reg).await.ok();
+    let mut syncer = Syncer::new(&base, &t.space, &t.bob.did, &key, t.net.credential_for(&t.carol, &t.space).await);
+    syncer.full().await;
+    let all = syncer.set.clone();
+    authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&all), "before").await;
+
+    t.takedown_bobs("gone", &gone, true).await;
+    let mut visible = all.clone();
+    visible.remove(&path("gone"));
+    let took = authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&visible), "the takedown").await;
+    eprintln!("the takedown reached listRepos in {took:?}");
+    forwarded(&stub, &t.bob.did, &rev, &set_hash(&visible), "the takedown").await;
+    // the spec's signal: the same rev with another hash, so a full pull
+    let pulls = syncer.full_pulls;
+    syncer.full().await;
+    assert_eq!((syncer.rev.as_deref(), &syncer.set), (Some(rev.as_str()), &visible));
+    assert_eq!(syncer.full_pulls, pulls + 1);
+
+    t.takedown_bobs("gone", &gone, false).await;
+    let took = authority_lists(&t, &acred, &t.bob.did, &rev, &set_hash(&all), "the reversal").await;
+    eprintln!("the reversal reached listRepos in {took:?}");
+    forwarded(&stub, &t.bob.did, &rev, &set_hash(&all), "the reversal").await;
+    syncer.full().await;
+    assert_eq!(syncer.set, all);
+
+    // a write after it is an ordinary forward again
+    let (_, more) = t.bob_writes("more", "after the reversal").await;
+    let mut now = all.clone();
+    now.insert(path("more"), more);
+    let rev2 = repo_state(&t.bob, &t.space).await.unwrap().0;
+    authority_lists(&t, &acred, &t.bob.did, &rev2, &set_hash(&now), "a later write").await;
+    forwarded(&stub, &t.bob.did, &rev2, &set_hash(&now), "a later write").await;
+    stub.assert_no_fork("the syncer");
+}
+
+/// The authority's own records: a takedown re-sequences its own row with
+/// the adjusted hash, and so does its next write while it lasts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_authoritys_own_record_takedown_moves_its_listed_hash() {
+    let t = td().await;
+    let pds0 = t.net.pds[0].url.clone();
+    let w = |rkey: &'static str, text: &'static str| W::new().rkey(rkey).text(text);
+    let gone = write(&t.alice, &t.space, w("gone", "alice's")).await.ok()["cid"].as_str().unwrap().to_string();
+    write(&t.alice, &t.space, w("kept", "kept")).await.ok();
+    let acred = t.net.credential_for(&t.alice, &t.space).await;
+    let all = listed(&pds0, &acred, &t.space, &t.alice.did).await;
+    let rev = repo_state(&t.alice, &t.space).await.unwrap().0;
+    authority_lists(&t, &acred, &t.alice.did, &rev, &set_hash(&all), "before").await;
+    let uri = record_uri(&t.space, &t.alice.did, TEST_COLLECTION, "gone");
+    takedown_record(&t.net.pds[0], &uri, &gone, true).await;
+    let mut visible = all.clone();
+    visible.remove(&path("gone"));
+    authority_lists(&t, &acred, &t.alice.did, &rev, &set_hash(&visible), "the takedown").await;
+    let more = write(&t.alice, &t.space, w("more", "during")).await.ok()["cid"].as_str().unwrap().to_string();
+    visible.insert(path("more"), more.clone());
+    let rev2 = repo_state(&t.alice, &t.space).await.unwrap().0;
+    authority_lists(&t, &acred, &t.alice.did, &rev2, &set_hash(&visible), "a write during it").await;
+    takedown_record(&t.net.pds[0], &uri, &gone, false).await;
+    let mut restored = all.clone();
+    restored.insert(path("more"), more);
+    authority_lists(&t, &acred, &t.alice.did, &rev2, &set_hash(&restored), "the reversal").await;
 }

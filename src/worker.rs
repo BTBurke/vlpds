@@ -2489,6 +2489,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 repo_rev: rev,
                 hash: head.hash.digest(),
                 seq,
+                epoch: st.partition.epoch,
             });
             let (sp, d) = (spaces.clone(), did.clone());
             let ack = move || {
@@ -2522,6 +2523,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                         repo_rev,
                         hash,
                         seq,
+                        epoch: st.partition.epoch,
                     };
                     let sp = spaces.clone();
                     let ack = move || {
@@ -2583,6 +2585,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 repo_rev: rev,
                 hash: head.hash.digest(),
                 seq,
+                epoch: st.partition.epoch,
             });
             let (sp, d) = (spaces.clone(), did.clone());
             let ack = move || {

@@ -8,7 +8,7 @@
 //!
 //! (or `just spaces-microbench`). One node (three for `cluster`), `--spaces` on, log segment PUTs
 //! delayed like S3 (`SPACES_BENCH_PUT_MS`, default 25 ms median, lognormal
-//! sigma 0.3). Sections, picked with
+//! sigma 0.3; below 5 ms a thread sleep, so 0.5 means 0.5). Sections, picked with
 //! `SPACES_BENCH_ONLY=noop,delta,cred,conc,bucket,load,cluster` (default all):
 //!
 //! - `noop`: listRepoOps with `since` at the head, client p50/p99, the
@@ -20,7 +20,8 @@
 //!   credentials (a cache miss: the full chain verify) against one
 //!   credential reused (a hit from C2 on).
 //! - `conc`: `SPACES_BENCH_CONC` (1,4,16) concurrent writers on one
-//!   account, public and then space, and log segment PUTs per write.
+//!   account, public (a session token), public over OAuth (DPoP, as every
+//!   space write is) and then space, and log segment PUTs per write.
 //! - `bucket`: object-store requests by op and component while public
 //!   writers run, without and then with concurrent space writes. The target
 //!   is zero added PUTs per space write.
@@ -887,6 +888,7 @@ where
 async fn bench_conc(s: &TestServer, fx: &Fixture, cfg: &Cfg, out: &mut Report) {
     let window = Duration::from_secs_f64(cfg.secs / 2.0);
     let a = s.create_account("sbc").await;
+    let oc = SpaceClient::new(s, "sbo", "repo:app.bsky.feed.post?action=create").await;
     for &c in &cfg.conc {
         let (publat, pubsegs) = one_repo(c, window, |i| {
             let (xrpc, a) = (&s.xrpc, &a);
@@ -898,6 +900,17 @@ async fn bench_conc(s: &TestServer, fx: &Fixture, cfg: &Cfg, out: &mut Report) {
             }
         })
         .await;
+        // space writes are OAuth-only: the like-for-like public write
+        let (olat, osegs) = one_repo(c, window, |i| {
+            let oc = &oc;
+            async move {
+                let rec = post_record(&format!("conc {i}"));
+                let body = json!({"repo": oc.did, "collection": "app.bsky.feed.post", "record": rec});
+                let r = oc.post("com.atproto.repo.createRecord", body).await;
+                assert_eq!(r.status, 200, "{}", r.json);
+            }
+        })
+        .await;
         let (splat, spsegs) = one_repo(c, window, |i| async move {
             let r = fx.authority.create_record(&fx.space, COLLECTION, None, note(i)).await;
             assert_eq!(r.status, 200, "space write: {}", r.text());
@@ -905,9 +918,11 @@ async fn bench_conc(s: &TestServer, fx: &Fixture, cfg: &Cfg, out: &mut Report) {
         .await;
         let n = |l: &Lat| l.0.len().max(1) as f64;
         out.say(format!(
-            "one repo, {c} concurrent: public {:.3} PUTs/write, {}; space {:.3} PUTs/write, {}",
+            "one repo, {c} concurrent: public {:.3} PUTs/write, {}; public over OAuth {:.3} PUTs/write, {}; space {:.3} PUTs/write, {}",
             pubsegs / n(&publat),
             publat.line(),
+            osegs / n(&olat),
+            olat.line(),
             spsegs / n(&splat),
             splat.line()
         ));

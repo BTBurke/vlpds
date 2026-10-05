@@ -5241,7 +5241,7 @@ URI), since URIs can run past 600 B. The URI is kept in `sH`, `sS` and
 | `sS/{auth}\0{sid}` | authority | the space: policies, created, a `deleted` tombstone |
 | `sM/{auth}\0{sid}{member}` | authority | a member's access |
 | `sW/{auth}\0{sid}{writer}` | authority | writer state: repoRev, hash, spaceRev |
-| `sQ/{auth}\0{sid}{spaceRev}` | authority | the writer, in `listRepos` order (latest per writer) |
+| `sQ/{auth}\0{sid}{spaceRev}` | authority | the writer, in `listRepos` order (latest per writer), and the spaceRev sequenced before it |
 | `sN/{auth}\0{sid}{service}` | authority | a notify registration, 24 h |
 | `sL/{did}\0{uri}\0{h\|s}` | the account | listSpaces's index: a repo held (`h`) or a live space governed (`s`), in URI order |
 
@@ -5329,8 +5329,15 @@ at most 8 to one authority and 32 in all to authorities whose last send
 failed, so a tarpit authority holds up nobody else.
 
 At the authority, a `repoRev` more than 5 min ahead gets `FutureRev`, the
-writer must pass the space's write policy, and a `repoRev` at or below the
-writer's last is a no-op. Otherwise the authority's worker assigns the next
+writer must pass the space's write policy, and a `repoRev` below the
+writer's last, or equal to it with the same hash, is a no-op. The same
+`repoRev` with another hash is sequenced again: a record takedown or its
+reversal changes what the writer serves at the same rev, and its host
+pushes that (an outbox renotify, or the authority's own entry when the
+repo is its own), so syncers get a forward with the spec's "same rev,
+new hash" signal and refetch at once. Every outbox send works out the
+served hash when it goes, so a resent row can't put the old one back.
+Otherwise the authority's worker assigns the next
 spaceRev (a TID) and writes `sW` and the `sQ` swap as one private entry
 before the 200. One worker per authority means no lock.
 
@@ -5340,7 +5347,12 @@ Sequenced writes leave the authority's worker in ack order for 8
 dispatchers split by space. Each (space, service) registration gets a lane
 that sends one forward at a time in spaceRev order. A writer's queued
 forward is replaced by its newer one, and the `prevSpaceRev` sent is the
-last spaceRev that lane delivered, so coalescing leaves no gap. A failed
+last spaceRev that lane tried to send (it may have arrived), so coalescing
+leaves no gap. After a lost forward, and on a shard lease's first forward
+per registration, it's the true predecessor, which `sQ` keeps with each
+spaceRev: a gap sends a syncer to listRepos, but a lane's memory from
+before a takeover could name a `prevSpaceRev` the old owner already sent
+with another successor, a fork. A failed
 send is retried with jittered backoff from 1 s only while nothing newer
 from its writer waits. Bounds: 256 per lane, 4,096 queued and 16 in flight
 per service host, 4,096 per dispatcher, 512 sends in flight in all, and
@@ -5350,7 +5362,7 @@ or IPv6 /64, ports ignored, so a DID document listing many hostnames under
 one domain can't multiply what a write sends one machine. Sends go through the pooled, SSRF-guarded
 client. Lanes are best effort and in memory. When a shard opens, each of
 its spaces with a live registration sends one forward of its newest writer,
-naming the spaceRev before it, so a syncer that missed one sees the gap and
+naming its true predecessor from `sQ`, so a syncer that missed one sees the gap and
 pulls `listRepos`. A taken-down space forwards nothing.
 
 ### Revocations, retention and operator reads
@@ -5436,7 +5448,8 @@ the space row, and counts a mismatch in
   at a time, and a writer's queued forward is replaced by its newer one.
   The reference sends each one as it's sequenced, unordered. The
   `prevSpaceRev` vlpds sends is the last spaceRev that service was sent,
-  so a replaced forward leaves no gap. A lost one does, and the service
+  so a replaced forward leaves no gap, or the true predecessor, never one
+  that forks the chain. A lost one does, and the service
   catches up with listRepos as it would with the reference.
 - Space data is OAuth-only. App passwords (scoped or not) and password
   sessions are refused on every space and simplespace method, delegation

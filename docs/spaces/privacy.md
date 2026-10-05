@@ -169,3 +169,13 @@ The adjusted view is cheap because a repo's taken-down set is tiny. The set hash
 minus the taken-down records' elements, and the commit is signed at serve time like every other one.
 `listRepoOps` leaves the record's ops out while the takedown lasts, so the incremental and the full
 views agree.
+
+A syncer doesn't have to poll to find out. When a record is taken down or the takedown is reversed,
+the author's host sends its authority a notify at the same rev with the hash it now serves, and the
+authority sequences it like any other. So `listRepos` shows the new hash within a few milliseconds
+(~1 ms for a takedown in the tests), and every registered syncer gets a forward with the same rev
+and a different hash. That's the spec's signal to fall back to `getRepo`. The rev doesn't move,
+since nothing was written. The push isn't logged, so if the author's host crashes before it goes,
+syncers find out on their next poll instead. Every notify works out the served hash when it's sent,
+so a resent row never puts the old hash back at the authority. An authority's own records work the
+same way, and so do its writes while one of its records is down.

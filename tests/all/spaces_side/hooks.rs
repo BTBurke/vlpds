@@ -421,6 +421,22 @@ impl StubDid {
         self.seen().into_iter().filter(|n| n.accepted).collect()
     }
 
+    /// No prevSpaceRev reached this service with two different successors
+    /// (refused forwards count: the refusal may not be what it acted on). A
+    /// gap is benign (the service pulls listRepos); a fork never is.
+    pub fn assert_no_fork(&self, ctx: &str) {
+        let seen = self.seen();
+        let mut next: std::collections::BTreeMap<Option<&str>, &str> = Default::default();
+        for n in &seen {
+            let (prev, rev) = (n.body["prevSpaceRev"].as_str(), n.body["spaceRev"].as_str().expect("spaceRev"));
+            if let Some(other) = next.insert(prev, rev).filter(|o| *o != rev) {
+                let chain: Vec<(&J, &J)> =
+                    seen.iter().map(|n| (&n.body["prevSpaceRev"], &n.body["spaceRev"])).collect();
+                panic!("{ctx}: prevSpaceRev {prev:?} forked to {other} and {rev}: {chain:?}");
+            }
+        }
+    }
+
     /// A service JWT from this DID for `aud`/`lxm`.
     pub fn service_jwt(&self, aud: &str, lxm: &str) -> String {
         vlpds::auth::service_auth_jwt(&self.key, &self.did, aud, Some(lxm), 60).unwrap()

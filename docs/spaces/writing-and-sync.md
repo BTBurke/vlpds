@@ -134,7 +134,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 - title: Check the rev
   body: "`repoRev` more than 5 min in the future gets `FutureRev`. The writer must pass the space's `writePolicy` (a managing app is asked with `checkUserAccess`)."
 - title: Sequence it on the authority's worker
-  body: "A `repoRev` at or below the writer's last one is a no-op, so a resent notify is harmless. Otherwise the worker assigns the next `spaceRev` (a TID) and writes `sW` plus the `sQ` swap as one private entry. One worker per authority means no lock."
+  body: "A `repoRev` below the writer's last one is a no-op, and so is the same `repoRev` with the same hash, so a resent notify is harmless. The same `repoRev` with another hash is a record takedown or its reversal changing what the writer serves ([Privacy](privacy.md#takedowns)), so it's sequenced again. Otherwise the worker assigns the next `spaceRev` (a TID) and writes `sW` plus the `sQ` swap as one private entry. One worker per authority means no lock."
 - title: Answer 200 once it's durable
   body: "The writer's outbox only drops its row after this."
 - title: Fan out
@@ -166,9 +166,13 @@ edges:
 
 - A forward waiting in a lane is replaced by a newer one from the same writer, since only a writer's
   newest state is worth sending.
-- The `prevSpaceRev` a lane sends is the last spaceRev it delivered, so a replaced forward leaves no
-  gap. A forward lost for good (a full queue, retries run out) does leave one, and the syncer catches
-  up with `listRepos`.
+- The `prevSpaceRev` a lane sends is the last spaceRev it tried to send, delivered or not, so a
+  replaced forward leaves no gap. After a forward lost for good (a full queue, retries run out), and
+  on the first forward to each registration after the shard changes hands, it's the spaceRev
+  sequenced just before, which `sQ` keeps. The syncer may never have heard that one, and the gap
+  sends it to `listRepos`. That's fine. What must never happen is two forwards naming one
+  `prevSpaceRev` with different successors, a fork in the chain the syncer follows, and a lane's
+  memory from before a takeover could do that. The takeover tests check no syncer ever sees one.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
 - Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.

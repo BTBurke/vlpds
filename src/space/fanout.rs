@@ -14,11 +14,15 @@
 //! Only a writer's newest state is worth sending: a forward waiting in a
 //! lane is replaced by a newer one of the same writer, and a failed one is
 //! retried only while nothing newer of its writer waits. The `prevSpaceRev`
-//! a lane sends is the last spaceRev it delivered, so what it skipped this
-//! way leaves no gap (the service pulls the writer from its own last rev
-//! anyway). A forward lost for good (a full queue, retries run out) does
-//! leave one: the next send names its true predecessor, and the service
-//! goes to listRepos.
+//! a lane sends is the last spaceRev it tried to send, so what it skipped
+//! this way leaves no gap (the service pulls the writer from its own last
+//! rev anyway). Otherwise it is the true predecessor from the sequence. A
+//! service may not hear some of them, and a gap only sends it to listRepos;
+//! two forwards naming one prevSpaceRev with different successors would
+//! fork the chain it follows, so the lane's memory counts a send it tried
+//! (which may have arrived though it failed) and is only used within the
+//! shard lease that sequenced the forward: a lease's first forward per
+//! registration, and anything after a lost one, names the true predecessor.
 //!
 //! Bounds: the dispatchers' queues, each lane, and each service host's
 //! queued forwards across its lanes (all drop the oldest and count it), a
@@ -58,12 +62,15 @@ pub struct Job {
     pub repo_rev: Tid,
     pub hash: [u8; 32],
     pub seq: Sequenced,
+    /// The lease epoch of the authority's shard that sequenced it.
+    pub epoch: u64,
 }
 
 type LaneKey = (Arc<str>, SpaceId, String);
 
 struct Queued {
     f: Forward,
+    epoch: u64,
     host: String,
     /// Something before it in the space's sequence was lost.
     gap: bool,
@@ -73,15 +80,33 @@ struct Queued {
 struct Lane {
     queue: VecDeque<Queued>,
     running: bool,
-    /// The spaceRev of the newest forward handed to the lane, and of the
-    /// last one delivered.
+    /// The lease epoch of the newest forward handed to the lane, and its
+    /// spaceRev.
+    epoch: u64,
     pushed: Option<Tid>,
-    sent: Option<Tid>,
+    /// The spaceRev the lane last tried to send, and its lease epoch.
+    sent: Option<(Tid, u64)>,
     /// The next forward follows a lost one.
     gap_next: bool,
 }
 
 impl Lane {
+    /// The next forward and the prevSpaceRev to send it with (None: it is
+    /// behind one already tried, so not sent), counted as tried.
+    #[allow(clippy::option_option)]
+    fn next(&mut self) -> Option<(Queued, Option<Option<Tid>>)> {
+        let q = self.queue.pop_front()?;
+        if self.sent.is_some_and(|(t, _)| t >= q.f.space_rev) {
+            return Some((q, None));
+        }
+        let prev = match self.sent {
+            Some((s, epoch)) if !q.gap && epoch == q.epoch => Some(s),
+            _ => q.f.prev_space_rev,
+        };
+        self.sent = Some((q.f.space_rev, q.epoch));
+        Some((q, Some(prev)))
+    }
+
     /// The forward at the head was lost.
     fn mark_gap(&mut self) {
         match self.queue.front_mut() {
@@ -259,7 +284,7 @@ impl Fanout {
                         prev_space_rev: job.seq.prev,
                         expires: row.expires,
                     };
-                    me.push(&app, job.sid, f);
+                    me.push(&app, job.sid, f, job.epoch);
                 }
             }
         });
@@ -280,11 +305,24 @@ impl Fanout {
         });
     }
 
-    fn push(self: &Arc<Self>, app: &Weak<crate::xrpc::App>, sid: SpaceId, f: Forward) {
+    fn push(self: &Arc<Self>, app: &Weak<crate::xrpc::App>, sid: SpaceId, f: Forward, epoch: u64) {
         let key: LaneKey = (f.authority.clone(), sid, f.service.clone());
         let host = host_of(&f.endpoint);
         let mut st = self.state.lock();
         let lane = st.lanes.entry(key.clone()).or_default();
+        if lane.epoch != epoch {
+            (lane.epoch, lane.pushed, lane.gap_next) = (epoch, None, false);
+        }
+        // a catch-up forward behind what this lease already sequenced: the
+        // newer one names it as its predecessor
+        let stale = |t: Tid| t >= f.space_rev;
+        if lane.pushed.is_some_and(stale) || lane.sent.is_some_and(|(t, _)| stale(t)) {
+            if lane.queue.is_empty() && !lane.running {
+                st.lanes.remove(&key);
+                st.unhost(&host);
+            }
+            return;
+        }
         let mut gap = std::mem::take(&mut lane.gap_next) || lane.pushed.is_some_and(|p| f.prev_space_rev != Some(p));
         lane.pushed = Some(f.space_rev);
         if let Some(i) = lane.queue.iter().position(|q| q.f.writer == f.writer) {
@@ -318,7 +356,7 @@ impl Fanout {
             st.unqueued(&old.host);
         }
         let lane = st.lanes.get_mut(&key).expect("present");
-        lane.queue.push_back(Queued { f, host: host.clone(), gap });
+        lane.queue.push_back(Queued { f, epoch, host: host.clone(), gap });
         let start = !std::mem::replace(&mut lane.running, true);
         st.host(&host).queued += 1;
         crate::metrics::space_fanout_depth(1);
@@ -335,15 +373,12 @@ impl Fanout {
             let (q, prev, sends) = {
                 let mut st = self.state.lock();
                 let Some(lane) = st.lanes.get_mut(&key) else { return };
-                let Some(q) = lane.queue.pop_front() else {
+                let Some((q, prev)) = lane.next() else {
                     st.lanes.remove(&key);
                     return;
                 };
-                let prev = match lane.sent {
-                    Some(s) if !q.gap => Some(s),
-                    _ => q.f.prev_space_rev,
-                };
                 st.unqueued(&q.host);
+                let Some(prev) = prev else { continue };
                 let sends = st.host(&q.host).sends.clone();
                 (q, prev, sends)
             };
@@ -380,10 +415,8 @@ impl Fanout {
             };
             let mut st = self.state.lock();
             let Some(lane) = st.lanes.get_mut(&key) else { return };
-            match sent {
-                Sent::Delivered => lane.sent = Some(q.f.space_rev),
-                Sent::Superseded => {}
-                Sent::Lost => lane.mark_gap(),
+            if let Sent::Lost = sent {
+                lane.mark_gap();
             }
         }
     }
@@ -456,19 +489,53 @@ mod tests {
             let f = fanout();
             let app = Weak::new();
             // the lane is "running" (its sender would be in flight)
-            f.push(&app, [0; 16], fwd("s", "a", 1, None));
+            f.push(&app, [0; 16], fwd("s", "a", 1, None), 1);
             f.state.lock().lanes.values_mut().next().unwrap().queue.clear();
-            f.push(&app, [0; 16], fwd("s", "a", 2, Some(1)));
-            f.push(&app, [0; 16], fwd("s", "b", 3, Some(2)));
-            f.push(&app, [0; 16], fwd("s", "a", 4, Some(3)));
+            f.push(&app, [0; 16], fwd("s", "a", 2, Some(1)), 1);
+            f.push(&app, [0; 16], fwd("s", "b", 3, Some(2)), 1);
+            f.push(&app, [0; 16], fwd("s", "a", 4, Some(3)), 1);
             assert_eq!(lane(&f), vec![("b".into(), 3, false), ("a".into(), 4, false)]);
             // a job lost upstream: the next one follows a gap
-            f.push(&app, [0; 16], fwd("s", "c", 6, Some(5)));
+            f.push(&app, [0; 16], fwd("s", "c", 6, Some(5)), 1);
             assert_eq!(lane(&f)[2], ("c".into(), 6, true));
             // replacing a gap-marked forward keeps the mark in place
-            f.push(&app, [0; 16], fwd("s", "c", 7, Some(6)));
+            f.push(&app, [0; 16], fwd("s", "c", 7, Some(6)), 1);
             assert_eq!(lane(&f)[2], ("c".into(), 7, true));
             assert_eq!(f.pending(), 3);
+        });
+    }
+
+    fn send_next(f: &Fanout) -> Option<(u64, Option<u64>)> {
+        let mut st = f.state.lock();
+        let l = st.lanes.values_mut().next().unwrap();
+        let (q, prev) = l.next()?;
+        Some((q.f.space_rev.0, prev?.map(|p| p.0)))
+    }
+
+    /// prevSpaceRev never forks: a lane names the last spaceRev it tried
+    /// (delivered or not) only within one lease, and drops what's behind it.
+    #[test]
+    fn prev_space_rev_is_tried_memory_within_a_lease_else_the_true_one() {
+        let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        rt.block_on(async {
+            let f = fanout();
+            let app = Weak::new();
+            f.push(&app, [0; 16], fwd("s", "a", 1, None), 1);
+            assert_eq!(send_next(&f), Some((1, None)));
+            // tried (it may have arrived), then 2 coalesced away by 3
+            f.push(&app, [0; 16], fwd("s", "a", 2, Some(1)), 1);
+            f.push(&app, [0; 16], fwd("s", "a", 3, Some(2)), 1);
+            f.push(&app, [0; 16], fwd("s", "b", 4, Some(3)), 1);
+            assert_eq!(send_next(&f), Some((3, Some(1))));
+            // a new lease (a takeover, a handback): the true predecessor
+            f.push(&app, [0; 16], fwd("s", "c", 6, Some(5)), 2);
+            assert_eq!(send_next(&f), Some((4, Some(3))));
+            assert_eq!(send_next(&f), Some((6, Some(5))));
+            // a catch-up forward behind what the lane has: dropped
+            f.push(&app, [0; 16], fwd("s", "c", 5, Some(4)), 2);
+            assert_eq!(f.pending(), 0);
+            f.push(&app, [0; 16], fwd("s", "d", 8, Some(7)), 2);
+            assert_eq!(send_next(&f), Some((8, Some(7))));
         });
     }
 
@@ -479,7 +546,7 @@ mod tests {
             let f = fanout();
             let app = Weak::new();
             for i in 0..LANE as u64 + 5 {
-                f.push(&app, [0; 16], fwd("s", &format!("w{i}"), i + 1, i.checked_sub(0).filter(|p| *p > 0)));
+                f.push(&app, [0; 16], fwd("s", &format!("w{i}"), i + 1, i.checked_sub(0).filter(|p| *p > 0)), 1);
             }
             let q = lane(&f);
             assert_eq!(q.len(), LANE);

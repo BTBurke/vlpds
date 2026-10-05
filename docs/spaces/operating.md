@@ -167,8 +167,9 @@ vlpds node on MinIO. All of these are client-side.
 - Server time for a no-op poll averages 0.12 ms, and 0.17 ms for a delta pull.
 - Public commit p99 held up with the spaces load running, but p50 went from 1.3 to 3.1 ms.
 - Sequential writes cost one bucket PUT each, the same as public writes. At a concurrency of 4 on
-  one repo, the harness measured 1.0 PUT per space write against 0.68 for public writes. The
-  in-tree bench below doesn't reproduce that, so the harness number needs a second look.
+  one repo with sub-ms MinIO PUTs, the harness measured 0.94 PUTs per space write against 0.60 for
+  public writes. That gap comes from the OAuth check, since space writes are OAuth-only and the
+  harness's public writer uses a session token (see "Server cost on one node").
 
 ### Server cost on one node
 
@@ -199,8 +200,15 @@ are in `bench/results/spaces-sync.md`.
   writes/s moved log segment PUTs from 35.7/s to 36.2/s, and PUTs per write of either kind went
   from 0.143 to 0.078.
 - On one repo, space writes share segments the same way public ones do. 4 concurrent writers cost
-  0.50 PUTs per write for both, and 16 cost 0.125. That doesn't match the harness's 1.0 at a
-  concurrency of 4 above, so that number needs a second look on the harness side.
+  0.50 PUTs per write for both, and 16 cost 0.125.
+- With fast PUTs, space writes share segments the way public writes over OAuth do. Writes only
+  share a segment if they reach the log while a PUT is in flight, and a DPoP-bound request spends
+  longer in auth than one with a session token, so fewer of them line up. At 0.2 ms PUTs and 4
+  writers on one repo, a session-token public writer gets 0.50 PUTs per write, an OAuth one 0.60
+  and a space writer 0.56. At 0.5 ms all three are within 0.01 of 0.50.
+- vlpds checks DPoP signatures with ring (~30 µs a signature against ~110 µs with the p256 crate).
+  That took OAuth auth from ~186 µs to ~86 µs a request, and space writes at 0.2 ms from 0.62 to
+  0.56 PUTs per write. The sweep is in `bench/results/spaces-sync.md`.
 - Public commit p99 didn't move under 20 spaces x 5 members x 3 pollers a second plus a syncer per
   space. Four runs gave 80 / 86 / 85 / 86 ms alone and 87 / 85 / 83 / 85 ms with the load.
 

@@ -15,7 +15,8 @@ systemd-run --user --scope -p MemoryMax=16G env CARGO_TARGET_DIR=<target> \
 
 `just spaces-microbench` runs the same thing. It's one in-process node with
 `--spaces` on and an in-memory bucket, and its log segment PUTs are delayed like S3
-(`SPACES_BENCH_PUT_MS`, 25 ms median, lognormal sigma 0.3). Metrics are
+(`SPACES_BENCH_PUT_MS`, 25 ms median, lognormal sigma 0.3). Below 5 ms the delay is a
+thread sleep, since tokio's timer rounds up to whole milliseconds. Metrics are
 process-wide, so nothing else may run in that test binary at the time.
 
 Knobs (env):
@@ -121,9 +122,51 @@ syncer notified is two of them in a row, ~93 ms.
 | 4 | 0.500 | 0.501 | 55.4 / 83.4 ms | 53.9 / 85.7 ms |
 | 16 | 0.125 | 0.126 | 52.3 / 89.4 ms | 52.3 / 85.4 ms |
 
-Space writes to one repo share segments exactly like public ones. The Mac harness's
-1.0 PUT per write at a concurrency of 4 (docs/spaces/operating.md) doesn't show up
-in process, so it's something about that harness's client or MinIO, not the write path.
+Space writes to one repo share segments exactly like public ones at S3 latency. With
+fast PUTs they don't quite, and the next section has why.
+
+### Fast PUTs (one repo, 4 concurrent)
+
+The Mac harness on MinIO (sub-ms PUTs, one account, 300 writes, 4 at a time) measured
+0.94 segment PUTs per space write against 0.60 for public writes. At the default 25 ms
+the in-process bench can't see that, and asking it for 0.5 ms didn't help either: tokio's
+timer rounded the delay up to 1-2 ms. With the delay as a thread sleep, it shows up.
+
+Run on 2026-10-05 at `spaces-2b` on top of 007c36e0, alone on benchbox between batch pipeline
+runs, `SPACES_BENCH_ONLY=conc SPACES_BENCH_CONC=4 SPACES_BENCH_SECS=10`, two runs each of
+the old and new binary in alternating order (the means below). "Public" posts with a session
+token, as the harness's public writer does. "Public over OAuth" posts with a DPoP-bound OAuth
+token, which every space write needs.
+
+| PUT delay | Public | Public over OAuth, before → after | Space, before → after | Space p50, before → after |
+|---|---|---|---|---|
+| 0 | 0.764 | 0.982 → 0.989 | 0.993 → 0.993 | 0.358 → 0.285 ms |
+| 0.1 ms | 0.542 | 0.791 → 0.717 | 0.776 → 0.670 | 0.597 → 0.538 ms |
+| 0.2 ms | 0.503 | 0.657 → 0.602 | 0.616 → 0.557 | 0.758 → 0.652 ms |
+| 0.3 ms | 0.501 | 0.581 → 0.535 | 0.555 → 0.515 | 0.881 → 0.815 ms |
+| 0.5 ms | 0.500 | 0.519 → 0.507 | 0.507 → 0.503 | 1.227 → 1.243 ms |
+
+Space writes track public writes over OAuth at every delay, so the space write path isn't
+what's missing segments. The worker already builds a repo's next space entry while the one
+before it is in flight, the same as a commit, and server time from the handler to the ack
+was ~80 µs at no delay against ~120 µs for a public commit.
+
+The gap is the OAuth check. A writer's requests only share a segment if they reach the log
+while a PUT is in flight. A DPoP-bound request spent ~186 µs in auth (~145 µs checking the
+proof, nearly all of it the P-256 signature, and ~30 µs reading the session and account)
+against ~1 µs for a session token. That spreads the four writers' arrivals out, so with PUTs this fast fewer of them
+line up behind one. The harness also signs a DPoP proof per request on the client side,
+which spreads them out further.
+
+"After" checks ES256 signatures with ring instead of the p256 crate. That's ~30 µs a
+signature instead of ~110, and it took OAuth auth from ~186 µs to ~86 µs a request. Space
+writes at 0.2 ms went from 0.62 to 0.56 PUTs per write, and every OAuth request got
+~100 µs cheaper. The brief's target (space within 0.05 of public at 0.5 ms) is met by both
+binaries: 0.507 and 0.503 against 0.500.
+
+What's left is the session and account reads and the client's own signing. At 0.1 ms and
+below, any OAuth writer pays for them. For the harness, comparing space writes with public
+writes made over OAuth isolates the space path.
 
 | Public commit latency (16 writers) | Alone p50 / p99 | With the spaces load p50 / p99 |
 |---|---|---|
@@ -148,6 +191,28 @@ in the next three runs, so public commit latency is unchanged.
 
 The flag-off comparison against main (the benchbox A/B grid) is in
 `docs/spaces/operating.md` under "What it costs".
+
+### Notify on a cluster with fast PUTs
+
+The Mac harness saw notify p99 go from 5.5 ms to 18 ms between two runs (p50 1.7 → 0.68 ms).
+The bench's `cluster` section measures the same path in process: a member writes on one node,
+its outbox tells the authority on another node, the authority sequences it in a durable entry and
+forwards it to the space's syncers. Run on 2026-10-05 at `spaces-2b` (f6b0dd25), 20 spaces x 5
+members, `SPACES_BENCH_ONLY=cluster`, with the thread-sleep PUT delay.
+
+| PUT delay, syncers per space | Writes | Write ack to authority ack p50 / p99 | Write sent to syncer notified p50 / p99 / max | Notified to pulled p50 / p99 |
+|---|---|---|---|---|
+| 0.5 ms, 1 (20 s) | 4,785 | 0.89 / 1.99 ms | 2.12 / 3.51 / 4.58 ms | 0.58 / 1.22 ms |
+| 0.5 ms, 3 (15 s) | 3,591 | 0.99 / 2.83 ms | 2.19 / 3.74 / 8.26 ms | 0.45 / 1.17 ms |
+| 25 ms, 1 (20 s) | 4,421 | 46.6 / 120 ms | 82.2 / 135 / 154 ms | 2.1 / 7.8 ms |
+
+Write sent to syncer notified is two durable entries (the member's and the authority's) and
+three HTTP hops, so ~2 ms at 0.5 ms PUTs. Every send succeeded, nothing was retried, and the
+outbox folded ~17% of the writes into a later notify of the same repo. Across ~5,000 notifies
+the slowest took 4.6 ms with one syncer and 8.3 ms with three, so an 18 ms p99 doesn't show up
+here. The 25 ms row matches the earlier run (93 / 142 ms). Nothing on the outbox or fan-out path
+needed fixing. If the harness run is small, its p99 is its slowest one or two notifies, and a
+cold connection or signing key is enough for that, so it's worth re-measuring there on a quiet box.
 
 ### createAccount under the benchbox methods sample
 

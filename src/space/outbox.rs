@@ -11,7 +11,8 @@
 //! the bucket. A delivered row's `sP` delete rides the author's next space
 //! write (see `take_delivered`), so delivery costs no extra PUT; a row left
 //! behind is resent once by the next owner, which the authority ignores as
-//! not newer.
+//! not newer (the send works out the hash the repo serves at that rev, so
+//! a resend matches what the authority has even across a takedown).
 //!
 //! Bounded: at most [`MAX_ROWS`] rows are held (a row past that stays in
 //! the bucket, and the owned shards' `sP` rows are scanned again once the
@@ -84,6 +85,8 @@ struct Row {
     /// Held for an inactive writer: left out of the age gauge, which would
     /// otherwise page for as long as an account stays deactivated.
     waiting: bool,
+    /// Sent again once the send in flight returns, at the same rev.
+    again: bool,
 }
 
 #[derive(Default)]
@@ -212,6 +215,19 @@ impl Outbox {
     /// just acked (not a row found on open). Runs in the node log's ack, so
     /// it does O(log n) work under the lock and never waits on a send.
     pub fn enqueue(&self, did: &str, sid: SpaceId, uri: &str, repo_rev: Tid, hash: [u8; 32], acked: bool) {
+        self.put(did, sid, uri, repo_rev, hash, acked, false);
+    }
+
+    /// Sends (did, space)'s notify at `repo_rev` again, delivered or not:
+    /// a record takedown or its reversal changed the hash the repo serves
+    /// at that rev (the send works out which). Not logged, so a crash
+    /// before it goes leaves the change to syncers' polls.
+    pub fn renotify(&self, did: &str, sid: SpaceId, uri: &str, repo_rev: Tid, hash: [u8; 32]) {
+        self.put(did, sid, uri, repo_rev, hash, false, true);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn put(&self, did: &str, sid: SpaceId, uri: &str, repo_rev: Tid, hash: [u8; 32], acked: bool, again: bool) {
         let now = Instant::now();
         {
             let mut d = self.delivered.lock();
@@ -227,7 +243,16 @@ impl Outbox {
         let st = &mut *guard;
         let full = st.rows.len() >= self.max_rows;
         match st.rows.get_mut(&key) {
-            Some(r) if r.repo_rev >= repo_rev => return,
+            Some(r) if r.repo_rev > repo_rev || (r.repo_rev == repo_rev && !again) => return,
+            Some(r) if r.repo_rev == repo_rev => {
+                r.attempts = 0;
+                r.again |= r.in_flight;
+                let idle = !r.in_flight && !r.queued;
+                st.set_waiting(&key, false);
+                if idle {
+                    st.schedule(&key, now, now);
+                }
+            }
             Some(r) => {
                 r.repo_rev = repo_rev;
                 r.hash = hash;
@@ -263,6 +288,7 @@ impl Outbox {
                     id,
                     acked: acked.then_some(now),
                     waiting: false,
+                    again: false,
                 };
                 st.rows.insert(key.clone(), row);
                 st.oldest.insert((now, id));
@@ -428,7 +454,7 @@ impl Outbox {
             return;
         };
         r.in_flight = false;
-        let newer = r.repo_rev > s.repo_rev;
+        let newer = r.repo_rev > s.repo_rev || std::mem::take(&mut r.again);
         let expired = Duration::from_micros(crate::tid::now_micros().saturating_sub(r.repo_rev.micros())) > DEADLINE;
         let (result, drop_row) = match outcome {
             Outcome::Delivered => {
@@ -558,6 +584,31 @@ mod tests {
         o.enqueue("did:a", sid, "at://s", Tid(5), [0; 32], false);
         o.enqueue("did:a", sid, "at://s", Tid(4), [0; 32], false);
         assert_eq!(send(&o)[0].repo_rev, Tid(5));
+    }
+
+    /// A renotify sends a delivered rev again, and one in flight once more
+    /// after it returns; it never replaces a newer rev.
+    #[test]
+    fn renotify_resends_the_same_rev() {
+        let o = Outbox::default();
+        let sid = [1; 16];
+        o.enqueue("did:a", sid, "at://s", Tid(3), [0; 32], true);
+        let s = send(&o);
+        o.finish(&s[0], &Outcome::Delivered);
+        assert!(o.is_empty());
+        o.renotify("did:a", sid, "at://s", Tid(3), [0; 32]);
+        let s = send(&o);
+        assert_eq!(s.iter().map(|s| s.repo_rev).collect::<Vec<_>>(), vec![Tid(3)]);
+        o.renotify("did:a", sid, "at://s", Tid(3), [0; 32]);
+        assert!(send(&o).is_empty(), "single flight");
+        o.finish(&s[0], &Outcome::Delivered);
+        let s = send(&o);
+        assert_eq!(s.len(), 1, "sent again after the one in flight");
+        o.finish(&s[0], &Outcome::Delivered);
+        assert!(o.is_empty());
+        o.enqueue("did:a", sid, "at://s", Tid(4), [0; 32], true);
+        o.renotify("did:a", sid, "at://s", Tid(3), [0; 32]);
+        assert_eq!(send(&o)[0].repo_rev, Tid(4));
     }
 
     #[test]

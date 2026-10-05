@@ -92,8 +92,8 @@ pub struct Host {
     /// `sS` holds a live space, or none (the defaults): not a tombstone.
     pub live: bool,
     pub writers: Vec<Writer>,
-    /// `sQ`: (spaceRev, writer DID).
-    pub seq: Vec<(Tid, String)>,
+    /// `sQ`: (spaceRev, the spaceRev before it, writer DID).
+    pub seq: Vec<(Tid, Option<Tid>, String)>,
 }
 
 /// The account's `sL` rows for the space.
@@ -198,7 +198,8 @@ pub async fn load<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, uri:
         let mut seq = Vec::new();
         for (k, v) in scan(db, &qp).await? {
             let rev = rows::seq_rev(&k).filter(|_| k.len() == qp.len() + 8).context("a bad listRepos (sQ) key")?;
-            seq.push((rev, String::from_utf8_lossy(&v).into_owned()));
+            let q = rows::SeqRow::decode(&v).context("a listRepos row (sQ) doesn't decode")?;
+            seq.push((rev, q.prev, q.writer));
         }
         out.governs = space.as_ref().is_some_and(|s| s.live() && s.uri == uri);
         if space.is_some() || !writers.is_empty() || !seq.is_empty() {
@@ -402,12 +403,25 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
 
     // the space host's rows, when the account governs the space
     let host = rows.host.as_ref().map(|h| {
-        let seq: HashMap<Tid, &str> = h.seq.iter().map(|(t, w)| (*t, w.as_str())).collect();
+        let seq: HashMap<Tid, &str> = h.seq.iter().map(|(t, _, w)| (*t, w.as_str())).collect();
         let writers: HashMap<&str, &Writer> = h.writers.iter().map(|w| (w.did.as_str(), w)).collect();
         let unsequenced = h.writers.iter().filter(|w| seq.get(&w.space_rev) != Some(&w.did.as_str())).count();
-        let stale_seq = h.seq.iter().filter(|(t, w)| writers.get(w.as_str()).is_none_or(|x| x.space_rev != *t)).count();
+        let stale_seq =
+            h.seq.iter().filter(|(t, _, w)| writers.get(w.as_str()).is_none_or(|x| x.space_rev != *t)).count();
+        // the spaceRev before a row's is at least the row before it in sQ
+        // (rows between them are writers that wrote again) and below its own
+        let bad_prev = h
+            .seq
+            .iter()
+            .enumerate()
+            .filter(|(i, (t, p, _))| {
+                let floor = i.checked_sub(1).map(|j| h.seq[j].0);
+                p.is_some_and(|p| p >= *t) || floor.is_some_and(|f| p.is_none_or(|p| p < f))
+            })
+            .count();
         count(&mut problems, unsequenced, "writer row(s) (sW) without their listRepos row (sQ)");
         count(&mut problems, stale_seq, "listRepos row(s) (sQ) that aren't their writer's latest");
+        count(&mut problems, bad_prev, "listRepos row(s) (sQ) whose prevSpaceRev is out of order");
         if !h.live && !(h.writers.is_empty() && h.seq.is_empty()) {
             problems.push(format!(
                 "a deleted space keeps {} writer and {} listRepos row(s)",
@@ -428,7 +442,7 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
             "live": h.live,
             "writers": h.writers.len(),
             "seq": h.seq.len(),
-            "maxSpaceRev": h.seq.iter().map(|(t, _)| *t).max().map(|t| t.to_string()),
+            "maxSpaceRev": h.seq.iter().map(|(t, ..)| *t).max().map(|t| t.to_string()),
             "unsequenced": unsequenced,
             "staleSeq": stale_seq,
         })
@@ -668,16 +682,19 @@ mod tests {
         rows.host = Some(Host {
             live: true,
             writers: vec![me, other.clone()],
-            seq: vec![(s1, other.did.clone()), (s2, DID.into())],
+            seq: vec![(s1, None, other.did.clone()), (s2, Some(s1), DID.into())],
         });
         let r = check(DID, own, &rows, NOW, RET);
         assert_eq!(r["ok"], json!(true), "{r}");
         assert_eq!(r["host"]["maxSpaceRev"], json!(s2.to_string()));
         let mut stale = rows.clone();
-        stale.host.as_mut().unwrap().seq.push((Tid(s1.0 - 1), other.did.clone()));
+        stale.host.as_mut().unwrap().seq.insert(0, (Tid(s1.0 - 1), None, other.did.clone()));
         assert_problem(&stale, NOW, "1 listRepos row(s) (sQ) that aren't their writer's latest");
         let mut unseq = rows.clone();
         unseq.host.as_mut().unwrap().seq.remove(0);
+        let mut forked = rows.clone();
+        forked.host.as_mut().unwrap().seq[1].1 = Some(Tid(s1.0 - 1));
+        assert_problem(&forked, NOW, "1 listRepos row(s) (sQ) whose prevSpaceRev is out of order");
         assert_problem(&unseq, NOW, "1 writer row(s) (sW) without their listRepos row");
         let mut behind = rows.clone();
         behind.host.as_mut().unwrap().writers[0].repo_rev = Tid(h.rev.0 - 1);

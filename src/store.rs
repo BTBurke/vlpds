@@ -100,8 +100,14 @@ impl Store {
             let u1: f64 = rand::random::<f64>().max(1e-12);
             let u2: f64 = rand::random();
             let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-            let ms = median * (sigma * z).exp();
-            tokio::time::sleep(Duration::from_secs_f64(ms / 1000.0)).await;
+            let d = Duration::from_secs_f64(median * (sigma * z).exp() / 1000.0);
+            // tokio's timer rounds up to whole milliseconds, which would
+            // turn a sub-ms PUT (MinIO, a same-zone S3 Express) into 1-2 ms
+            if d < Duration::from_millis(5) {
+                let _ = tokio::task::spawn_blocking(move || std::thread::sleep(d)).await;
+            } else {
+                tokio::time::sleep(d).await;
+            }
         }
     }
 }

@@ -289,8 +289,9 @@ impl Spaces {
         if shards.is_empty() {
             return;
         }
+        // the lease epoch, while `db` is still the shard's
         let owned = move |shard: crate::slots::ShardId, db: &Arc<slatedb::Db>| {
-            table.upgrade().and_then(|t| t.get(shard)).is_some_and(|p| Arc::ptr_eq(&p.db, db))
+            table.upgrade().and_then(|t| t.get(shard)).filter(|p| Arc::ptr_eq(&p.db, db)).map(|p| p.epoch)
         };
         tokio::spawn(async move {
             for (shard, db) in shards {
@@ -299,7 +300,10 @@ impl Spaces {
                     let r = self.rescan_outbox(&db).await;
                     let r = match r {
                         Ok(n) if overflow => Ok((n, 0)),
-                        Ok(n) => self.catch_up_registrations(&db).await.map(|c| (n, c)),
+                        Ok(n) => match owned(shard, &db) {
+                            Some(epoch) => self.catch_up_registrations(&db, epoch).await.map(|c| (n, c)),
+                            None => Ok((n, 0)),
+                        },
                         Err(e) => Err(e),
                     };
                     match r {
@@ -312,7 +316,7 @@ impl Spaces {
                             }
                             break;
                         }
-                        Err(e) if owned(shard, &db) => {
+                        Err(e) if owned(shard, &db).is_some() => {
                             tracing::warn!(shard = shard.0, "space notify outbox rescan failed (retrying): {e:#}");
                             tokio::time::sleep(wait).await;
                             wait = (wait * 2).min(RESCAN_RETRY_MAX);
@@ -330,10 +334,11 @@ impl Spaces {
     /// Fan-out lanes live in memory, so a forward queued on the shard's
     /// last owner may be gone. Each space of the shard with a live
     /// registration gets one forward of its newest sequenced writer, naming
-    /// the spaceRev before it: a syncer that's current ignores it, one that
-    /// missed something sees the gap and pulls listRepos. Once per shard
-    /// open, nothing in steady state.
-    async fn catch_up_registrations(&self, db: &slatedb::Db) -> anyhow::Result<usize> {
+    /// the spaceRev sequenced just before it (`sQ` keeps it: the row that
+    /// held it may be gone, and the row before isn't always it): a syncer
+    /// that's current ignores it, one that missed something sees the gap
+    /// and pulls listRepos. Once per shard open, nothing in steady state.
+    async fn catch_up_registrations(&self, db: &slatedb::Db, epoch: u64) -> anyhow::Result<usize> {
         use crate::state::{self, SpaceId};
         let opts = slatedb::config::ScanOptions::default();
         let mut scan = state::FamilyScan::new(db, state::SPACE_NOTIFY_FAMILY, None, &opts).await?;
@@ -360,9 +365,8 @@ impl Spaces {
             let desc = slatedb::config::ScanOptions::default().with_order(slatedb::IterationOrder::Descending);
             let mut it = db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &desc).await?;
             let Some(last) = it.next().await? else { continue };
-            let prev = it.next().await?.and_then(|kv| rows::seq_rev(&kv.key));
             let Some(space_rev) = rows::seq_rev(&last.key) else { continue };
-            let writer = std::str::from_utf8(&last.value)?.to_string();
+            let rows::SeqRow { prev, writer } = rows::SeqRow::decode(&last.value)?;
             let Some(w) = db.get(state::space_writer_key(&authority, &sid, &writer)).await? else { continue };
             let w = rows::WriterRow::decode(&w)?;
             self.fanout.notify(fanout::Job {
@@ -373,6 +377,7 @@ impl Spaces {
                 repo_rev: w.repo_rev,
                 hash: w.hash,
                 seq: repo::Sequenced { space_rev, prev },
+                epoch,
             });
             sent += 1;
         }

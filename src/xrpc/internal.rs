@@ -371,10 +371,12 @@ async fn put_private(State(app): AppState, headers: HeaderMap, axum::Json(inp): 
     app.partition(&inp.routing)?;
     let sec = state::private_key(&inp.routing, super::server::SEC);
     let touches_sec = muts.iter().any(|m| m.key.starts_with(&sec));
+    let keys: Vec<Mutation> = muts.iter().map(|m| Mutation { key: m.key.clone(), val: None }).collect();
     app.put_private(&inp.routing, muts).await?;
     if touches_sec {
         // a revocation/takedown written from another node: drop our view
         super::server::ctl_changed(&app, &inp.routing);
+        super::space::sec_written(&app, &inp.routing, &keys).await;
     }
     Ok(Json(json!({})))
 }
