@@ -52,6 +52,8 @@ pub fn internal_routes() -> Router<Arc<App>> {
     Router::new()
         .route("/internal/v1/space/revocations/reload", post(internal_reload_revocations))
         .route("/internal/v1/space/notify", post(internal_notify))
+        .route("/internal/v1/space/holdsRepo", get(internal_holds_repo))
+        .route("/internal/v1/space/importCheck", get(super::space_import::internal_import_check))
 }
 
 pub(super) fn spaces(app: &App) -> XResult<&Arc<Spaces>> {
@@ -1439,12 +1441,10 @@ async fn notify_credential_revoked(
     if auth.iss != space.authority {
         return Err(forbidden("Revocation issuer is not the space authority"));
     }
+    // unsure (its shard's owner unreachable) counts as hosted: refusing
+    // would drop a revocation that may be ours
     let hosted = super::syntax::valid_did(&auth.aud)
-        && match super::internal::account_anywhere(&app, &auth.aud).await {
-            Ok(_) => true,
-            Err(e) if e.error == "AccountNotFound" => false,
-            Err(e) => return Err(e),
-        };
+        && !matches!(super::internal::account_anywhere(&app, &auth.aud).await, Err(e) if e.error == "AccountNotFound");
     if !hosted {
         return Err(forbidden("Revocation audience does not match a repo hosted here"));
     }
@@ -1460,8 +1460,10 @@ async fn notify_credential_revoked(
     // so no credential for it reads anything through this audience: there
     // is nothing to enforce, and nothing is written. An authority tells
     // each member's host, addressed to that member.
-    let local_authority = authority_hosted(&app, &space.authority).await?;
-    if !local_authority && !aud_holds_repo(&app, &sp, &space, &auth.aud).await? {
+    // unsure counts as hosted: stored, and blocked alone rather than
+    // escalated past it
+    let local_authority = authority_hosted(&app, &space.authority).await.unwrap_or(true);
+    if !local_authority && !aud_holds_repo(&app, &sp, &space, &auth.aud).await {
         return Ok(StatusCode::OK);
     }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
@@ -1502,12 +1504,42 @@ async fn notify_credential_revoked(
     }
 }
 
-/// Whether the revocation's audience holds a repo in `space` here.
-async fn aud_holds_repo(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
-    match app.partition(aud) {
-        Ok(p) => Ok(load_head(sp, &p, aud, space).await?.is_some()),
-        Err(_) => Ok(false),
-    }
+/// Whether the revocation's audience holds a repo in `space` in this
+/// cluster, asked of its shard's owner. Unsure (the owner unreachable, the
+/// shard moving) is yes: a stored entry is bounded, a dropped revocation
+/// leaves the credential readable.
+async fn aud_holds_repo(app: &App, sp: &Spaces, space: &Space, aud: &str) -> bool {
+    let held = match app.remote_owner(aud) {
+        Some(owner) => {
+            let q = [("did", aud), ("space", space.uri.as_str())];
+            super::internal::owner_get(app, &owner, "/internal/v1/space/holdsRepo", &q)
+                .await
+                .map(|v| v["holds"].as_bool() != Some(false))
+        }
+        None => match app.partition(aud) {
+            Ok(p) => load_head(sp, &p, aud, space).await.map(|h| h.is_some()),
+            Err(e) => Err(e),
+        },
+    };
+    held.unwrap_or_else(|e| {
+        tracing::warn!(space = hex::encode(space.sid), "space revocation stake unknown, stored: {}", e.message);
+        true
+    })
+}
+
+#[derive(Deserialize)]
+struct HoldsQ {
+    did: String,
+    space: String,
+}
+
+/// [`aud_holds_repo`] at the owner of `did`'s shard.
+async fn internal_holds_repo(State(app): AppState, headers: HeaderMap, Query(q): Query<HoldsQ>) -> XResult<Json<J>> {
+    super::internal::check(&app, &headers)?;
+    let sp = spaces(&app)?;
+    let space = Space::parse(&q.space)?;
+    let p = app.partition(&q.did)?;
+    Ok(Json(json!({"holds": load_head(sp, &p, &q.did, &space).await?.is_some()})))
 }
 
 /// Whether the cluster hosts `authority` (a revocation of its space has a
@@ -1575,7 +1607,7 @@ async fn internal_reload_revocations(
     let sp = spaces(&app)?;
     if let Some(space) = &q.block {
         let local = match crate::space::revocations::authority_of(space) {
-            Some(a) => authority_hosted(&app, a).await.unwrap_or(false),
+            Some(a) => authority_hosted(&app, a).await.unwrap_or(true),
             None => false,
         };
         sp.revocations.block(space, local, crate::tid::now_micros() as i64 / 1_000_000);

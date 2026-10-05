@@ -5453,7 +5453,9 @@ credential can be revoked). Only a revocation with a stake here is
 stored: the audience account holds a repo in the space, or its authority
 is hosted here. Any other is answered 200 and dropped, since no credential
 for the space reads anything through that audience (an authority tells
-each member's host, addressed to that member). Stored ones are capped at
+each member's host, addressed to that member). "Here" is the cluster: the
+receiving node asks the owner of the audience's shard, and an answer it
+can't get counts as a stake, so the revocation is stored, never dropped. Stored ones are capped at
 2,000 live entries per authority, 1,000 per space, 5,000 per audience
 account (so one account here and many authorities can't fill it) and
 50,000 (~7 MB) in all, and rate-limited per authority and per audience

@@ -593,6 +593,33 @@ pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
     r.json().await.map_err(|e| upstream(e.without_url()))
 }
 
+/// GET `path` at `owner`, another node: its own 4xx comes back as is,
+/// anything else that isn't a 2xx (or no answer) as an [`upstream`] error.
+pub async fn owner_get(app: &App, owner: &str, path: &str, query: &[(&str, &str)]) -> XResult<J> {
+    let r = app
+        .http
+        .get(format!("{}{path}", owner.trim_end_matches('/')))
+        .header(HDR, &app.config.internal_token)
+        .timeout(OWNER_CALL_TIMEOUT)
+        .query(query)
+        .send()
+        .await
+        .map_err(|e| upstream(e.without_url()))?;
+    if r.status().is_client_error() {
+        let status = r.status();
+        let v: J = r.json().await.unwrap_or_default();
+        return Err(XrpcError {
+            status,
+            error: v["error"].as_str().unwrap_or("InvalidRequest").into(),
+            message: v["message"].as_str().unwrap_or_default().into(),
+        });
+    }
+    if !r.status().is_success() {
+        return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
+    }
+    r.json().await.map_err(|e| upstream(e.without_url()))
+}
+
 /// Single-use claim of an OAuth replay `key` until `until` (unix secs), at
 /// the owner of `routing` so every node agrees, and persisted so a later
 /// owner agrees too. Ok(false) = replayed.
