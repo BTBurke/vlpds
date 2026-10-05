@@ -5445,8 +5445,17 @@ account (so one account here and many authorities can't fill it) and
 50,000 (~7 MB) in all, and rate-limited per authority and per audience
 account. A revocation that can't be stored gets a 503 and blocks that
 space's credentials for 3,610 s, as a block in the object itself, so it
-reaches every node and outlives a restart. Past 10,000 blocked spaces,
-every space credential is refused until they drain: it never fails open.
+reaches every node and outlives a restart. Blocks never fail open, and
+widen only over the party behind them: past 100 blocked spaces of one
+authority (or 10,000 in all) the authority is blocked and its space
+blocks fold into it; past 1,000 blocked authorities every remote
+authority is (a local authority is always blocked alone, so local users'
+spaces keep working), and `vlpds_space_revocations_saturated` pages.
+Only a store outage, where the object can't be written or read, refuses
+every credential (the 6 min staleness cutoff). A block ends 3,610 s after
+it was made, an authority's after the latest block it folded in: it
+stands for revocations of credentials that existed then, all expired by
+that time, and a credential issued after it isn't one of them.
 Appends on a node go one at a time, with at most 8 waiting (more are
 refused, the space blocked), and re-reads take their own lock, so a queue
 of appends can't hold the re-read past the 6 min staleness cutoff and turn

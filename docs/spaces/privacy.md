@@ -126,6 +126,14 @@ hex id and leaves member DIDs and record paths out of its log lines. The two rat
 talks to which authority (`space-credential` and `space-read-credential`) show a keyed hash of the
 pair in the console.
 
+## Revoked credentials
+
+A revoked credential never reads again. When a revocation can't be stored (its caps are full), the
+space's credentials are refused instead, on every node and across restarts, until the credentials
+it named have expired. Past 100 blocked spaces of one authority the whole authority is refused,
+and past 1,000 such authorities every remote authority is, but never one hosted here. Nothing about
+a block fails open ([Revocation](reading.md#revocation)).
+
 ## Takedowns
 
 | Takedown | What happens to space data |

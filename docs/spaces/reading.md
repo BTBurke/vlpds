@@ -146,8 +146,15 @@ Every node reads the object whole, so anyone with a DID could grow it if nothing
   authority telling every member's host about the same credential pays once per host.
 - A revocation that can't be stored gets a 503, and that space's credentials are refused on every
   node for as long as the revocation would have lasted. The block goes in the object, so it
-  outlives a restart. Past 10,000 blocked spaces every space credential is refused until they
-  drain: it never fails open.
+  outlives a restart. It never fails open, and it widens only over the party that caused it:
+  - Over 100 blocked spaces of one authority, the authority is blocked instead (all its spaces),
+    and its space blocks fold into that one. The same happens past 10,000 blocked spaces in all.
+  - Over 1,000 blocked authorities, every remote authority's credentials are refused (503) and
+    `VlpdsSpaceRevocationsSaturated` fires. Spaces whose authority is hosted here keep working, and
+    a local authority is always blocked on its own.
+  - Every block ends 3,610 s after it was made (an authority's, after the latest one it folded
+    in). A block stands for revocations of credentials that existed when it was made, and each of
+    those has expired by then. A credential issued later isn't one of them.
 - A node runs one append at a time and refuses a ninth waiting one (blocking its space). Re-reads
   don't wait behind appends, so a flood can't make the set go stale.
 

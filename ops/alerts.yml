@@ -1235,6 +1235,19 @@ groups:
           summary: "{{ $value | humanizePercentage }} of space notifies forwarded to syncers from {{ $labels.instance }} fail"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacenotifyfanoutfailing"
 
+      # The revocation blocks are saturated: over 1,000 authorities each had
+      # over 100 spaces' revocations refused, so every remote authority's
+      # credentials are refused (local ones keep working). Someone is
+      # flooding revocations, or the caps are far too low (design: blocks
+      # never fail open).
+      - alert: VlpdsSpaceRevocationsSaturated
+        expr: max by (instance) (vlpds_space_revocations_saturated{job="vlpds"}) > 0
+        labels:
+          severity: page
+        annotations:
+          summary: "{{ $labels.instance }}: space revocation blocks are saturated; every remote space authority's credentials are refused"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacerevocationssaturated"
+
       # Over a quarter of space credential reads are refused, at over 0.5/s,
       # for 15 min (guess). Expired credentials are left out: clients fetch a
       # new one when theirs runs out.

@@ -868,6 +868,57 @@ async fn a_revocation_flood_never_refuses_other_authorities() {
     assert!(!spaces(&s).revocations.is_blocked(&lsp, 0));
 }
 
+/// An account here staking its own remote authorities' revocations past
+/// every cap blocks their spaces, then those authorities, then every remote
+/// authority, but never a local authority's spaces: their credentials keep
+/// reading. The saturation shows on its metric.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn saturated_blocks_never_refuse_local_authorities() {
+    use vlpds::space::revocations::BlockCaps;
+    let s = spawn().await;
+    let (local, attacker) = (SpaceClient::new(&s, "rsl", SCOPE).await, SpaceClient::new(&s, "rsa", ANY_SCOPE).await);
+    let mine = local.create_space(TYPE, "main").await;
+    local.create_record(&mine, COLL, Some("r"), rec("x")).await.ok();
+    let cred = local.credential(&mine).await;
+    let q = record_q(&mine, &local.did, "r");
+    local.signed_get(&s.url, "com.atproto.space.getRecord", &q, &cred, &local.did).await.ok();
+    let rv = &spaces(&s).revocations;
+    rv.set_caps(1, 100, 100, 100);
+    rv.set_block_caps(BlockCaps { per_authority: 2, spaces: 100, authorities: 2 });
+    let first = Stub::new().await;
+    let fill = first.space("fill");
+    attacker.create_record(&fill, COLL, Some("r"), rec("f")).await.ok();
+    revoke(&s, &first.service_jwt(&attacker.did, REVOKE), &fill, &["f"]).await.ok();
+    // three remote authorities, three spaces each, every revocation refused
+    let mut stubs = Vec::new();
+    for _ in 0..3 {
+        let st = Stub::new().await;
+        for k in 0..3 {
+            let sp = st.space(&format!("s{k}"));
+            attacker.create_record(&sp, COLL, Some("r"), rec("y")).await.ok();
+            revoke(&s, &st.service_jwt(&attacker.did, REVOKE), &sp, &["j"]).await.err(503, "Unavailable");
+        }
+        stubs.push(st);
+    }
+    // (what the saturated gauge reports; the gauge is process-wide, and
+    // other tests' nodes set it too)
+    assert!(rv.saturated(0));
+    assert_eq!(rv.blocks(0), (0, 2));
+    // a remote authority's credential is refused, even one never blocked
+    let holder = Holder::new();
+    let other = first.space("other");
+    attacker.create_record(&other, COLL, Some("r"), rec("z")).await.ok();
+    let rcred = first.credential(&other, &holder, "fresh", 0, 600);
+    let rq = record_q(&other, &attacker.did, "r");
+    signed_get_as(&attacker.srv.http, &holder, &s.url, "com.atproto.space.getRecord", &rq, &rcred, &attacker.did)
+        .await
+        .err(503, "Unavailable");
+    // a local authority's spaces keep working
+    local.signed_get(&s.url, "com.atproto.space.getRecord", &q, &cred, &local.did).await.ok();
+    let fresh = local.credential(&mine).await;
+    local.signed_get(&s.url, "com.atproto.space.getRecord", &q, &fresh, &local.did).await.ok();
+}
+
 /// A shard's `sP` rescan (what a takeover or a restart runs) sends what's
 /// owed even past rows that don't decode: those are skipped, not the shard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

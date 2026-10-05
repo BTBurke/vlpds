@@ -1457,23 +1457,24 @@ async fn notify_credential_revoked(
     // so no credential for it reads anything through this audience: there
     // is nothing to enforce, and nothing is written. An authority tells
     // each member's host, addressed to that member.
-    if !revocation_staked(&app, &sp, &space, &auth.aud).await? {
+    let local_authority = authority_hosted(&app, &space.authority).await?;
+    if !local_authority && !aud_holds_repo(&app, &sp, &space, &auth.aud).await? {
         return Ok(StatusCode::OK);
     }
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE], &auth.iss, new.len() as u32)?;
     crate::ratelimit::check(&[&crate::ratelimit::SPACE_REVOKE_AUD], &auth.aud, new.len() as u32)?;
-    match sp.revoke(&app.store, &space.uri, &auth.aud, &new).await {
+    match sp.revoke(&app.store, &space.uri, &auth.aud, &new, local_authority).await {
         Ok(Ok(wrote)) => {
             if wrote {
                 nudge_revocation_peers(&app, None).await;
             }
             Ok(StatusCode::OK)
         }
-        Ok(Err(refused)) => {
-            nudge_revocation_peers(&app, Some(&space.uri)).await;
+        Ok(Err((refused, in_object))) => {
+            nudge_revocation_peers(&app, (!in_object).then_some(space.uri.as_str())).await;
             tracing::warn!(
                 space = hex::encode(space.sid),
-                ?refused,
+                refused = refused.as_str(),
                 "space revocation not stored: the space is blocked"
             );
             Err(XrpcError::unavailable("Unavailable", "revocation not stored: too many revocations held; retry later"))
@@ -1482,15 +1483,18 @@ async fn notify_credential_revoked(
     }
 }
 
-/// Whether an account here has a stake in `space`: it governs it, or the
-/// revocation's audience holds a repo in it.
-async fn revocation_staked(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
-    if let Ok(p) = app.partition(aud) {
-        if load_head(sp, &p, aud, space).await?.is_some() {
-            return Ok(true);
-        }
+/// Whether the revocation's audience holds a repo in `space` here.
+async fn aud_holds_repo(app: &App, sp: &Spaces, space: &Space, aud: &str) -> XResult<bool> {
+    match app.partition(aud) {
+        Ok(p) => Ok(load_head(sp, &p, aud, space).await?.is_some()),
+        Err(_) => Ok(false),
     }
-    match super::internal::account_anywhere(app, &space.authority).await {
+}
+
+/// Whether the cluster hosts `authority` (a revocation of its space has a
+/// stake here, and its blocks never escalate to every remote authority).
+pub(super) async fn authority_hosted(app: &App, authority: &str) -> XResult<bool> {
+    match super::internal::account_anywhere(app, authority).await {
         Ok(_) => Ok(true),
         Err(e) if e.error == "AccountNotFound" => Ok(false),
         Err(e) => Err(e),
@@ -1551,7 +1555,11 @@ async fn internal_reload_revocations(
     super::internal::check(&app, &headers)?;
     let sp = spaces(&app)?;
     if let Some(space) = &q.block {
-        sp.revocations.block(space, crate::tid::now_micros() as i64 / 1_000_000);
+        let local = match crate::space::revocations::authority_of(space) {
+            Some(a) => authority_hosted(&app, a).await.unwrap_or(false),
+            None => false,
+        };
+        sp.revocations.block(space, local, crate::tid::now_micros() as i64 / 1_000_000);
     }
     sp.refresh_revocations(&app.store)
         .await
