@@ -1,0 +1,3 @@
+# seeded test passwords (boards/ui.mjs) and the built UI
+.local/
+web/dist/

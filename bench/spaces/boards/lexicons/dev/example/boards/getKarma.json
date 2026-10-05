@@ -1,0 +1,13 @@
+{
+  "lexicon": 1,
+  "id": "dev.example.boards.getKarma",
+  "defs": {
+    "main": {
+      "type": "query",
+      "description": "A member's karma in a board: the scores of their posts and comments. Viewers authenticate with a space credential for the board (Authorization: Atproto-Space, audience = this appview's DID).",
+      "parameters": { "type": "params", "required": ["board", "actor"], "properties": { "board": { "type": "string", "format": "uri" }, "actor": { "type": "string", "format": "did" } } },
+      "output": { "encoding": "application/json", "schema": { "type": "object", "required": ["post", "comment", "total"], "properties": { "post": { "type": "integer" }, "comment": { "type": "integer" }, "total": { "type": "integer" } } } },
+      "errors": [{ "name": "BoardNotFound" }, { "name": "AuthRequired" }]
+    }
+  }
+}

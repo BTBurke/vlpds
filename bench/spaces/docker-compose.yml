@@ -1,0 +1,168 @@
+# Local stand-ins for the Spaces harness (README.md): a PLC directory, two
+# reference PDSes (ref-a, ref-b) at the Spaces alpha, and MinIO for vlpds.
+# Nothing here talks to the public network once the images exist.
+#
+# Every service URL is http://localhost:<port>, on the host and inside each
+# reference PDS: a PDS shares the network namespace of a small socat sidecar
+# (net-a, net-b) that forwards the other harness ports to the other PDS or to
+# the host (vlpds, the driver's syncer and fault proxies). So a DID document
+# says the same thing to everyone who reads it.
+name: vlpds-spaces
+
+x-ref-pds: &ref-pds
+  # The reference PDS at the pin, built natively by run.sh (refpds.sh) from
+  # .scratch/atproto. The published ghcr.io/bluesky-social/atproto:pds-spaces-alpha
+  # (79d6307e, the same packages as the pin) is amd64 only; REF_PDS_IMAGE
+  # points at it on a host that can run it.
+  image: ${REF_PDS_IMAGE:-vlpds-spaces-refpds:5b95b2f2}
+  pull_policy: never
+  depends_on:
+    plc:
+      condition: service_healthy
+  tmpfs: /pds
+  mem_limit: 1g
+
+x-ref-env: &ref-env
+  PDS_HOSTNAME: localhost
+  PDS_DEV_MODE: "true"
+  PDS_DATA_DIRECTORY: /pds
+  PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+  PDS_JWT_SECRET: spaces-e2e-jwt-secret
+  PDS_ADMIN_PASSWORD: spaces-e2e-admin
+  PDS_DID_PLC_URL: http://plc:2582
+  PDS_INVITE_REQUIRED: "false"
+  PDS_CRAWLERS: ""
+  PDS_BSKY_APP_VIEW_URL: http://127.0.0.1:9
+  PDS_BSKY_APP_VIEW_DID: did:web:appview.invalid
+  PDS_RATE_LIMITS_ENABLED: "false"
+  LOG_ENABLED: "true"
+  LOG_LEVEL: ${REF_LOG_LEVEL:-info}
+
+x-net: &net
+  image: alpine/socat:1.8.0.3
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - |
+      for p in $$(seq $${FWD_FIRST} $${FWD_LAST}); do
+        [ "$$p" = "$$SELF" ] && continue
+        case "$$p" in
+          $${REF_A_PORT}) t=net-a ;;
+          $${REF_B_PORT}) t=net-b ;;
+          *) t=host.docker.internal ;;
+        esac
+        socat TCP-LISTEN:$$p,fork,reuseaddr TCP:$$t:$$p &
+        # "localhost" may resolve to ::1 first
+        socat TCP6-LISTEN:$$p,fork,reuseaddr,ipv6only=1 TCP:$$t:$$p 2>/dev/null &
+      done
+      wait
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  mem_limit: 64m
+
+services:
+  plc-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    tmpfs: /var/lib/postgresql/data
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  # did-method-plc publishes amd64-only images; built from source (the same
+  # pin as bench/migrate, so the image is shared) so it runs natively
+  plc:
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git#9c8ea2fe23b89a5c1011246cbb4957dad9dbf7db
+      dockerfile: packages/server/Dockerfile
+    image: vlpds-migrate-plc:9c8ea2f
+    depends_on:
+      plc-db:
+        condition: service_healthy
+    environment:
+      DB_CREDS_JSON: '{"host":"plc-db","password":"postgres"}'
+      DB_MIGRATE_CREDS_JSON: '{"host":"plc-db","password":"postgres"}'
+      ENABLE_MIGRATIONS: "true"
+      PORT: "2582"
+    ports:
+      - "127.0.0.1:${PLC_PORT:-2860}:2582"
+    mem_limit: 256m
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:2582/_health"]
+      interval: 1s
+      retries: 60
+
+  net-a:
+    <<: *net
+    environment: &net-env
+      SELF: ${REF_A_PORT:-2861}
+      REF_A_PORT: ${REF_A_PORT:-2861}
+      REF_B_PORT: ${REF_B_PORT:-2862}
+      FWD_FIRST: ${FWD_FIRST:-2861}
+      FWD_LAST: ${FWD_LAST:-2889}
+    ports:
+      - "127.0.0.1:${REF_A_PORT:-2861}:${REF_A_PORT:-2861}"
+
+  net-b:
+    <<: *net
+    environment:
+      <<: *net-env
+      SELF: ${REF_B_PORT:-2862}
+    ports:
+      - "127.0.0.1:${REF_B_PORT:-2862}:${REF_B_PORT:-2862}"
+
+  ref-a:
+    <<: *ref-pds
+    network_mode: service:net-a
+    environment:
+      <<: *ref-env
+      PDS_PORT: "${REF_A_PORT:-2861}"
+      # test-only rotation key; the harness signs PLC ops for ref-a accounts with it
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: 5c4e2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0918f7e6d5c4b3a291807f6e
+    healthcheck: &ref-health
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${REF_A_PORT:-2861}/xrpc/_health"]
+      interval: 2s
+      retries: 90
+
+  ref-b:
+    <<: *ref-pds
+    network_mode: service:net-b
+    environment:
+      <<: *ref-env
+      PDS_PORT: "${REF_B_PORT:-2862}"
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: 6d5f3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0918f7e6d5c4b3a291807f
+    healthcheck:
+      <<: *ref-health
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${REF_B_PORT:-2862}/xrpc/_health"]
+
+  # vlpds's bucket: persistence across kill -9, and request counters for the
+  # bucket-ops-per-write cost (/minio/v2/metrics/cluster, public in this stack)
+  minio:
+    # the repo's MinIO image (MinIO no longer publishes one); shared with build/ and bench/ha
+    build:
+      context: ../../build
+      dockerfile: Dockerfile.minio
+    image: vlpds-minio:local
+    command: server /data --address :9000
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    tmpfs: /data
+    ports:
+      - "127.0.0.1:${MINIO_PORT:-2868}:9000"
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 1s
+      retries: 60
+
+  minio-init:
+    image: vlpds-minio:local
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "mc alias set m http://minio:9000 minioadmin minioadmin >/dev/null && mc mb -p m/vlpds"]
+    restart: "no"

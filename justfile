@@ -106,6 +106,39 @@ migrate-spaces-e2e:
 passkeys-e2e:
     bench/passkeys/run.sh
 
+# Spaces e2e matrix (bench/spaces/README.md): local PLC, two reference PDSes at the Spaces alpha and MinIO in
+# docker, vlpds from the newest spaces branch; each role on vlpds or a reference PDS, pass / fail / not impl. per step
+# (configs: ref-ref vlpds-authority ref-authority vlpds-only; default all; KEEP=1 leaves it up, CLUSTER=1 for 3 nodes)
+spaces-e2e *configs:
+    bench/spaces/run.sh e2e {{configs}}
+
+# Randomized Spaces workload with invariants (no lost acked write, syncers converge, LtHash, spaceRev order);
+# scale: small | medium | large | <ops>; HOSTS=ref-a,ref-b runs it all-ref
+spaces-sim seed="1" scale="small":
+    bench/spaces/run.sh sim {{seed}} {{scale}}
+
+# The sim under faults: notify drops/delays/duplicates on both hops, vlpds kill -9 and SIGTERM mid-burst
+# (CLUSTER=1: a node dies, its shards move), syncer restarts; the same invariants after recovery
+spaces-fault seed="1" scale="small":
+    bench/spaces/run.sh fault {{seed}} {{scale}}
+
+# Spaces sync cost against the targets: no-op poll and delta pull server time, notify latency, bucket ops per
+# space write, public commit p99 under a space write load, warm sequential write latency with vlpds's commit
+# stages (host: vlpds | ref-a; steps: a comma list, e.g. `just spaces-cost vlpds warm-writes`)
+spaces-cost host="vlpds" steps="":
+    bench/spaces/run.sh cost {{host}} {{steps}}
+
+# boards, a Reddit-like private board on Spaces (bench/spaces/boards/README.md): user stories against its appview's
+# API and direct space reads (configs: all-vlpds vlpds-owner ref-owner; default all; CLUSTER=1 adds the kill -9 story)
+spaces-boards *configs:
+    bench/spaces/run.sh boards {{configs}}
+
+# The boards web UI on the local stack until Ctrl-C: vlpds (--spaces --dev-mode), the appview and UI on
+# http://127.0.0.1:2888, a seeded demo board (handles printed; passwords in bench/spaces/boards/.local/);
+# UI_E2E=1 instead runs the headless two-person check (screenshots in bench/spaces/out/boards-ui/) and exits
+spaces-boards-ui:
+    bench/spaces/run.sh boards-ui
+
 # The WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs; its own crate, since passkey-types
 # turns on serde_json's preserve_order, which would change every vlpds test build
 passkey-differential:
