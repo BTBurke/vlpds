@@ -27,6 +27,7 @@
 
 pub mod attestation;
 pub mod car;
+pub mod check;
 pub mod commit;
 pub mod credcache;
 pub mod fanout;

@@ -119,6 +119,10 @@ pub enum Cmd {
     /// Check a repo's stored state (commit, records, MST, persisted nodes,
     /// indexes); exits 1 if anything is wrong.
     CheckRepo { did: String },
+    /// Check an account's repo in one space (records against the head's set
+    /// hash and count, the oplog against the records, the notify outbox and
+    /// the space host's rows); exits 1 if anything is wrong.
+    CheckSpace { did: String, space: String },
     /// Re-derive a repo from its records and sign a new commit, #sync
     /// (script rebuild-repo).
     RebuildRepo {
@@ -448,6 +452,22 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             }
             if r["ok"] != json!(true) {
                 bail!("{did}: {} problem(s)", r["problems"].as_array().map_or(0, Vec::len));
+            }
+            Ok(())
+        }
+        Cmd::CheckSpace { did, space } => {
+            check_did(&did)?;
+            if !space.starts_with("at://") {
+                bail!("space must be a space URI (at://{{authority}}/space/{{type}}/{{skey}}): {space}");
+            }
+            let r = c.get("vlpds.admin.checkSpace", &[("did", &did), ("space", &space)]).await?;
+            if opts.json {
+                pretty(out, &r)?;
+            } else {
+                write_space_check(out, &r)?;
+            }
+            if r["ok"] != json!(true) {
+                bail!("{did} in {space}: {} problem(s)", r["problems"].as_array().map_or(0, Vec::len));
             }
             Ok(())
         }
@@ -939,6 +959,58 @@ fn write_check(out: &mut dyn Write, r: &J) -> Result<()> {
         s(&ix["blobRefExtra"]),
         s(&ix["collectionsMissing"])
     )?;
+    for p in r["problems"].as_array().into_iter().flatten() {
+        writeln!(out, "  - {}", s(p))?;
+    }
+    Ok(())
+}
+
+fn write_space_check(out: &mut dyn Write, r: &J) -> Result<()> {
+    let ok = if r["ok"] == json!(true) { "ok" } else { "PROBLEMS" };
+    writeln!(out, "Repo         : {} in {} ({ok})", s(&r["did"]), s(&r["space"]))?;
+    match r["head"].is_null() {
+        true => writeln!(out, "Head         : none")?,
+        false => writeln!(
+            out,
+            "Head         : rev {} records {} hash {}",
+            s(&r["head"]["rev"]),
+            s(&r["head"]["records"]),
+            s(&r["head"]["hash"])
+        )?,
+    }
+    let rec = &r["records"];
+    writeln!(
+        out,
+        "Records      : {} ({} bad), rehash {} (matches head: {})",
+        s(&rec["count"]),
+        s(&rec["badCount"]),
+        s(&rec["rehash"]),
+        s(&rec["matchesHead"])
+    )?;
+    let ol = &r["oplog"];
+    writeln!(
+        out,
+        "Oplog        : {} op(s) in {} rev(s), {} .. {} ({})",
+        s(&ol["ops"]),
+        s(&ol["revs"]),
+        s(&ol["oldestRev"]),
+        s(&ol["newestRev"]),
+        if ol["complete"] == json!(true) { "complete" } else { "window" }
+    )?;
+    if !r["outbox"].is_null() {
+        writeln!(out, "Outbox       : notify owed for rev {}", s(&r["outbox"]["repoRev"]))?;
+    }
+    if !r["host"].is_null() {
+        let h = &r["host"];
+        writeln!(
+            out,
+            "Space host   : {} writer(s), {} listRepos row(s), max spaceRev {}{}",
+            s(&h["writers"]),
+            s(&h["seq"]),
+            s(&h["maxSpaceRev"]),
+            if h["live"] == json!(true) { "" } else { " (deleted)" }
+        )?;
+    }
     for p in r["problems"].as_array().into_iter().flatten() {
         writeln!(out, "  - {}", s(p))?;
     }
