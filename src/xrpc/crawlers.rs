@@ -114,11 +114,19 @@ impl Crawlers {
     }
 
     /// The configured relay a firehose subscriber looks like: its address is
-    /// one the relay's hostname resolves to, or its user agent names the
-    /// hostname. Answers from a cache and never waits on DNS or the bucket
-    /// (a stale cache is refreshed in the background, so a relay connecting
-    /// right after startup may go unnamed).
-    pub fn relay_hint(self: &Arc<Self>, store: &Store, ip: Option<std::net::IpAddr>, ua: &str) -> Option<String> {
+    /// one the relay's hostname resolves to, its user agent names the
+    /// hostname, or its forward-confirmed PTR name (`verified_ptr`, see
+    /// `crate::ptr`) is in the hostname's domain. Answers from a cache and
+    /// never waits on DNS or the bucket (a stale cache is refreshed in the
+    /// background, so a relay connecting right after startup may go
+    /// unnamed).
+    pub fn relay_hint(
+        self: &Arc<Self>,
+        store: &Store,
+        ip: Option<std::net::IpAddr>,
+        ua: &str,
+        verified_ptr: Option<&str>,
+    ) -> Option<String> {
         self.refresh_hints(store);
         let ip = ip.map(|i| i.to_canonical());
         let ua = ua.to_ascii_lowercase();
@@ -126,7 +134,9 @@ impl Crawlers {
         h.relays
             .iter()
             .find(|(_, host, ips)| {
-                ip.is_some_and(|i| ips.contains(&i)) || (!host.is_empty() && ua.contains(host.as_str()))
+                ip.is_some_and(|i| ips.contains(&i))
+                    || (!host.is_empty() && ua.contains(host.as_str()))
+                    || verified_ptr.is_some_and(|p| in_domain(p, host))
             })
             .map(|(r, ..)| r.clone())
     }
@@ -165,6 +175,15 @@ impl Crawlers {
             h.refreshing = false;
         });
     }
+}
+
+/// `name` is `domain` or a name under it; an address literal is no domain.
+fn in_domain(name: &str, domain: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty() || domain.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    name == domain || name.strip_suffix(domain).is_some_and(|rest| rest.ends_with('.'))
 }
 
 /// A relay as stored and used as the metric label: a lowercase hostname
@@ -714,6 +733,48 @@ mod tests {
         doc.interval_secs = Some(5);
         assert!(c.relays(&doc).is_empty());
         assert_eq!(c.interval(&doc), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn ptr_domain_match() {
+        assert!(in_domain("relay1.us-east.bsky.network", "bsky.network"));
+        assert!(in_domain("Bsky.Network.", "bsky.network"));
+        assert!(!in_domain("evilbsky.network", "bsky.network"));
+        assert!(!in_domain("bsky.network.evil.example", "bsky.network"));
+        assert!(!in_domain("1.2.3.4", "1.2.3.4"));
+        assert!(!in_domain("anything", ""));
+    }
+
+    #[tokio::test]
+    async fn relay_hint_through_a_verified_ptr() {
+        let c = Arc::new(Crawlers::new(&["bsky.network".into(), "relay.example.com:8443".into()], DEFAULT_INTERVAL));
+        {
+            let mut h = c.hints.lock();
+            h.relays = vec![
+                ("bsky.network".into(), "bsky.network".into(), vec!["192.0.2.1".parse().unwrap()]),
+                ("relay.example.com:8443".into(), "relay.example.com".into(), vec![]),
+            ];
+            h.refreshed = Some(std::time::Instant::now());
+        }
+        let store = Store::memory(None);
+        let other: Option<std::net::IpAddr> = Some("198.51.100.9".parse().unwrap());
+        let ua = "indigo-relay (atproto-relay)";
+        assert_eq!(c.relay_hint(&store, other, ua, None), None);
+        assert_eq!(
+            c.relay_hint(&store, other, ua, Some("relay1.us-west.bsky.network")).as_deref(),
+            Some("bsky.network")
+        );
+        assert_eq!(
+            c.relay_hint(&store, other, ua, Some("a.relay.example.com")).as_deref(),
+            Some("relay.example.com:8443")
+        );
+        assert_eq!(c.relay_hint(&store, other, ua, Some("bsky.network.evil.example")), None);
+        // the address and user agent still match on their own
+        assert_eq!(c.relay_hint(&store, Some("192.0.2.1".parse().unwrap()), "", None).as_deref(), Some("bsky.network"));
+        assert_eq!(
+            c.relay_hint(&store, other, "relay.example.com/1.0", None).as_deref(),
+            Some("relay.example.com:8443")
+        );
     }
 
     #[test]

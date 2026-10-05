@@ -1,5 +1,6 @@
 #![allow(clippy::type_complexity)]
 
+pub mod asn;
 pub mod auth;
 pub mod backfill;
 pub mod backlinks;
@@ -38,6 +39,7 @@ pub mod partitions;
 pub mod peer_tls;
 pub mod plc;
 pub mod profiling;
+pub mod ptr;
 pub mod ratelimit;
 pub mod real_dist;
 pub mod recent_writes;

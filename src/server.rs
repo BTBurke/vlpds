@@ -109,6 +109,12 @@ pub struct Config {
     pub mod_service_did: Option<String>,
     /// None: the system resolver; tests inject a stub.
     pub txt_resolver: Option<crate::handle_resolver::TxtResolverRef>,
+    /// Firehose subscribers' reverse DNS. None: the system resolver; tests
+    /// inject a stub.
+    pub ptr_resolver: Option<crate::ptr::PtrResolverRef>,
+    /// The whois server (`host:port`) asked for firehose subscribers' AS.
+    /// None: no lookups.
+    pub asn_whois: Option<String>,
     /// None: the SSRF-guarded HTTPS fetch; tests inject a stub.
     pub well_known_fetcher: Option<crate::handle_resolver::WellKnownRef>,
     /// None: node id "single", addr = public_url.
@@ -300,6 +306,8 @@ impl Default for Config {
             invite_epoch_ms: 0,
             mod_service_did: None,
             txt_resolver: None,
+            ptr_resolver: None,
+            asn_whois: None,
             well_known_fetcher: None,
             rate_limits_enabled: true,
             trusted_proxies: Vec::new(),
@@ -548,6 +556,8 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         http,
         ratelimit: Arc::new(crate::ratelimit::Limiter::new(&cfg)),
         crawlers: Arc::new(xrpc::crawlers::Crawlers::new(&cfg.crawlers, cfg.crawl_interval)),
+        ptr: crate::ptr::PtrCache::new(cfg.ptr_resolver.as_ref()),
+        asn: crate::asn::AsnCache::new(cfg.asn_whois.clone()),
         secrets,
         plc,
         config: Arc::new(cfg),

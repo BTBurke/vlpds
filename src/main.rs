@@ -388,6 +388,11 @@ struct Args {
     /// activity (the reference's 20 min). The console's value overrides it.
     #[arg(long, env = "VLPDS_CRAWL_INTERVAL_SECS", default_value_t = 1200, value_parser = clap::value_parser!(u64).range(1..=604_800))]
     crawl_interval_secs: u64,
+    /// Where the console's firehose page looks up each subscriber's origin
+    /// AS: bgp.tools' whois (subscriber addresses are sent there, batched
+    /// and cached), or off.
+    #[arg(long, env = "VLPDS_ASN_LOOKUP", value_enum, default_value_t = AsnLookup::BgpTools)]
+    asn_lookup: AsnLookup,
     /// Dev mode: email/password tokens are logged instead of mailed, and the
     /// well-known dev secrets are accepted.
     #[arg(long, env = "VLPDS_DEV_MODE")]
@@ -1061,6 +1066,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum AsnLookup {
+    Off,
+    #[value(name = "bgp.tools")]
+    BgpTools,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum LogFormat {
     /// Human-readable lines; ANSI colour only when stderr is a terminal and
     /// NO_COLOR is unset.
@@ -1420,6 +1432,8 @@ async fn run(args: Args) -> anyhow::Result<()> {
             .unwrap_or(0),
         mod_service_did: flag_or_env(&args.mod_service_did, "PDS_MOD_SERVICE_DID"),
         txt_resolver: None,
+        ptr_resolver: None,
+        asn_whois: (args.asn_lookup == AsnLookup::BgpTools).then(|| vlpds::asn::BGP_TOOLS.to_string()),
         well_known_fetcher: None,
         rate_limits_enabled: !args.no_rate_limits,
         resolve_lexicons: args.resolve_lexicons.then_some(vlpds::lexicon::RESOLVE_TIMEOUT),

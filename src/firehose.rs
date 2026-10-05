@@ -1524,6 +1524,20 @@ pub struct SubscriberView {
     pub conn: String,
     pub labelled: bool,
     pub ip: Option<String>,
+    /// The address's PTR name (filled in by the listing, from `ptr`'s cache).
+    #[serde(default)]
+    pub ptr: Option<String>,
+    /// `ptr` resolves back to the address; an unverified name is anyone's
+    /// claim.
+    #[serde(default)]
+    pub ptr_verified: bool,
+    /// Its origin AS (from `asn`'s cache).
+    #[serde(default)]
+    pub asn: Option<u32>,
+    #[serde(default)]
+    pub as_name: Option<String>,
+    #[serde(default)]
+    pub as_country: Option<String>,
     pub user_agent: String,
     pub relay: Option<String>,
     pub connected_at: u64,
@@ -1564,6 +1578,11 @@ impl Firehose {
                 conn: e.id.to_string(),
                 labelled: e.labelled,
                 ip: e.ip.map(|ip| ip.to_canonical().to_string()),
+                ptr: None,
+                ptr_verified: false,
+                asn: None,
+                as_name: None,
+                as_country: None,
                 user_agent: e.user_agent.clone(),
                 relay: e.relay.clone(),
                 connected_at: e.connected_at_ms,

@@ -116,6 +116,9 @@ pub struct App {
     pub node: Arc<crate::node::Node>,
     pub ratelimit: Arc<crate::ratelimit::Limiter>,
     pub crawlers: Arc<crawlers::Crawlers>,
+    /// Firehose subscribers' reverse DNS and origin AS, for the console.
+    pub ptr: Arc<crate::ptr::PtrCache>,
+    pub asn: Arc<crate::asn::AsnCache>,
     pub secrets: Arc<crate::secrets::Secrets>,
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
