@@ -1,0 +1,13 @@
+{
+  "lexicon": 1,
+  "id": "dev.example.boards.board",
+  "defs": {
+    "main": {
+      "type": "space",
+      "name": "Board",
+      "description": "A private message board: posts, threaded comments and votes from its members.",
+      "key": "any",
+      "collections": ["dev.example.boards.settings", "dev.example.boards.post", "dev.example.boards.comment", "dev.example.boards.vote"]
+    }
+  }
+}

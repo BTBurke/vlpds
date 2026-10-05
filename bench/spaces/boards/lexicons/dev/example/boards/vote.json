@@ -1,0 +1,20 @@
+{
+  "lexicon": 1,
+  "id": "dev.example.boards.vote",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "One vote per member per subject: the rkey is derived from the subject URI, so a changed vote is a putRecord and an unvote a deleteRecord.",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["subject", "direction", "createdAt"],
+        "properties": {
+          "subject": { "type": "string", "format": "uri", "description": "A post or comment URI." },
+          "direction": { "type": "string", "knownValues": ["up", "down"] },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    }
+  }
+}

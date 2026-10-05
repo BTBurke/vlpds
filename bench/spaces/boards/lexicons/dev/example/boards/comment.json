@@ -1,0 +1,20 @@
+{
+  "lexicon": 1,
+  "id": "dev.example.boards.comment",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["subject", "body", "createdAt"],
+        "properties": {
+          "subject": { "type": "string", "format": "uri", "description": "The post's space record URI." },
+          "parent": { "type": "string", "format": "uri", "description": "The comment this replies to; absent for a top-level comment." },
+          "body": { "type": "string", "maxLength": 20000, "maxGraphemes": 5000 },
+          "createdAt": { "type": "string", "format": "datetime" }
+        }
+      }
+    }
+  }
+}

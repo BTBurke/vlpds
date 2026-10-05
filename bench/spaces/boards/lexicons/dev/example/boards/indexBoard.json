@@ -1,0 +1,13 @@
+{
+  "lexicon": 1,
+  "id": "dev.example.boards.indexBoard",
+  "defs": {
+    "main": {
+      "type": "procedure",
+      "description": "Ask the appview to index a board. Its owner first adds the appview's account as a read-only member; the appview then registers for the board's notifies and syncs it. Owner auth: a space credential issued to the board's owner.",
+      "input": { "encoding": "application/json", "schema": { "type": "object", "required": ["board"], "properties": { "board": { "type": "string", "format": "uri" } } } },
+      "output": { "encoding": "application/json", "schema": { "type": "object", "required": ["board"], "properties": { "board": { "type": "string", "format": "uri" }, "spaceRev": { "type": "string" } } } },
+      "errors": [{ "name": "NotAMember", "description": "The appview's account can't get a credential for the board." }, { "name": "AuthRequired" }]
+    }
+  }
+}

@@ -7,6 +7,8 @@
 #   bench/spaces/run.sh sim [seed] [scale]      (just spaces-sim)
 #   bench/spaces/run.sh fault [seed]            (just spaces-fault)
 #   bench/spaces/run.sh cost                    (just spaces-cost)
+#   bench/spaces/run.sh boards [config ...]     (just spaces-boards; boards/README.md)
+#   bench/spaces/run.sh boards-ui               (just spaces-boards-ui; UI_E2E=1 runs the headless check and exits)
 #
 # Env: VLPDS_BIN (skip the build), BRANCH (default: origin/spaces-1, else
 # origin/spaces-0), CLUSTER=1 (3 vlpds nodes on MinIO behind a balancer),
@@ -54,5 +56,21 @@ case "$mode" in
   sim) node sim.mjs "$@" ;;
   fault) FAULTS=1 node sim.mjs "$@" ;;
   cost) node cost.mjs "$@" ;;
-  *) echo "unknown mode $mode (e2e | sim | fault | cost)" >&2; exit 2 ;;
+  boards) node boards/scenarios.mjs "$@" ;;
+  boards-ui)
+    (cd boards/web && npm install --no-audit --no-fund --silent && npm run build --silent) >/dev/null
+    if [ "${UI_E2E:-}" = 1 ]; then
+      rm -f boards/.local/seed-accounts.json
+      node boards/ui.mjs &
+      ui=$!
+      until [ -f boards/.local/seed-accounts.json ]; do kill -0 "$ui" 2>/dev/null || exit 1; sleep 1; done
+      rc=0
+      (cd boards/web && npx playwright install chromium >/dev/null && node e2e.mjs) || rc=$?
+      kill "$ui"
+      wait "$ui" || true
+      exit "$rc"
+    fi
+    node boards/ui.mjs
+    ;;
+  *) echo "unknown mode $mode (e2e | sim | fault | cost | boards | boards-ui)" >&2; exit 2 ;;
 esac

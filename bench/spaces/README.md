@@ -12,6 +12,9 @@ just spaces-cost                 # server time, notify latency and bucket ops ag
 just spaces-cost vlpds warm-writes   # only the warm write-latency step (ref-a for the reference)
 ```
 
+`just spaces-boards` runs boards, a Reddit-like private board app on Spaces, through its user stories,
+and `just spaces-boards-ui` serves its web UI on this stack (boards/README.md).
+
 Everything runs on this machine, and nothing talks to the real PLC, a relay or bsky. Accounts,
 passwords and keys are generated per run (or are fixed test values in this directory).
 
