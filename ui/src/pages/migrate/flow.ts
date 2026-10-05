@@ -7,6 +7,7 @@
 import { call, XrpcError, type CallOpts, type Session } from '../../lib/xrpc'
 import { fetchOk, httpError, quickServerErrors, retry, sleep } from '../../lib/backoff'
 import type { RecordCounts } from './count'
+import type { SpaceMove } from './spaces'
 
 export type Tokens = { accessJwt: string; refreshJwt: string }
 
@@ -44,6 +45,10 @@ export type Saved = {
   plcRequestedAt?: number
   identityDone?: boolean
   activated?: boolean
+  /** The Spaces step, between activating here and deactivating there:
+   * nothing to copy, copied (some may have failed), or declined. */
+  spaces?: 'none' | 'done' | 'skipped'
+  spaceMoves?: SpaceMove[]
   oldDeactivated?: boolean
   /** Counted from the copied repo, kept once they match the import's record total. */
   counts?: RecordCounts
