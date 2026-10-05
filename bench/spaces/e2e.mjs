@@ -12,7 +12,7 @@ import { P256Keypair } from '@atproto/crypto'
 import { LtHash, createSpaceSigHeaders, verifyCommit, verifyRepoCarFull } from '@atproto/space'
 import { APP_SCOPE, Actor, RUN } from './lib/actor.mjs'
 import { COLL, COLL_ALT, HOSTS, REF_ADMIN_PASSWORD, SPACE_TYPE, VLPDS_ADMIN_TOKEN, log } from './lib/env.mjs'
-import { NotImplemented, attempt, makeClient, rawXrpc, sleep, timings, waitFor } from './lib/http.mjs'
+import { NotImplemented, attempt, makeClient, rawXrpc, sleep, setTimingScope, waitFor } from './lib/http.mjs'
 import { signingKey, spaceHostEndpoint } from './lib/identity.mjs'
 import { FirehoseTap, SENTINEL, checkAuthor } from './lib/leak.mjs'
 import { NotifyService } from './lib/notifysvc.mjs'
@@ -792,12 +792,10 @@ async function main() {
   try {
     for (const cfg of configs) {
       if (!CONFIGS[cfg]) throw new Error(`unknown config ${cfg}`)
+      setTimingScope(cfg)
       await runConfig(rep, cfg, env)
     }
   } finally {
-    const reqs = {}
-    for (const [k, v] of timings) if (k.startsWith('com.atproto.space.')) reqs[k] = summarize(v)
-    rep.metrics.client_ms = reqs
     const path = rep.write()
     log(`report: ${path}`)
     await env.svc.stop()

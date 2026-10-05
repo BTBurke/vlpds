@@ -114,9 +114,10 @@ spaces-fault seed="1" scale="small":
     bench/spaces/run.sh fault {{seed}} {{scale}}
 
 # Spaces sync cost against the targets: no-op poll and delta pull server time, notify latency, bucket ops per
-# space write, public commit p99 under a space write load
-spaces-cost:
-    bench/spaces/run.sh cost
+# space write, public commit p99 under a space write load, warm sequential write latency with vlpds's commit
+# stages (host: vlpds | ref-a; steps: a comma list, e.g. `just spaces-cost vlpds warm-writes`)
+spaces-cost host="vlpds" steps="":
+    bench/spaces/run.sh cost {{host}} {{steps}}
 
 # The WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs; its own crate, since passkey-types
 # turns on serde_json's preserve_order, which would change every vlpds test build

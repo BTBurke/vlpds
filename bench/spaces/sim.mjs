@@ -19,7 +19,7 @@
 //   I5 syncers never saw a protocol violation (cursor, ordering, rev going back)
 import { Actor, RUN } from './lib/actor.mjs'
 import { COLL, HOSTS, PORTS, log } from './lib/env.mjs'
-import { attempt, notImplemented, sleep, timings } from './lib/http.mjs'
+import { attempt, notImplemented, sleep, setTimingScope } from './lib/http.mjs'
 import { setService } from './lib/identity.mjs'
 import { FaultProxy } from './lib/faultproxy.mjs'
 import { NotifyService } from './lib/notifysvc.mjs'
@@ -85,6 +85,7 @@ async function main() {
     }
 
     let world
+    setTimingScope(`${cfg} setup`)
     await rep.step(cfg, 'setup', async (check) => {
       world = await setup(check, env)
     })
@@ -109,6 +110,7 @@ async function afterSetup(world, env, stats, ackTimes) {
     for (const px of Object.values(env.hostProxies)) px.rules = { drop: 0.3, dup: 0.1, delayMs: [0, 800] }
   }
 
+  setTimingScope(`${cfg} workload`)
   await rep.step(cfg, 'workload', async (check) => {
     await workload(world, env, stats, ackTimes)
     check(stats.acked > 0, 'some writes were acked', JSON.stringify(stats))
@@ -118,6 +120,7 @@ async function afterSetup(world, env, stats, ackTimes) {
     for (const px of [...env.proxies, ...Object.values(env.hostProxies)]) px.rules = { drop: 0, dup: 0, delayMs: [0, 0] }
   }
 
+  setTimingScope(`${cfg} invariants`)
   await rep.step(cfg, 'invariants', async (check) => {
     await invariants(world, env, check)
   }, { needs: ['workload'] })
@@ -127,9 +130,6 @@ async function afterSetup(world, env, stats, ackTimes) {
   rep.metrics.stats = stats
   rep.metrics.syncers = world ? Object.fromEntries(world.syncers.map((s) => [s.name, s.stats])) : {}
   rep.metrics.proxies = Object.fromEntries([...env.proxies.map((p, i) => [`syncer${i}`, p.stats]), ...Object.entries(env.hostProxies).map(([h, p]) => [`authority@${h}`, p.stats])])
-  const reqs = {}
-  for (const [k, v] of timings) if (k.startsWith('com.atproto.space.')) reqs[k] = summarize(v)
-  rep.metrics.client_ms = reqs
 }
 
 async function setup(check, env) {

@@ -3,7 +3,7 @@
 // pass) or skip (not applicable to this placement). Results go to
 // out/<mode>.json and a short out/<mode>.md.
 import { writeFileSync } from 'node:fs'
-import { notImplemented } from './http.mjs'
+import { notImplemented, timingByHost, timingRows } from './http.mjs'
 import { OUT, log } from './env.mjs'
 
 export class StepFailed extends Error {}
@@ -15,6 +15,11 @@ export class Report {
     this.rows = [] // { config, step, status, detail, ms, checks }
     this.notes = []
     this.metrics = {}
+    this.sections = [] // extra markdown: [title, lines]
+  }
+
+  section(title, lines) {
+    this.sections.push([title, lines])
   }
 
   note(s) {
@@ -80,7 +85,14 @@ export class Report {
 
   write() {
     this.meta.finished = new Date().toISOString()
-    const json = { mode: this.mode, meta: this.meta, rows: this.rows, notes: this.notes, metrics: this.metrics }
+    const json = {
+      mode: this.mode,
+      meta: this.meta,
+      rows: this.rows,
+      notes: this.notes,
+      metrics: this.metrics,
+      client_ms: { by_config_host: timingRows(summarize), by_host_ok: timingByHost(summarize) },
+    }
     writeFileSync(`${OUT}${this.mode}.json`, JSON.stringify(json, null, 2))
     writeFileSync(`${OUT}${this.mode}.md`, this.markdown())
     return `${OUT}${this.mode}.md`
@@ -119,6 +131,8 @@ export class Report {
     if (Object.keys(this.metrics).length) {
       lines.push('## Metrics', '', '```json', JSON.stringify(this.metrics, null, 2), '```', '')
     }
+    for (const [title, body] of this.sections) lines.push(`## ${title}`, '', ...body, '')
+    lines.push(...timingMarkdown())
     if (this.notes.length) lines.push('## Notes', '', ...this.notes.map((n) => `- ${n}`), '')
     return lines.join('\n')
   }
@@ -132,4 +146,34 @@ export function pct(arr, p) {
 
 export function summarize(arr) {
   return arr.length ? { n: arr.length, p50: pct(arr, 50), p90: pct(arr, 90), p99: pct(arr, 99), max: pct(arr, 100) } : { n: 0 }
+}
+
+const short = (m) => m.replace(/^com\.atproto\./, '')
+const f = (x) => (x == null ? '' : x < 10 ? x.toFixed(1) : Math.round(x))
+
+/**
+ * The driver's client-side latency (ms) as markdown: successful calls by host
+ * pooled over every config, then every config / host / outcome. A call that
+ * retried (DPoP nonce, token refresh) counts its final attempt only.
+ */
+function timingMarkdown() {
+  const byHost = timingByHost(summarize)
+  if (!byHost.length) return []
+  const lines = [
+    '## Client latency by host (ok calls, ms)',
+    '',
+    '| method | host | n | p50 | p90 | p99 | max |',
+    '|---|---|---|---|---|---|---|',
+    ...byHost.map((r) => `| ${short(r.method)} | ${r.host} | ${r.n} | ${f(r.p50)} | ${f(r.p90)} | ${f(r.p99)} | ${f(r.max)} |`),
+    '',
+    '## Client latency by config, host and outcome (ms)',
+    '',
+    '| config | host | method | outcome | n | p50 | p90 | p99 | max | retried |',
+    '|---|---|---|---|---|---|---|---|---|---|',
+    ...timingRows(summarize).map(
+      (r) => `| ${r.config} | ${r.host} | ${short(r.method)} | ${r.outcome} | ${r.n} | ${f(r.p50)} | ${f(r.p90)} | ${f(r.p99)} | ${f(r.max)} | ${r.retried || ''} |`,
+    ),
+    '',
+  ]
+  return lines
 }

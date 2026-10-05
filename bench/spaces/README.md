@@ -9,6 +9,7 @@ just spaces-e2e                  # the scenario matrix (bench/spaces/run.sh e2e)
 just spaces-sim 42 medium        # seeded random workload with invariants
 just spaces-fault 42             # the same under faults
 just spaces-cost                 # server time, notify latency and bucket ops against the targets
+just spaces-cost vlpds warm-writes   # only the warm write-latency step (ref-a for the reference)
 ```
 
 Everything runs on this machine, and nothing talks to the real PLC, a relay or bsky. Accounts,
@@ -141,13 +142,28 @@ The proxies heal before the invariants run.
 | notify | write, then time to the forwarded `notifyWrite` | p50 under 100 ms locally (no linger) |
 | bucket ops | `vlpds_object_store_requests_total` and MinIO's counters per write, net of idle | space write ≤ public write |
 | public p99 | 300 public writes alone, then with 8 space writers running | within 25% + 2 ms |
+| warm writes | after 30 warmup rounds, `WARM_N` (210) rounds of createRecord, putRecord and a one-op applyWrites in turn, one account in one space | reported, not gated |
 
-Against a reference PDS (`node cost.mjs ref-a`) it reports the client-side numbers only.
+The warm-writes step reports client p50/p90/p99 per method, and on vlpds the deltas over the run of
+`vlpds_http_request_duration_seconds` per method, `vlpds_commit_stage_seconds` per stage (seal_wait,
+put, apply_lock, apply, ack; these are per segment, not per write), and `vlpds_commit_durable_seconds`. Histogram quantiles are bucket upper bounds.
+
+Against a reference PDS (`just spaces-cost ref-a`) it reports the client-side numbers only. A
+second argument picks steps (a comma list); setup always runs. The report is
+`out/cost-<host>[-<steps>].md`.
 
 ## Reading the results
 
 Each run writes `out/<mode>.json` (every check) and `out/<mode>.md` (the table, failures, metrics and
-notes), and prints the markdown at the end. vlpds's log is `out/vlpds-n<i>.log`. The exit code is 0
+notes), and prints the markdown at the end.
+
+Both also carry the driver's client-side latency for every space call, keyed by scope (the e2e
+config, the sim phase, the cost step), host (`vlpds`, `ref-a`, `ref-b`, a fault proxy as
+`<host>~proxy`) and outcome (`ok`, `refused` for a 4xx, `error` for a 5xx or a dropped connection,
+`ni` for 501). The md has a by-host table of ok calls pooled over configs, then the full breakdown
+(`client_ms` in the json). A call the auth layer retried (a DPoP nonce, an expired token) is timed
+on its final attempt only, and counted in `retried`. The e2e samples are small and include each
+host's cold first calls; the cost run's warm-writes step is the latency number to quote. vlpds's log is `out/vlpds-n<i>.log`. The exit code is 0
 when nothing failed, 1 on a failure, and 3 for a sim that stopped at a method that isn't implemented.
 
 ## Iterating
