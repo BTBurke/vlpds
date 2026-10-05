@@ -189,9 +189,9 @@ impl Default for ClusterConfig {
     }
 }
 
-/// The renew loop's least time between one renewal's end and the next
-/// one's start: R2 takes about one write a second to one key. Never more
-/// than `renew_every`, so a short test TTL keeps its cadence.
+/// The least time from one answered write of our lease to the next one's
+/// send: R2 takes about one write a second to one key. Never more than
+/// `renew_every`, so a short test TTL keeps its cadence.
 const LEASE_KEY_GAP: Duration = Duration::from_secs(1);
 
 fn lease_key_gap(renew_every: Duration) -> Duration {
@@ -367,6 +367,9 @@ pub struct Cluster {
     gone: AtomicBool,
     /// Held across each renewal so shutdown can't delete the lease under one.
     renew_lock: tokio::sync::Mutex<()>,
+    /// The last write of our lease: when it was answered, whether it landed,
+    /// and the `joined` / `draining` it carried.
+    last_lease_write: parking_lot::Mutex<Option<(Instant, bool, bool, bool)>>,
     /// With a lease plane every renewal runs there: callers elsewhere ask
     /// its loop (`renew_now`) and wait for a renewal that started after
     /// they asked (`renew_started`, then `renew_done` carrying its number).
@@ -575,6 +578,7 @@ impl Cluster {
             step_lock: tokio::sync::Mutex::new(()),
             gone: AtomicBool::new(false),
             renew_lock: tokio::sync::Mutex::new(()),
+            last_lease_write: parking_lot::Mutex::new(None),
             renew_now: tokio::sync::Notify::new(),
             renew_started: AtomicU64::new(0),
             renew_done: tokio::sync::watch::channel(0).0,
@@ -1292,6 +1296,7 @@ impl Cluster {
         l.wm_cap = crate::nodelog::seq_floor(expires_local_ms * 1000);
         let store = self.cfg.lease_plane.as_ref().map_or(&self.store, |p| &p.store);
         let put = Self::put_json_on(store, &self.path(&format!("nodes/{}", self.cfg.node_id)), &l, mode).await;
+        *self.last_lease_write.lock() = Some((Instant::now(), put.is_ok(), l.joined, l.draining));
         self.count("put");
         crate::metrics::LEASE_RENEW_SECONDS.observe(sent.elapsed().as_secs_f64());
         let etag = put?;
@@ -1471,18 +1476,10 @@ impl Cluster {
         spawn(Box::pin(async move {
             let mut tick = tokio::time::interval(me.cfg.renew_every);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let gap = lease_key_gap(me.cfg.renew_every);
-            let mut last: Option<Instant> = None;
             loop {
                 tokio::select! {
                     _ = tick.tick() => {}
                     _ = me.renew_now.notified() => {}
-                }
-                // A renewal that outlived its tick (the store retrying it)
-                // is followed at once by the missed tick: wait out the gap
-                // from its answer first.
-                if let Some(at) = last {
-                    tokio::time::sleep(gap.saturating_sub(at.elapsed())).await;
                 }
                 // keeps renewing through a graceful shutdown's drain
                 if me.gone.load(Ordering::Acquire) {
@@ -1492,7 +1489,6 @@ impl Cluster {
                 }
                 let n = me.renew_started.fetch_add(1, Ordering::AcqRel) + 1;
                 me.renew_here(&h).await;
-                last = Some(Instant::now());
                 me.renew_done.send_replace(n);
             }
         }));
@@ -1760,6 +1756,29 @@ impl Cluster {
         let _g = self.renew_lock.lock().await;
         if self.gone.load(Ordering::Acquire) {
             return;
+        }
+        // At most one write to our lease key per gap (R2 throttles a key
+        // past about one a second). A renewal right after a write that
+        // landed and carried the same flags would only push validity a few
+        // hundred ms further: skipped, and the next tick renews. One that
+        // must publish a flag, or follows a failed write, waits out the gap.
+        let gap = lease_key_gap(self.cfg.renew_every);
+        let last = *self.last_lease_write.lock();
+        if let Some((at, landed, joined, draining)) = last {
+            let since = at.elapsed();
+            if since < gap {
+                let same = {
+                    let l = self.lease.read();
+                    l.joined == joined && l.draining == draining
+                };
+                if landed && same && self.lease_valid() {
+                    return;
+                }
+                tokio::time::sleep(gap - since).await;
+                if self.gone.load(Ordering::Acquire) {
+                    return;
+                }
+            }
         }
         // Never resurrect a lapsed lease: peers may have fenced our log, and
         // a renewal landing now would make them count us live again and
@@ -3043,6 +3062,7 @@ mod tests {
         let a = join(cfg(&id), store.clone()).await.unwrap();
         let (timed0, conflicts0) =
             (crate::metrics::LEASE_RENEW_SECONDS.get_sample_count(), m.with_label_values(&["conflict"]).get());
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert!(crate::metrics::LEASE_RENEW_SECONDS.get_sample_count() > timed0);
         let v = a.lease_validity_secs();
@@ -3051,6 +3071,7 @@ mod tests {
         assert!(crate::metrics::LEASE_VALIDITY.with_label_values(&[id.as_str()]).get() > 0.0, "exported at render");
         // someone else rewrites our lease: the next renewal loses its CAS
         store.raw.put(&a.path(&format!("nodes/{id}")), PutPayload::from_static(b"{}")).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 1);
         assert!(m.with_label_values(&["conflict"]).get() > conflicts0);
@@ -3854,9 +3875,11 @@ mod tests {
         let (ha, ha_dyn) = host();
         a.step(&ha_dyn).await.unwrap();
         stalls.arm("landed", "nodes/a");
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(stalls.stalled.load(Ordering::SeqCst), 1, "the armed renewal ran");
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "a landed renewal is no lost lease");
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(ha.lost.load(Ordering::SeqCst), 0, "the next renewal CASes on the adopted ETag");
         assert!(a.lease_valid());
@@ -3865,6 +3888,7 @@ mod tests {
         let mut l = a.lease.read().clone();
         l.log_id = "someone-else".into();
         a.put_json_unbounded(&a.path("nodes/a"), &l, PutMode::Overwrite).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&ha_dyn).await;
         assert_eq!(ha.lost.load(Ordering::SeqCst), 1);
     }
@@ -3924,16 +3948,19 @@ mod tests {
         let a = join(cfg("rv"), store.clone()).await.unwrap();
         let path = a.path("nodes/rv");
         store.raw.delete(&path).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
         let (l, _) = a.get_json::<NodeLease>(&path).await.unwrap().expect("recreated");
         assert_eq!(l.log_id, a.log_id);
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await; // and renews from there
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
         // presumed dead: a peer fenced our log, then deleted the lease
         let p = join(cfg("rv-peer"), store.clone()).await.unwrap();
         p.fence(&a.log_id).await.unwrap();
         store.raw.delete(&path).await.unwrap();
+        tokio::time::sleep(a.cfg.renew_every).await; // past the lease-write gap
         a.renew(&hd).await;
         assert_eq!(h.lost.load(Ordering::SeqCst), 1);
         assert!(a.get_json::<NodeLease>(&path).await.unwrap().is_none(), "not resurrected");
@@ -4728,6 +4755,39 @@ mod tests {
         let next = puts.get(slow + 1).expect("a renewal after it");
         let after = next.0 - puts[slow].1;
         assert!(after >= Duration::from_millis(950), "renewed {after:?} after the failed one");
+        assert!(c.lease_valid());
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    /// The join's lease write, the first step's renewal and the renewal
+    /// that publishes `joined` used to land within a few ms on one key (a
+    /// likely cause of R2's 429 at a restart). Now no two writes to it are
+    /// under the gap apart, a renewal that only refreshes is skipped, and
+    /// `joined` still gets published.
+    #[tokio::test]
+    async fn startup_lease_writes_are_a_gap_apart() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = ClusterConfig {
+            ttl: Duration::from_secs(6),
+            renew_every: Duration::from_secs(1),
+            skew: Duration::from_secs(1),
+            ..cfg("s")
+        };
+        let c = lone_join(c, store.clone()).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert!(c.joined() && c.owned().len() == 8);
+        c.spawn(d);
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let puts: Vec<(Instant, Instant)> =
+            stalls.puts.lock().iter().filter(|(k, _, _)| k.ends_with("nodes/s")).map(|&(_, s, e)| (s, e)).collect();
+        assert!(puts.len() >= 3, "{} lease writes", puts.len());
+        for w in puts.windows(2) {
+            let apart = w[1].0 - w[0].1;
+            assert!(apart >= Duration::from_millis(990), "lease writes {apart:?} apart");
+        }
+        assert!(c.read_lease("s").await.unwrap().unwrap().joined, "joined published");
         assert!(c.lease_valid());
         assert_eq!(h.lost.load(Ordering::SeqCst), 0);
     }
