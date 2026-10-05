@@ -277,6 +277,21 @@ vlpds_invite_required: true
 vlpds_invite_interval_ms: "" # earned invites; empty = none
 vlpds_invite_epoch_ms: ""
 vlpds_max_blob_mb: 100
+# Largest CAR importRepo accepts, in MiB (--max-import-mb). Empty = vlpds'
+# default (1024).
+vlpds_max_import_mb: ""
+
+# Spaces (--spaces): com.atproto.space.* and com.atproto.simplespace.* are
+# served here, not proxied. Off by default. The checklist for turning it on
+# is in docs/spaces/operating.md. The knobs below only matter with it on, and
+# empty keeps vlpds' default.
+vlpds_spaces: false
+# Most records one account's repo in one space may hold
+# (--space-repo-max-records, default 100000).
+vlpds_space_repo_max_records: ""
+# How long space oplog entries are kept for syncers to catch up from
+# (--space-oplog-retention, default 7d; "off" keeps them all).
+vlpds_space_oplog_retention: ""
 
 # Rate limits (reference limits, keyed on the client IP from
 # X-Forwarded-For when the peer is a trusted proxy: Caddy).
@@ -326,13 +341,13 @@ vlpds_caddy_blocked_paths: ["/internal/*", "/metrics", "/debug/*", "/xrpc/vlpds.
 # Body caps, in binary units like vlpds' own (Caddy reads MB/GB as powers of
 # 10, so 1GB would refuse imports vlpds accepts). Everything but importRepo:
 # blobs, vlpds_max_blob_mb MiB + 5 MiB slack (MiB, as --max-blob-mb).
-# importRepo: vlpds' own cap is 1 GiB (src/xrpc/repo.rs MAX_IMPORT_BYTES);
-# Caddy allows 64 MiB more so vlpds, not Caddy, answers an oversized CAR.
+# importRepo: vlpds_max_import_mb MiB (--max-import-mb) + 64 MiB, so vlpds,
+# not Caddy, answers an oversized CAR.
 # `tailscale serve` port for the operator console (tailnet only; 0 = off).
 # Not 443: Docker's DNAT for Caddy takes 443 on every local address.
 vlpds_tailnet_console_port: 0
 vlpds_caddy_max_body_mb: "{{ vlpds_max_blob_mb | int + 5 }}"
-vlpds_caddy_import_max_body: 1088MiB
+vlpds_caddy_import_max_body: "{{ (vlpds_max_import_mb | string | default('1024', true) | int) + 64 }}MiB"
 # Upstream proxies in front of Caddy whose X-Forwarded-For Caddy may trust
 # (e.g. Cloudflare ranges). Empty = Caddy sets X-Forwarded-For to the peer.
 vlpds_caddy_trusted_proxies: []

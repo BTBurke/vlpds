@@ -18,7 +18,7 @@ runs it between roles/common and roles/caddy + roles/alloy.
 
 | Step | Tasks (tag) | Notes |
 |---|---|---|
-| Refuse bad config | `assert.yml` (`vlpds-assert`) | Pinned image, identity (service DID = `did:web:<hostname>`), bucket, secrets (>= 32 bytes, all distinct), KEK (local, or Cloud KMS with an optional service-account key), PLC key, email, log format, disk cache size, lease >= 10 s, stop grace >= 60 s, the peer TLS material when clustered. Runs before anything changes. |
+| Refuse bad config | `assert.yml` (`vlpds-assert`) | Pinned image, identity (service DID = `did:web:<hostname>`), bucket, secrets (>= 32 bytes, all distinct), KEK (local, or Cloud KMS with an optional service-account key), PLC key, email, log format, disk cache size, lease >= 10 s, stop grace >= 60 s, the peer TLS material when clustered, the Spaces knobs, and no dev mode or `--lexicon-authority-override` in `vlpds_extra_env` / `vlpds_extra_args`. Runs before anything changes. |
 | Host prep | `host.yml` (`vlpds-host`) | chrony, sysctls (`/etc/sysctl.d/90-vlpds.conf`), ufw (SSH + 80/443 public, everything on `tailscale0`), unattended-upgrades (security only, **no automatic reboot**), an optional NVMe cache device. |
 | Node | `deploy.yml` (`vlpds-deploy`) | Disk cache size and a free-space check, secret files (0400, uid 10001, read-only at `/run/vlpds`, passed as `VLPDS_*_FILE` so neither the compose file nor `docker inspect` shows a secret; an emptied secret's file is removed), peer TLS files, `/opt/vlpds/docker-compose.yml` (0600), the `vlpds` docker network, image pull, optional bucket probe, then `compose up`. |
 | Console | `console.yml` (`vlpds-console`) | `tailscale serve` on `vlpds_tailnet_console_port` for `/admin` (tailnet only). |
@@ -101,6 +101,30 @@ vlpds-deploy,vlpds-verify`. Until `vlpds admin cluster finalize --level L+1`
 a rollback is a redeploy of the previous tag; after it, forward fixes only.
 RUNBOOK "Rolling upgrade, finalize, rollback" has the details. In a cluster
 `playbooks/vlpds.yml` restarts one node at a time (`serial: 1`).
+
+## Spaces
+
+`vlpds_spaces: false` (the default) leaves Spaces off. Turned on, the node
+gets `--spaces` and serves `com.atproto.space.*` and
+`com.atproto.simplespace.*` itself. Read the checklist in
+`docs/spaces/operating.md` ("Enabling on a single node")
+first. The knobs only matter with it on, and empty keeps vlpds' default:
+
+| Variable | Flag | Default |
+|---|---|---|
+| `vlpds_spaces` | `--spaces` | `false` |
+| `vlpds_space_repo_max_records` | `--space-repo-max-records` | empty (vlpds: 100000) |
+| `vlpds_space_oplog_retention` | `--space-oplog-retention` | empty (vlpds: `7d`, `off` keeps all) |
+| `vlpds_max_import_mb` | `--max-import-mb` | empty (vlpds: 1024; Caddy's importRepo cap is this + 64 MiB) |
+
+Turning it on or off is a graceful restart. With it off again, space-only
+blobs stay private and the space data stays in the bucket.
+
+The role never runs a node in dev mode. `assert.yml` refuses
+`VLPDS_DEV_MODE` / `--dev-mode` and `VLPDS_LEXICON_AUTHORITY_OVERRIDE` /
+`--lexicon-authority-override` in the extras, and the compose file drops
+those two env vars even with the assert skipped. The override lets a chosen
+repo stand in for a lexicon's DNS authority, which could widen OAuth grants.
 
 ## Clustering
 

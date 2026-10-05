@@ -121,6 +121,29 @@
     fail_msg: "Set vlpds_email_smtp_url + vlpds_email_from_address (or vlpds_email_required: false); the moderation URL and address go together"
     quiet: true
 
+# The role has no dev mode: --dev-mode accepts the well-known dev secrets,
+# and --lexicon-authority-override (dev only) lets a chosen repo stand in
+# for a lexicon's DNS authority, which would let it widen OAuth grants.
+- name: No dev-only settings
+  ansible.builtin.assert:
+    that:
+      - (vlpds_extra_env.keys() | intersect(_vlpds_dev_only_env) | length) == 0
+      - vlpds_extra_args | map('string') | select('match', '^--(dev-mode|lexicon-authority-override)(=|$)') | list | length == 0
+    fail_msg: "vlpds_extra_env / vlpds_extra_args must not set dev mode or the lexicon authority override in a deployed node"
+    quiet: true
+
+- name: Spaces settings are valid
+  ansible.builtin.assert:
+    that:
+      - vlpds_spaces | type_debug == 'bool' or vlpds_spaces | string | lower in ['true', 'false']
+      - vlpds_max_import_mb | string == '' or (vlpds_max_import_mb | string is match('^[0-9]+$') and vlpds_max_import_mb | int >= 1)
+      - >-
+        vlpds_space_repo_max_records | string == ''
+        or (vlpds_space_repo_max_records | string is match('^[0-9]+$') and vlpds_space_repo_max_records | int >= 1)
+      - vlpds_space_oplog_retention | string is match('^(|off|none|[0-9]+(\.[0-9]+)?(ms|s|m|h|d)?)$')
+    fail_msg: "vlpds_spaces true|false; vlpds_max_import_mb empty or >= 1 (MiB); vlpds_space_repo_max_records empty or >= 1; vlpds_space_oplog_retention empty, off or a duration like 7d"
+    quiet: true
+
 - name: Leases and shards are production-safe
   ansible.builtin.assert:
     that:
