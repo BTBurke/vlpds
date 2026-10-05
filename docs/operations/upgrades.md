@@ -56,7 +56,7 @@ resends them for up to 20 s. Expect a burst of resends and some cold repo loads 
 
 A single node is different, because every restart is a short outage. A graceful stop takes ~0.1 s
 idle and ~0.2 s under write load, and the restarted node takes its first write ~1.3 s after it
-starts (measured on benchbox against MinIO). The stop waits only for requests already in flight.
+starts (measured on a dev box against MinIO). The stop waits only for requests already in flight.
 Writes that arrive while it stops get a 503 (nothing done) right away, and firehose subscribers get a
 going-away close, so relays reconnect with their cursor. On a real server add the container's own
 restart, so expect a few seconds of Caddy 502s and pick a quiet time. The Ansible role
