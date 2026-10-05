@@ -5,11 +5,6 @@
 
 use crate::common::spaces::SpaceClient;
 use crate::common::*;
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::routing::get;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use vlpds::cbor::Value;
 use vlpds::cid::Cid;
@@ -290,27 +285,7 @@ async fn blobs_of_taken_down_records_are_hidden() {
 
 // ---------------------------------------------------------------- importRepo
 
-type Docs = Arc<Mutex<HashMap<String, J>>>;
-
-/// A PLC directory stand-in: `GET /{did}` -> the document set for it.
-async fn stub_plc() -> (String, Docs) {
-    let docs: Docs = Arc::default();
-    let app = axum::Router::new()
-        .route(
-            "/{did}",
-            get(|State(d): State<Docs>, Path(did): Path<String>| async move {
-                match d.lock().unwrap().get(&did) {
-                    Some(doc) => Ok(axum::Json(doc.clone())),
-                    None => Err(StatusCode::NOT_FOUND),
-                }
-            }),
-        )
-        .with_state(docs.clone());
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
-    (url, docs)
-}
+use crate::spaces_side::import_repo::stub_plc;
 
 async fn pds(plc: &str, service_did: &str) -> TestServer {
     let (plc, sd) = (plc.to_string(), service_did.to_string());
@@ -418,7 +393,9 @@ async fn import_repo_round_trip_and_refusals() {
     let at_x = a.get("com.atproto.space.getLatestCommit", &rq).await.ok()["commit"].clone();
     let records_x = a.get("com.atproto.space.listRecords", &rq).await.ok()["records"].clone();
 
-    // the account on y, deactivated until it moves
+    // the account on y; it moves (DID switched, activated), then imports
+    // with OAuth: the CAR's commit was signed by x's key, which the DID's
+    // PLC history says it held at the rev
     let handle = format!("{}.{HANDLE_DOMAIN}", unique_name("moved"));
     let token = x
         .xrpc
@@ -435,10 +412,30 @@ async fn import_repo_round_trip_and_refusals() {
     let body = json!({"handle": handle, "email": format!("{}@example.com", unique_name("m")), "password": crate::oauth::PASSWORD, "did": a.did});
     let created = y.xrpc.post("com.atproto.server.createAccount", &body, &Auth::Bearer(token)).await.ok();
     let jwt = created["accessJwt"].as_str().unwrap().to_string();
-    // OAuth signs no deactivated account in: moving in, its password session imports
     let session = Auth::Bearer(jwt.clone());
     let path = format!("{IMPORT}?space={space}");
-    let import = async |car: Vec<u8>| y.xrpc.post_bytes(&path, car, CAR, &session).await;
+    let rdc = y.xrpc.get("com.atproto.identity.getRecommendedDidCredentials", &[], &session).await.ok();
+    let key = rdc["verificationMethods"]["atproto"].as_str().unwrap();
+    let did = a.did.clone();
+    let doc = json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "alsoKnownAs": rdc["alsoKnownAs"],
+        "verificationMethod": [{
+            "id": format!("{did}#atproto"), "type": "Multikey", "controller": did,
+            "publicKeyMultibase": key.strip_prefix("did:key:").unwrap(),
+        }],
+        "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": rdc["services"]["atproto_pds"]["endpoint"]}],
+    });
+    // a password session is no space access, before the move or after
+    let r = y.xrpc.post_bytes(&path, exported.clone(), CAR, &session).await;
+    assert_eq!(r.status, 403, "{}", r.text());
+    docs.lock().unwrap().insert(did.clone(), doc);
+    y.xrpc.post_empty("com.atproto.server.activateAccount", &session).await.ok();
+    let r = y.xrpc.post_bytes(&path, exported.clone(), CAR, &session).await;
+    r.err(403, "InsufficientScope");
+    let b = SpaceClient::for_account(&y, &a.did, &handle, &jwt, OWNER).await;
+    let import = async |car: Vec<u8>| b.post_bytes(IMPORT, &[("space", space.as_str())], car, CAR).await;
 
     let (roots, blocks) = vlpds::car::read_car(&exported).unwrap();
     let blocks: Vec<(Cid, Vec<u8>)> = blocks.into_iter().map(|(c, b)| (c, b.to_vec())).collect();
@@ -459,7 +456,7 @@ async fn import_repo_round_trip_and_refusals() {
     let mut bad = commit.clone();
     *bad.mac.last_mut().unwrap() ^= 1;
     import(with_commit(&bad)).await.err(400, "InvalidCommit");
-    // signed by a key that isn't the DID's
+    // signed by a key the DID never had
     let Value::Map(entries) = &index else { panic!("index") };
     let mut set = vlpds::space::lthash::LtHash::default();
     for (path, v) in entries {
@@ -497,33 +494,15 @@ async fn import_repo_round_trip_and_refusals() {
     // the imported record's blob hasn't come over yet
     let lm = y.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &session).await.ok();
     assert_eq!(lm["blobs"], json!([{"cid": blob_cid, "recordUri": format!("{space}/{}/{COLL}/aa", a.did)}]), "{lm}");
+    // the same rev again isn't newer
     import(exported.clone()).await.err(400, "InvalidRequest");
 
-    // the DID moves to y, and the account reads its imported repo there
-    let rdc = y.xrpc.get("com.atproto.identity.getRecommendedDidCredentials", &[], &session).await.ok();
-    let key = rdc["verificationMethods"]["atproto"].as_str().unwrap();
-    let did = a.did.clone();
-    let doc = json!({
-        "@context": ["https://www.w3.org/ns/did/v1"],
-        "id": did,
-        "alsoKnownAs": rdc["alsoKnownAs"],
-        "verificationMethod": [{
-            "id": format!("{did}#atproto"), "type": "Multikey", "controller": did,
-            "publicKeyMultibase": key.strip_prefix("did:key:").unwrap(),
-        }],
-        "service": [{"id": "#atproto_pds", "type": "AtprotoPersonalDataServer", "serviceEndpoint": rdc["services"]["atproto_pds"]["endpoint"]}],
-    });
-    docs.lock().unwrap().insert(did.clone(), doc);
-    y.xrpc.post_empty("com.atproto.server.activateAccount", &session).await.ok();
-    let b = SpaceClient::for_account(&y, &a.did, &handle, &jwt, OWNER).await;
     let at_y = b.get("com.atproto.space.getLatestCommit", &rq).await.ok()["commit"].clone();
     assert_eq!((at_y["hash"].clone(), at_y["rev"].clone()), (at_x["hash"].clone(), at_x["rev"].clone()));
     assert_eq!(b.get("com.atproto.space.listRecords", &rq).await.ok()["records"], records_x);
     // the oplog starts empty; the next write follows the imported rev
     let ops = b.get("com.atproto.space.listRepoOps", &rq).await.ok();
     assert_eq!(ops["ops"], json!([]), "{ops}");
-    // OAuth imports too, but never over a repo that's there
-    b.post_bytes(IMPORT, &[("space", space.as_str())], exported, CAR).await.err(400, "InvalidRequest");
     b.create_record(&space, COLL, Some("dd"), rec("four")).await.ok();
     let next = b.get("com.atproto.space.getLatestCommit", &rq).await.ok()["commit"]["rev"].clone();
     assert!(next.as_str().unwrap() > at_x["rev"].as_str().unwrap(), "{next} after {}", at_x["rev"]);

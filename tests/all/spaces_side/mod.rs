@@ -21,7 +21,7 @@ mod cluster_takeover;
 mod durability;
 mod fuzz;
 mod hooks;
-mod import_repo;
+pub(crate) mod import_repo;
 mod leak;
 mod operator_reads;
 mod phase3;

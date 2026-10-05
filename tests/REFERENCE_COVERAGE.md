@@ -904,8 +904,9 @@ Divergences, also in DESIGN.md's Spaces section:
   and space takedowns are vlpds extensions. The reference has neither, so its suites have no cases for them. They're tested in
   `spaces_admin`, `spaces_sync::record_takedown_serves_a_consistent_view` and `spaces_blobs`.
 - **vlpds-only methods.** `vlpds.space.importRepo` and the audited operator reads (`vlpds.admin.getSpaceRepo`,
-  `listSpaceRecords`, `getSpaceRecord`, `checkSpace`) have no upstream counterpart (`spaces_admin`). importRepo takes a
-  deactivated account's own password session, the one exception to OAuth-only, which is still an open decision.
+  `listSpaceRecords`, `getSpaceRecord`, `checkSpace`) have no upstream counterpart (`spaces_admin`). importRepo is
+  OAuth-only like every space method, and takes a CAR signed by any `#atproto` key the DID's PLC history says it held at
+  the commit's rev (`spaces_side::import_repo`).
 
 The notification retry rows and the registration expiry row run through test hooks: `Outbox::set_retry_base` shortens the
 1 min retry pause, and `xrpc::space::set_registration_expiry` expires a registration through the authority's worker (the

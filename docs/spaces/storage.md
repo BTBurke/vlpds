@@ -88,10 +88,13 @@ it, and isn't built.
 
 ## Moving a repo in
 
-`vlpds.space.importRepo` takes the 2-root CAR that `space.getRepo` serves on the old host, for an
-account moving in (it may still be deactivated). Before anything is written, the commit's signature
-and MAC must verify against the DID's current `#atproto` key, and the set hash recomputed from the
-index must be the commit's. The CAR must be laid out as the reference's `verifyRepoCarFull` reads it:
+`vlpds.space.importRepo` takes the 2-root CAR that `space.getRepo` serves on the old host. It's an
+OAuth call like any space write, so an account moving in imports once it's active here (OAuth
+signs no deactivated account in). By then the DID points here and its `#atproto` key is this
+host's, while the CAR was signed on the old host. So before anything is written, the commit's
+signature and MAC must verify against the DID's current key or the key its PLC history says it held
+at the commit's rev (a did:plc's audit log, 5 min of slack either side). A key the DID never had is
+refused (`InvalidCommit`). The set hash recomputed from the index must be the commit's. The CAR must be laid out as the reference's `verifyRepoCarFull` reads it:
 the commit, the index, then one block per index entry in the index's order, and nothing else. The
 records then stream in, each block checked against its CID, in frameless entries of at most 1,000
 rows or 4 MiB. One last entry on the repo's worker puts the head
@@ -105,15 +108,26 @@ The account's writes to that space are refused while it imports.
 - An import that fails clears what it staged. If the node dies part way, the rows it left have no
   head over them, so nothing serves them. The next import or the repo's first write clears them
   before it lands.
-- An import over a repo with records is refused. One over a repo that's been emptied works if the
-  CAR's rev is newer, and the old head goes in the same entry.
+- An import over a repo that's already here replaces it with the snapshot, as
+  `com.atproto.repo.importRepo` does for a public repo. The CAR's rev must be newer than the repo's.
+  The first entry takes the old head away, the old rows go in bounded batches, the new ones are
+  staged, and the last entry puts the new head in. Reads see no repo in the space between the first
+  and last entries, so a syncer polling then gets `RepoNotFound` and falls back to `getRepo` after.
+- A second import of the same space repo while one is running is refused, and so are the account's
+  writes there.
 - The blobs the imported records name don't come with the CAR. `repo.listMissingBlobs` lists them
   next to the public repo's, with a space record URI for each, so the blob step of a move copies
   them the same way.
 
-It takes an OAuth session that may create records in the space, or the account's own password
-session while the account is still deactivated (an account moving in can't sign in with OAuth
-until it's active). App passwords can't import.
+It takes an OAuth session that may create records in the space. Password sessions and app
+passwords can't import.
+
+So a move has a short gap. Once the DID points here and the account is active, syncers that look the
+account up find this host, and it has none of the account's space repos until the import runs. They
+see `RepoNotFound` for those spaces until then, and a syncer that missed the gap catches up with
+`getRepo` when the repo turns up. The import should run right after activation to keep the gap
+short. `/migrate` doesn't move space repos yet, so today that's a tool holding an OAuth grant on
+both hosts.
 
 ## Revocations
 

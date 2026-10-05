@@ -1,19 +1,13 @@
-//! Space repos in the account backup (plan §2.7 "Backup ZIP"): the ZIP
-//! gains `spaces/<sid>/space.txt` (the space URI) and `spaces/<sid>/repo.car`
-//! (the account's own repo in it, from getRepo) for every space listSpaces
-//! names, and the space blobs those repos name go into `blobs/<cid>` with
-//! the rest. `<sid>` is the hex space id vlpds keys its rows by.
-//!
-//! The ZIP is built in the browser (ui/src/lib/backup.ts), so these tests
-//! drive the same XRPC calls through [`space_backup`], a model of that step
-//! returning the files it would write, and check what the server hands it:
-//! every space repo of the account and nothing of any other member's, even
-//! in a space the account governs. Restoring brings the repos back through
+//! Space repos and backups. The browser backup on the account page stays
+//! public-repo only (brief, FINAL decision 2): it signs in with a password
+//! session, space data is OAuth-only, and the page and the ZIP's README say
+//! space repos aren't included yet. `backup_space_step_needs_oauth` pins
+//! why. The rest holds what an OAuth-backed space backup, once the account
+//! page moves to OAuth, gets from the server: [`space_backup`] models it
+//! (`spaces/<sid>/space.txt`, `spaces/<sid>/repo.car` per space listSpaces
+//! names, its space blobs in `blobs/<cid>`), with every space repo of the
+//! account and nothing of any other member's, and a restore through
 //! importRepo on a new host.
-//!
-//! The backup on the account page signs in with a password session today,
-//! and space data is OAuth-only; `backup_space_step_needs_oauth` pins that,
-//! so the space step needs an OAuth grant (see the report).
 
 use super::import_repo::*;
 use super::leak::Sentinels;
@@ -184,7 +178,8 @@ async fn backup_reads_only_the_accounts_own_repos() {
 }
 
 /// The account page's backup signs in with a password session; space data
-/// is OAuth-only, so on that session the space step gets nothing.
+/// is OAuth-only, so that session reads no space data, which is why the
+/// backup has no space step.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn backup_space_step_needs_oauth() {
     let net = Net::new(0).await;
@@ -226,22 +221,24 @@ async fn backup_restores_on_a_new_host() {
     let b_did = h.b.pds_did().await;
     let sa = service_jwt(&h.bob, &b_did, "com.atproto.server.createAccount").await;
     let arrived = arrive(&h.b, &h.bob.did, sa).await;
+    complete_move(&h.docs, &h.b, &arrived).await;
+    let moved = arrived.oauth(&h.b).await;
     for (path, bytes) in &files {
         let Some(dir) = path.strip_suffix("/repo.car") else { continue };
         let space = String::from_utf8(files[&format!("{dir}/space.txt")].clone()).unwrap().trim().to_string();
-        arrived.import(&h.b, &space, bytes).await.ok();
+        import_repo(&moved, &space, bytes).await.ok();
     }
-    // every backed-up blob, not what listMissingBlobs asks for: it doesn't
-    // count imported space blob refs yet
-    for (path, bytes) in &files {
-        if path.starts_with("blobs/") {
-            h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes.clone(), "image/png", &arrived.session).await.ok();
-        }
+    // the blobs listMissingBlobs asks for, which the backup holds
+    let missing = h.b.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &arrived.session).await.ok();
+    let missing: Vec<String> =
+        missing["blobs"].as_array().unwrap().iter().map(|b| b["cid"].as_str().unwrap().to_string()).collect();
+    assert!(!missing.is_empty(), "the imported repos name blobs");
+    for cid in &missing {
+        let bytes = files[&format!("blobs/{cid}")].clone();
+        h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &arrived.session).await.ok();
     }
     let missing = h.b.xrpc.get("com.atproto.repo.listMissingBlobs", &[], &arrived.session).await.ok();
     assert_eq!(missing["blobs"], json!([]));
-    complete_move(&h.docs, &h.b, &arrived).await;
-    let moved = arrived.oauth(&h.b).await;
     for (space, head) in [&h.space, &own].into_iter().zip(heads) {
         assert_eq!(repo_state(&moved, space).await, Some(head), "{space}");
         expect_set_hash_matches_store(&moved, space).await;

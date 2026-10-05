@@ -4,19 +4,25 @@
 //! follows the plan's proposal and changes when the upstream contract
 //! settles.
 //!
-//! The commit is checked before anything is written: its signature and MAC
-//! against the DID's current `#atproto` key (the old host's, since the DID
-//! hasn't moved yet), and the set hash recomputed from the index. The
+//! It's OAuth-only like every space write, so an account moving in imports
+//! once it's active here, after its DID points here. The commit is checked
+//! before anything is written: its signature and MAC against the DID's
+//! current `#atproto` key, or the one its PLC history says it held at the
+//! commit's rev (the old host's), and the set hash recomputed from the
+//! index. The
 //! records then stream in, each block's CID checked and the index naming
 //! it, staged in bounded frameless entries; a final entry on the repo's
 //! worker switches the head in at the CAR's rev. The oplog stays empty (the
 //! spec lets a host drop ops: a syncer falls back to getRepo), and the
 //! authority is owed a notify like any write.
 //!
-//! The worker refuses the account's writes to the space while it imports
-//! (`Spaces::begin_import`). An import stopped part way leaves staged rows
-//! no head names, which no read serves; the next import of the space
-//! deletes them first.
+//! An import over a repo that's there replaces it, as the public importRepo
+//! does: the claim's entry takes the old head away, the old rows are swept
+//! in bounded batches, and the new head goes in at the end. The worker
+//! refuses the account's writes to the space, and other imports of it,
+//! while it imports (`Spaces::begin_import`). An import stopped part way
+//! leaves staged rows no head names, which no read serves; the next import
+//! of the space deletes them first.
 
 use super::repo::{check_path, imported_record_blobs};
 use super::space::{spaces, submit_space, Space};
@@ -162,6 +168,53 @@ fn decode_index(b: &[u8], max: u64) -> XResult<Vec<(String, Cid)>> {
         .collect()
 }
 
+/// A key held a little before and after its PLC operation's `createdAt`,
+/// as the rev and the directory's clock needn't agree.
+const KEY_SLACK_MICROS: u64 = 300_000_000;
+
+/// The `#atproto` keys `did` held at `at` (Unix microseconds) by its PLC
+/// audit log: each operation's key from its `createdAt` until the next
+/// one's (the first from the start). Empty for any other DID method.
+async fn past_keys(app: &App, did: &str, at: u64) -> XResult<Vec<String>> {
+    if !did.starts_with("did:plc:") {
+        return Ok(Vec::new());
+    }
+    let client = match &app.plc {
+        Some(p) => p.client.clone(),
+        None => crate::plc::PlcClient::new(&app.config.plc_url),
+    };
+    let log = client.audit_log(did).await.map_err(|e| {
+        XrpcError::unavailable("PlcUnavailable", format!("Could not read the PLC history of {did}: {e}"))
+    })?;
+    let mut held: Vec<(u64, Option<String>)> = Vec::new();
+    for e in log.as_array().into_iter().flatten() {
+        if e["nullified"].as_bool() == Some(true) {
+            continue;
+        }
+        let Some(from) = e["createdAt"]
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .and_then(|t| u64::try_from(t.timestamp_micros()).ok())
+        else {
+            continue;
+        };
+        let op = &e["operation"];
+        let key = op["verificationMethods"]["atproto"].as_str().or(op["signingKey"].as_str()).map(String::from);
+        held.push((from, key));
+    }
+    let mut out = Vec::new();
+    for (i, (from, key)) in held.iter().enumerate() {
+        let start = if i == 0 { 0 } else { from.saturating_sub(KEY_SLACK_MICROS) };
+        let end = held.get(i + 1).map_or(u64::MAX, |(next, _)| next.saturating_add(KEY_SLACK_MICROS));
+        if let Some(k) = key.as_ref().filter(|_| (start..=end).contains(&at)) {
+            if !out.contains(k) {
+                out.push(k.clone());
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// The DID's current `#atproto` key, as its document says now.
 async fn current_key(app: &App, did: &str) -> XResult<String> {
     app.did_resolver.invalidate(did);
@@ -209,24 +262,16 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     let sp = spaces(app)?;
     let space = Space::parse(&q.space)?;
     let did = creds.user_did()?.to_string();
-    let status = app.account(&did).await?.status;
-    // OAuth, as every space write. An account moving in is deactivated,
-    // and OAuth signs no deactivated account in, so until it's active its
-    // own password session imports too, as com.atproto.repo.importRepo
-    // takes it. App passwords never do.
-    let oauth = matches!(creds, Credentials::OAuth { .. });
-    let moving_in = matches!(creds, Credentials::Session { .. }) && status.as_deref() == Some("deactivated");
-    if !oauth && !moving_in {
+    // OAuth, as every space write: need_space refuses anything else, and
+    // OAuth signs only an active account in
+    if !matches!(creds, Credentials::OAuth { .. }) {
         creds.need_space(&space.target(), SpaceAccess::ReadSelf)?;
     }
-    if let Some(st) = status.filter(|s| s != "deactivated") {
+    if let Some(st) = app.account(&did).await?.status {
         return Err(inactive_account_error(&st));
     }
     // before reading the body (the worker checks again)
     let held = super::space::load_head(sp, &*app.partition(&did)?, &did, &space).await?;
-    if held.as_ref().is_some_and(|h| h.records > 0) {
-        return Err(invalid("this account already has records in the space; delete them first"));
-    }
     let mut car = CarReader::new(body, app.config.max_import_bytes);
     let header = car.section().await?.ok_or_else(|| invalid("invalid CAR: empty"))?;
     let roots = crate::car::read_header(&header).map_err(|e| invalid(format!("invalid CAR: {e}")))?;
@@ -241,10 +286,10 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     let index = decode_index(&index_block, sp.limits.max_records)?;
     let collections: std::collections::BTreeSet<&str> =
         index.iter().filter_map(|(p, _)| p.split_once('/').map(|(c, _)| c)).collect();
-    for c in collections.iter().filter(|_| oauth) {
+    for c in &collections {
         creds.need_space(&space.target(), SpaceAccess::Write("create", c))?;
     }
-    if collections.is_empty() && oauth {
+    if collections.is_empty() {
         creds.need_space(&space.target(), SpaceAccess::ReadSelf)?;
     }
     drop(collections);
@@ -275,8 +320,15 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
         return Err(invalid("the imported commit's rev must be newer than the repo's in the space"));
     }
     let ctx = CommitCtx { space: &space.uri, author: &did, rev: &commit.rev };
-    if !commit::verify(&commit, &ctx, &current_key(app, &did).await?) {
-        return Err(bad("InvalidCommit", "The commit's signature or MAC does not verify against the account's key"));
+    let current = current_key(app, &did).await?;
+    if !commit::verify(&commit, &ctx, &current) {
+        let past = past_keys(app, &did, rev.micros()).await?;
+        if !past.iter().any(|k| *k != current && commit::verify(&commit, &ctx, k)) {
+            return Err(bad(
+                "InvalidCommit",
+                "The commit's signature or MAC does not verify against a key the account held at its rev",
+            ));
+        }
     }
     let mut set = LtHash::default();
     for (path, cid) in &index {

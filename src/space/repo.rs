@@ -836,9 +836,6 @@ fn importable(head: &SpaceHead, uri: &str, rev: Option<Tid>) -> Result<(), Space
     if *head.uri != *uri {
         return Err(internal(format!("space id collision: {} and {uri}", head.uri)));
     }
-    if head.records > 0 {
-        return invalid("this account already has records in the space; delete them first");
-    }
     match (head.rev, rev) {
         (None, _) => Ok(()),
         (Some(_), None) => invalid("this account has a repo in the space"),
@@ -850,8 +847,8 @@ fn importable(head: &SpaceHead, uri: &str, rev: Option<Tid>) -> Result<(), Space
     }
 }
 
-/// importRepo's claim: only into a space the account holds no records in.
-/// Some(the head's delete) when an empty repo's head goes.
+/// importRepo's claim. Some(the head's delete) when a repo is there: it's
+/// replaced, its rows swept under the claim before the new ones stage.
 pub fn import_begin(
     st: &mut SpaceStates,
     did: &str,
@@ -868,8 +865,9 @@ pub fn import_begin(
         st.repos.remove(&sid);
         return Ok(None);
     }
-    // its oplog is still there, and the head's delete is in flight: a write
-    // after a failed import clears what's left before it lands
+    // its rows are still there, and the head's delete is in flight: the
+    // import sweeps them, and a write after a failed import clears what's
+    // left before it lands
     let mut empty = SpaceHead::new(head.uri.clone(), None);
     empty.unswept = true;
     *head = empty;
@@ -1329,7 +1327,7 @@ mod tests {
         go(&mut st, sid, &uri, vec![create("a", 1)]).unwrap();
         let invalid =
             |r: Result<Option<Mutation>, SpaceError>| matches!(r, Err(SpaceError::Write(WriteError::Invalid(_))));
-        assert!(invalid(import_begin(&mut st, did, sid, URI, Some(Tid(u64::MAX >> 2)))), "it holds records");
+        assert!(invalid(import_begin(&mut st, did, sid, URI, Some(Tid(1)))), "an older rev over its records");
         let del = SpaceWrite::Delete { collection: "com.example.post".into(), rkey: "a".into(), must_exist: true };
         let gone = go(&mut st, sid, &uri, vec![del]).unwrap().rev;
         assert!(invalid(import_begin(&mut st, did, sid, URI, None)), "a sweep never takes a head");
@@ -1338,6 +1336,12 @@ mod tests {
         let m = import_begin(&mut st, did, sid, URI, Some(Tid(gone.0 + (1 << 20)))).unwrap().unwrap();
         assert_eq!((m.key.to_vec(), m.val), (state::space_head_key(did, &sid), None));
         assert!(st.repos[&sid].rev.is_none() && st.repos[&sid].unswept);
+        // a repo with records is replaced the same way at a newer rev
+        let (mut st, sid, uri) = states_with(&[("com.example.post/a", None)]);
+        let rev = go(&mut st, sid, &uri, vec![create("a", 1)]).unwrap().rev;
+        let m = import_begin(&mut st, did, sid, URI, Some(Tid(rev.0 + (1 << 20)))).unwrap().unwrap();
+        assert_eq!((m.key.to_vec(), m.val), (state::space_head_key(did, &sid), None));
+        assert!(st.repos[&sid].rev.is_none() && st.repos[&sid].unswept && st.repos[&sid].records == 0);
     }
 
     #[test]

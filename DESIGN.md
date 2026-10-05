@@ -5435,10 +5435,9 @@ oplog replay from one snapshot and counts a mismatch in
   sessions are refused on every space and simplespace method, delegation
   tokens included, and `getServiceAuth` mints them no token for a
   `com.atproto.space.*` or `com.atproto.simplespace.*` method. The
-  reference lets them read and write the account's own space records. The
-  one exception is `vlpds.space.importRepo` for a deactivated account
-  moving in, which can't sign in with OAuth until it's active (an open
-  decision, see below).
+  reference lets them read and write the account's own space records.
+  `vlpds.space.importRepo` is no exception, so an account moving in
+  imports after it's activated (see below).
 - The notifyWrite outbox is the `sP` row written in the write's own entry,
   so there's no lease retry worker and no extra PUT. A delivered row's
   delete rides the shard's next entry instead of its own, so after a
@@ -5464,14 +5463,21 @@ oplog replay from one snapshot and counts a mismatch in
   `listSpaceRecords` and `getSpaceRecord`, admin or the moderation service
   only, each call audited (`space.read`) before it reads.
 - `vlpds.space.importRepo` (Q8) has no upstream counterpart. It takes
-  space.getRepo's 2-root CAR, checks the signature and MAC against the
-  DID's current key and the set hash against the index, stages the records
+  space.getRepo's 2-root CAR on an OAuth grant that may create records in
+  the space, checks the signature and MAC against the DID's current key,
+  or the `#atproto` key its PLC audit log says it held at the commit's rev
+  (an account imports after its DID points here, while the CAR was signed
+  on the old host), and the set hash against the index, stages the records
   in bounded frameless entries and switches the head in at the CAR's rev
   with an empty oplog. The CAR's layout is verifyRepoCarFull's (commit,
   index, one block per entry in index order, nothing else), and an
   authority on the same node must let the account write. It follows the upstream contract once there is one.
-  A rev more than 5 min ahead gets FutureRev, an import over a repo with
-  records is refused, and one over an emptied repo works at a newer rev.
+  A rev more than 5 min ahead gets FutureRev. An import over a repo that's
+  there replaces it at a newer rev, as the public importRepo does: the old
+  head goes in the first entry, the old rows in bounded batches, and the
+  new head in the last, so reads see no repo in between. A second import
+  while one runs is refused. Between the DID switch and the import,
+  syncers find no space data for the account here.
   A failed import clears what it staged, and rows a crashed one left with
   no head over them are cleared by the next import or the repo's first
   write before it lands.

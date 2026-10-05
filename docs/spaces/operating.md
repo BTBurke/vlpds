@@ -59,9 +59,9 @@ A few rules decide what your users and their apps can do:
 - Space data is OAuth only. An app needs a `space:` scope, and app passwords and password sessions
   get no space reads, writes or delegation tokens. `getServiceAuth` won't mint them a token for a
   space method either ([Reading a space](reading.md#oauth-only)).
-- The one exception is `vlpds.space.importRepo` for an account that's moving in. It's still
-  deactivated, so it can't sign in with OAuth, and its own password session may import until it's
-  activated ([Moving a repo in](storage.md#moving-a-repo-in)).
+- That includes `vlpds.space.importRepo`, so an account moving in imports its space repos after it's
+  activated here, with OAuth. Syncers see none of its space data for that short gap
+  ([Moving a repo in](storage.md#moving-a-repo-in)).
 - `sync.getBlob` serves a blob only once a public record names it. A blob only space records name
   is served by `space.getBlob` to a credential for that space ([Blobs](privacy.md#blobs)).
 - The oplog keeps 7 days. A syncer further behind falls back to `getRepo`, which the reference

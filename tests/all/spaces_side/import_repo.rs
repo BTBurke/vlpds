@@ -13,16 +13,13 @@
 //!   account can't write in, and anything but OAuth. A refused import writes
 //!   nothing.
 //!
-//! Mid-migration the account is deactivated on the new host (created with an
-//! existing DID), and the commit still verifies under the old host's key,
-//! the DID's current one. OAuth signs no deactivated account in, so the
-//! import goes in on the createAccount session: the "narrow exception"
-//! (option a) vlpds has today, while migration-in vs OAuth-only waits on a
-//! decision. Space reads use an OAuth grant once the account is active.
-//!
-//! listMissingBlobs doesn't count imported space blob refs yet, so the
-//! moves upload their space blobs without asking it
-//! (`imported_space_blobs_are_listed_missing`, ignored, holds that contract).
+//! importRepo is OAuth-only (brief, FINAL decision 1, option b), and OAuth
+//! signs no deactivated account in, so a move imports once the DID points
+//! at the new host and the account is active there. The CAR was signed on
+//! the old host, so it verifies under the key the DID's PLC history says it
+//! held at the commit's rev: the stub directory serves an audit log of
+//! every document a test puts in it. An import over a repo that's there
+//! replaces it.
 
 use super::phase3::*;
 use super::ref_net::*;
@@ -37,12 +34,44 @@ use std::time::Duration;
 const EXPORT_CAR: &[u8] = include_bytes!("../../../testdata/spaces-alpha/export.car");
 const EXPORT_JSON: &str = include_str!("../../../testdata/spaces-alpha/export.json");
 
-pub(super) type Docs = Arc<Mutex<HashMap<String, J>>>;
+pub(crate) type Docs = Arc<Mutex<DocMap>>;
+
+/// Each DID's document, and every one it had as an audit log.
+#[derive(Default)]
+pub(crate) struct DocMap {
+    docs: HashMap<String, J>,
+    history: HashMap<String, Vec<J>>,
+}
+
+impl DocMap {
+    pub fn get(&self, did: &str) -> Option<&J> {
+        self.docs.get(did)
+    }
+
+    pub fn insert(&mut self, did: String, doc: J) -> Option<J> {
+        let key = doc["verificationMethod"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["id"].as_str().is_some_and(|i| i.ends_with("#atproto")))
+            .and_then(|m| m["publicKeyMultibase"].as_str())
+            .map(|mb| format!("did:key:{mb}"));
+        let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        self.history.entry(did.clone()).or_default().push(json!({
+            "did": did,
+            "operation": {"type": "plc_operation", "verificationMethods": {"atproto": key}},
+            "cid": "bafyreie5737gdxlw5i64vzichcalba3z2v5n6icifvx5xytvske7mr3hpm",
+            "nullified": false,
+            "createdAt": at,
+        }));
+        self.docs.insert(did, doc)
+    }
+}
 
 /// A PLC directory stand-in serving whatever documents a test puts in it
 /// (tests/all/migration.rs's): a DID moves between hosts by a test
-/// replacing its document.
-pub(super) async fn stub_plc() -> (String, Docs) {
+/// replacing its document, and `/log/audit` lists each one it had.
+pub(crate) async fn stub_plc() -> (String, Docs) {
     let docs: Docs = Arc::default();
     let app = axum::Router::new()
         .route(
@@ -50,6 +79,15 @@ pub(super) async fn stub_plc() -> (String, Docs) {
             axum::routing::get(|State(d): State<Docs>, Path(did): Path<String>| async move {
                 match d.lock().unwrap().get(&did) {
                     Some(doc) => Ok(axum::Json(doc.clone())),
+                    None => Err(axum::http::StatusCode::NOT_FOUND),
+                }
+            }),
+        )
+        .route(
+            "/{did}/log/audit",
+            axum::routing::get(|State(d): State<Docs>, Path(did): Path<String>| async move {
+                match d.lock().unwrap().history.get(&did) {
+                    Some(h) => Ok(axum::Json(J::Array(h.clone()))),
                     None => Err(axum::http::StatusCode::NOT_FOUND),
                 }
             }),
@@ -107,8 +145,7 @@ pub(super) async fn oauth_client(s: &TestServer, did: &str, handle: &str, jwt: &
 pub(super) struct Arrived {
     pub did: String,
     pub handle: String,
-    /// The createAccount session: public methods, and importRepo while
-    /// deactivated.
+    /// The createAccount session: public methods (not space data).
     pub session: Auth,
 }
 
@@ -119,8 +156,9 @@ impl Arrived {
         oauth_client(new, &self.did, &self.handle, jwt, FULL_SCOPE).await
     }
 
+    /// importRepo on the account's OAuth grant: once it's active.
     pub async fn import(&self, new: &TestServer, space: &str, car: &[u8]) -> Resp {
-        import_repo_as(&new.url, &self.session, space, car).await
+        import_repo(&self.oauth(new).await, space, car).await
     }
 }
 
@@ -242,10 +280,11 @@ fn reference_export_verifies_and_reencodes() {
 }
 
 /// A reference-hosted account moves to vlpds with its space repo: created
-/// with its DID (deactivated), the reference's getRepo CAR imported under
-/// the DID's current key (the old host's), the record's blob listed missing
-/// until uploaded, then the DID moves. vlpds then serves the same repo: the
-/// same rev, set hash, index and record blocks, signed by its own key.
+/// with its DID, the DID moved and the account activated, then the
+/// reference's getRepo CAR imported with OAuth under the key the DID held
+/// at its rev (the old host's), the record's blob listed missing until
+/// uploaded. vlpds then serves the same repo: the same rev, set hash,
+/// index and record blocks, signed by its own key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reference_export_imports_mid_migration() {
     let f = fixture();
@@ -269,21 +308,21 @@ async fn reference_export_imports_mid_migration() {
     let sa =
         vlpds::auth::service_auth_jwt(&f.key, &f.did, &new_did, Some("com.atproto.server.createAccount"), 60).unwrap();
     let a = arrive(&new, &f.did, sa).await;
+    complete_move(&docs, &new, &a).await;
+    let oauth = a.oauth(&new).await;
 
-    let out = a.import(&new, &f.space, EXPORT_CAR).await.ok();
+    let out = import_repo(&oauth, &f.space, EXPORT_CAR).await.ok();
     assert_eq!(out["rev"], json!(f.rev), "{out}");
     assert_eq!(out["records"], json!(5), "{out}");
     check_space_ok(&new, &f.did, &f.space).await;
 
-    // the migration copies the record's blob
+    // the migration copies the record's blob, which listMissingBlobs names
     let blob = f.j["blob"]["cid"].as_str().unwrap().to_string();
+    assert_eq!(missing_blobs(&new, &a.session).await, vec![blob.clone()]);
     let bytes = hex::decode(f.j["blob"]["bytesHex"].as_str().unwrap()).unwrap();
     let up = new.xrpc.post_bytes("com.atproto.repo.uploadBlob", bytes, "image/png", &a.session).await.ok();
     assert_eq!(up["blob"]["ref"]["$link"], json!(blob));
     assert!(missing_blobs(&new, &a.session).await.is_empty());
-
-    complete_move(&docs, &new, &a).await;
-    let oauth = a.oauth(&new).await;
     assert_eq!(head(&oauth, &f.space).await.map(|h| h.0), Some(f.rev.clone()));
     let (_, hash) = head(&oauth, &f.space).await.unwrap();
     assert_eq!(hex::encode(hash), f.j["hash"].as_str().unwrap());
@@ -339,7 +378,6 @@ use vlpds::space::lthash::LtHash;
 /// The reference export's record names a blob the new host doesn't hold
 /// yet: listMissingBlobs lists it until the migration uploads it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "not built: listMissingBlobs counts public blob refs only, not imported space ones (sb/)"]
 async fn imported_space_blobs_are_listed_missing() {
     let f = fixture();
     let (plc, docs) = stub_plc().await;
@@ -360,6 +398,7 @@ async fn imported_space_blobs_are_listed_missing() {
     let sa =
         vlpds::auth::service_auth_jwt(&f.key, &f.did, &new_did, Some("com.atproto.server.createAccount"), 60).unwrap();
     let a = arrive(&new, &f.did, sa).await;
+    complete_move(&docs, &new, &a).await;
     a.import(&new, &f.space, EXPORT_CAR).await.ok();
     let blob = f.j["blob"]["cid"].as_str().unwrap().to_string();
     assert_eq!(missing_blobs(&new, &a.session).await, vec![blob]);
@@ -429,9 +468,10 @@ pub(super) async fn fill_bob(h: &TwoHosts) -> (String, Vec<u8>) {
     (blob_cid(&blob), bytes)
 }
 
-/// bob, on host b with a deactivated account and his space repo imported
-/// (blobs copied): the move up to the DID switch, then the switch, so his
-/// OAuth grant there (the second value) reads the repo.
+/// bob moves to host b: exported from host a, the DID switched and the
+/// account activated on b, then his space repo imported there with his
+/// OAuth grant (the first value) and its blobs copied as listMissingBlobs
+/// asks.
 pub(super) async fn move_bob(h: &TwoHosts, blob: &(String, Vec<u8>)) -> (SpaceClient, VerifiedRepo) {
     let b_did = h.b.pds_did().await;
     let sa = service_jwt(&h.bob, &b_did, "com.atproto.server.createAccount").await;
@@ -439,7 +479,9 @@ pub(super) async fn move_bob(h: &TwoHosts, blob: &(String, Vec<u8>)) -> (SpaceCl
     let r = get_repo_self(&h.bob, &h.space).await;
     assert_eq!(r.status, 200, "{}", r.text());
     let exported = verify_repo_car(&r.body, &h.space, &h.bob.did, &did_key(&h.a, &h.bob.did).await, true).unwrap();
-    let out = arrived.import(&h.b, &h.space, &r.body).await.ok();
+    complete_move(&h.docs, &h.b, &arrived).await;
+    let moved = arrived.oauth(&h.b).await;
+    let out = import_repo(&moved, &h.space, &r.body).await.ok();
     assert_eq!(out["rev"], json!(exported.commit.rev), "{out}");
     assert_eq!(out["records"], json!(exported.index.len()), "{out}");
     // the blob from the old host's space.getBlob, as the migrate page copies it
@@ -448,10 +490,10 @@ pub(super) async fn move_bob(h: &TwoHosts, blob: &(String, Vec<u8>)) -> (SpaceCl
         .get_raw("com.atproto.space.getBlob", &[("space", &h.space), ("repo", &h.bob.did), ("cid", &blob.0)])
         .await;
     assert_eq!((status, &got), (200, &blob.1));
+    assert_eq!(missing_blobs(&h.b, &arrived.session).await, vec![blob.0.clone()]);
     h.b.xrpc.post_bytes("com.atproto.repo.uploadBlob", got, "image/png", &arrived.session).await.ok();
     assert!(missing_blobs(&h.b, &arrived.session).await.is_empty());
-    complete_move(&h.docs, &h.b, &arrived).await;
-    (arrived.oauth(&h.b).await, exported)
+    (moved, exported)
 }
 
 /// bob's space repo moves from one vlpds host to another with his account:
@@ -784,4 +826,77 @@ async fn import_is_oauth_only() {
     assert!((400..500).contains(&r.status), "a read-only grant: {}", r.text());
     nothing_written(&o.bob, &o.space, "a read-only grant").await;
     import_repo(&o.bob, &o.space, &car).await.ok();
+}
+
+/// After a key rotation the DID's current key is another one: a CAR signed
+/// by a key the DID held at the commit's rev (its PLC history) imports, one
+/// signed by a key it never had doesn't, and neither does one by a key it
+/// held but long before the rev.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_verifies_against_the_key_held_at_the_rev() {
+    let h = two_hosts().await;
+    let old_key = account_key(&h.a, &h.bob.did).await;
+    let rev = rev_ago(Duration::from_secs(60));
+    let built = |key: &vlpds::crypto::Keypair| records(RepoBuilder::new(&h.space, &h.bob.did, &rev), 2).build(key);
+    let b_did = h.b.pds_did().await;
+    let sa = service_jwt(&h.bob, &b_did, "com.atproto.server.createAccount").await;
+    let arrived = arrive(&h.b, &h.bob.did, sa).await;
+    complete_move(&h.docs, &h.b, &arrived).await;
+    let moved = arrived.oauth(&h.b).await;
+    assert_ne!(did_key(&h.b, &h.bob.did).await, old_key.did_key(), "the DID's key rotated");
+
+    let never = built(&vlpds::crypto::Keypair::generate());
+    let r = import_repo(&moved, &h.space, &never.car()).await;
+    assert_eq!(r.status, 400, "a key the DID never had: {}", r.text());
+    assert_eq!(r.json["error"], json!("InvalidCommit"), "{}", r.text());
+    nothing_written(&moved, &h.space, "a key the DID never had").await;
+
+    import_repo(&moved, &h.space, &built(&old_key).car()).await.ok();
+    assert_eq!(head(&moved, &h.space).await.map(|h| h.0), Some(rev));
+}
+
+/// An import over a repo that's there replaces it with the snapshot at a
+/// newer rev, as com.atproto.repo.importRepo does: the old records go, the
+/// new ones are served, check-space is clean. An older or equal rev is
+/// refused, and so is a second import while one runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn import_over_a_repo_replaces_it() {
+    let o = one().await;
+    let s = &o.net.pds[0];
+    let key = account_key(s, &o.bob.did).await;
+    write(&o.bob, &o.space, W::new().rkey("live").text("written here")).await.ok();
+    let first = rev_ago(Duration::from_secs(30));
+    let mut b = RepoBuilder::new(&o.space, &o.bob.did, &first);
+    for i in 0..3 {
+        b.records.insert(format!("{TEST_COLLECTION}/old{i}"), record_block(&json!({"$type": TEST_COLLECTION, "i": i})));
+    }
+    let r = import_repo(&o.bob, &o.space, &b.build(&key).car()).await;
+    assert_eq!(r.status, 400, "a rev older than the repo's: {}", r.text());
+
+    let newer = vlpds::tid::Tid::from_parts(vlpds::tid::now_micros(), 0).to_string();
+    let mut b = RepoBuilder::new(&o.space, &o.bob.did, &newer);
+    for i in 0..2 {
+        b.records.insert(format!("{TEST_COLLECTION}/new{i}"), record_block(&json!({"$type": TEST_COLLECTION, "n": i})));
+    }
+    let built = b.build(&key);
+    // an import already running holds the space repo
+    let sp = s.app.spaces.as_ref().unwrap();
+    let sid = vlpds::state::space_id(&o.space);
+    assert!(sp.begin_import(&o.bob.did, sid, 7));
+    let r = import_repo(&o.bob, &o.space, &built.car()).await;
+    assert_eq!(r.status, 400, "a second import: {}", r.text());
+    assert!(r.text().contains("in progress"), "{}", r.text());
+    sp.end_import(&o.bob.did, sid, 7);
+
+    let out = import_repo(&o.bob, &o.space, &built.car()).await.ok();
+    assert_eq!((out["rev"].clone(), out["records"].clone()), (json!(newer), json!(2)), "{out}");
+    let mut got: Vec<String> =
+        all_records(&o.bob, &o.space).await.iter().map(|r| r["rkey"].as_str().unwrap().to_string()).collect();
+    got.sort();
+    assert_eq!(got, ["new0", "new1"], "the snapshot replaced the repo");
+    assert_eq!(head(&o.bob, &o.space).await.map(|h| h.0), Some(newer.clone()));
+    expect_set_hash_matches_store(&o.bob, &o.space).await;
+    check_space_ok(s, &o.bob.did, &o.space).await;
+    let r = import_repo(&o.bob, &o.space, &built.car()).await;
+    assert_eq!(r.status, 400, "the same rev again: {}", r.text());
 }
