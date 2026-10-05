@@ -1,7 +1,8 @@
 //! Server-rendered pages for the authorization flow and session management.
 //! No external assets: one inline stylesheet allowed by hash in the
-//! Content-Security-Policy. The only script is the fixed auto-submit of the
-//! `response_mode=form_post` page, also allowed by hash and only there.
+//! Content-Security-Policy. Two fixed scripts, each allowed by hash and
+//! only on its pages: the auto-submit of the `response_mode=form_post`
+//! page, and the passkey ceremony on the sign-in pages ([`PASSKEY_JS`]).
 
 use super::scopes::{IncludeScope, Permission};
 use super::util::{html_escape as e, sha256};
@@ -70,6 +71,13 @@ ul.scopes input:disabled+div label{cursor:default}
 code.sc{display:block;margin-top:2px;color:var(--ink2);font:12px/1.5 "JetBrains Mono",ui-monospace,Menlo,monospace;overflow-wrap:anywhere}
 .sd{margin:4px 0 0;color:var(--ink2);font-size:13.5px}
 .warn{margin:6px 0 0;padding:6px 9px;border-left:3px solid var(--amber);background:var(--paper);font-size:13.5px}
+label.check{display:flex;gap:8px;align-items:center;font-weight:500}
+.wide{width:100%}
+form.pk{margin:14px 0 4px}
+.sep{border-top:1px solid var(--rule);margin:18px 0 0}
+.or{text-align:center;margin:14px 0 0}
+details.alt-code{margin:16px 0 0}
+details.alt-code summary{cursor:pointer;color:var(--accent);font-size:14px}
 "#;
 
 static STYLE_HASH: LazyLock<String> = LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(STYLE)));
@@ -165,12 +173,58 @@ pub struct LoginForm<'a> {
     pub action: &'a str,
     pub identifier: &'a str,
     pub error: Option<&'a str>,
-    /// Password accepted; ask for the second-factor code.
-    pub totp: bool,
-    /// With `totp`: the code was emailed to this (obfuscated) address.
+    /// Password accepted: the second-factor step.
+    pub second: Option<Second<'a>>,
+    /// The password step: also offer a passkey instead of the password.
+    pub passkey: Option<PasskeyUi<'a>>,
+}
+
+/// What the second-factor step offers.
+pub struct Second<'a> {
+    /// The code was emailed to this (obfuscated) address: the only factor.
     pub email_hint: Option<&'a str>,
-    /// With `totp`: offer to trust this browser for this many days (0: don't).
+    pub totp: bool,
+    /// Offer to trust this browser for this many days (0: don't).
     pub trust_days: u32,
+    /// The account's passkeys.
+    pub passkey: Option<PasskeyUi<'a>>,
+}
+
+/// What [`PASSKEY_JS`] reads from the passkey form's `data-*` attributes.
+pub struct PasskeyUi<'a> {
+    /// base64url
+    pub challenge: &'a str,
+    pub rp_id: &'a str,
+    /// `allowCredentials` as JSON (empty for passwordless).
+    pub allow: &'a str,
+}
+
+/// The passkey ceremony on the sign-in and second-factor pages. Fixed bytes
+/// (allowed by hash, like the style), reading everything from the `#pk`
+/// form's data attributes, posting the assertion as hidden fields: no
+/// fetch, so no connect-src. Conditional UI (autofill) on the password step.
+pub const PASSKEY_JS: &str = "(function(){var f=document.getElementById('pk');if(!f||!window.PublicKeyCredential)return;\
+var d=f.dataset,E=f.elements,ctl;\
+function b(s){var r=atob(s.replace(/-/g,'+').replace(/_/g,'/')),u=new Uint8Array(r.length);for(var i=0;i<r.length;i++)u[i]=r.charCodeAt(i);return u}\
+function e(a){var u=new Uint8Array(a),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'')}\
+var o={challenge:b(d.challenge),rpId:d.rp,timeout:300000,userVerification:d.uv,\
+allowCredentials:JSON.parse(d.allow||'[]').map(function(c){return{type:'public-key',id:b(c.id),transports:c.transports}})};\
+function go(m){if(ctl)ctl.abort();ctl=new AbortController();var q={publicKey:o,signal:ctl.signal};if(m)q.mediation=m;\
+navigator.credentials.get(q).then(function(c){var r=c.response,t=document.querySelector('input[type=checkbox][name=trust]');\
+E.passkey_id.value=e(c.rawId);E.client_data.value=e(r.clientDataJSON);E.auth_data.value=e(r.authenticatorData);\
+E.signature.value=e(r.signature);E.user_handle.value=r.userHandle?e(r.userHandle):'';\
+if(t&&t.checked&&E.trust)E.trust.value='1';f.submit()},\
+function(x){if(!m&&x&&x.name!=='AbortError'){var p=document.getElementById('pk-err');if(p)p.hidden=false}})}\
+var g=document.getElementById('pk-go');if(g){g.hidden=false;g.addEventListener('click',function(){go()})}\
+if(d.mode==='signin'&&PublicKeyCredential.isConditionalMediationAvailable)\
+PublicKeyCredential.isConditionalMediationAvailable().then(function(a){if(a)go('conditional')})})();";
+
+static PASSKEY_JS_HASH: LazyLock<String> =
+    LazyLock::new(|| base64::engine::general_purpose::STANDARD.encode(sha256(PASSKEY_JS)));
+
+/// [`csp`] plus the passkey script, on the sign-in and second-factor pages.
+pub fn csp_passkey(form_action: &[String]) -> String {
+    format!("{}; script-src 'sha256-{}'", csp(form_action), *PASSKEY_JS_HASH)
 }
 
 /// The second-factor step's "trust this browser" choice, whatever the factor.
@@ -182,6 +236,35 @@ fn trust_choice(days: u32) -> String {
     format!(
         "<label class=\"check\"><input type=\"checkbox\" name=\"trust\" value=\"1\">Trust this browser for {n}</label>\
 <p class=\"muted\">You won't be asked for a code on this browser until then. Leave it unticked on a shared computer.</p>"
+    )
+}
+
+/// The hidden form the script fills and posts; its button stays hidden
+/// without the script.
+fn passkey_form(hidden: &str, action: &str, pk: &PasskeyUi, second: bool) -> String {
+    let (mode, step, uv, label, err) = if second {
+        ("2fa", "2fa", "preferred", "Use your passkey", "That passkey wasn't used. Try again, or use a code.")
+    } else {
+        (
+            "signin",
+            "passkey",
+            "required",
+            "Sign in with a passkey",
+            "No passkey was used. Try again, or use your password.",
+        )
+    };
+    format!(
+        "<form method=\"post\" action=\"{}\" id=\"pk\" class=\"pk\" data-mode=\"{mode}\" data-challenge=\"{}\" data-rp=\"{}\" data-uv=\"{uv}\" data-allow=\"{}\">{hidden}\
+<input type=\"hidden\" name=\"step\" value=\"{step}\"><input type=\"hidden\" name=\"action\" value=\"sign-in\">\
+<input type=\"hidden\" name=\"passkey_id\"><input type=\"hidden\" name=\"client_data\"><input type=\"hidden\" name=\"auth_data\">\
+<input type=\"hidden\" name=\"signature\"><input type=\"hidden\" name=\"user_handle\"><input type=\"hidden\" name=\"trust\">\
+<button type=\"button\" id=\"pk-go\" class=\"{}\" hidden>{label}</button>\
+<p class=\"err\" id=\"pk-err\" role=\"alert\" hidden>{err}</p></form>",
+        e(action),
+        e(pk.challenge),
+        e(pk.rp_id),
+        e(pk.allow),
+        if second { "primary wide" } else { "wide" },
     )
 }
 
@@ -200,60 +283,86 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     if let Some(err) = f.error {
         b.push_str(&format!("<p class=\"err\" role=\"alert\">{}</p>", e(err)));
     }
-    b.push_str(&format!("<form method=\"post\" action=\"{}\">", e(f.action)));
-    match ctx {
-        Some(c) => b.push_str(&hidden(c)),
-        None => b.push_str(&format!("<input type=\"hidden\" name=\"csrf\" value=\"{}\">", e(csrf_only))),
+    let hidden_fields = match ctx {
+        Some(c) => hidden(c),
+        None => format!("<input type=\"hidden\" name=\"csrf\" value=\"{}\">", e(csrf_only)),
+    };
+    let username = format!(
+        "<input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">",
+        e(f.identifier)
+    );
+    let mut script = false;
+    // a passkey-only second factor: the code form is only for recovery codes
+    let mut recovery_only = false;
+    if let Some(s) = &f.second {
+        b.push_str(&format!("<p>Two-factor authentication is enabled for <b>{}</b>.</p>", e(f.identifier)));
+        if let Some(pk) = &s.passkey {
+            script = true;
+            recovery_only = !s.totp;
+            b.push_str(&passkey_form(&hidden_fields, f.action, pk, true));
+            b.push_str("<noscript><p class=\"muted\">Turn on JavaScript to use your passkey.</p></noscript>");
+        }
     }
-    if let (true, Some(hint)) = (f.totp, f.email_hint) {
-        b.push_str(&format!(
-            "<p>Two-factor authentication is enabled for <b>{}</b>. We sent a sign-in code to <b>{}</b>.</p>\
-<input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
+    b.push_str(&format!("<form method=\"post\" action=\"{}\">", e(f.action)));
+    b.push_str(&hidden_fields);
+    match &f.second {
+        Some(Second { email_hint: Some(hint), trust_days, .. }) => b.push_str(&format!(
+            "<p>We sent a sign-in code to <b>{}</b>.</p>{username}\
 <label for=\"code\">Sign-in code from your email</label>\
 <input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" spellcheck=\"false\" required autofocus>\
-{}<input type=\"hidden\" name=\"step\" value=\"totp\">",
-            e(f.identifier),
+{}<input type=\"hidden\" name=\"step\" value=\"2fa\">",
             e(hint),
-            e(f.identifier),
-            trust_choice(f.trust_days)
-        ));
-    } else if f.totp {
-        b.push_str(&format!(
-            "<p>Two-factor authentication is enabled for <b>{}</b>.</p>\
-<input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
+            trust_choice(*trust_days)
+        )),
+        Some(s) if recovery_only => b.push_str(&format!(
+            "{username}{}<input type=\"hidden\" name=\"step\" value=\"2fa\">\
+<details class=\"alt-code\"><summary>Use a recovery code instead</summary>\
+<label for=\"code\">Recovery code</label>\
+<input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"none\" spellcheck=\"false\" required>\
+<div class=\"row\"><button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></details>",
+            trust_choice(s.trust_days)
+        )),
+        Some(s) => b.push_str(&format!(
+            "{}{username}\
 <label for=\"code\">Authenticator code (or a recovery code)</label>\
-<input type=\"text\" id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required autofocus>\
-{}<input type=\"hidden\" name=\"step\" value=\"totp\">",
-            e(f.identifier),
-            e(f.identifier),
-            trust_choice(f.trust_days)
-        ));
-    } else {
-        b.push_str(&format!(
+<input type=\"text\" id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required{}>\
+{}<input type=\"hidden\" name=\"step\" value=\"2fa\">",
+            if s.passkey.is_some() { "<p class=\"muted or\">or enter a code</p>" } else { "" },
+            if s.passkey.is_some() { "" } else { " autofocus" },
+            trust_choice(s.trust_days)
+        )),
+        None => b.push_str(&format!(
             "<label for=\"identifier\">Handle or DID</label>\
-<input type=\"text\" id=\"identifier\" name=\"identifier\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" required{}>\
+<input type=\"text\" id=\"identifier\" name=\"identifier\" value=\"{}\" autocomplete=\"username{}\" autocapitalize=\"none\" spellcheck=\"false\" required{}>\
 <label for=\"password\">Password</label>\
 <input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"current-password\" required{}>",
             e(f.identifier),
+            if f.passkey.is_some() { " webauthn" } else { "" },
             if f.identifier.is_empty() { " autofocus" } else { "" },
             if f.identifier.is_empty() { "" } else { " autofocus" }
-        ));
+        )),
     }
     b.push_str("<div class=\"row\">");
     if ctx.is_some() {
         b.push_str("<button type=\"submit\" name=\"action\" value=\"deny\" formnovalidate>Cancel</button>");
     }
-    b.push_str(
-        "<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></form>",
-    );
-    if let (Some(c), false) = (ctx, f.totp) {
+    if !recovery_only {
+        b.push_str("<button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button>");
+    }
+    b.push_str("</div></form>");
+    if let (None, Some(pk)) = (&f.second, &f.passkey) {
+        script = true;
+        b.push_str("<div class=\"sep\" aria-hidden=\"true\"></div>");
+        b.push_str(&passkey_form(&hidden_fields, f.action, pk, false));
+    }
+    if let (Some(c), None) = (ctx, &f.second) {
         b.push_str(&format!(
             "<p class=\"alt\">New to {}? <a href=\"{}\">Create an account</a></p>",
             e(c.server_name),
             e(&screen_url(c, "sign-up"))
         ));
     }
-    page("Sign in", &b)
+    page_with_script("Sign in", &b, if script { PASSKEY_JS } else { "" })
 }
 
 fn screen_url(c: &Ctx, screen: &str) -> String {

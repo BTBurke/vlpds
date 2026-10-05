@@ -1794,7 +1794,14 @@ async fn create_session_inner(
         Some("trusted")
     } else {
         step.second_factor = true;
-        super::email2fa::check_second_factor(app, &acct, code, app_pass.is_some()).await?;
+        super::email2fa::check_second_factor(
+            app,
+            &acct,
+            code,
+            app_pass.is_some(),
+            super::passkeys::has_any(app, &acct.did).await?,
+        )
+        .await?;
         step.second_factor = false;
         match (&app_pass, code) {
             (None, Some(_)) if crate::totp::enabled_for(app, &acct).await? => Some("totp"),

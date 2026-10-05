@@ -1,7 +1,7 @@
 //! Email second factor: the reference PDS's `emailAuthFactor`, plus a
 //! wrong-code lockout on TOTP's schedule (DESIGN.md "Email second factor").
-//! When TOTP is also enabled, TOTP alone is asked for: the weaker factor
-//! never stands in for the stronger one.
+//! When TOTP or a passkey is also set up, the email code isn't offered: the
+//! weaker factor never stands in for a stronger one.
 
 use super::server::{
     assert_email_token, create_email_token, delete_email_tokens, deliver, email_token_age_ms, invalid_request,
@@ -45,6 +45,9 @@ pub(super) fn check_row(_routing: &str, name: &str, val: &[u8]) -> Option<anyhow
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Factor {
     Totp,
+    /// The account has passkeys and no TOTP: an assertion (checked by the
+    /// caller), or a recovery code.
+    Passkey,
     /// A code was (or would have been) mailed; `hint` is the obfuscated
     /// address, as the reference shows it (`a***e@e***m`).
     Email {
@@ -82,15 +85,17 @@ fn factor_required() -> XrpcError {
     }
 }
 
-/// TOTP when enabled, else the email factor when enabled; app passwords
-/// bypass both. A code sent anyway is still checked as an email sign-in
-/// code, as the reference's `login()` does, and counts against the lockout
-/// like any wrong code.
+/// TOTP when enabled; else, with passkeys, a recovery code (the caller
+/// checks a passkey itself); else the email factor when enabled. App
+/// passwords bypass all of them. A code sent anyway is still checked as an
+/// email sign-in code, as the reference's `login()` does, and counts
+/// against the lockout like any wrong code.
 pub(super) async fn check_second_factor(
     app: &App,
     acct: &Account,
     code: Option<&str>,
     app_password: bool,
+    passkeys: bool,
 ) -> Result<(), FactorErr> {
     let code = code.map(str::trim).filter(|c| !c.is_empty());
     let hint = || Factor::Email { hint: acct.email.as_deref().map(obfuscate_email).unwrap_or_default() };
@@ -107,6 +112,18 @@ pub(super) async fn check_second_factor(
         return crate::totp::check_second_factor(app, acct, code)
             .await
             .map_err(|err| FactorErr { err, factor: Factor::Totp });
+    }
+    if passkeys {
+        let err = match code {
+            None => XrpcError {
+                status: StatusCode::UNAUTHORIZED,
+                error: "AuthFactorTokenRequired".into(),
+                message: "Use your passkey, or a recovery code".into(),
+            },
+            // recovery codes move to their own row with the next change
+            Some(_) => XrpcError::bad("InvalidToken", "Token is invalid"),
+        };
+        return Err(FactorErr { err, factor: Factor::Passkey });
     }
     match (&acct.email, enabled(acct), code) {
         (Some(email), true, _) => {

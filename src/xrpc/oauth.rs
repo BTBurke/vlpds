@@ -133,7 +133,7 @@ pub async fn route_key(app: &App, path: &str, query: Option<&str>, headers: &Hea
         // device's pending one
         "/oauth/authorize/sign-in" | "/oauth/account/sign-in" => {
             let p = params();
-            let did = if p.get("step").map(String::as_str) == Some("totp") {
+            let did = if p.get("step").map(String::as_str) == Some("2fa") {
                 let id = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i))?;
                 store::get_device(app, &id).await.ok()??.pending_2fa.map(|(did, _)| did)
             } else {
@@ -918,19 +918,12 @@ async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAu
     Ok(!flow.req.params.scope.split(' ').all(|s| a.scopes.iter().any(|x| x == s)))
 }
 
-fn login_page(
-    app: &App,
-    flow: &Flow,
-    identifier: &str,
-    error: Option<&str>,
-    totp: bool,
-    status: StatusCode,
-) -> Response {
+fn login_page(app: &App, flow: &Flow, identifier: &str, error: Option<&str>, status: StatusCode) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, totp, email_hint: None, trust_days: 0 },
+        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, second: None, passkey: None },
         "",
     );
     let mut r = flow.page(app, body);
@@ -943,7 +936,7 @@ fn login_page(
 async fn consent_step(app: &App, flow: Flow, did: &str) -> Response {
     let acct = match account_any(app, did).await {
         Ok(a) => a,
-        Err(_) => return login_page(app, &flow, "", Some("Account not found"), false, StatusCode::OK),
+        Err(_) => return login_page(app, &flow, "", Some("Account not found"), StatusCode::OK),
     };
     match consent_required(app, &flow, did).await {
         Ok(false) => return issue_code(app, flow, did).await,
@@ -969,7 +962,7 @@ async fn issue_code(app: &App, mut flow: Flow, did: &str) -> Response {
     let Some((epoch, auth_cred)) =
         flow.device.accounts.iter().find(|a| a.did == did).map(|a| (a.auth_epoch.clone(), a.auth_cred.clone()))
     else {
-        return login_page(app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
+        return login_page(app, &flow, "", Some("Please sign in again"), StatusCode::UNAUTHORIZED);
     };
     let code = store::new_code(&flow.id);
     flow.req.auth_epoch = epoch;
@@ -1024,7 +1017,7 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
     // the sign-in <-> sign-up links between the two pages
     match q.get("screen").map(String::as_str) {
         Some("sign-up") => return signup_page(&app, &flow, &SignupValues::default(), None, StatusCode::OK),
-        Some("sign-in") => return login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        Some("sign-in") => return login_page(&app, &flow, &hint, None, StatusCode::OK),
         _ => {}
     }
     match params.prompt.as_deref() {
@@ -1045,7 +1038,7 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
                 Err(e) => redirect_error(&app, &params, "server_error", &e.description),
             }
         }
-        Some("login") => login_page(&app, &flow, &hint, None, false, StatusCode::OK),
+        Some("login") => login_page(&app, &flow, &hint, None, StatusCode::OK),
         // prompt=create: the sign-up page (which links to sign-in)
         Some("create") => signup_page(&app, &flow, &SignupValues::default(), None, StatusCode::OK),
         Some("select_account") if !accounts.is_empty() => chooser_page(&app, &flow, &accounts),
@@ -1053,7 +1046,7 @@ async fn authorize(State(app): AppState, headers: HeaderMap, Query(q): Query<Has
             if let Some((did, _)) = hinted {
                 consent_step(&app, flow, &did).await
             } else if !hint.is_empty() || accounts.is_empty() {
-                login_page(&app, &flow, &hint, None, false, StatusCode::OK)
+                login_page(&app, &flow, &hint, None, StatusCode::OK)
             } else {
                 chooser_page(&app, &flow, &accounts)
             }
@@ -1091,13 +1084,44 @@ async fn form_flow(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(Flow,
 
 enum SignIn {
     Ok(String),
-    /// Password accepted, a code is needed: (handle, the obfuscated address
-    /// when it is an emailed code).
-    NeedTotp(String, Option<String>),
-    /// Wrong code, still pending.
-    NeedTotpErr(String, Option<String>),
+    /// Password accepted, a second factor is needed.
+    NeedFactor(Pending),
+    /// A wrong code or passkey, still pending.
+    NeedFactorErr(Pending, LoginError),
     /// (identifier to pre-fill, why)
     Failed(String, LoginError),
+}
+
+/// A sign-in waiting for its second factor, and what its page offers.
+struct Pending {
+    did: String,
+    handle: String,
+    /// The code was mailed to this (obfuscated) address: the only factor.
+    email_hint: Option<String>,
+    totp: bool,
+    /// `allowCredentials` for the passkey button; empty without passkeys.
+    passkeys: Vec<J>,
+}
+
+impl Pending {
+    async fn of(app: &App, acct: &Account, factor: &super::email2fa::Factor) -> Result<Pending, OAuthError> {
+        let email_hint = match factor {
+            super::email2fa::Factor::Email { hint } => Some(hint.clone()),
+            _ => None,
+        };
+        let passkeys = if email_hint.is_some() {
+            Vec::new()
+        } else {
+            super::passkeys::descriptors(&super::passkeys::load(app, &acct.did).await?)
+        };
+        Ok(Pending {
+            did: acct.did.clone(),
+            handle: acct.handle.clone(),
+            totp: email_hint.is_none() && crate::totp::enabled_for(app, acct).await?,
+            email_hint,
+            passkeys,
+        })
+    }
 }
 
 /// Pages show only these fixed messages, and `/oauth/account?error=` carries
@@ -1111,16 +1135,20 @@ pub(crate) enum LoginError {
     TooManyCodes,
     RateLimited,
     Inactive,
+    /// One message for every passkey failure: nothing says whether an
+    /// account has passkeys, or which check failed.
+    Passkey,
 }
 
 impl LoginError {
-    const ALL: [LoginError; 6] = [
+    const ALL: [LoginError; 7] = [
         LoginError::Invalid,
         LoginError::Timeout,
         LoginError::BadCode,
         LoginError::TooManyCodes,
         LoginError::RateLimited,
         LoginError::Inactive,
+        LoginError::Passkey,
     ];
 
     pub(crate) fn code(self) -> &'static str {
@@ -1131,6 +1159,7 @@ impl LoginError {
             LoginError::TooManyCodes => "too_many_codes",
             LoginError::RateLimited => "rate_limited",
             LoginError::Inactive => "inactive",
+            LoginError::Passkey => "passkey",
         }
     }
 
@@ -1146,6 +1175,7 @@ impl LoginError {
             LoginError::TooManyCodes => "Too many invalid authenticator codes. Please sign in again later.",
             LoginError::RateLimited => "Too many sign-in attempts. Please try again later.",
             LoginError::Inactive => "This account is deactivated or suspended",
+            LoginError::Passkey => "Passkey not recognized",
         }
     }
 
@@ -1159,7 +1189,8 @@ impl LoginError {
 
 /// Records the login on the device. Wrong codes count against the account's
 /// TOTP lockout and, past [`PENDING_2FA_MAX_FAILURES`], drop the pending
-/// sign-in.
+/// sign-in; a refused passkey only counts toward the latter, since there's
+/// nothing to guess.
 async fn sign_in(
     app: &App,
     device: &mut Device,
@@ -1169,25 +1200,49 @@ async fn sign_in(
     let r = sign_in_inner(app, device, f, req).await;
     let result = match &r {
         Ok(SignIn::Ok(_)) => "success",
-        Ok(SignIn::NeedTotp(..)) => "second_factor_required",
-        Ok(SignIn::NeedTotpErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => {
+        Ok(SignIn::NeedFactor(..)) => "second_factor_required",
+        Ok(SignIn::NeedFactorErr(..)) | Ok(SignIn::Failed(_, LoginError::BadCode | LoginError::TooManyCodes)) => {
             "second_factor_failed"
         }
         Ok(SignIn::Failed(_, LoginError::RateLimited)) => "rate_limited",
         Ok(SignIn::Failed(_, LoginError::Inactive)) => "inactive",
-        Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout)) => "failed",
+        Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout | LoginError::Passkey)) => "failed",
         Err(_) => "error",
     };
     crate::metrics::login("oauth", result);
     r
 }
 
-/// Where a sign-in form post came from, for the sign-in log.
+/// Where a sign-in form post came from, for the sign-in log and the
+/// passkey challenge's binding.
 struct SignInReq<'a> {
     ip: Option<std::net::IpAddr>,
     user_agent: Option<&'a str>,
     /// None: `/oauth/account`.
     client_id: Option<&'a str>,
+    /// The OAuth request id, or "account".
+    flow_key: &'a str,
+}
+
+/// A passkey challenge can only finish the flow, in the browser, (and for
+/// the second factor, the account) it was minted for.
+fn passkey_binding(device_id: &str, flow_key: &str, did: Option<&str>) -> String {
+    match did {
+        Some(d) => format!("{device_id}\0{flow_key}\0{d}"),
+        None => format!("{device_id}\0{flow_key}"),
+    }
+}
+
+/// The assertion the page's script posted.
+fn posted_assertion(f: &HashMap<String, String>) -> Option<super::passkeys::AssertionIn> {
+    let g = |k: &str| f.get(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    Some(super::passkeys::AssertionIn {
+        id: g("passkey_id")?,
+        client_data_json: g("client_data")?,
+        authenticator_data: g("auth_data")?,
+        signature: g("signature")?,
+        user_handle: g("user_handle"),
+    })
 }
 
 async fn sign_in_inner(
@@ -1204,7 +1259,7 @@ async fn sign_in_inner(
     if rl::check_ip(&[&rl::GLOBAL_IP, &rl::OAUTH_SIGN_IN_IP], 1).is_err() {
         return limited(ident);
     }
-    let password_step = f.get("step").map(String::as_str) != Some("totp");
+    let password_step = f.get("step").map(String::as_str) != Some("2fa");
     let (acct, ident, epoch) = if !password_step {
         // password already verified for the pending account
         let Some((did, _)) = device.pending_2fa.clone().filter(|(_, at)| now - at < PENDING_2FA_TTL) else {
@@ -1256,10 +1311,42 @@ async fn sign_in_inner(
         };
         (acct, ident, epoch)
     };
+    let has_passkeys = super::passkeys::has_any(app, &acct.did).await?;
     // a trusted browser skips every factor, whichever are set up
     let trusted = password_step && super::signin::trusted(app, &acct, &epoch, &device.id).await?;
-    // TOTP, else the email factor (which mails the code on the password step)
-    let checked = if trusted { Ok(()) } else { super::email2fa::check_second_factor(app, &acct, code, false).await };
+    let mut auth_cred = None;
+    let checked = match (trusted, posted_assertion(f).filter(|_| !password_step)) {
+        (true, _) => Ok(()),
+        (false, Some(a)) => {
+            let ex = super::passkeys::Expect {
+                purpose: "2fa",
+                binding: passkey_binding(&device.id, req.flow_key, Some(&acct.did)),
+                require_uv: false,
+            };
+            match super::passkeys::use_passkey(app, &acct.did, &a, &ex).await {
+                Ok(used) => {
+                    auth_cred = Some(used.cred.auth_ref());
+                    Ok(())
+                }
+                Err(super::passkeys::UseErr::Server(e)) => return Err(e.into()),
+                Err(super::passkeys::UseErr::Refused(_)) => {
+                    device.pending_2fa_failures += 1;
+                    if device.pending_2fa_failures >= PENDING_2FA_MAX_FAILURES {
+                        device.pending_2fa = None;
+                        device.pending_2fa_failures = 0;
+                        store::put_device(app, device).await?;
+                        return Ok(SignIn::Failed(ident, LoginError::Passkey));
+                    }
+                    store::put_device(app, device).await?;
+                    let p = Pending::of(app, &acct, &super::email2fa::Factor::Passkey).await?;
+                    return Ok(SignIn::NeedFactorErr(p, LoginError::Passkey));
+                }
+            }
+        }
+        // TOTP, a recovery code with passkeys, else the email factor (which
+        // mails the code on the password step)
+        (false, None) => super::email2fa::check_second_factor(app, &acct, code, false, has_passkeys).await,
+    };
     match checked {
         Ok(()) => {}
         Err(fe) if fe.err.error == "AuthFactorTokenRequired" => {
@@ -1267,7 +1354,7 @@ async fn sign_in_inner(
             device.pending_2fa_epoch = epoch;
             device.pending_2fa_failures = 0;
             store::put_device(app, device).await?;
-            return Ok(SignIn::NeedTotp(acct.handle, email_hint(fe.factor)));
+            return Ok(SignIn::NeedFactor(Pending::of(app, &acct, &fe.factor).await?));
         }
         Err(fe) if fe.err.status.is_server_error() => return Err(fe.err.into()),
         // no code could be mailed: not a wrong code
@@ -1275,7 +1362,7 @@ async fn sign_in_inner(
             return Ok(SignIn::Failed(ident, LoginError::RateLimited))
         }
         Err(fe) => {
-            let (e, hint) = (fe.err, email_hint(fe.factor));
+            let e = fe.err;
             // a password step starts a new pending sign-in
             if password_step {
                 device.pending_2fa = Some((acct.did.clone(), now));
@@ -1290,15 +1377,20 @@ async fn sign_in_inner(
                 return Ok(SignIn::Failed(ident, LoginError::TooManyCodes));
             }
             store::put_device(app, device).await?;
-            return Ok(SignIn::NeedTotpErr(acct.handle, hint));
+            let p = Pending::of(app, &acct, &fe.factor).await?;
+            return Ok(SignIn::NeedFactorErr(p, LoginError::BadCode));
         }
     }
     let factor = if trusted {
         Some("trusted")
+    } else if auth_cred.is_some() {
+        Some("passkey")
     } else if password_step {
         None
     } else if crate::totp::enabled_for(app, &acct).await? {
         Some("totp")
+    } else if has_passkeys {
+        Some("recovery")
     } else {
         Some("email")
     };
@@ -1311,49 +1403,77 @@ async fn sign_in_inner(
     }
     let method = super::signin::Method::OAuth(req.client_id.map(String::from));
     super::signin::record(app, &acct, method, factor, &ctx).await;
-    let did = acct.did;
+    finish_device_sign_in(app, device, acct.did, epoch, auth_cred).await
+}
+
+/// The device's account list gains this sign-in.
+async fn finish_device_sign_in(
+    app: &App,
+    device: &mut Device,
+    did: String,
+    epoch: String,
+    auth_cred: Option<String>,
+) -> Result<SignIn, OAuthError> {
+    let now = now_secs();
     device.pending_2fa = None;
     device.pending_2fa_failures = 0;
     device.accounts.retain(|a| a.did != did);
-    let auth_cred = None;
     device.accounts.push(DeviceAccount { did: did.clone(), authenticated_at: now, auth_epoch: epoch, auth_cred });
     device.last_seen_at = now;
     store::put_device(app, device).await?;
     Ok(SignIn::Ok(did))
 }
 
-fn email_hint(f: super::email2fa::Factor) -> Option<String> {
-    match f {
-        super::email2fa::Factor::Email { hint } => Some(hint),
-        super::email2fa::Factor::Totp => None,
+/// The passkey parts of a second-factor page.
+fn passkey_ui(app: &App, binding: &str, allow: &[J]) -> Option<(String, String, String)> {
+    if allow.is_empty() {
+        return None;
+    }
+    let rp = super::passkeys::rp(app).ok()?;
+    let ch = crate::webauthn::mint_challenge(&super::passkeys::challenge_key(app), "2fa", binding, now_secs() as u64);
+    Some((ou::b64u(ch), rp.id, J::Array(allow.to_vec()).to_string()))
+}
+
+fn second_factor_form<'a>(p: &'a Pending, pk: &'a Option<(String, String, String)>, trust_days: u32) -> ui::Second<'a> {
+    ui::Second {
+        email_hint: p.email_hint.as_deref(),
+        totp: p.totp,
+        trust_days,
+        passkey: pk.as_ref().map(|(c, r, a)| ui::PasskeyUi { challenge: c, rp_id: r, allow: a }),
     }
 }
 
-/// `email_hint`: the code was just mailed rather than from an authenticator.
-fn code_page(app: &App, flow: &Flow, handle: &str, email_hint: Option<&str>, bad_code: bool) -> Response {
+fn code_page(app: &App, flow: &Flow, p: &Pending, error: Option<LoginError>) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
-    let error = bad_code.then(|| match email_hint {
-        Some(_) => "Invalid sign-in code",
-        None => LoginError::BadCode.message(),
+    let msg = error.map(|e| match (e, &p.email_hint) {
+        (LoginError::BadCode, Some(_)) => "Invalid sign-in code",
+        _ => e.message(),
     });
+    let pk = passkey_ui(app, &passkey_binding(&flow.device.id, &flow.id, Some(&p.did)), &p.passkeys);
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
         &ui::LoginForm {
             action: "/oauth/authorize/sign-in",
-            identifier: handle,
-            error,
-            totp: true,
-            email_hint,
-            trust_days: super::signin::trust_days(app),
+            identifier: &p.handle,
+            error: msg,
+            second: Some(second_factor_form(p, &pk, super::signin::trust_days(app))),
+            passkey: None,
         },
         "",
     );
     let mut r = flow.page(app, body);
-    if bad_code {
+    set_passkey_csp(&mut r, &flow.form_action());
+    if error.is_some() {
         *r.status_mut() = StatusCode::UNAUTHORIZED;
     }
     r
+}
+
+/// The sign-in pages run one fixed script, allowed by its hash.
+fn set_passkey_csp(r: &mut Response, form_action: &[String]) {
+    r.headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_str(&ui::csp_passkey(form_action)).unwrap());
 }
 
 async fn authorize_sign_in(
@@ -1371,15 +1491,21 @@ async fn authorize_sign_in(
         return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
     }
     let client_id = flow.client.id.clone();
-    let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: Some(&client_id) };
+    let flow_key = flow.id.clone();
+    let req = SignInReq {
+        ip,
+        user_agent: super::signin::user_agent(&headers),
+        client_id: Some(&client_id),
+        flow_key: &flow_key,
+    };
     match sign_in(&app, &mut flow.device, &f, &req).await {
         Ok(SignIn::Ok(did)) => consent_step(&app, flow, &did).await,
-        Ok(SignIn::NeedTotp(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), false),
-        Ok(SignIn::NeedTotpErr(handle, hint)) => code_page(&app, &flow, &handle, hint.as_deref(), true),
-        Ok(SignIn::Failed(ident, e)) => login_page(&app, &flow, &ident, Some(e.message()), false, e.status()),
+        Ok(SignIn::NeedFactor(p)) => code_page(&app, &flow, &p, None),
+        Ok(SignIn::NeedFactorErr(p, e)) => code_page(&app, &flow, &p, Some(e)),
+        Ok(SignIn::Failed(ident, e)) => login_page(&app, &flow, &ident, Some(e.message()), e.status()),
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {
             let ident = f.get("identifier").map(|s| s.trim().to_string()).unwrap_or_default();
-            with_retry_after(login_page(&app, &flow, &ident, Some(BUSY_MESSAGE), false, e.status))
+            with_retry_after(login_page(&app, &flow, &ident, Some(BUSY_MESSAGE), e.status))
         }
         Err(e) => server_error_page(&app, "Sign-in failed", &e.description),
     }
@@ -1478,16 +1604,16 @@ async fn authorize_select(State(app): AppState, headers: HeaderMap, body: AxByte
     };
     let did = f.get("did").cloned().unwrap_or_default();
     if did.is_empty() {
-        return login_page(&app, &flow, "", None, false, StatusCode::OK);
+        return login_page(&app, &flow, "", None, StatusCode::OK);
     }
     let accounts = device_accounts(&app, &flow.device).await;
     match accounts.iter().find(|(d, _)| *d == did) {
         Some(_) if flow.req.params.prompt.as_deref() != Some("login") => consent_step(&app, flow, &did).await,
         Some((_, handle)) => {
             let h = handle.clone();
-            login_page(&app, &flow, &h, None, false, StatusCode::OK)
+            login_page(&app, &flow, &h, None, StatusCode::OK)
         }
-        None => login_page(&app, &flow, "", Some("Please sign in again"), false, StatusCode::OK),
+        None => login_page(&app, &flow, "", Some("Please sign in again"), StatusCode::OK),
     }
 }
 
@@ -1504,7 +1630,7 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
     let did = f.get("did").cloned().unwrap_or_default();
     let accounts = device_accounts(&app, &flow.device).await;
     if !accounts.iter().any(|(d, _)| *d == did) {
-        return login_page(&app, &flow, "", Some("Please sign in again"), false, StatusCode::UNAUTHORIZED);
+        return login_page(&app, &flow, "", Some("Please sign in again"), StatusCode::UNAUTHORIZED);
     }
     let mut flow = flow;
     match granted_scope(&flow.req.params.scope, consent_scopes(&body).as_deref()) {
@@ -1998,23 +2124,46 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
     let accounts = device_accounts(&app, &device).await;
     let cookie = new_cookie.then_some(&device);
     if accounts.is_empty() || q.contains_key("add") {
-        let pending = device.pending_2fa.as_ref().filter(|(_, at)| now_secs() - at < PENDING_2FA_TTL).is_some()
-            && q.contains_key("totp");
+        // never echo the query text
+        let error = q.get("error").and_then(|c| LoginError::from_code(c)).map(LoginError::message);
+        let pending_did = device
+            .pending_2fa
+            .as_ref()
+            .filter(|(_, at)| now_secs() - at < PENDING_2FA_TTL && q.contains_key("2fa"))
+            .map(|(d, _)| d.clone());
+        let mut pending = None;
+        if let Some(did) = pending_did {
+            let acct = match account_any(&app, &did).await {
+                Ok(a) => a,
+                Err(e) => return server_error_page(&app, "Error", &e.message),
+            };
+            // the address isn't put in the URL; the page says "your email"
+            let factor = match q.contains_key("email") {
+                true => super::email2fa::Factor::Email { hint: "your email address".into() },
+                false => super::email2fa::Factor::Totp,
+            };
+            match Pending::of(&app, &acct, &factor).await {
+                Ok(p) => pending = Some(p),
+                Err(e) => return server_error_page(&app, "Error", &e.description),
+            }
+        }
+        let pk = pending
+            .as_ref()
+            .and_then(|p| passkey_ui(&app, &passkey_binding(&device.id, "account", Some(&p.did)), &p.passkeys));
         let body = ui::login(
             None,
             &ui::LoginForm {
                 action: "/oauth/account/sign-in",
-                identifier: "",
-                // never echo the query text
-                error: q.get("error").and_then(|c| LoginError::from_code(c)).map(LoginError::message),
-                totp: pending,
-                // the address isn't put in the URL; the page says "your email"
-                email_hint: (pending && q.contains_key("email")).then_some("your email address"),
-                trust_days: super::signin::trust_days(&app),
+                identifier: pending.as_ref().map_or("", |p| p.handle.as_str()),
+                error,
+                second: pending.as_ref().map(|p| second_factor_form(p, &pk, super::signin::trust_days(&app))),
+                passkey: None,
             },
             &csrf,
         );
-        return html(&app, StatusCode::OK, body, &[], cookie);
+        let mut r = html(&app, StatusCode::OK, body, &[], cookie);
+        set_passkey_csp(&mut r, &[]);
+        return r;
     }
     let mut rows = Vec::new();
     for (did, handle) in accounts {
@@ -2060,16 +2209,16 @@ async fn account_sign_in(
         Ok(x) => x,
         Err(r) => return r,
     };
-    let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: None };
+    let req = SignInReq { ip, user_agent: super::signin::user_agent(&headers), client_id: None, flow_key: "account" };
     match sign_in(&app, &mut device, &f, &req).await {
         Ok(SignIn::Ok(_)) => redirect_to("/oauth/account"),
-        Ok(SignIn::NeedTotp(_, hint)) => {
-            redirect_to(&format!("/oauth/account?add=1&totp=1{}", if hint.is_some() { "&email=1" } else { "" }))
+        Ok(SignIn::NeedFactor(p)) => {
+            redirect_to(&format!("/oauth/account?add=1&2fa=1{}", if p.email_hint.is_some() { "&email=1" } else { "" }))
         }
-        Ok(SignIn::NeedTotpErr(_, hint)) => redirect_to(&format!(
-            "/oauth/account?add=1&totp=1{}&error={}",
-            if hint.is_some() { "&email=1" } else { "" },
-            LoginError::BadCode.code()
+        Ok(SignIn::NeedFactorErr(p, e)) => redirect_to(&format!(
+            "/oauth/account?add=1&2fa=1{}&error={}",
+            if p.email_hint.is_some() { "&email=1" } else { "" },
+            e.code()
         )),
         Ok(SignIn::Failed(_, e)) => redirect_to(&format!("/oauth/account?add=1&error={}", e.code())),
         Err(e) if e.status == StatusCode::SERVICE_UNAVAILABLE => {

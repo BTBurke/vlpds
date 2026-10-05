@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-const PASSWORD: &str = "correct horse battery staple";
-const REDIRECT: &str = "http://127.0.0.1/cb";
+pub(crate) const PASSWORD: &str = "correct horse battery staple";
+pub(crate) const REDIRECT: &str = "http://127.0.0.1/cb";
 const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 const FORM: &str = "application/x-www-form-urlencoded";
 
@@ -31,25 +31,25 @@ fn rand_str(n: usize) -> String {
     b64((0..n).map(|_| rand::random::<u8>()).collect::<Vec<u8>>())
 }
 
-fn enc(s: &str) -> String {
+pub(crate) fn enc(s: &str) -> String {
     vlpds::oauth::util::form_encode_component(s)
 }
 
-fn form(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form(pairs: &[(&str, &str)]) -> String {
     pairs.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&")
 }
 
-struct Srv {
-    app: Arc<vlpds::xrpc::App>,
-    base: String,
-    http: reqwest::Client,
+pub(crate) struct Srv {
+    pub(crate) app: Arc<vlpds::xrpc::App>,
+    pub(crate) base: String,
+    pub(crate) http: reqwest::Client,
 }
 
-async fn spawn() -> Srv {
+pub(crate) async fn spawn() -> Srv {
     spawn_with(|_| {}).await
 }
 
-async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> Srv {
+pub(crate) async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> Srv {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let mut cfg = vlpds::server::Config { dev_mode: true, public_url: base.clone(), ..Default::default() };
@@ -60,13 +60,13 @@ async fn spawn_with(f: impl FnOnce(&mut vlpds::server::Config)) -> Srv {
 }
 
 impl Srv {
-    async fn get_json(&self, path: &str) -> J {
+    pub(crate) async fn get_json(&self, path: &str) -> J {
         self.http.get(format!("{}{path}", self.base)).send().await.unwrap().json().await.unwrap()
     }
 
     /// An XRPC call with a password session's access JWT (POST when `body`
     /// is given or `post` is set).
-    async fn bearer(&self, jwt: &str, nsid: &str, post: bool, body: Option<J>) -> (u16, J) {
+    pub(crate) async fn bearer(&self, jwt: &str, nsid: &str, post: bool, body: Option<J>) -> (u16, J) {
         let url = format!("{}/xrpc/{nsid}", self.base);
         let mut rb = if post || body.is_some() { self.http.post(url) } else { self.http.get(url) }.bearer_auth(jwt);
         if let Some(b) = &body {
@@ -77,13 +77,13 @@ impl Srv {
     }
 }
 
-struct Account {
-    did: String,
-    handle: String,
-    jwt: String,
+pub(crate) struct Account {
+    pub(crate) did: String,
+    pub(crate) handle: String,
+    pub(crate) jwt: String,
 }
 
-async fn create_account(s: &Srv, name: &str) -> Account {
+pub(crate) async fn create_account(s: &Srv, name: &str) -> Account {
     let handle = format!("{name}{}.vlpds.test", rand::random::<u32>() % 100000);
     let r = s
         .http
@@ -170,10 +170,10 @@ fn client_assertion(sk: &SigningKey, client_id: &str, aud: &str) -> String {
     sign_jwt(sk, &json!({"alg": "ES256", "kid": "k1", "typ": "JWT"}), &payload)
 }
 
-struct Resp {
-    status: u16,
-    headers: HeaderMap,
-    body: J,
+pub(crate) struct Resp {
+    pub(crate) status: u16,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: J,
 }
 
 /// A DPoP request, retried once on use_dpop_nonce (as real clients do).
@@ -204,7 +204,7 @@ async fn dpop_send(
 }
 
 /// POST a form to an AS endpoint with DPoP.
-async fn as_post(s: &Srv, key: &DpopKey, path: &str, pairs: &[(&str, &str)]) -> Resp {
+pub(crate) async fn as_post(s: &Srv, key: &DpopKey, path: &str, pairs: &[(&str, &str)]) -> Resp {
     let body = form(pairs);
     dpop_send(s, key, reqwest::Method::POST, &format!("{}{path}", s.base), None, |rb| {
         rb.header("content-type", FORM).body(body.clone())
@@ -213,7 +213,7 @@ async fn as_post(s: &Srv, key: &DpopKey, path: &str, pairs: &[(&str, &str)]) -> 
 }
 
 /// DPoP-authenticated XRPC call.
-async fn xrpc_dpop(s: &Srv, key: &DpopKey, token: &str, method: &str, nsid: &str, body: Option<J>) -> Resp {
+pub(crate) async fn xrpc_dpop(s: &Srv, key: &DpopKey, token: &str, method: &str, nsid: &str, body: Option<J>) -> Resp {
     let m = if method == "GET" { reqwest::Method::GET } else { reqwest::Method::POST };
     dpop_send(s, key, m, &format!("{}/xrpc/{nsid}", s.base), Some(token), |rb| match &body {
         Some(b) => rb.json(b),
@@ -242,12 +242,12 @@ async fn create_post(s: &Srv, key: &DpopKey, token: &str, did: &str, collection:
 
 // ---------- client + browser simulation ----------
 
-struct Pkce {
-    verifier: String,
-    challenge: String,
+pub(crate) struct Pkce {
+    pub(crate) verifier: String,
+    pub(crate) challenge: String,
 }
 
-fn pkce() -> Pkce {
+pub(crate) fn pkce() -> Pkce {
     let verifier = rand_str(32);
     let challenge = b64(Sha256::digest(&verifier));
     Pkce { verifier, challenge }
@@ -257,26 +257,26 @@ fn loopback_client_id(scope: &str, redirect: &str) -> String {
     format!("http://localhost?scope={}&redirect_uri={}", enc(scope), enc(redirect))
 }
 
-fn hidden_field(html: &str, name: &str) -> Option<String> {
+pub(crate) fn hidden_field(html: &str, name: &str) -> Option<String> {
     let pat = format!("name=\"{name}\" value=\"");
     let i = html.find(&pat)? + pat.len();
     Some(html[i..i + html[i..].find('"').unwrap()].replace("&amp;", "&"))
 }
 
-fn csrf_of(html: &str) -> String {
+pub(crate) fn csrf_of(html: &str) -> String {
     hidden_field(html, "csrf").expect("csrf field")
 }
 
-type Page = (u16, HeaderMap, String);
+pub(crate) type Page = (u16, HeaderMap, String);
 
 /// Minimal cookie-jar browser.
 #[derive(Default)]
-struct Browser {
-    cookie: Option<String>,
+pub(crate) struct Browser {
+    pub(crate) cookie: Option<String>,
 }
 
 impl Browser {
-    async fn get(&mut self, s: &Srv, url: &str) -> Page {
+    pub(crate) async fn get(&mut self, s: &Srv, url: &str) -> Page {
         let mut rb = s.http.get(url);
         if let Some(c) = &self.cookie {
             rb = rb.header("cookie", c);
@@ -284,7 +284,7 @@ impl Browser {
         self.absorb(rb.send().await.unwrap()).await
     }
 
-    async fn post(&mut self, s: &Srv, path: &str, pairs: &[(&str, &str)]) -> Page {
+    pub(crate) async fn post(&mut self, s: &Srv, path: &str, pairs: &[(&str, &str)]) -> Page {
         let mut rb = s.http.post(format!("{}{path}", s.base)).header("content-type", FORM).body(form(pairs));
         if let Some(c) = &self.cookie {
             rb = rb.header("cookie", c);
@@ -292,7 +292,7 @@ impl Browser {
         self.absorb(rb.send().await.unwrap()).await
     }
 
-    async fn absorb(&mut self, r: reqwest::Response) -> Page {
+    pub(crate) async fn absorb(&mut self, r: reqwest::Response) -> Page {
         let status = r.status().as_u16();
         let headers = r.headers().clone();
         for sc in headers.get_all("set-cookie") {
@@ -305,12 +305,12 @@ impl Browser {
     }
 
     /// Opens the authorization page of a pushed request.
-    async fn authorize(&mut self, s: &Srv, f: &Flow<'_>, request_uri: &str) -> Page {
+    pub(crate) async fn authorize(&mut self, s: &Srv, f: &Flow<'_>, request_uri: &str) -> Page {
         self.get(s, &f.authorize_url(s, request_uri)).await
     }
 
     /// The authorization page's password step.
-    async fn sign_in(&mut self, s: &Srv, ru: &str, csrf: &str, identifier: &str, password: &str) -> Page {
+    pub(crate) async fn sign_in(&mut self, s: &Srv, ru: &str, csrf: &str, identifier: &str, password: &str) -> Page {
         self.post(
             s,
             "/oauth/authorize/sign-in",
@@ -326,54 +326,54 @@ impl Browser {
     }
 
     /// The authorization page's second-factor (authenticator or email) step.
-    async fn second_factor(&mut self, s: &Srv, ru: &str, csrf: &str, code: &str) -> (u16, String) {
+    pub(crate) async fn second_factor(&mut self, s: &Srv, ru: &str, csrf: &str, code: &str) -> (u16, String) {
         let (st, _, html) = self
             .post(
                 s,
                 "/oauth/authorize/sign-in",
-                &[("request_uri", ru), ("csrf", csrf), ("step", "totp"), ("code", code), ("action", "sign-in")],
+                &[("request_uri", ru), ("csrf", csrf), ("step", "2fa"), ("code", code), ("action", "sign-in")],
             )
             .await;
         (st, html)
     }
 }
 
-fn location_params(h: &HeaderMap) -> (String, HashMap<String, String>) {
+pub(crate) fn location_params(h: &HeaderMap) -> (String, HashMap<String, String>) {
     let loc = h.get("location").expect("location").to_str().unwrap().to_string();
     let (base, q) = loc.split_once(['?', '#']).unwrap_or((&loc, ""));
     (base.to_string(), vlpds::oauth::util::parse_form(q).into_iter().collect())
 }
 
-struct Tokens {
-    access: String,
-    refresh: Option<String>,
-    scope: String,
+pub(crate) struct Tokens {
+    pub(crate) access: String,
+    pub(crate) refresh: Option<String>,
+    pub(crate) scope: String,
 }
 
-struct Flow<'a> {
-    client_id: String,
-    redirect_uri: String,
-    scope: String,
-    key: &'a DpopKey,
-    extra: Vec<(String, String)>,
+pub(crate) struct Flow<'a> {
+    pub(crate) client_id: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) scope: String,
+    pub(crate) key: &'a DpopKey,
+    pub(crate) extra: Vec<(String, String)>,
 }
 
 impl<'a> Flow<'a> {
-    fn new(client_id: &str, redirect_uri: &str, scope: &str, key: &'a DpopKey) -> Self {
+    pub(crate) fn new(client_id: &str, redirect_uri: &str, scope: &str, key: &'a DpopKey) -> Self {
         Flow { client_id: client_id.into(), redirect_uri: redirect_uri.into(), scope: scope.into(), key, extra: vec![] }
     }
 
     /// A loopback client (redirect [`REDIRECT`]) declaring and requesting `scope`.
-    fn loopback(scope: &str, key: &'a DpopKey) -> Self {
+    pub(crate) fn loopback(scope: &str, key: &'a DpopKey) -> Self {
         Flow::new(&loopback_client_id(scope, REDIRECT), REDIRECT, scope, key)
     }
 
-    fn with(mut self, k: &str, v: &str) -> Self {
+    pub(crate) fn with(mut self, k: &str, v: &str) -> Self {
         self.extra.push((k.into(), v.into()));
         self
     }
 
-    async fn par(&self, s: &Srv, p: &Pkce, state: &str) -> Resp {
+    pub(crate) async fn par(&self, s: &Srv, p: &Pkce, state: &str) -> Resp {
         let mut pairs: Vec<(&str, &str)> = vec![
             ("client_id", &self.client_id),
             ("response_type", "code"),
@@ -388,19 +388,19 @@ impl<'a> Flow<'a> {
     }
 
     /// A PAR that must succeed; its request_uri.
-    async fn request_uri(&self, s: &Srv, p: &Pkce, state: &str) -> String {
+    pub(crate) async fn request_uri(&self, s: &Srv, p: &Pkce, state: &str) -> String {
         let par = self.par(s, p, state).await;
         assert_eq!(par.status, 201, "PAR: {}", par.body);
         par.body["request_uri"].as_str().unwrap().to_string()
     }
 
-    fn authorize_url(&self, s: &Srv, request_uri: &str) -> String {
+    pub(crate) fn authorize_url(&self, s: &Srv, request_uri: &str) -> String {
         format!("{}/oauth/authorize?client_id={}&request_uri={}", s.base, enc(&self.client_id), enc(request_uri))
     }
 }
 
 /// Full interactive flow: PAR, login, consent; returns the code.
-async fn authorize_interactive(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account, p: &Pkce) -> String {
+pub(crate) async fn authorize_interactive(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account, p: &Pkce) -> String {
     let state = rand_str(8);
     let request_uri = f.request_uri(s, p, &state).await;
     let (st, h, body) = browser_consent(s, b, f, acct, &request_uri, &[]).await;
@@ -413,7 +413,7 @@ async fn authorize_interactive(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Ac
 }
 
 /// [`authorize_interactive`] then the code exchange.
-async fn grant(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account) -> Tokens {
+pub(crate) async fn grant(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account) -> Tokens {
     let p = pkce();
     let code = authorize_interactive(s, b, f, acct, &p).await;
     tokens(&exchange(s, f, &code, &p, &[]).await)
@@ -431,7 +431,7 @@ async fn login(s: &Srv, acct: &Account, scope: &str) -> (DpopKey, String) {
 /// Browser side of a pushed request: open the authorization page, pick or
 /// sign in to `acct`, and post "allow" on the consent page (with `extra`
 /// form fields). Returns the consent POST's response.
-async fn browser_consent(
+pub(crate) async fn browser_consent(
     s: &Srv,
     b: &mut Browser,
     f: &Flow<'_>,
@@ -463,7 +463,7 @@ async fn browser_consent(
     b.post(s, "/oauth/authorize/consent", &pairs).await
 }
 
-async fn exchange(s: &Srv, f: &Flow<'_>, code: &str, p: &Pkce, extra: &[(&str, &str)]) -> Resp {
+pub(crate) async fn exchange(s: &Srv, f: &Flow<'_>, code: &str, p: &Pkce, extra: &[(&str, &str)]) -> Resp {
     let mut pairs = vec![
         ("grant_type", "authorization_code"),
         ("client_id", f.client_id.as_str()),
@@ -475,7 +475,7 @@ async fn exchange(s: &Srv, f: &Flow<'_>, code: &str, p: &Pkce, extra: &[(&str, &
     as_post(s, f.key, "/oauth/token", &pairs).await
 }
 
-fn tokens(r: &Resp) -> Tokens {
+pub(crate) fn tokens(r: &Resp) -> Tokens {
     assert_eq!(r.status, 200, "token: {}", r.body);
     assert_eq!(r.body["token_type"], "DPoP");
     assert!(r.headers.get("dpop-nonce").is_some());
@@ -531,7 +531,7 @@ fn unsecured_jwt(payload: &J) -> String {
 
 /// Enables TOTP for `acct`; returns the secret and the step the confirm code
 /// spent.
-async fn enable_totp(s: &Srv, acct: &Account) -> (Vec<u8>, u64) {
+pub(crate) async fn enable_totp(s: &Srv, acct: &Account) -> (Vec<u8>, u64) {
     let (_, setup) = s.bearer(&acct.jwt, "vlpds.server.setupTotp", true, None).await;
     let secret = vlpds::totp::base32_decode(setup["secret"].as_str().unwrap()).unwrap();
     let step = vlpds::totp::step_at(vlpds::totp::now_secs());
@@ -548,7 +548,7 @@ async fn enable_totp(s: &Srv, acct: &Account) -> (Vec<u8>, u64) {
 }
 
 /// Newest dev-mode mail token of `purpose` sent to `email`.
-async fn dev_mail_token(s: &Srv, email: &str, purpose: &str) -> String {
+pub(crate) async fn dev_mail_token(s: &Srv, email: &str, purpose: &str) -> String {
     let v: J = s
         .http
         .get(format!("{}/xrpc/vlpds.admin.getDevMail?email={}", s.base, enc(email)))
@@ -2014,7 +2014,7 @@ mod ref_oauth;
 
 /// A new pushed request in browser `b`, signed in with the password only:
 /// the page that follows.
-async fn password_step(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account) -> String {
+pub(crate) async fn password_step(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account) -> String {
     let ru = f.request_uri(s, &pkce(), "t").await;
     let (_, _, html) = b.authorize(s, f, &ru).await;
     let (st, _, html) = b.sign_in(s, &ru, &csrf_of(&html), &acct.handle, PASSWORD).await;
@@ -2043,7 +2043,7 @@ async fn trusted_browser_skips_the_second_factor() {
     let pairs = [
         ("request_uri", ru.as_str()),
         ("csrf", csrf.as_str()),
-        ("step", "totp"),
+        ("step", "2fa"),
         ("code", code.as_str()),
         ("trust", "1"),
         ("action", "sign-in"),
