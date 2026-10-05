@@ -320,9 +320,10 @@ async fn get_blob(State(app): AppState, MaybeAuth(creds): MaybeAuth, Query(q): Q
     if app.config.spaces && !publicly_referenced(&app, &q.did, &cid_s).await? {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
+    // a public ref settles it: only a blob none names pays for the sc/ scan
     if !app.config.spaces
-        && space_referenced(&app, &q.did, &cid_s).await?
         && !publicly_referenced(&app, &q.did, &cid_s).await?
+        && space_referenced(&app, &q.did, &cid_s).await?
     {
         return Err(XrpcError::bad("BlobNotFound", "Blob not found"));
     }
