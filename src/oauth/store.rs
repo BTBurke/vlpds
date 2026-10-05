@@ -250,7 +250,11 @@ pub async fn list_sessions(app: &App, did: &str) -> Result<Vec<Session>, OAuthEr
 /// device logins and codes approved before it are void. Returns how many
 /// sessions were revoked.
 pub async fn revoke_all_sessions(app: &App, did: &str) -> Result<usize, OAuthError> {
-    let ops = vec![crate::xrpc::new_auth_epoch_op(), Op::DeletePrefix { prefix: "oauth/ses/".into() }];
+    let ops = vec![
+        crate::xrpc::new_auth_epoch_op(),
+        Op::DeletePrefix { prefix: "oauth/ses/".into() },
+        Op::DeletePrefix { prefix: crate::xrpc::TRUST_PREFIX.into() },
+    ];
     let out = app.private_cas(did, Vec::new(), ops).await?;
     Ok(out.deleted.len())
 }
@@ -320,6 +324,14 @@ pub struct Device {
     pub pending_2fa_failures: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub pending_2fa_epoch: String,
+    /// Kept past the idle expiry until then: an account trusts this browser
+    /// (`xrpc::signin`), and the trust is keyed by this id.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub trusted_until: i64,
+}
+
+fn is_zero(v: &i64) -> bool {
+    *v == 0
 }
 
 pub fn new_device_id() -> String {

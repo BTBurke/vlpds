@@ -1,6 +1,7 @@
 //! Bounded, resumable sweep of expired private rows in the partitions this
 //! node owns: OAuth rows (mod.rs) and, sharing the walk, `sec/rvk/` session
-//! revocations once every token they revoke has expired.
+//! revocations once every token they revoke has expired, and expired
+//! trusted browsers (`trust/`, `xrpc::signin`).
 //!
 //! Every candidate is re-read under the row's lock and deleted on condition
 //! it is unchanged, so a row renewed in between survives. All expiry
@@ -35,6 +36,7 @@ enum Kind {
     Session,
     Replay,
     Revocation,
+    Trust,
 }
 
 fn classify(routing: &str, name: &str) -> Option<Kind> {
@@ -50,6 +52,8 @@ fn classify(routing: &str, name: &str) -> Option<Kind> {
         Some(Kind::Replay)
     } else if crate::xrpc::revocation_expired(routing, name, b"", 0).is_some() {
         Some(Kind::Revocation)
+    } else if crate::xrpc::trust_expired(routing, name, b"", 0).is_some() {
+        Some(Kind::Trust)
     } else {
         None
     }
@@ -75,13 +79,14 @@ fn expired(kind: Kind, routing: &str, name: &str, val: &[u8], now: i64) -> bool 
     match kind {
         Kind::Replay => serde_json::from_slice::<i64>(val).map(|until| until <= now).unwrap_or(true),
         Kind::Revocation => crate::xrpc::revocation_expired(routing, name, val, now.max(0) as u64).unwrap_or(false),
+        Kind::Trust => crate::xrpc::trust_expired(routing, name, val, now).unwrap_or(false),
         Kind::Request => serde_json::from_slice::<RequestData>(val).map(|r| request_expired(&r, now)).unwrap_or(true),
         Kind::CodeChallenge => {
             serde_json::from_slice::<i64>(val).map(|at| now - at >= CODE_CHALLENGE_REPLAY_TIMEFRAME).unwrap_or(true)
         }
-        Kind::Device => {
-            serde_json::from_slice::<Device>(val).map(|d| now - d.last_seen_at > AUTHENTICATION_MAX_AGE).unwrap_or(true)
-        }
+        Kind::Device => serde_json::from_slice::<Device>(val)
+            .map(|d| now - d.last_seen_at > AUTHENTICATION_MAX_AGE && now > d.trusted_until)
+            .unwrap_or(true),
         Kind::Session => serde_json::from_slice::<Session>(val).map(|s| session_expired(&s, now)).unwrap_or(true),
     }
 }
@@ -95,7 +100,7 @@ fn lock_key(kind: Kind, routing: &str, name: &str) -> String {
     match kind {
         Kind::Request => format!("req:{}", routing.trim_start_matches("oauth:req:")),
         Kind::Session => format!("ses:{}", name.trim_start_matches("oauth/ses/")),
-        Kind::CodeChallenge | Kind::Device | Kind::Replay | Kind::Revocation => routing.to_string(),
+        Kind::CodeChallenge | Kind::Device | Kind::Replay | Kind::Revocation | Kind::Trust => routing.to_string(),
     }
 }
 
@@ -224,6 +229,8 @@ mod tests {
         assert_eq!(classify("did:plc:x", "sec/rvk/d/0000000000000001"), Some(Kind::Revocation));
         assert_eq!(classify("did:plc:x", "sec/rvk/f/fam"), Some(Kind::Revocation));
         assert_eq!(classify("did:plc:x", "sec/td/rec/a/b"), None);
+        assert_eq!(classify("did:plc:x", "trust/abc"), Some(Kind::Trust));
+        assert_eq!(classify("oauth:dev:x", "trust/abc"), None);
         assert_eq!(lock_key(Kind::Request, "oauth:req:req-1", "oauth/req"), "req:req-1");
         assert_eq!(lock_key(Kind::Session, "did:plc:x", "oauth/ses/ses-1"), "ses:ses-1");
     }

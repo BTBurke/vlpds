@@ -26,6 +26,7 @@ pub(crate) mod proxy;
 mod ratelimits;
 mod repo;
 mod server;
+mod signin;
 pub mod staged_import;
 mod sync;
 pub mod syntax;
@@ -42,6 +43,7 @@ pub use server::{
     spawn_reserved_key_gc, sweep_reserved_keys,
 };
 pub use server::{LogMailer, Mail, Mailer};
+pub use signin::{trust_expired, ALERTS_PER_DAY, DEFAULT_TRUST_DAYS, TRUST as TRUST_PREFIX};
 pub use staged_import::import_rows;
 pub use sync::{
     export_memory_bytes, find_record, set_export_prefetch_max_bytes, size_export_prefetch_pool, stream_export,
@@ -307,6 +309,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(extract::debug_output_layer(
             Router::new()
                 .merge(server::routes())
+                .merge(signin::routes())
                 .merge(identity::routes())
                 .merge(repo::routes())
                 .merge(sync::routes())

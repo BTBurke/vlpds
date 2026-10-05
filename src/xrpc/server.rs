@@ -278,7 +278,7 @@ fn user_did(creds: &Credentials) -> XResult<String> {
 }
 
 /// The reference's ACCESS_FULL (OAuth refused).
-fn full_access(creds: &Credentials) -> XResult<String> {
+pub(super) fn full_access(creds: &Credentials) -> XResult<String> {
     match creds {
         // takendown tokens only reach the methods that accept them
         Credentials::Session { did } | Credentials::Takendown { did } => Ok(did.clone()),
@@ -663,7 +663,7 @@ pub(super) fn deliver(app: &App, permit: MailPermit, to: &str, email: crate::mai
         body: r.text,
         html: Some(r.html),
         purpose: email.purpose().to_string(),
-        token: Some(email.token().to_string()),
+        token: Some(email.token()).filter(|t| !t.is_empty()).map(String::from),
         sent_at: crate::events::now_rfc3339(),
     };
     send_mail(app, mail, app.config.mailer.as_ref());
@@ -1069,6 +1069,7 @@ pub(super) async fn revoke_all_sessions(app: &App, did: &str) -> XResult<()> {
         ),
         new_auth_epoch_op(),
         Op::DeletePrefix { prefix: "sess/".into() },
+        Op::DeletePrefix { prefix: super::signin::TRUST.into() },
     ];
     app.private_cas(did, Vec::new(), ops).await?;
     Ok(())
@@ -1558,6 +1559,10 @@ struct CreateSessionIn {
     auth_factor_token: Option<String>,
     #[serde(default)]
     allow_takendown: bool,
+    /// vlpds: after a second factor on this server's own page, trust the
+    /// browser (its device cookie) to skip the factor next time.
+    #[serde(default)]
+    trust_device: bool,
 }
 
 /// The account a login identifier (handle, DID or email) names. A moving
@@ -1617,23 +1622,66 @@ struct LoginStep {
     second_factor: bool,
 }
 
-async fn create_session(State(app): AppState, Json(inp): Json<CreateSessionIn>) -> XResult<Json<J>> {
+/// A browser request from this server's own pages (the account page).
+/// Fetch metadata can't be set by a cross-site page, so only those pages
+/// get to use the device cookie on createSession, and the OAuth-only switch
+/// lets them through to the second factor.
+fn own_page(headers: &HeaderMap) -> bool {
+    headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin")
+}
+
+async fn create_session(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+    Json(inp): Json<CreateSessionIn>,
+) -> XResult<Response> {
     let mut step = LoginStep { method: "password", second_factor: false };
-    let r = create_session_inner(&app, inp, &mut step).await;
+    let r = create_session_inner(&app, inp, &mut step, ip, &headers).await;
     let result = match &r {
         Ok(_) => "success",
         Err(e) if e.status == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
         Err(e) if e.status.is_server_error() => "error",
         Err(e) if e.error == "AuthFactorTokenRequired" => "second_factor_required",
         Err(_) if step.second_factor => "second_factor_failed",
-        Err(e) if e.error == "AccountTakedown" => "blocked",
+        Err(e) if e.error == "AccountTakedown" || e.error == OAUTH_REQUIRED || e.error == APP_PASSWORDS_BLOCKED => {
+            "blocked"
+        }
         Err(_) => "failed",
     };
     crate::metrics::login(step.method, result);
     r
 }
 
-async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginStep) -> XResult<Json<J>> {
+const OAUTH_REQUIRED: &str = "OAuthRequired";
+const APP_PASSWORDS_BLOCKED: &str = "AppPasswordsBlocked";
+
+/// Not "Authentication Required" or "Invalid identifier or password": the
+/// Bluesky app turns those into "Incorrect username or password", and shows
+/// any other message as it is.
+fn oauth_required() -> XrpcError {
+    err(
+        StatusCode::UNAUTHORIZED,
+        OAUTH_REQUIRED,
+        "This account only accepts its main password on its server's sign-in page. Sign in with OAuth, or use an app password.",
+    )
+}
+
+fn app_passwords_blocked() -> XrpcError {
+    err(
+        StatusCode::UNAUTHORIZED,
+        APP_PASSWORDS_BLOCKED,
+        "This account doesn't accept app passwords. Sign in with OAuth on its server's sign-in page.",
+    )
+}
+
+async fn create_session_inner(
+    app: &App,
+    inp: CreateSessionIn,
+    step: &mut LoginStep,
+    ip: Option<std::net::IpAddr>,
+    headers: &HeaderMap,
+) -> XResult<Response> {
     if inp.password.len() > OLD_PASSWORD_MAX_LENGTH {
         return Err(XrpcError::auth("Password too long. Consider resetting your password."));
     }
@@ -1663,16 +1711,66 @@ async fn create_session_inner(app: &App, inp: CreateSessionIn, step: &mut LoginS
     if soft_deleted && !inp.allow_takendown {
         return Err(takedown_error());
     }
-    step.second_factor = true;
-    super::email2fa::check_second_factor(app, &acct, inp.auth_factor_token.as_deref(), app_pass.is_some()).await?;
-    step.second_factor = false;
+    let prefs = super::signin::prefs(app, &acct.did).await?;
+    if app_pass.is_some() && prefs.block_app_passwords {
+        return Err(app_passwords_blocked());
+    }
+    let own = own_page(headers);
+    // only while a factor is on: without one there's nothing to get around
+    if app_pass.is_none() && prefs.oauth_only && !own && super::signin::factor_enabled(app, &acct).await? {
+        return Err(oauth_required());
+    }
     let epoch = epoch_for_login(app, &acct).await?.ok_or_else(invalid)?;
+    let cookie_id = if own { super::oauth::device_cookie_id(headers) } else { None };
+    let trusted = match (&app_pass, &cookie_id) {
+        (None, Some(id)) => super::signin::trusted(app, &acct, &epoch, id).await?,
+        _ => false,
+    };
+    let code = inp.auth_factor_token.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let factor = if trusted {
+        Some("trusted")
+    } else {
+        step.second_factor = true;
+        super::email2fa::check_second_factor(app, &acct, code, app_pass.is_some()).await?;
+        step.second_factor = false;
+        match (&app_pass, code) {
+            (None, Some(_)) if crate::totp::enabled_for(app, &acct).await? => Some("totp"),
+            (None, Some(_)) if super::email2fa::enabled(&acct) => Some("email"),
+            _ => None,
+        }
+    };
     super::cas::pause_point("legacy_login", &acct.did).await;
+    let method = match &app_pass {
+        Some(a) => super::signin::Method::AppPassword(a.name.clone()),
+        None => super::signin::Method::Password,
+    };
     let (access, refresh) = create_session_tokens(app, &acct.did, app_pass, soft_deleted, Some(epoch.as_str())).await?;
+    let ua = super::signin::user_agent(headers);
+    // a new browser gets its device cookie here, as on the OAuth pages
+    let mut set_cookie = None;
+    let mut device_id = cookie_id;
+    if inp.trust_device && own && matches!(factor, Some("totp" | "email")) {
+        let oauth_err =
+            |e: crate::oauth::OAuthError| XrpcError { status: e.status, error: e.error, message: e.description };
+        let (mut d, _) = super::oauth::device_for(app, headers).await.map_err(oauth_err)?;
+        let ctx = super::signin::Ctx { ip, user_agent: ua, device_id: Some(&d.id) };
+        if let Some(until) = super::signin::trust(app, &acct, &epoch, &d.id.clone(), &ctx).await? {
+            d.trusted_until = d.trusted_until.max(until as i64);
+            crate::oauth::store::put_device(app, &d).await.map_err(oauth_err)?;
+            set_cookie = Some(super::oauth::device_cookie(app, &d));
+        }
+        device_id = Some(d.id);
+    }
+    let ctx = super::signin::Ctx { ip, user_agent: ua, device_id: device_id.as_deref() };
+    super::signin::record(app, &acct, method, factor, &ctx).await;
     let mut out = session_info(app, &acct, true).await;
     out["accessJwt"] = json!(access);
     out["refreshJwt"] = json!(refresh);
-    Ok(Json(out))
+    let mut r = Json(out).into_response();
+    if let Some(c) = set_cookie {
+        r.headers_mut().insert(header::SET_COOKIE, c);
+    }
+    Ok(r)
 }
 
 async fn get_session(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {

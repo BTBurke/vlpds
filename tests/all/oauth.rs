@@ -1962,3 +1962,88 @@ async fn loopback_clients_work_and_metadata_fetches_are_guarded_outside_dev_mode
 // Reference-suite ports that reuse this file's client simulation.
 #[path = "ref_oauth.rs"]
 mod ref_oauth;
+
+/// A new pushed request in browser `b`, signed in with the password only:
+/// the page that follows.
+async fn password_step(s: &Srv, b: &mut Browser, f: &Flow<'_>, acct: &Account) -> String {
+    let ru = f.request_uri(s, &pkce(), "t").await;
+    let (_, _, html) = b.authorize(s, f, &ru).await;
+    let (st, _, html) = b.sign_in(s, &ru, &csrf_of(&html), &acct.handle, PASSWORD).await;
+    assert_eq!(st, 200, "{html}");
+    html
+}
+
+/// "Trust this browser" on the sign-in page's second-factor step
+/// (src/xrpc/signin.rs): that browser skips the code until a password
+/// change; the OAuth-only switch leaves this page alone; each sign-in is
+/// logged with its client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_browser_skips_the_second_factor() {
+    let s = spawn().await;
+    let acct = create_account(&s, "tess").await;
+    let (secret, step) = enable_totp(&s, &acct).await;
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto", &key).with("prompt", "login");
+    let mut b = Browser::default();
+    let ru = f.request_uri(&s, &pkce(), "t").await;
+    let (_, _, html) = b.authorize(&s, &f, &ru).await;
+    let csrf = csrf_of(&html);
+    let (_, _, html) = b.sign_in(&s, &ru, &csrf, &acct.handle, PASSWORD).await;
+    assert!(html.contains("name=\"trust\"") && html.contains("Trust this browser for 30 days"), "{html}");
+    let code = vlpds::totp::code_for_step(&secret, step + 1);
+    let pairs = [
+        ("request_uri", ru.as_str()),
+        ("csrf", csrf.as_str()),
+        ("step", "totp"),
+        ("code", code.as_str()),
+        ("trust", "1"),
+        ("action", "sign-in"),
+    ];
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-in", &pairs).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access"), "{html}");
+
+    // the same browser: password only, straight to consent
+    let html = password_step(&s, &mut b, &f, &acct).await;
+    assert!(html.contains("Authorize access"), "trusted browser asked for a code: {html}");
+    // another browser is asked
+    let html = password_step(&s, &mut Browser::default(), &f, &acct).await;
+    assert!(html.contains("name=\"code\""), "{html}");
+
+    // OAuth-only doesn't touch this page
+    let (st, j) =
+        s.bearer(&acct.jwt, "vlpds.server.updateSignInSecurity", true, Some(json!({"oauthOnly": true}))).await;
+    assert_eq!(st, 200, "{j}");
+    let html = password_step(&s, &mut b, &f, &acct).await;
+    assert!(html.contains("Authorize access"), "{html}");
+
+    // the log: OAuth sign-ins with their client and factor
+    let (_, j) = s.bearer(&acct.jwt, "vlpds.server.getSignInSecurity", false, None).await;
+    let recent = j["recentSignIns"].as_array().unwrap();
+    assert_eq!(recent.len(), 3, "{j}");
+    assert!(recent.iter().all(|e| e["method"] == "oauth" && e["clientId"] == json!(f.client_id)), "{j}");
+    let factors: Vec<&str> = recent.iter().map(|e| e["factor"].as_str().unwrap()).collect();
+    assert_eq!(factors, ["trusted", "trusted", "totp"]);
+    assert_eq!(j["trustedBrowsers"].as_array().unwrap().len(), 1);
+
+    // a password change: the code is asked for again
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.requestPasswordReset", s.base))
+        .json(&json!({"email": "tess@example.com"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+    let tok = dev_mail_token(&s, "tess@example.com", "reset_password").await;
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.resetPassword", s.base))
+        .json(&json!({"token": tok, "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success(), "{}", r.text().await.unwrap());
+    let html = password_step(&s, &mut b, &f, &acct).await;
+    assert!(html.contains("name=\"code\""), "trust survived a password change: {html}");
+}

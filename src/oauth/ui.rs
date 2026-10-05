@@ -158,6 +158,20 @@ pub struct LoginForm<'a> {
     pub totp: bool,
     /// With `totp`: the code was emailed to this (obfuscated) address.
     pub email_hint: Option<&'a str>,
+    /// With `totp`: offer to trust this browser for this many days (0: don't).
+    pub trust_days: u32,
+}
+
+/// The second-factor step's "trust this browser" choice, whatever the factor.
+fn trust_choice(days: u32) -> String {
+    if days == 0 {
+        return String::new();
+    }
+    let n = if days == 1 { "1 day".to_string() } else { format!("{days} days") };
+    format!(
+        "<label class=\"check\"><input type=\"checkbox\" name=\"trust\" value=\"1\">Trust this browser for {n}</label>\
+<p class=\"muted\">You won't be asked for a code on this browser until then. Leave it unticked on a shared computer.</p>"
+    )
 }
 
 pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
@@ -186,10 +200,11 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
 <input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
 <label for=\"code\">Sign-in code from your email</label>\
 <input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"characters\" spellcheck=\"false\" required autofocus>\
-<input type=\"hidden\" name=\"step\" value=\"totp\">",
+{}<input type=\"hidden\" name=\"step\" value=\"totp\">",
             e(f.identifier),
             e(hint),
-            e(f.identifier)
+            e(f.identifier),
+            trust_choice(f.trust_days)
         ));
     } else if f.totp {
         b.push_str(&format!(
@@ -197,9 +212,10 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
 <input type=\"text\" class=\"u\" autocomplete=\"username\" value=\"{}\" readonly tabindex=\"-1\" aria-hidden=\"true\">\
 <label for=\"code\">Authenticator code (or a recovery code)</label>\
 <input type=\"text\" id=\"code\" name=\"code\" inputmode=\"numeric\" autocomplete=\"one-time-code\" required autofocus>\
-<input type=\"hidden\" name=\"step\" value=\"totp\">",
+{}<input type=\"hidden\" name=\"step\" value=\"totp\">",
             e(f.identifier),
-            e(f.identifier)
+            e(f.identifier),
+            trust_choice(f.trust_days)
         ));
     } else {
         b.push_str(&format!(
