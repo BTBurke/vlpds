@@ -38,6 +38,7 @@ export type FeatureLevels = {
 
 export type ClusterStatus = {
   node: string
+  publicUrl?: string
   log: string
   logDurableOrdinal: number | null
   owned: number[]

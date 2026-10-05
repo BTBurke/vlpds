@@ -419,6 +419,7 @@ async fn cluster_status(State(app): AppState, Auth(creds): Auth) -> XResult<Json
     };
     let mut out = json!({
         "node": "",
+        "publicUrl": app.public_url,
         "log": app.log.log_id.to_string(),
         "logDurableOrdinal": durable,
         "owned": owned,

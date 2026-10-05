@@ -4,9 +4,21 @@ import { fmtTime } from '../../lib/format'
 import { useAction } from '../../lib/hooks'
 import { Link } from '../../lib/router'
 import { admin } from '../../lib/xrpc'
+import type { ClusterStatus } from './Cluster'
 
 /** `available` is the code's total uses, as the reference PDS reports it; what's left is `available - uses.length`. */
 type Code = { code: string; available: number; disabled: boolean; forAccount: string; createdBy: string; createdAt: string; uses: { usedBy: string; usedAt: string }[] }
+
+/** The server's --public-url: the console may be open on another host (a tailnet or admin address), and invite links must work for whoever receives them. */
+function usePublicUrl() {
+  const [url, setUrl] = useState<string>()
+  useEffect(() => {
+    admin<ClusterStatus>('vlpds.admin.getClusterStatus')
+      .then((s) => setUrl((s.publicUrl ?? location.origin).replace(/\/+$/, '')))
+      .catch(() => setUrl(location.origin))
+  }, [])
+  return url
+}
 
 const left = (c: Code) => Math.max(0, c.available - c.uses.length)
 
@@ -17,6 +29,7 @@ export function Invites() {
   const [sel, setSel] = useState<Set<string>>(new Set())
   const [open, setOpen] = useState<Set<string>>(new Set())
   const [partial, setPartial] = useState<PartialResult>()
+  const base = usePublicUrl()
   const page = useAction(async (cur?: string) => {
     const r = await admin('com.atproto.admin.getInviteCodes', { params: { sort: 'recent', limit: 100, cursor: cur } })
     setPartial(partialOf(r))
@@ -66,7 +79,7 @@ export function Invites() {
             {created.map((c) => (
               <div key={c} className="row">
                 <CopyText text={c} />
-                <InviteLinks code={c} />
+                <InviteLinks code={c} base={base} />
               </div>
             ))}
           </Notice>
@@ -164,7 +177,7 @@ export function Invites() {
                           )}
                         </td>
                         <td>{c.disabled ? <Status kind="bad">Disabled</Status> : usable ? <Status kind="ok">Active</Status> : <Status kind="idle">Used up</Status>}</td>
-                        <td>{usable ? <InviteLinks code={c.code} /> : <span className="muted">—</span>}</td>
+                        <td>{usable ? <InviteLinks code={c.code} base={base} /> : <span className="muted">—</span>}</td>
                         <td>
                           {!c.disabled && (
                             <button type="button" className="btn sm danger" disabled={disable.busy} onClick={() => disable.run([c.code])}>
@@ -226,12 +239,13 @@ function Owner({ c }: { c: Code }) {
   )
 }
 
-function InviteLinks({ code }: { code: string }) {
+function InviteLinks({ code, base }: { code: string; base?: string }) {
+  if (!base) return null
   const q = `?invite=${encodeURIComponent(code)}`
   return (
     <span className="invite-links small">
-      <CopyText text={`${location.origin}/migrate${q}`} display="Migrate" label="Copy migrate link" mono={false} />
-      <CopyText text={`${location.origin}/account/signup${q}`} display="Sign-up" label="Copy sign-up link" mono={false} />
+      <CopyText text={`${base}/migrate${q}`} display="Migrate" label="Copy migrate link" mono={false} />
+      <CopyText text={`${base}/account/signup${q}`} display="Sign-up" label="Copy sign-up link" mono={false} />
     </span>
   )
 }

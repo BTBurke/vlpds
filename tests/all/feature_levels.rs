@@ -33,6 +33,8 @@ async fn cluster_status_shows_levels_and_a_raise_waits_for_every_node() {
         (st["nodes"].as_array().unwrap().len() == 2).then_some(st)
     })
     .await;
+    // the console builds invite links from it, wherever it's opened
+    assert_eq!(st["publicUrl"], a.app.public_url.as_str(), "{st}");
     let v = &st["version"];
     assert_eq!((v["active"].as_u64(), &v["target"], v["binary"]["max"].as_u64()), (Some(1), &J::Null, Some(1)), "{st}");
     assert_eq!(
