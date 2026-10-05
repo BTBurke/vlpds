@@ -1708,7 +1708,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
         crate::space::commit::sign(&set, &ctx, rand::random(), |b| Ok::<_, std::convert::Infallible>(key.sign(b)))
             .map_err(|_| XrpcError::internal("space commit context too long"))?;
     metrics::space_sign(t.elapsed());
-    let (stall, repo) = (app.config.export_stall, q.repo.clone());
+    let stall = app.config.export_stall;
     Ok(super::sync::export_body(slot, "application/vnd.ipld.car", move |tx| async move {
         const CHUNK: usize = super::sync::EXPORT_CHUNK;
         let mut car = Car::new(commit_block(&commit));
@@ -1730,7 +1730,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
                 let mut it = match snap.scan_with_options(lo..hi, &opts).await {
                     Ok(it) => state::BatchedScan::new(it),
                     Err(e) => {
-                        tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
+                        tracing::warn!("space getRepo: record scan failed: {e}");
                         return Err("error");
                     }
                 };
@@ -1742,7 +1742,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
                             Ok(Some(kv)) => break kv,
                             Ok(None) => return Err("error"),
                             Err(e) => {
-                                tracing::warn!(%repo, "space getRepo: record scan failed: {e}");
+                                tracing::warn!("space getRepo: record scan failed: {e}");
                                 return Err("error");
                             }
                         }
@@ -1751,7 +1751,7 @@ async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Q
                     let (cid, bytes) = match state::record_value_parts(&kv.value) {
                         Ok(v) if &kv.key[prefix.len()..] == path.as_bytes() && v.0 == *entries.cid(i) => v,
                         _ => {
-                            tracing::warn!(%repo, path, "space getRepo: the snapshot changed between passes");
+                            tracing::warn!("space getRepo: the snapshot changed between passes");
                             return Err("error");
                         }
                     };
@@ -1799,7 +1799,7 @@ pub(super) async fn process_notify_write(
     }
     let row = super::simplespace::live_space(app, space).await?;
     if space_takendown(app, space).await? {
-        tracing::debug!(space = %space.uri, writer, "notifyWrite to a taken-down space dropped");
+        tracing::debug!(space = %hex::encode(space.sid), "notifyWrite to a taken-down space dropped");
         return Ok(None);
     }
     let managing_app = match &row.write_policy {

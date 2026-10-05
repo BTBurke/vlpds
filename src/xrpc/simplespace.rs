@@ -289,7 +289,7 @@ async fn delete_space(State(app): AppState, Auth(creds): Auth, Json(inp): Json<J
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(space = %space.uri, "space registrations unreadable, none told of the deletion: {e:#}")
+                tracing::warn!(space = %hex::encode(space.sid), "space registrations unreadable, none told of the deletion: {e:#}")
             }
         }
     }

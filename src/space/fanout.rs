@@ -212,7 +212,7 @@ impl Fanout {
                 let (regs, expired) = match super::host::registrations(&a, &job.authority, &job.sid).await {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::warn!(space = %job.uri, "space notify registrations unreadable: {e:#}");
+                        tracing::warn!(space = %hex::encode(job.sid), "space notify registrations unreadable: {e:#}");
                         crate::metrics::space_notify("fanout", "error");
                         continue;
                     }
@@ -249,7 +249,7 @@ impl Fanout {
         let (me, app, uri) = (self.clone(), app.clone(), uri.clone());
         tokio::spawn(async move {
             if let Err(e) = crate::xrpc::space::prune_registration(&app, &uri, &service).await {
-                tracing::info!(space = %uri, service, "expired space notify registration not pruned: {e:#}");
+                tracing::info!(space = %crate::state::space_log_id(&uri), service, "expired space notify registration not pruned: {e:#}");
             }
             me.pruning.lock().remove(&(uri, service));
         });

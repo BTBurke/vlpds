@@ -449,7 +449,7 @@ async fn check_space(
     }
     let report = check::check(&q.did, &q.space, &rows, crate::tid::now_micros(), app.config.space_oplog_retention);
     if report.pointer("/records/matchesHead") == Some(&J::Bool(false)) {
-        tracing::warn!(did = %q.did, space = %q.space, "check-space: records don't hash to the space head");
+        tracing::warn!(did = %q.did, space = %crate::state::space_log_id(&q.space), "check-space: records don't hash to the space head");
         crate::metrics::space_digest_mismatch();
     }
     Ok(Json(report))

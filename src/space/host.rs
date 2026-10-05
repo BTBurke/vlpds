@@ -100,7 +100,7 @@ pub async fn check_user_access(
 ) -> bool {
     let lxm = "com.atproto.simplespace.checkUserAccess";
     let Some(endpoint) = resolve_service_endpoint(app, managing_app).await else {
-        tracing::info!(space, managing_app, "could not resolve managing app");
+        tracing::info!(space = %crate::state::space_log_id(space), managing_app, "could not resolve managing app");
         return false;
     };
     let mut q = vec![("space", space), ("user", user), ("access", access)];
@@ -111,11 +111,11 @@ pub async fn check_user_access(
     match call(app, client, authority, managing_app, &endpoint, lxm, reqwest::Method::GET, &q, None).await {
         Ok((200, body)) => body["authorized"] == J::Bool(true),
         Ok((status, _)) => {
-            tracing::info!(space, managing_app, user, status, "managing app check failed");
+            tracing::info!(space = %crate::state::space_log_id(space), managing_app, status, "managing app check failed");
             false
         }
         Err(e) => {
-            tracing::info!(space, managing_app, user, "managing app check failed: {e}");
+            tracing::info!(space = %crate::state::space_log_id(space), managing_app, "managing app check failed: {e}");
             false
         }
     }
@@ -190,15 +190,15 @@ pub async fn forward(app: &App, f: &Forward, prev: Option<Tid>) -> &'static str 
     match call(app, client, &f.authority, &f.service, &f.endpoint, lxm, post, &[], Some(&body)).await {
         Ok((s, _)) if (200..300).contains(&s) => "ok",
         Ok((s, _)) if crate::xrpc::space::retryable_status(s) => {
-            tracing::info!(space = %f.uri, service = f.service, status = s, "space notify forward failed");
+            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward failed");
             "error"
         }
         Ok((s, _)) => {
-            tracing::info!(space = %f.uri, service = f.service, status = s, "space notify forward refused");
+            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, status = s, "space notify forward refused");
             "refused"
         }
         Err(e) => {
-            tracing::info!(space = %f.uri, service = f.service, "space notify forward failed: {e}");
+            tracing::info!(space = %crate::state::space_log_id(&f.uri), service = f.service, "space notify forward failed: {e}");
             "error"
         }
     }
@@ -216,8 +216,12 @@ pub async fn notify_space_deleted(app: &App, authority: &str, uri: &str, service
             call(app, client, authority, &service, &row.endpoint, lxm, reqwest::Method::POST, &[], Some(&body)).await;
         match r {
             Ok((s, _)) if (200..300).contains(&s) => {}
-            Ok((s, _)) => tracing::info!(space = uri, service, status = s, "notifySpaceDeleted refused"),
-            Err(e) => tracing::info!(space = uri, service, "notifySpaceDeleted failed: {e}"),
+            Ok((s, _)) => {
+                tracing::info!(space = %crate::state::space_log_id(uri), service, status = s, "notifySpaceDeleted refused")
+            }
+            Err(e) => {
+                tracing::info!(space = %crate::state::space_log_id(uri), service, "notifySpaceDeleted failed: {e}")
+            }
         }
     }
 }

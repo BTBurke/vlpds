@@ -114,6 +114,12 @@ operator confirm a guessed value. Reading the value is a separate
 operator sees has its own audit entry. `vlpds admin check-space` reports a repo's head and record
 paths, so it writes an audit entry as well.
 
+Logs and the console's rate-limit pages are the other places an operator could pick up space
+metadata, since skeys and rkeys are often meaningful names. So vlpds logs a space by its 32-character
+hex id and leaves member DIDs and record paths out of its log lines. The two rate limits keyed by who
+talks to which authority (`space-credential` and `space-read-credential`) show a keyed hash of the
+pair in the console.
+
 ## Takedowns
 
 | Takedown | What happens to space data |

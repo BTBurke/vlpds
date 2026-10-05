@@ -474,7 +474,7 @@ impl Outbox {
         }
         self.wake.notify_one();
         if let Outcome::Refused(why) | Outcome::Retry(why) = outcome {
-            tracing::info!(did = %s.did, space = %s.uri, rev = %s.repo_rev, "space notifyWrite {result}: {why}");
+            tracing::info!(space = %hex::encode(s.sid), rev = %s.repo_rev, "space notifyWrite {result}: {why}");
         }
     }
 

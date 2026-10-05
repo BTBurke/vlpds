@@ -722,6 +722,14 @@ async fn verify_space_token(app: &App, t: &token::SpaceToken) -> XResult<()> {
     Ok(())
 }
 
+/// A rate-limit key the console can show without naming who talks to which
+/// space authority: keyed by the server secret, so it can't be matched
+/// against a list of DIDs.
+fn private_limit_key(app: &App, key: &str) -> String {
+    let k = crate::oauth::util::derive_secret(&app.config.jwt_secret, "space-rate-limit-key");
+    hex::encode(&crate::prims::hmac_sha256(&k, &[key.as_bytes()])[..16])
+}
+
 /// Reference `spaceCredentialAuth`: the credential, issued by its space's
 /// authority; a DID audience; the request signed by the credential's key
 /// over exactly the authorization and audience headers, each sent once;
@@ -747,7 +755,7 @@ pub async fn verify_space_credential(app: &App, headers: &HeaderMap) -> XResult<
     }
     if let Ok(Credentials::SpaceCredential { iss, jti, .. }) = &r {
         use crate::ratelimit::{check, SPACE_READ_CREDENTIAL};
-        check(&[&SPACE_READ_CREDENTIAL], &format!("{iss} {jti}"), 1)?;
+        check(&[&SPACE_READ_CREDENTIAL], &private_limit_key(app, &format!("{iss} {jti}")), 1)?;
     }
     r
 }
@@ -838,7 +846,8 @@ pub async fn verify_delegation(app: &App, headers: &HeaderMap) -> XResult<Delega
     }
     let key_id = crate::space::httpsig::verify(headers, None).map_err(sig_err)?;
     // before the claim, which a refused exchange would otherwise spend
-    crate::ratelimit::check(&[&crate::ratelimit::SPACE_CREDENTIAL], &format!("{} {authority}", t.claims.iss), 1)?;
+    let limit_key = private_limit_key(app, &format!("{} {authority}", t.claims.iss));
+    crate::ratelimit::check(&[&crate::ratelimit::SPACE_CREDENTIAL], &limit_key, 1)?;
     let claim = format!("space-delegation:{}:{}", t.claims.iss, t.claims.jti);
     if !super::internal::claim_replay_anywhere(app, &authority, &claim, t.claims.exp.ceil() as i64).await? {
         return Err(space_auth_err("JwtReplayed", "delegation token has already been used"));

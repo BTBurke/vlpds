@@ -255,6 +255,12 @@ pub const SPACE_FAMILIES: [&[u8]; 11] = [
 pub const SPACE_ID_LEN: usize = 16;
 pub type SpaceId = [u8; SPACE_ID_LEN];
 
+/// How logs name a space: its id, so log readers don't see the space's
+/// name or who is in it.
+pub fn space_log_id(uri: &str) -> String {
+    hex::encode(space_id(uri))
+}
+
 pub fn space_id(uri: &str) -> SpaceId {
     Sha256::digest(uri.as_bytes())[..SPACE_ID_LEN].try_into().unwrap()
 }

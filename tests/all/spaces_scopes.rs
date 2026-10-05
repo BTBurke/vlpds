@@ -559,6 +559,17 @@ async fn space_rate_buckets_trip() {
     bearer_post(&s, lxm, &jwt, revoke("3l2cqzy5yf22b")).await.ok();
     let jwt = service_jwt(&s, &a.did, &b.did, lxm).await;
     tripped(&bearer_post(&s, lxm, &jwt, revoke("3l2cqzy5yf22c")).await, 1);
+
+    // the console sees who talks to which authority only as a keyed hash
+    let rl = s.xrpc.get("vlpds.admin.getRateLimits", &[("top", "50")], &Auth::Admin).await.ok();
+    for bucket in ["space-credential", "space-read-credential"] {
+        let top = rl["top"][bucket].as_array().unwrap_or_else(|| panic!("{bucket} in {rl}"));
+        assert!(!top.is_empty(), "{rl}");
+        for c in top {
+            let k = c["key"].as_str().unwrap();
+            assert!(k.len() == 32 && k.bytes().all(|b| b.is_ascii_hexdigit()), "{bucket} key {k}");
+        }
+    }
 }
 
 /// With `--spaces` off nothing changes: `space:` scopes aren't offered and
