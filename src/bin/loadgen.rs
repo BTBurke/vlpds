@@ -48,7 +48,7 @@ enum Cmd {
         #[arg(long, default_value_t = 512)]
         concurrency: usize,
         /// Handle prefix, so repeated setups don't collide.
-        #[arg(long, default_value = "u")]
+        #[arg(long, default_value = "user")]
         prefix: String,
     },
     /// Run an open-loop write workload.
