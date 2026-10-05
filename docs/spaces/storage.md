@@ -113,6 +113,10 @@ The account's writes to that space are refused while it imports.
   The first entry takes the old head away, the old rows go in bounded batches, the new ones are
   staged, and the last entry puts the new head in. Reads see no repo in the space between the first
   and last entries, so a syncer polling then gets `RepoNotFound` and falls back to `getRepo` after.
+- A retried import is the one exception to the newer rev. The same rev with the same records answers
+  200 and writes nothing: no log entry, no outbox row, no notify. The repo's head already holds the
+  set hash and the record count, so telling a retry apart costs no read past the one every import
+  makes. The same rev with other records is refused.
 - A second import of the same space repo while one is running is refused, and so are the account's
   writes there.
 - The blobs the imported records name don't come with the CAR. `repo.listMissingBlobs` lists them

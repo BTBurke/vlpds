@@ -316,7 +316,9 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     if rev.micros() > crate::tid::now_micros() + super::space::FUTURE_REV.as_micros() as u64 {
         return Err(bad("FutureRev", "The commit's rev is in the future"));
     }
-    if held.is_some_and(|h| rev <= h.rev) {
+    // an equal rev is let through here only to be checked for the same
+    // content below, once the commit verifies
+    if held.as_ref().is_some_and(|h| rev < h.rev) {
         return Err(invalid("the imported commit's rev must be newer than the repo's in the space"));
     }
     let ctx = CommitCtx { space: &space.uri, author: &did, rev: &commit.rev };
@@ -338,13 +340,22 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, body: Body) ->
     if !commit::matches(&set, &commit) {
         return Err(bad("DigestMismatch", "The index's set hash is not the commit's"));
     }
+    if let Some(h) = held.filter(|h| h.rev == rev) {
+        // a retried import of the repo as it stands: the set hash covers
+        // every (path, CID), so an equal state and count is the same records
+        if h.records != index.len() as u64 || h.hash.state() != set.state() {
+            return Err(invalid("the imported commit's rev must be newer than the repo's in the space"));
+        }
+        let records = stage(None, &did, &space, &mut car, index, rev).await?;
+        return Ok(Json(json!({"rev": rev.to_string(), "records": records})));
+    }
 
     let nonce = rand::random::<u64>();
     let _claim = Claim { sp, did: &did, sid: space.sid, nonce };
     submit_space(app, &did, &space, SpaceOp::ImportBegin { nonce, rev: Some(rev) }).await?;
     let p = app.partition(&did)?;
     clear_unheaded(&p, &did, &space).await?;
-    let staged = stage(&p, &did, &space, &mut car, index, rev).await;
+    let staged = stage(Some(&p), &did, &space, &mut car, index, rev).await;
     let records = match staged {
         Ok(n) => n,
         Err(e) => {
@@ -374,9 +385,10 @@ async fn root_block(car: &mut CarReader, want: Cid, what: &str) -> XResult<Vec<u
 }
 
 /// Writes the CAR's records (and their blob refs) as rows with no head
-/// over them yet; Ok(the record count).
+/// over them yet; Ok(the record count). With no partition it only checks
+/// the blocks.
 async fn stage(
-    p: &crate::partition::Partition,
+    p: Option<&crate::partition::Partition>,
     did: &str,
     space: &Space,
     car: &mut CarReader,
@@ -395,6 +407,7 @@ async fn stage(
             return Err(invalid(format!("expected block {expected} for {path}, got {cid}")));
         }
         let blobs = imported_record_blobs(&path, &b)?;
+        let Some(p) = p else { continue };
         for blob in &blobs {
             let r = Bytes::copy_from_slice(&rev.0.to_be_bytes());
             muts.push(put(state::space_blob_key(did, &space.sid, blob, &path), r));
@@ -410,7 +423,7 @@ async fn stage(
     if let Some((path, cid)) = want.next() {
         return Err(invalid(format!("the CAR has no block for {path} ({cid})")));
     }
-    if !muts.is_empty() {
+    if let Some(p) = p.filter(|_| !muts.is_empty()) {
         write_private_local(p, muts).await?;
     }
     Ok(records)

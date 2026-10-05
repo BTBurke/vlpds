@@ -5475,7 +5475,10 @@ oplog replay from one snapshot and counts a mismatch in
   A rev more than 5 min ahead gets FutureRev. An import over a repo that's
   there replaces it at a newer rev, as the public importRepo does: the old
   head goes in the first entry, the old rows in bounded batches, and the
-  new head in the last, so reads see no repo in between. A second import
+  new head in the last, so reads see no repo in between. The same rev
+  with the same records (the head's LtHash state and count) is a retry:
+  the blocks are checked, nothing is written and it answers 200. The same
+  rev with other records, or an older one, is refused. A second import
   while one runs is refused. Between the DID switch and the import,
   syncers find no space data for the account here.
   A failed import clears what it staged, and rows a crashed one left with

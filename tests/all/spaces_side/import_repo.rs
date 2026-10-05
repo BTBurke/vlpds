@@ -857,8 +857,10 @@ async fn import_verifies_against_the_key_held_at_the_rev() {
 
 /// An import over a repo that's there replaces it with the snapshot at a
 /// newer rev, as com.atproto.repo.importRepo does: the old records go, the
-/// new ones are served, check-space is clean. An older or equal rev is
-/// refused, and so is a second import while one runs.
+/// new ones are served, check-space is clean. The same rev with the same
+/// records is a no-op 200 (a retried import); an older rev, or the same
+/// rev with other records, is refused, and so is a second import while one
+/// runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn import_over_a_repo_replaces_it() {
     let o = one().await;
@@ -897,6 +899,45 @@ async fn import_over_a_repo_replaces_it() {
     assert_eq!(head(&o.bob, &o.space).await.map(|h| h.0), Some(newer.clone()));
     expect_set_hash_matches_store(&o.bob, &o.space).await;
     check_space_ok(s, &o.bob.did, &o.space).await;
-    let r = import_repo(&o.bob, &o.space, &built.car()).await;
-    assert_eq!(r.status, 400, "the same rev again: {}", r.text());
+
+    // the same snapshot again (a retried import, signed afresh): a 200 that
+    // writes nothing
+    o.net.await_writer(&o.alice, &o.space, &o.bob.did).await;
+    let p = s.app.partition(&o.bob.did).ok().unwrap();
+    let outbox = || p.db.get(vlpds::state::space_outbox_key(&o.bob.did, &sid));
+    let ordinal = settled_ordinal(s).await;
+    let sp_row = outbox().await.unwrap();
+    let again = b.build(&key);
+    assert_ne!(again.commit_cid, built.commit_cid, "a fresh signature");
+    let out = import_repo(&o.bob, &o.space, &again.car()).await.ok();
+    assert_eq!((out["rev"].clone(), out["records"].clone()), (json!(newer), json!(2)), "{out}");
+    assert_eq!(s.app.log.next_ordinal(), ordinal, "a same-content import wrote a log segment");
+    assert_eq!(outbox().await.unwrap(), sp_row, "a same-content import touched the outbox");
+    assert_eq!(head(&o.bob, &o.space).await.map(|h| h.0), Some(newer.clone()));
+
+    // the same rev with other records is refused, and so is an older one
+    let mut other = RepoBuilder::new(&o.space, &o.bob.did, &newer);
+    other.records.insert(format!("{TEST_COLLECTION}/new0"), record_block(&json!({"$type": TEST_COLLECTION, "n": 9})));
+    let r = import_repo(&o.bob, &o.space, &other.build(&key).car()).await;
+    assert_eq!(r.status, 400, "the same rev with other records: {}", r.text());
+    let r = import_repo(&o.bob, &o.space, &RepoBuilder::new(&o.space, &o.bob.did, &first).build(&key).car()).await;
+    assert_eq!(r.status, 400, "an older rev: {}", r.text());
+    let mut got: Vec<String> =
+        all_records(&o.bob, &o.space).await.iter().map(|r| r["rkey"].as_str().unwrap().to_string()).collect();
+    got.sort();
+    assert_eq!(got, ["new0", "new1"], "a refused import changed the repo");
+}
+
+/// The node log's next ordinal once nothing has been written for 300 ms.
+async fn settled_ordinal(s: &TestServer) -> u64 {
+    let mut last = s.app.log.next_ordinal();
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let now = s.app.log.next_ordinal();
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    panic!("the node log never settled");
 }
