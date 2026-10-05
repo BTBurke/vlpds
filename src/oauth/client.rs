@@ -533,11 +533,46 @@ impl<T: Clone> Cache<T> {
 static CLIENTS: LazyLock<Arc<Cache<Arc<Client>>>> =
     LazyLock::new(|| crate::caches::track(crate::caches::Cache::OAuthClients, Arc::new(Cache::new())));
 
-pub async fn get_client(client_id: &str, dev_mode: bool) -> Result<Arc<Client>, OAuthError> {
+/// The web UI's own client (the migration page's OAuth sign-ins): a public
+/// client whose metadata this server serves at [`FIRST_PARTY_PATH`].
+pub const FIRST_PARTY_PATH: &str = "/oauth/client-metadata.json";
+/// The UI's `CLIENT_SCOPE` (ui/src/lib/oauth.ts) lists the same values.
+pub const FIRST_PARTY_SCOPE: &str = "atproto space:*?authority=*&action=read_self \
+space:*?authority=*&collection=*&action=create&action=read_self blob:*/*";
+pub const FIRST_PARTY_CALLBACK: &str = "/migrate/oauth/callback";
+
+pub fn first_party_id(public_url: &str) -> String {
+    format!("{}{FIRST_PARTY_PATH}", public_url.trim_end_matches('/'))
+}
+
+pub fn first_party_metadata(public_url: &str) -> J {
+    let origin = public_url.trim_end_matches('/');
+    let host = reqwest::Url::parse(origin).ok().and_then(|u| u.host_str().map(String::from)).unwrap_or_default();
+    json!({
+        "client_id": first_party_id(public_url),
+        "client_name": format!("{host} (moving an account)"),
+        "client_uri": origin,
+        "redirect_uris": [format!("{origin}{FIRST_PARTY_CALLBACK}")],
+        "scope": FIRST_PARTY_SCOPE,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "application_type": "web",
+        "token_endpoint_auth_method": "none",
+        "dpop_bound_access_tokens": true,
+    })
+}
+
+/// `public_url`: this server's, so its own UI's client is built here
+/// rather than fetched from itself.
+pub async fn get_client(client_id: &str, dev_mode: bool, public_url: &str) -> Result<Arc<Client>, OAuthError> {
     if let Some(c) = CLIENTS.get(client_id) {
         return Ok(c);
     }
-    let client = Arc::new(load_client(client_id, dev_mode).await?);
+    let client = Arc::new(if client_id == first_party_id(public_url) {
+        validate_metadata(client_id, first_party_metadata(public_url), false, dev_mode)?
+    } else {
+        load_client(client_id, dev_mode).await?
+    });
     if !client.loopback {
         CLIENTS.put(client_id, client.clone());
     }
@@ -843,6 +878,26 @@ fn validate_metadata(client_id: &str, md: J, loopback: bool, dev_mode: bool) -> 
 mod tests {
     use super::*;
     use p256::elliptic_curve::Generate;
+
+    #[test]
+    fn first_party_client_validates() {
+        let url = "https://pds.example.com";
+        let id = first_party_id(url);
+        assert_eq!(id, "https://pds.example.com/oauth/client-metadata.json");
+        assert!(matches!(parse_client_id(&id, false), Ok(ClientIdKind::Discoverable(_))));
+        let c = validate_metadata(&id, first_party_metadata(url), false, false).unwrap();
+        assert!(!c.is_confidential());
+        assert!(c.allows_redirect_uri("https://pds.example.com/migrate/oauth/callback"));
+        assert!(!c.allows_redirect_uri("https://pds.example.com/migrate"));
+        for s in [
+            "space:*?authority=*&action=read_self",
+            "space:*?authority=*&collection=*&action=create&action=read_self",
+            "blob:*/*",
+        ] {
+            assert!(c.scopes.iter().any(|x| x == s), "{s}");
+            assert!(crate::oauth::scopes::Permission::parse(s).is_some(), "{s}");
+        }
+    }
 
     #[test]
     fn loopback_ids() {

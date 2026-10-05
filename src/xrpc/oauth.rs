@@ -77,6 +77,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/.well-known/oauth-protected-resource", get(protected_resource_metadata).options(preflight))
         .route("/.well-known/oauth-authorization-server", get(authorization_server_metadata).options(preflight))
         .route("/oauth/jwks", get(jwks).options(preflight))
+        .route(client::FIRST_PARTY_PATH, get(first_party_metadata).options(preflight))
         .route("/oauth/par", post(par).options(preflight))
         .route("/oauth/token", post(token).options(preflight))
         .route("/oauth/revoke", post(revoke).options(preflight))
@@ -231,6 +232,14 @@ async fn protected_resource_metadata(State(app): AppState) -> Response {
     r
 }
 
+/// The web UI's own OAuth client, for other servers' authorization servers.
+async fn first_party_metadata(State(app): AppState) -> Response {
+    let mut r = Json(client::first_party_metadata(&app.public_url)).into_response();
+    cors(r.headers_mut());
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("public, max-age=600"));
+    r
+}
+
 async fn authorization_server_metadata(State(app): AppState) -> Response {
     let iss = issuer(&app);
     let mut r = Json(json!({
@@ -381,7 +390,7 @@ async fn par_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<J, OAu
     let p = parse_params(headers, body)?;
     let proof = check_as_dpop(app, headers, "/oauth/par").await?;
     let creds = ClientCredentials::from_params(&p)?;
-    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode, &app.public_url).await?;
     let (client_auth, assertion) = client.authenticate(&creds, &issuer(app))?;
     if let Some(r) = &assertion {
         claim(app, r, OAuthError::invalid_client("client assertion replayed")).await?;
@@ -854,7 +863,7 @@ async fn load_flow(
     req.device_id = Some(device.id.clone());
     req.expires_at = now + AUTHORIZATION_INACTIVITY_TIMEOUT;
     store::put_request(app, &id, Some(&req)).await?;
-    let client = client::get_client(&req.client_id, app.config.dev_mode)
+    let client = client::get_client(&req.client_id, app.config.dev_mode, &app.public_url)
         .await
         .map_err(|e| FlowError::Redirect(Box::new(req.params.clone()), "invalid_client", e.description))?;
     Ok(Flow { id, uri: uri.to_string(), req, client, device, new_cookie })
@@ -1824,7 +1833,7 @@ async fn token_inner(app: &Arc<App>, headers: &HeaderMap, body: &[u8]) -> Result
     let p = parse_params(headers, body)?;
     let proof = check_as_dpop(app, headers, "/oauth/token").await?;
     let creds = ClientCredentials::from_params(&p)?;
-    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode, &app.public_url).await?;
     let (client_auth, assertion) = client.authenticate(&creds, &issuer(app))?;
     if let Some(r) = &assertion {
         claim(app, r, OAuthError::invalid_client("client assertion replayed")).await?;
@@ -2060,7 +2069,7 @@ async fn revoke_inner(app: &App, headers: &HeaderMap, body: &[u8]) -> Result<(),
     let tok =
         p.get("token").filter(|t| !t.is_empty()).ok_or_else(|| OAuthError::invalid_request("Missing \"token\""))?;
     let creds = ClientCredentials::from_params(&p)?;
-    let client = client::get_client(&creds.client_id, app.config.dev_mode).await?;
+    let client = client::get_client(&creds.client_id, app.config.dev_mode, &app.public_url).await?;
     if let (_, Some(r)) = client.authenticate(&creds, &issuer(app))? {
         claim(app, &r, OAuthError::invalid_client("client assertion replayed")).await?;
     }
