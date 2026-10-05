@@ -375,6 +375,29 @@ async function keyCheck(ctx) {
     }
   })
   check(out.startsWith('refused'), 'a private key made with extractable=false cannot be exported', out)
+  // a key a closed tab left behind a day ago is swept when the page loads
+  const idb = (op) =>
+    page.evaluate(
+      (op) =>
+        new Promise((ok, no) => {
+          const r = indexedDB.open('vlpds-oauth', 1)
+          r.onupgradeneeded = () => r.result.createObjectStore('dpop-keys')
+          r.onerror = () => no(r.error)
+          r.onsuccess = async () => {
+            const st = () => r.result.transaction('dpop-keys', 'readwrite').objectStore('dpop-keys')
+            if (op === 'plant') {
+              const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify'])
+              st().put({ pair, at: Date.now() - 2 * 86400_000 }, 'stale').onsuccess = () => ok(1)
+            } else st().count().onsuccess = (e) => ok(e.target.result)
+          }
+        }),
+      op,
+    )
+  await idb('plant')
+  await page.reload()
+  await page.locator('.mig-card h1').first().waitFor()
+  await sleep(500)
+  check((await idb('count')) === 0, 'an orphaned DPoP key is swept on the next visit')
   await page.close()
 }
 

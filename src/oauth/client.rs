@@ -569,6 +569,7 @@ pub async fn get_client(client_id: &str, dev_mode: bool, public_url: &str) -> Re
         return Ok(c);
     }
     let client = Arc::new(if client_id == first_party_id(public_url) {
+        parse_client_id(client_id, dev_mode)?;
         validate_metadata(client_id, first_party_metadata(public_url), false, dev_mode)?
     } else {
         load_client(client_id, dev_mode).await?

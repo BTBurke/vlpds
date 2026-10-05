@@ -68,9 +68,36 @@ async function keyOp<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDB
   }
 }
 
-const putKey = (id: string, k: CryptoKeyPair) => keyOp<void>('readwrite', (s) => s.put(k, id))
-const getKey = (id: string) => keyOp<CryptoKeyPair | undefined>('readonly', (s) => s.get(id))
+type StoredKey = { pair: CryptoKeyPair; at: number }
+
+const putKey = (id: string, pair: CryptoKeyPair) => keyOp<void>('readwrite', (s) => s.put({ pair, at: Date.now() } satisfies StoredKey, id))
+const getKey = (id: string) => keyOp<StoredKey | undefined>('readonly', (s) => s.get(id)).then((k) => k?.pair)
 const delKey = (id: string) => keyOp<void>('readwrite', (s) => s.delete(id)).catch(() => undefined)
+
+/** A tab closed mid sign-in (or before the step ended) leaves its key
+ * behind with nothing to revoke it. Sessions here last minutes, so a key
+ * a day old that this tab doesn't use is an orphan. */
+const KEY_MAX_AGE = 24 * 3600_000
+
+export async function sweepKeys(names: string[]) {
+  const mine = new Set<string>()
+  const pending = ssGet<Pending>(PKEY)
+  if (pending) mine.add(pending.keyId)
+  for (const n of names) {
+    const s = ssGet<Stored>(SKEY(n))
+    if (s) mine.add(s.keyId)
+  }
+  try {
+    const all = await keyOp<IDBValidKey[]>('readonly', (s) => s.getAllKeys())
+    for (const id of all) {
+      if (typeof id !== 'string' || mine.has(id)) continue
+      const k = await keyOp<StoredKey | undefined>('readonly', (s) => s.get(id))
+      if (!k || typeof k.at !== 'number' || Date.now() - k.at > KEY_MAX_AGE) await delKey(id)
+    }
+  } catch {
+    /* no IndexedDB: nothing was kept */
+  }
+}
 
 async function newKey(): Promise<{ id: string; pair: CryptoKeyPair }> {
   const pair = (await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign', 'verify'])) as CryptoKeyPair
@@ -159,33 +186,42 @@ async function getJson(url: string): Promise<any> {
   return r.json()
 }
 
-/** https, or the issuer's own origin (a plain-http dev server). */
-function endpoint(name: string, v: unknown, issuer: string): string {
-  if (typeof v !== 'string') throw new OAuthError('discovery', `${issuer} lists no ${name} endpoint.`)
-  const u = new URL(v)
-  if (u.protocol !== 'https:' && u.origin !== new URL(issuer).origin) throw new OAuthError('discovery', `${issuer} lists an insecure endpoint.`)
-  return u.href
+/** Plain http only for the loopback dev client (a local stack). */
+const httpOk = () => location.protocol === 'http:'
+
+function url(v: unknown, what: string): URL {
+  try {
+    if (typeof v !== 'string') throw new Error()
+    const u = new URL(v)
+    if (u.protocol !== 'https:' && !(u.protocol === 'http:' && httpOk())) throw new Error()
+    return u
+  } catch {
+    throw new OAuthError('discovery', `The server lists no usable ${what} (https only).`)
+  }
+}
+
+function endpoint(name: string, v: unknown): string {
+  return url(v, `${name} endpoint`).href
 }
 
 /** The PDS's authorization server, from its protected-resource metadata. */
 export async function discover(pds: string): Promise<AuthServer> {
   const origin = new URL(pds).origin
   const pr = await getJson(`${origin}/.well-known/oauth-protected-resource`)
-  if (typeof pr.resource === 'string' && new URL(pr.resource).origin !== origin) {
-    throw new OAuthError('discovery', `${new URL(origin).host} names another server as itself.`)
-  }
+  // RFC 9728 §3.3: the metadata must name the server it came from
+  if (url(pr.resource, 'resource').origin !== origin) throw new OAuthError('discovery', `${new URL(origin).host} names another server as itself.`)
   const issuer = pr.authorization_servers?.[0]
-  if (typeof issuer !== 'string') throw new OAuthError('discovery', `${new URL(origin).host} names no authorization server.`)
-  const m = await getJson(`${new URL(issuer).origin}/.well-known/oauth-authorization-server`)
+  const iss = url(issuer, 'authorization server')
+  const m = await getJson(`${iss.origin}/.well-known/oauth-authorization-server`)
   // RFC 8414 §3.3: the metadata must be the issuer's own (mix-up attacks)
   if (m.issuer !== issuer) throw new OAuthError('discovery', `${issuer}'s metadata names another issuer.`)
   if (!(m.dpop_signing_alg_values_supported ?? []).includes('ES256')) throw new OAuthError('discovery', `${issuer} doesn't take ES256 DPoP proofs.`)
   return {
     issuer,
-    par: endpoint('pushed authorization request', m.pushed_authorization_request_endpoint, issuer),
-    authorize: endpoint('authorization', m.authorization_endpoint, issuer),
-    token: endpoint('token', m.token_endpoint, issuer),
-    revoke: m.revocation_endpoint ? endpoint('revocation', m.revocation_endpoint, issuer) : undefined,
+    par: endpoint('pushed authorization request', m.pushed_authorization_request_endpoint),
+    authorize: endpoint('authorization', m.authorization_endpoint),
+    token: endpoint('token', m.token_endpoint),
+    revoke: m.revocation_endpoint ? endpoint('revocation', m.revocation_endpoint) : undefined,
   }
 }
 
@@ -306,7 +342,10 @@ export const isCallback = () => location.pathname === CALLBACK_PATH
 /** On {@link CALLBACK_PATH}: checks the answer against the pending sign-in,
  * redeems the code and keeps the session. Returns its name. */
 export async function finishSignIn(): Promise<string> {
-  const p = new URLSearchParams(location.hash.slice(1) || location.search.slice(1))
+  // the code only ever comes in the fragment (response_mode=fragment), which
+  // no server sees; a query is read for an error and nothing else
+  const q = new URLSearchParams(location.search)
+  const p = location.hash.length > 1 ? new URLSearchParams(location.hash.slice(1)) : new URLSearchParams(q.has('error') ? { state: q.get('state') ?? '', iss: q.get('iss') ?? '', error: q.get('error')!, error_description: q.get('error_description') ?? '' } : {})
   // the code is single-use, but it shouldn't sit in the address bar or history
   history.replaceState(null, '', '/migrate')
   const pending = ssGet<Pending>(PKEY)
@@ -457,7 +496,8 @@ export class OAuthSession {
         headers: o.type ? { 'Content-Type': o.type } : undefined,
         body: o.body,
       })
-    } catch {
+    } catch (e) {
+      if (e instanceof OAuthError) throw e
       throw new Error(`Couldn't reach ${new URL(this.s.pds).host}. Check your connection and retry.`)
     }
     if (o.raw) {

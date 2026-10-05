@@ -32,7 +32,7 @@ import {
 } from './flow'
 import type { RecordCounts } from './count'
 import { BLOB_SCOPE, copySpace, NEW_SCOPE, OLD_SCOPE, plan, reasonOf, servesSpaces, spaceLabel, type SpaceMove, type SpacePlan } from './spaces'
-import { beginSignIn, clientInfo, finishSignIn, forgetAll, isCallback, OAuthSession } from '../../lib/oauth'
+import { beginSignIn, clientInfo, finishSignIn, forgetAll, isCallback, OAuthSession, sweepKeys } from '../../lib/oauth'
 
 type Describe = { did: string; availableUserDomains: string[]; inviteCodeRequired?: boolean }
 
@@ -89,7 +89,10 @@ export function Migrate() {
   const [callback, setCallback] = useState(isCallback)
   const [oauthError, setOauthError] = useState<unknown>()
   useEffect(() => {
-    if (!callback) return
+    if (!callback) {
+      void sweepKeys(['old', 'new'])
+      return
+    }
     once('oauth-callback', finishSignIn)
       .catch(setOauthError)
       .finally(() => setCallback(false))
@@ -201,6 +204,7 @@ export function Migrate() {
             <input type="checkbox" name="advanced" checked={advanced} onChange={(e) => setAdvanced(e.target.checked)} />
             <span>I'm familiar with AT Protocol: show the technical details</span>
           </label>
+          {!!oauthError && !(saved?.activated && !saved.spaces) && <Problem error={oauthError} />}
           {body}
         </section>
       </main>

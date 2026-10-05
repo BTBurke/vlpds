@@ -21,6 +21,11 @@ export type SpaceMove = {
   reason?: string
 }
 
+/** Past these, a listing that keeps paging is broken (or hostile), not big:
+ * a repo holds at most 100k records. */
+const MAX_SPACES = 10_000
+const MAX_BLOBS = 100_000
+
 export type SpacePlan = { uri: string; blobs: string[]; empty: boolean }
 
 /** Whether `base` serves Spaces at all: an unauthenticated listSpaces is
@@ -42,22 +47,28 @@ const notFound = (e: unknown) => e instanceof XrpcError && (e.error === 'RepoNot
 /** Every space the account holds a repo in (or governs) there, and each repo's blobs. */
 export async function plan(old: OAuthSession, onPause: (until: number) => void): Promise<SpacePlan[]> {
   const uris: string[] = []
+  const seen = new Set<string>()
   for (let cursor: string | undefined; ; ) {
     const page = await retry(() => old.call('com.atproto.space.listSpaces', { params: { limit: 100, cursor } }), onPause)
     for (const s of page.spaces as { uri: string }[]) uris.push(s.uri)
+    if (uris.length > MAX_SPACES) throw new Error(`${new URL(old.pds).host} lists more than ${MAX_SPACES} spaces.`)
     cursor = page.cursor
-    if (!cursor || !page.spaces.length) break
+    if (!cursor || !page.spaces.length || seen.has(cursor)) break
+    seen.add(cursor)
   }
   const out: SpacePlan[] = []
   for (const uri of uris) {
     const blobs: string[] = []
     let empty = false
     try {
+      const seen = new Set<string>()
       for (let cursor: string | undefined; ; ) {
         const page = await retry(() => old.call('com.atproto.space.listBlobs', { params: { space: uri, repo: old.did, limit: 1000, cursor } }), onPause)
         blobs.push(...(page.cids as string[]))
+        if (blobs.length > MAX_BLOBS) throw new Error(`${new URL(old.pds).host} lists more than ${MAX_BLOBS} files in one space.`)
         cursor = page.cursor
-        if (!cursor || !page.cids.length) break
+        if (!cursor || !page.cids.length || seen.has(cursor)) break
+        seen.add(cursor)
       }
     } catch (e) {
       // a space it governs but never wrote in: no repo to bring
@@ -115,7 +126,7 @@ export async function copySpace(
       const type = r.headers.get('content-type') || 'application/octet-stream'
       const up = await here.call('com.atproto.repo.uploadBlob', { body: await r.blob(), type })
       const got = up?.blob?.ref?.$link
-      if (got && got !== cid) throw new Error(`a file hashed to ${got}, not ${cid}`)
+      if (got !== cid) throw new Error(`a file hashed to ${got ?? 'nothing'}, not ${cid}`)
     }, onPause)
     onBlob(++n)
   }
