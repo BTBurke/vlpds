@@ -10,7 +10,7 @@ const SERVICE_DID: &str = "did:web:localhost";
 
 /// HS256 JWT signed with the test server's session secret.
 fn forge(claims: &J, typ: &str, secret: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let header = b64url(json!({"alg": "HS256", "typ": typ}).to_string());
     let payload = b64url(claims.to_string());
     let input = format!("{header}.{payload}");

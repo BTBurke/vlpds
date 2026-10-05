@@ -21,7 +21,7 @@ fn commit_signatures_match_k256_across_keys_and_lengths() {
         for len in (0..200usize).step_by(if k == 0 { 1 } else { 37 }) {
             let msg: Vec<u8> = (0..len).map(|i| (i as u32 * 31 + k) as u8).collect();
             let theirs: k256::ecdsa::Signature = sk.sign(&msg);
-            let theirs = theirs.normalize_s().unwrap_or(theirs);
+            let theirs = theirs.normalize_s();
             assert_eq!(kp.sign_deterministic(&msg)[..], theirs.to_bytes()[..], "key {k} len {len}");
         }
         // the commit object a worker signs
@@ -36,7 +36,7 @@ fn commit_signatures_match_k256_across_keys_and_lengths() {
         let sig: [u8; 64] = sig[..].try_into().unwrap();
         assert_eq!(&block[..], &vlpds::events::encode_commit(did, "3lbcdefghij22", &data, Some(&sig))[..]);
         let theirs = k256::ecdsa::Signature::from_slice(&sig).unwrap();
-        assert!(theirs.normalize_s().is_none(), "high-S");
+        assert!(theirs.normalize_s() == theirs, "high-S");
         sk.verifying_key().verify(&unsigned, &theirs).unwrap();
     }
 }

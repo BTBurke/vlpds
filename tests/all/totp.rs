@@ -24,7 +24,7 @@ fn b32_decode(s: &str) -> Vec<u8> {
 }
 
 fn hotp(secret: &[u8], counter: u64) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(secret).unwrap();
     mac.update(&counter.to_be_bytes());
     let h = mac.finalize().into_bytes();

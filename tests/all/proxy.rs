@@ -162,7 +162,7 @@ fn verify_service_jwt(headers: &HeaderMap, key: &k256::ecdsa::VerifyingKey) -> J
     let header: J = serde_json::from_slice(&B64.decode(h).unwrap()).unwrap();
     assert_eq!(header["alg"], "ES256K");
     let sig = k256::ecdsa::Signature::from_slice(&B64.decode(sig).unwrap()).unwrap();
-    assert!(sig.normalize_s().is_none(), "signature must be low-S");
+    assert!(sig.normalize_s() == sig, "signature must be low-S");
     key.verify(signing_input.as_bytes(), &sig).expect("service JWT signature verifies with the repo key");
     let claims: J = serde_json::from_slice(&B64.decode(p).unwrap()).unwrap();
     let now = chrono::Utc::now().timestamp();

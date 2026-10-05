@@ -17,7 +17,7 @@ path = "src/main.rs"
 # sync 1.1 Verifier (pinned; see ../bench/results/differential/SHRIKE_ISSUES.md)
 shrike = { version = "=0.7.0", default-features = false, features = ["syntax", "cbor", "crypto", "mst", "car", "repo", "identity", "sync"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
-tokio-tungstenite = "0.26"
+tokio-tungstenite = "0.30"
 futures = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"

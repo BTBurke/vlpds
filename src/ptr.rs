@@ -5,6 +5,7 @@
 //! to the same address.
 
 use futures::future::BoxFuture;
+use hickory_resolver::proto::rr::RData;
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::num::NonZeroUsize;
@@ -39,14 +40,20 @@ impl std::fmt::Debug for PtrResolverRef {
 struct SystemPtr;
 
 static SYSTEM: LazyLock<Option<hickory_resolver::TokioResolver>> =
-    LazyLock::new(|| hickory_resolver::TokioResolver::builder_tokio().ok().map(|b| b.build()));
+    LazyLock::new(|| hickory_resolver::TokioResolver::builder_tokio().and_then(|b| b.build()).ok());
 
 impl PtrResolver for SystemPtr {
     fn reverse(&self, ip: IpAddr) -> BoxFuture<'_, Result<Vec<String>, String>> {
         Box::pin(async move {
             let r = SYSTEM.as_ref().ok_or("DNS resolver unavailable")?;
             let l = r.reverse_lookup(ip).await.map_err(|e| e.to_string())?;
-            Ok(l.iter().map(|p| p.to_string()).collect())
+            Ok(l.answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    RData::PTR(p) => Some(p.to_string()),
+                    _ => None,
+                })
+                .collect())
         })
     }
 

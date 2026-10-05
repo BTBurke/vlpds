@@ -36,7 +36,7 @@ async fn cache_metrics_report_entries_bytes_and_caps() {
 /// The high-S form of an ES256K signature.
 fn high_s(sig: &[u8]) -> Vec<u8> {
     let s = k256::ecdsa::Signature::from_slice(sig).unwrap();
-    assert!(s.normalize_s().is_none(), "issued signatures are low-S");
+    assert!(s.normalize_s() == s, "issued signatures are low-S");
     let high = k256::ecdsa::Signature::from_scalars(s.r(), -*s.s()).unwrap();
     high.to_bytes().to_vec()
 }

@@ -1125,7 +1125,7 @@ impl CommitObj {
     pub fn verify(&self, key: &k256::ecdsa::VerifyingKey) -> anyhow::Result<()> {
         use k256::ecdsa::signature::Verifier;
         let sig = k256::ecdsa::Signature::from_slice(&self.sig)?;
-        anyhow::ensure!(sig.normalize_s().is_none(), "signature is not low-S");
+        anyhow::ensure!(sig.normalize_s() == sig, "signature is not low-S");
         key.verify(&self.unsigned_bytes(), &sig)?;
         Ok(())
     }

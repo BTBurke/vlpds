@@ -16,7 +16,7 @@ use crate::xrpc::mfa::{self, Mfa};
 use crate::xrpc::{App, XrpcError};
 use axum::http::StatusCode;
 use bytes::Bytes;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha1::Sha1;
 
 pub const STEP_SECS: u64 = 30;
