@@ -2556,7 +2556,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                         sp.forget_space(&d, &sid);
                         SpaceAck::Host
                     };
-                    (vec![m], Box::new(ack))
+                    (m, Box::new(ack))
                 }
             }
         }

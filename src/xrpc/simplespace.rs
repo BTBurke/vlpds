@@ -336,6 +336,10 @@ pub(super) async fn delete_space_rows(app: &App, space: &Space) -> XResult<()> {
                     let key = state::space_blob_cid_key(&space.authority, &cid, &space.sid, path);
                     muts.push(crate::segment::Mutation { key: key.into(), val: None });
                 }
+                if fam == state::SPACE_HEAD_FAMILY {
+                    let key = state::space_list_key(&space.authority, &space.uri, state::SpaceListed::Repo);
+                    muts.push(crate::segment::Mutation { key: key.into(), val: None });
+                }
                 muts.push(crate::segment::Mutation { key: kv.key, val: None });
             }
             super::write_private_local(&p, muts).await?;

@@ -5243,6 +5243,7 @@ URI), since URIs can run past 600 B. The URI is kept in `sH`, `sS` and
 | `sW/{auth}\0{sid}{writer}` | authority | writer state: repoRev, hash, spaceRev |
 | `sQ/{auth}\0{sid}{spaceRev}` | authority | the writer, in `listRepos` order (latest per writer) |
 | `sN/{auth}\0{sid}{service}` | authority | a notify registration, 24 h |
+| `sL/{did}\0{uri}\0{h\|s}` | the account | listSpaces's index: a repo held (`h`) or a live space governed (`s`), in URI order |
 
 Space takedowns live with the other takedowns (`sec/td/space/{sid}` for a
 space, `sec/td/space/{sid}/{coll}/{rkey}` for a record). The one
@@ -5275,7 +5276,12 @@ was read under.
 
 ### Read path
 
-`getRecord`, `listRecords` and `listSpaces` read the rows. Commits are
+`getRecord`, `listRecords` and `listSpaces` read the rows. `listSpaces`
+pages through `sL`, which the entries that put or take away an `sH` head
+or a live `sS` row keep in step. A page is a range scan from the cursor.
+The `did` filter narrows the range (and `spaceType` with it), and
+`spaceType` alone seeks past each authority's other types, so a page reads
+its own rows plus about one per authority skipped. Commits are
 signed per response with a fresh `ikm` (`getLatestCommit`, the last page of
 `listRepoOps`, `getRepo`), so a key rotation never re-signs anything. A
 `listRepoOps` with `since` at the head is answered from the heads cache
@@ -5365,7 +5371,8 @@ entries, never per write. Operator reads (Q6) are
 admin Basic or the moderation service's JWT with `lxm` set to the method.
 Each call writes a `space.read` audit entry before it reads, and so does
 `vlpds.admin.checkSpace`, which recomputes a repo's set hash, count and
-oplog replay from one snapshot and counts a mismatch in
+oplog replay from one snapshot, checks its `sL` rows against the head and
+the space row, and counts a mismatch in
 `vlpds_space_digest_mismatch_total`.
 
 ### Deliberate divergences from the reference

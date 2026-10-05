@@ -236,9 +236,10 @@ pub const SPACE_SEQ_FAMILY: &[u8] = b"sQ/";
 pub const SPACE_NOTIFY_FAMILY: &[u8] = b"sN/";
 pub const SPACE_BLOB_FAMILY: &[u8] = b"sb/";
 pub const SPACE_BLOB_CID_FAMILY: &[u8] = b"sc/";
+pub const SPACE_LIST_FAMILY: &[u8] = b"sL/";
 
 /// Every Spaces family: rows that must never reach a firehose frame.
-pub const SPACE_FAMILIES: [&[u8]; 11] = [
+pub const SPACE_FAMILIES: [&[u8]; 12] = [
     SPACE_HEAD_FAMILY,
     SPACE_RECORD_FAMILY,
     SPACE_OPLOG_FAMILY,
@@ -250,7 +251,39 @@ pub const SPACE_FAMILIES: [&[u8]; 11] = [
     SPACE_NOTIFY_FAMILY,
     SPACE_BLOB_FAMILY,
     SPACE_BLOB_CID_FAMILY,
+    SPACE_LIST_FAMILY,
 ];
+
+/// Why an account is listed under a space URI in `sL/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpaceListed {
+    /// It holds a repo there (an `sH` row).
+    Repo,
+    /// It governs the space and it's live (an `sS` row that isn't a tombstone).
+    Governs,
+}
+
+impl SpaceListed {
+    fn byte(self) -> u8 {
+        match self {
+            SpaceListed::Repo => b'h',
+            SpaceListed::Governs => b's',
+        }
+    }
+}
+
+/// `sL/{did}\0{uri}\0{h|s}`: listSpaces's index, in URI order. URIs hold
+/// no NUL, so a key's URI ends at the first one and the order is the URIs'.
+pub fn space_list_key(did: &str, uri: &str, why: SpaceListed) -> Vec<u8> {
+    keyed(did, SPACE_LIST_FAMILY, &[did.as_bytes(), b"\0", uri.as_bytes(), b"\0", &[why.byte()]])
+}
+
+/// The URI of an `sL/` key under `prefix` ([`space_did_prefix`]).
+pub fn space_list_uri<'a>(key: &'a [u8], prefix: &[u8]) -> Option<&'a str> {
+    let rest = key.strip_prefix(prefix)?;
+    let end = rest.iter().position(|b| *b == 0)?;
+    std::str::from_utf8(&rest[..end]).ok()
+}
 
 pub const SPACE_ID_LEN: usize = 16;
 pub type SpaceId = [u8; SPACE_ID_LEN];

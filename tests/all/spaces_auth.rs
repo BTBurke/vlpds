@@ -424,6 +424,13 @@ async fn space_keys(s: &TestServer, did: &str) -> Vec<String> {
     for fam in vlpds::state::SPACE_FAMILIES {
         let mut scan = vlpds::state::FamilyScan::new(p.db.as_ref(), fam, None, &Default::default()).await.unwrap();
         while let Some(kv) = scan.next().await.unwrap() {
+            // an sL key names other authorities' DIDs in its URIs
+            if fam == vlpds::state::SPACE_LIST_FAMILY {
+                if vlpds::state::key_body(&kv.key).starts_with(format!("sL/{did}\0").as_bytes()) {
+                    out.push(String::from_utf8_lossy(vlpds::state::key_body(&kv.key)).into_owned());
+                }
+                continue;
+            }
             if vlpds::space::rows::did_sid(&kv.key).is_some_and(|(d, _)| d == did)
                 || vlpds::state::key_body(&kv.key).windows(did.len()).any(|w| w == did.as_bytes())
             {
@@ -467,7 +474,7 @@ async fn delete_account_sweeps_every_space_family() {
     a.create_record(&mine, COLL, Some("img"), with_blob.clone()).await.ok();
     a.create_record(&stub.space("x"), COLL, Some("img"), with_blob).await.ok();
     let keys = space_keys(&s, &a.did).await;
-    for fam in ["sH/", "sR/", "sO/", "sS/", "sW/", "sQ/", "sP/", "sb/", "sc/"] {
+    for fam in ["sH/", "sR/", "sO/", "sS/", "sW/", "sQ/", "sP/", "sb/", "sc/", "sL/"] {
         assert!(keys.iter().any(|k| k.starts_with(fam)), "no {fam} row before: {keys:?}");
     }
     let b_keys = space_keys(&s, &b.did).await;
@@ -575,6 +582,94 @@ async fn list_spaces_one_type_grant() {
     let c = SpaceClient::new(&s, "slv", "blob:*/* repo:*").await;
     wildcard(c.get("com.atproto.space.listSpaces", &[]).await);
     c.get("com.atproto.space.listSpaces", &[("spaceType", TYPE)]).await.err(403, "ScopeMissingError");
+}
+
+/// listSpaces pages from its index (`sL`) and lists what the full scan did:
+/// many spaces of two types at three authorities, held, governed or both
+/// (listed once), deleted ones gone, under every filter and a small page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_spaces_index_pages() {
+    let (s1, s2) = (Stub::new().await, Stub::new().await);
+    let s = spawn().await;
+    let a = SpaceClient::new(
+        &s,
+        "sli",
+        "space:*?authority=*&collection=com.example.post&action=read&action=create&manage=create&manage=delete",
+    )
+    .await;
+    const OTHER: &str = "com.example.board";
+    let mut want = std::collections::BTreeSet::new();
+    for i in 0..12 {
+        want.insert(a.create_space(TYPE, &format!("g{i:02}")).await);
+        want.insert(a.create_space(OTHER, &format!("b{i:02}")).await);
+    }
+    let own = |t: &str, k: &str| format!("at://{}/space/{t}/{k}", a.did);
+    for i in 0..4 {
+        a.create_record(&own(TYPE, &format!("g{i:02}")), COLL, Some("r"), rec("x")).await.ok();
+    }
+    for (stub, n) in [(&s1, 5), (&s2, 3)] {
+        for i in 0..n {
+            let space = stub.space(&format!("x{i}"));
+            a.create_record(&space, COLL, Some("r"), rec("x")).await.ok();
+            want.insert(space);
+        }
+    }
+    // a deleted space goes, whether the authority wrote in it or not
+    for (t, k) in [(TYPE, "g01"), (TYPE, "g05"), (OTHER, "b07")] {
+        a.post("com.atproto.simplespace.deleteSpace", json!({"space": own(t, k)})).await.ok();
+        want.remove(&own(t, k));
+    }
+    assert_eq!(want.len(), 21 + 8);
+
+    let filters: Vec<(Option<&str>, Option<&str>)> = vec![
+        (None, None),
+        (Some(TYPE), None),
+        (Some(OTHER), None),
+        (Some("com.example.none"), None),
+        (None, Some(&a.did)),
+        (None, Some(&s1.did)),
+        (Some(TYPE), Some(&a.did)),
+        (Some(OTHER), Some(&s2.did)),
+        (Some(TYPE), Some(&s2.did)),
+    ];
+    for (t, d) in filters {
+        let expect: Vec<String> = want
+            .iter()
+            .filter(|u| {
+                let p: Vec<&str> = u.trim_start_matches("at://").split('/').collect();
+                t.is_none_or(|t| p[2] == t) && d.is_none_or(|d| p[0] == d)
+            })
+            .cloned()
+            .collect();
+        for limit in [100, 5, 1] {
+            let (mut got, mut cursor) = (Vec::new(), None::<String>);
+            for _ in 0..100 {
+                let mut q = vec![("limit", limit.to_string())];
+                q.extend(t.map(|t| ("spaceType", t.to_string())));
+                q.extend(d.map(|d| ("did", d.to_string())));
+                q.extend(cursor.clone().map(|c| ("cursor", c)));
+                let q: Vec<(&str, &str)> = q.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let r = a.get("com.atproto.space.listSpaces", &q).await.ok();
+                let page = r["spaces"].as_array().unwrap();
+                assert!(page.len() <= limit, "{r}");
+                got.extend(page.iter().map(|s| s["uri"].as_str().unwrap().to_string()));
+                match r["cursor"].as_str() {
+                    Some(c) => {
+                        assert_eq!(page.len(), limit, "a cursor on a short page: {r}");
+                        cursor = Some(c.to_string());
+                    }
+                    None => break,
+                }
+            }
+            assert_eq!(got, expect, "spaceType {t:?}, did {d:?}, limit {limit}");
+        }
+    }
+    // a cursor that isn't a listed URI pages from where it sorts
+    let mid = own(OTHER, "b05x");
+    let r = a.get("com.atproto.space.listSpaces", &[("cursor", mid.as_str())]).await.ok();
+    let after: Vec<&String> = want.iter().filter(|u| **u > mid).take(50).collect();
+    let got: Vec<&str> = r["spaces"].as_array().unwrap().iter().map(|s| s["uri"].as_str().unwrap()).collect();
+    assert_eq!(got, after);
 }
 
 /// listRecords: newest URI first by default, `reverse` oldest first, a

@@ -3,7 +3,9 @@
 //! a public repo. The set hash and count are recomputed from `sR` and
 //! compared with `sH`; the oplog (`sO`) is replayed onto `sR`; the outbox
 //! row (`sP`) and, when the account is the space's authority, the host's
-//! writer rows (`sW`, `sQ`) are checked against the head.
+//! writer rows (`sW`, `sQ`) are checked against the head. listSpaces's
+//! index rows (`sL`) must be there exactly when the head is and when a live
+//! space row (`sS`) is.
 //!
 //! [`check`] is pure: it takes decoded rows, so the fuzz and crash
 //! harnesses can feed it whatever a snapshot held.
@@ -94,6 +96,13 @@ pub struct Host {
     pub seq: Vec<(Tid, String)>,
 }
 
+/// The account's `sL` rows for the space.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Listed {
+    pub repo: bool,
+    pub governs: bool,
+}
+
 /// One snapshot's rows of (account, space), in key order.
 #[derive(Clone, Debug, Default)]
 pub struct Rows {
@@ -106,6 +115,9 @@ pub struct Rows {
     pub bad_ops: Vec<String>,
     pub outbox: Option<Outbox>,
     pub host: Option<Host>,
+    /// The account governs the space and its `sS` row is live.
+    pub governs: bool,
+    pub listed: Listed,
 }
 
 impl Rows {
@@ -117,6 +129,7 @@ impl Rows {
             && self.bad_ops.is_empty()
             && self.outbox.is_none()
             && self.host.is_none()
+            && self.listed == Listed::default()
     }
 }
 
@@ -187,12 +200,18 @@ pub async fn load<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, uri:
             let rev = rows::seq_rev(&k).filter(|_| k.len() == qp.len() + 8).context("a bad listRepos (sQ) key")?;
             seq.push((rev, String::from_utf8_lossy(&v).into_owned()));
         }
+        out.governs = space.as_ref().is_some_and(|s| s.live() && s.uri == uri);
         if space.is_some() || !writers.is_empty() || !seq.is_empty() {
             // no sS row: governed with the defaults (ensureSpace), not deleted
             let live = space.as_ref().is_none_or(|s| s.live() && s.uri == uri);
             out.host = Some(Host { live, writers, seq });
         }
     }
+    let listed = |why| db.get(state::space_list_key(did, uri, why));
+    out.listed = Listed {
+        repo: listed(state::SpaceListed::Repo).await?.is_some(),
+        governs: listed(state::SpaceListed::Governs).await?.is_some(),
+    };
     Ok(out)
 }
 
@@ -369,6 +388,18 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
         json!({"repoRev": o.repo_rev.to_string(), "hash": hex::encode(o.hash)})
     });
 
+    // listSpaces's index
+    match (head.is_some(), rows.listed.repo) {
+        (true, false) => problems.push("the head (sH) has no listSpaces row (sL)".into()),
+        (false, true) => problems.push("a listSpaces row (sL) for a repo with no head".into()),
+        _ => {}
+    }
+    match (rows.governs, rows.listed.governs) {
+        (true, false) => problems.push("the live space row (sS) has no listSpaces row (sL)".into()),
+        (false, true) => problems.push("a listSpaces row (sL) for a space that isn't live here".into()),
+        _ => {}
+    }
+
     // the space host's rows, when the account governs the space
     let host = rows.host.as_ref().map(|h| {
         let seq: HashMap<Tid, &str> = h.seq.iter().map(|(t, w)| (*t, w.as_str())).collect();
@@ -438,6 +469,7 @@ pub fn check(did: &str, uri: &str, rows: &Rows, now_us: u64, retention: Option<s
         },
         "outbox": outbox,
         "host": host,
+        "listed": {"repo": rows.listed.repo, "governs": rows.listed.governs},
     })
 }
 
@@ -488,6 +520,7 @@ mod tests {
             live.iter().map(|(p, (cid, rev))| Record { path: p.clone(), cid: *cid, rev: *rev, hashes: true }).collect();
         rows.head =
             Some(Head { uri: URI.into(), rev, hash: set, records: live.len() as u64, created: NOW - 1_000_000 });
+        rows.listed.repo = true;
         rows
     }
 
@@ -652,6 +685,24 @@ mod tests {
         let mut deleted = rows.clone();
         deleted.host.as_mut().unwrap().live = false;
         assert_problem(&deleted, NOW, "a deleted space keeps 2 writer");
+    }
+
+    #[test]
+    fn list_index_rows() {
+        let mut unlisted = healthy();
+        unlisted.listed.repo = false;
+        assert_problem(&unlisted, NOW, "the head (sH) has no listSpaces row (sL)");
+        let mut headless = Rows::default();
+        headless.listed.repo = true;
+        assert!(!headless.is_empty());
+        assert_problem(&headless, NOW, "a listSpaces row (sL) for a repo with no head");
+        let mut governs = healthy();
+        governs.governs = true;
+        assert_problem(&governs, NOW, "the live space row (sS) has no listSpaces row (sL)");
+        governs.listed.governs = true;
+        assert_eq!(check(DID, URI, &governs, NOW, RET)["ok"], json!(true));
+        governs.governs = false;
+        assert_problem(&governs, NOW, "a listSpaces row (sL) for a space that isn't live here");
     }
 
     #[test]

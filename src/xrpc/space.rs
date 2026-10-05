@@ -1220,44 +1220,12 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
     super::authn::check_space_read_account(&creds)?;
     let did = creds.user_did()?.to_string();
     let p = app.partition(&did)?;
-    // keyed by space id, not URI: every page reads all of the account's
-    // spaces, holding only the page, and pays for the rows it read
-    let mut uris = std::collections::BTreeSet::new();
-    let mut scanned = 0u64;
-    for fam in [state::SPACE_HEAD_FAMILY, state::SPACE_FAMILY] {
-        let prefix = state::space_did_prefix(fam, &did);
-        let opts = slatedb::config::ScanOptions::default();
-        let mut iter =
-            p.db.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts)
-                .await
-                .map_err(XrpcError::from_err)?;
-        while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
-            scanned += 1;
-            let uri = match fam == state::SPACE_HEAD_FAMILY {
-                true => HeadRow::decode(&kv.value).map_err(XrpcError::from_err)?.uri,
-                false => match crate::space::rows::SpaceRow::decode(&kv.value).map_err(XrpcError::from_err)? {
-                    row if row.deleted_at.is_none() => row.uri,
-                    _ => continue,
-                },
-            };
-            let Some(u) = super::syntax::parse_space_uri(&uri) else { continue };
-            let keep = q.space_type.as_deref().is_none_or(|t| t == u.space_type)
-                && q.did.as_deref().is_none_or(|d| d == u.authority)
-                && q.cursor.as_deref().is_none_or(|c| uri.as_str() > c);
-            if keep && (uris.len() < limit || uris.last().is_some_and(|l| uri < *l)) {
-                uris.insert(uri);
-                if uris.len() > limit {
-                    uris.pop_last();
-                }
-            }
-        }
-    }
+    let (page, scanned) = list_space_uris(&p.db, &did, &q, limit).await.map_err(XrpcError::from_err)?;
     let extra = (scanned / LIST_SPACES_ROWS_PER_POINT).min(u32::MAX as u64) as u32;
     if extra > 0 {
         // the next call is refused once these are spent
         let _ = crate::ratelimit::check(&[&crate::ratelimit::SPACE_READ_ACCOUNT], &did, extra);
     }
-    let page: Vec<String> = uris.into_iter().collect();
     let mut out = json!({"spaces": page.iter().map(|u| json!({"uri": u})).collect::<Vec<_>>()});
     if page.len() == limit {
         out["cursor"] = json!(page.last());
@@ -1268,6 +1236,65 @@ async fn list_spaces(State(app): AppState, Auth(creds): Auth, Query(q): Query<Li
 /// listSpaces charges a further `space-read-account` point per this many
 /// rows it reads.
 const LIST_SPACES_ROWS_PER_POINT: u64 = 1000;
+
+/// Up to `limit` URIs past the cursor that `did` holds a repo in or governs
+/// live, in URI order, from `sL/`, and how many rows that read. The `did`
+/// filter (and `spaceType` with it) narrows the range; `spaceType` alone
+/// seeks past each authority's other types, so a page reads about its own
+/// rows plus one per authority skipped.
+async fn list_space_uris(
+    db: &slatedb::Db,
+    did: &str,
+    q: &ListSpacesQ,
+    limit: usize,
+) -> anyhow::Result<(Vec<String>, u64)> {
+    let base = state::space_did_prefix(state::SPACE_LIST_FAMILY, did);
+    let narrow = match (q.did.as_deref(), q.space_type.as_deref()) {
+        (Some(a), Some(t)) => format!("at://{a}/space/{t}/"),
+        (Some(a), None) => format!("at://{a}/space/"),
+        (None, _) => String::new(),
+    };
+    let lo = [&base[..], narrow.as_bytes()].concat();
+    let hi = state::prefix_end(&lo);
+    // every key of the cursor's URI is `{uri}\0..`, below `{uri}\x01`
+    let start = match q.cursor.as_deref() {
+        Some(c) => std::cmp::max(lo.clone(), [&base[..], c.as_bytes(), b"\x01"].concat()),
+        None => lo,
+    };
+    let mut uris: Vec<String> = Vec::with_capacity(limit);
+    let mut scanned = 0u64;
+    if start >= hi {
+        return Ok((uris, scanned));
+    }
+    let opts = slatedb::config::ScanOptions::default();
+    let mut iter = db.scan_with_options(start..hi.clone(), &opts).await?;
+    while let Some(kv) = iter.next().await? {
+        scanned += 1;
+        let uri = state::space_list_uri(&kv.key, &base).ok_or_else(|| anyhow::anyhow!("bad space list key"))?;
+        if uris.last().is_some_and(|l| l == uri) || q.cursor.as_deref().is_some_and(|c| uri <= c) {
+            continue;
+        }
+        let Some(u) = super::syntax::parse_space_uri(uri) else { continue };
+        if let Some(t) = q.space_type.as_deref().filter(|t| *t != u.space_type) {
+            let want = [&base[..], format!("at://{}/space/{t}/", u.authority).as_bytes()].concat();
+            let next = match want[..] > kv.key[..] {
+                true => want,
+                // '0' follows '/': past every space of this authority
+                false => [&base[..], format!("at://{}/space0", u.authority).as_bytes()].concat(),
+            };
+            if next >= hi {
+                break;
+            }
+            iter.seek(next).await?;
+            continue;
+        }
+        uris.push(uri.to_string());
+        if uris.len() == limit {
+            break;
+        }
+    }
+    Ok((uris, scanned))
+}
 
 #[derive(Deserialize)]
 struct RevokedIn {

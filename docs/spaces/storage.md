@@ -12,8 +12,8 @@ diagram:
   nodes:
     - { id: api, label: Apps · syncers, sub: "space.* · simplespace.*", at: [0, 5.5], size: [9, 3], tone: ink }
     - { id: fwd, label: Any node, sub: routes the call, at: [12, 5.5], size: [9, 3], tone: accent }
-    - { id: as, label: Author's shard, sub: "sH · sR · sO · sP · sb · sc", at: [25, 1], size: [11, 3], tone: accent }
-    - { id: hs, label: Authority's shard, sub: "sS · sM · sW · sQ · sN", at: [25, 10], size: [11, 3], tone: accent }
+    - { id: as, label: Author's shard, sub: "sH · sR · sO · sP · sb · sc · sL", at: [25, 1], size: [11, 3], tone: accent }
+    - { id: hs, label: Authority's shard, sub: "sS · sM · sW · sQ · sN · sL", at: [25, 10], size: [11, 3], tone: accent }
     - { id: fh, label: Firehose, sub: "merger · peers · backfill", at: [40, 0], size: [11, 2.6], tone: blue }
     - { id: log, label: "`log/` segments", sub: "private entries", at: [40, 5.2], size: [11, 3.2], shape: store, tone: amber }
   edges:
@@ -24,7 +24,7 @@ diagram:
     - { from: hs.r, to: log.l70, label: one entry }
     - { from: log.t, to: fh.b, label: empty frame · skipped, dash: true, tone: blue }
 facts:
-  - { value: "11", unit: families, label: of space rows, note: "six per author · five per authority" }
+  - { value: "12", unit: families, label: of space rows, note: "six per author · five per authority · one index for both" }
   - { value: "0", unit: frames, label: per space entry, note: "a debug assertion refuses a space row with a frame", tone: blue }
   - { value: "2,048 B", label: LtHash state, note: "in every write's `sH` row · random, so it doesn't compress", tone: amber }
   - { value: "1", unit: control object, label: cluster-wide, note: "the revocations · written only when something is revoked", tone: violet }
@@ -43,7 +43,7 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 
 | Key | In the slot of | Holds |
 |---|---|---|
-| `sH/{did}\0{sid}` | the author | the space repo head: URI, rev, LtHash state, record count, created. `listSpaces` scans it |
+| `sH/{did}\0{sid}` | the author | the space repo head: URI, rev, LtHash state, record count, created |
 | `sR/{did}\0{sid}{coll}/{rkey}` | the author | CID, rev and record bytes, as `R/` holds them. The source of truth |
 | `sO/{did}\0{sid}{rev}{idx}` | the author | the oplog: action, collection, rkey, CID and prev CID. Kept 7 days |
 | `sP/{did}\0{sid}` | the author | the notifyWrite outbox: URI, repoRev and hash, one row per (repo, space) |
@@ -54,6 +54,14 @@ hash collision fails loudly with `space id collision` instead of mixing two spac
 | `sN/{auth}\0{sid}{service}` | the authority | a notify registration: endpoint and expiry (24 h) |
 | `sb/{did}\0{sid}{cid}\0{path}` | the author | a space record's blob ref, at the rev that wrote it. `space.listBlobs` scans it in CID order |
 | `sc/{did}\0{cid}\0{sid}{path}` | the author | the same ref, CID first, so the blob GC and `sync.getBlob` find a blob's space refs in one scan |
+| `sL/{did}\0{uri}\0{h\|s}` | the account | `listSpaces`'s index, in URI order: `h` for a repo the account holds, `s` for a live space it governs |
+
+`sL` is there so a `listSpaces` page is a range scan from its cursor instead of a read of every
+space the account touches. It's written in the same entries that put or take away the `sH` head or
+the live `sS` row, so it never disagrees with them, and check-space says so if it does. A space the
+account both writes in and governs has both rows and is listed once. With a `did` filter the scan
+covers that authority's URIs only. With `spaceType` alone it seeks past each authority's other
+types, so a page reads its own rows plus about one per authority it skips.
 
 A deleted space keeps its `sS` tombstone so `getSpaceCredential` can answer `SpaceDeleted`. Its
 other host rows are swept, and a space created again at the same URI starts fresh. `deleteSpace`

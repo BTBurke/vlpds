@@ -345,6 +345,18 @@ fn space_blob_refs() -> Vec<u8> {
     pretty(&k)
 }
 
+/// listSpaces's index rows (`sL`): held and governed, both empty.
+fn space_list() -> Vec<u8> {
+    use vlpds::state::SpaceListed;
+    let k: BTreeMap<&str, String> = [
+        ("space list sL/ repo", hex::encode(vlpds::state::space_list_key(DID, SPACE, SpaceListed::Repo))),
+        ("space list sL/ governs", hex::encode(vlpds::state::space_list_key(DID, SPACE, SpaceListed::Governs))),
+    ]
+    .into_iter()
+    .collect();
+    pretty(&k)
+}
+
 fn space_space() -> vlpds::space::rows::SpaceRow {
     vlpds::space::rows::SpaceRow::defaults(SPACE, TIME)
 }
@@ -493,6 +505,7 @@ fn written() -> Vec<(&'static str, Vec<u8>)> {
         ("state/space_space.json", space_space().encode().to_vec()),
         ("state/space_notify.json", space_notify()),
         ("state/space_blob_refs.json", space_blob_refs()),
+        ("state/space_list.json", space_list()),
         ("control/node_lease.json", compact(&lease())),
         ("control/assignment.json", compact(&assignment())),
         ("control/layout.json", compact(&layout())),
@@ -947,6 +960,21 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             assert!(vlpds::state::space_blob_cid_key(DID, &blob, &sid, path) == sc);
             let rev = vlpds::space::rows::blob_ref_rev(&hex::decode(&k["sb row"]).unwrap());
             assert_eq!(rev.0, 0x1234_5678_9abc);
+        }
+        "state/space_list.json" => {
+            use vlpds::state::SpaceListed;
+            let k: BTreeMap<String, String> = serde_json::from_slice(b).unwrap();
+            assert!(pretty(&k) == b);
+            let base = vlpds::state::space_did_prefix(vlpds::state::SPACE_LIST_FAMILY, DID);
+            for (name, why) in
+                [("space list sL/ repo", SpaceListed::Repo), ("space list sL/ governs", SpaceListed::Governs)]
+            {
+                let key = hex::decode(&k[name]).unwrap();
+                assert_eq!(vlpds::state::key_slot(&key), Some(vlpds::slots::slot_of(DID)));
+                assert!(vlpds::state::is_space_key(&key));
+                assert_eq!(vlpds::state::space_list_uri(&key, &base), Some(SPACE));
+                assert!(vlpds::state::space_list_key(DID, SPACE, why) == key);
+            }
         }
         "state/space_space.json" => {
             let r = vlpds::space::rows::SpaceRow::decode(b).unwrap();

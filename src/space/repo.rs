@@ -19,7 +19,7 @@ use super::lthash::LtHash;
 use super::rows::{AppAccess, HeadRow, MemberRow, NotifyRow, OpAction, OpRow, OutboxRow, Policy, SpaceRow, WriterRow};
 use crate::cid::Cid;
 use crate::segment::Mutation;
-use crate::state::{self, SpaceId};
+use crate::state::{self, SpaceId, SpaceListed};
 use crate::tid::{self, Tid};
 use crate::worker::WriteError;
 use bytes::Bytes;
@@ -691,6 +691,7 @@ pub fn write(
     blob_ref_mutations(did, sid, rev, &batch, &before, &mut muts);
     if head.rev.is_none() {
         head.created = tid::now_micros();
+        muts.push(put(state::space_list_key(did, uri, SpaceListed::Repo), Bytes::new()));
     }
     head.rev = Some(rev);
     for (path, rec) in batch {
@@ -855,7 +856,7 @@ pub fn import_begin(
     sid: SpaceId,
     uri: &str,
     rev: Option<Tid>,
-) -> Result<Option<Mutation>, SpaceError> {
+) -> Result<Option<Vec<Mutation>>, SpaceError> {
     let head = st.repos.get_mut(&sid).ok_or_else(|| internal("space head not loaded"))?;
     importable(head, uri, rev)?;
     if head.rev.is_none() {
@@ -871,7 +872,7 @@ pub fn import_begin(
     let mut empty = SpaceHead::new(head.uri.clone(), None);
     empty.unswept = true;
     *head = empty;
-    Ok(Some(del(state::space_head_key(did, &sid))))
+    Ok(Some(vec![del(state::space_head_key(did, &sid)), del(state::space_list_key(did, uri, SpaceListed::Repo))]))
 }
 
 /// importRepo's head: the `sH` row at the imported rev, and the notify the
@@ -894,7 +895,10 @@ pub fn import_commit(
     (head.rev, head.hash, head.records, head.created) = (Some(rev), hash.clone(), records, created);
     st.repos.insert(sid, head);
     let row = HeadRow { uri: uri.to_string(), rev, hash: hash.clone(), records, created };
-    let mut muts = vec![put(state::space_head_key(did, &sid), row.encode())];
+    let mut muts = vec![
+        put(state::space_head_key(did, &sid), row.encode()),
+        put(state::space_list_key(did, uri, SpaceListed::Repo), Bytes::new()),
+    ];
     let digest = hash.digest();
     let (notify, sequenced) = if authority(uri) == Some(did) {
         (None, record_self(st, did, sid, rev, digest, clock_id, &mut muts)?)
@@ -930,7 +934,10 @@ pub fn create_space(
         host.writers.insert(authority.to_string(), None);
         host.max_space_rev = None;
     }
-    let mut muts = vec![put(state::space_key(authority, &sid), row.encode())];
+    let mut muts = vec![
+        put(state::space_key(authority, &sid), row.encode()),
+        put(state::space_list_key(authority, &row.uri, SpaceListed::Governs), Bytes::new()),
+    ];
     host.space = Some(row);
     if let Some((rev, hash)) = own {
         sequence(host, authority, sid, authority, rev, hash, clock_id, &mut muts)?;
@@ -1038,7 +1045,12 @@ pub fn delete_space(
         None => return Err(SpaceError::SpaceNotFound),
     };
     row.deleted_at = Some(deleted_at);
-    let muts = vec![put(state::space_key(authority, &sid), row.encode()), del(state::space_head_key(authority, &sid))];
+    let muts = vec![
+        put(state::space_key(authority, &sid), row.encode()),
+        del(state::space_head_key(authority, &sid)),
+        del(state::space_list_key(authority, uri, SpaceListed::Governs)),
+        del(state::space_list_key(authority, uri, SpaceListed::Repo)),
+    ];
     host.space = Some(row);
     host.members.clear();
     host.writers.clear();
@@ -1326,7 +1338,7 @@ mod tests {
         let (mut st, sid, uri) = states_with(&[("com.example.post/a", None)]);
         go(&mut st, sid, &uri, vec![create("a", 1)]).unwrap();
         let invalid =
-            |r: Result<Option<Mutation>, SpaceError>| matches!(r, Err(SpaceError::Write(WriteError::Invalid(_))));
+            |r: Result<Option<Vec<Mutation>>, SpaceError>| matches!(r, Err(SpaceError::Write(WriteError::Invalid(_))));
         assert!(invalid(import_begin(&mut st, did, sid, URI, Some(Tid(1)))), "an older rev over its records");
         let del = SpaceWrite::Delete { collection: "com.example.post".into(), rkey: "a".into(), must_exist: true };
         let gone = go(&mut st, sid, &uri, vec![del]).unwrap().rev;
@@ -1334,13 +1346,17 @@ mod tests {
         assert!(invalid(import_begin(&mut st, did, sid, URI, Some(gone))), "the import's rev must be newer");
         // an empty repo's head goes, and what's held is headless and unswept
         let m = import_begin(&mut st, did, sid, URI, Some(Tid(gone.0 + (1 << 20)))).unwrap().unwrap();
-        assert_eq!((m.key.to_vec(), m.val), (state::space_head_key(did, &sid), None));
+        let keys: Vec<_> = m.iter().map(|m| (m.key.to_vec(), m.val.clone())).collect();
+        let list = state::space_list_key(did, URI, SpaceListed::Repo);
+        assert_eq!(keys, [(state::space_head_key(did, &sid), None), (list, None)]);
         assert!(st.repos[&sid].rev.is_none() && st.repos[&sid].unswept);
         // a repo with records is replaced the same way at a newer rev
         let (mut st, sid, uri) = states_with(&[("com.example.post/a", None)]);
         let rev = go(&mut st, sid, &uri, vec![create("a", 1)]).unwrap().rev;
         let m = import_begin(&mut st, did, sid, URI, Some(Tid(rev.0 + (1 << 20)))).unwrap().unwrap();
-        assert_eq!((m.key.to_vec(), m.val), (state::space_head_key(did, &sid), None));
+        let keys: Vec<_> = m.iter().map(|m| (m.key.to_vec(), m.val.clone())).collect();
+        let list = state::space_list_key(did, URI, SpaceListed::Repo);
+        assert_eq!(keys, [(state::space_head_key(did, &sid), None), (list, None)]);
         assert!(st.repos[&sid].rev.is_none() && st.repos[&sid].unswept && st.repos[&sid].records == 0);
     }
 
@@ -1366,7 +1382,16 @@ mod tests {
         let m = update_space(&mut st, auth, sid, Some(Policy::Public), None, None).unwrap().unwrap();
         assert_eq!(SpaceRow::decode(m.val.as_ref().unwrap()).unwrap().read_policy, Policy::Public);
         let muts = delete_space(&mut st, auth, sid, URI, "t2".into()).unwrap().unwrap();
-        assert_eq!(muts.len(), 2);
+        let keys: Vec<_> = muts[1..].iter().map(|m| (m.key.to_vec(), m.val.is_none())).collect();
+        let list = |why| state::space_list_key(auth, URI, why);
+        assert_eq!(
+            keys,
+            [
+                (state::space_head_key(auth, &sid), true),
+                (list(SpaceListed::Governs), true),
+                (list(SpaceListed::Repo), true)
+            ]
+        );
         assert!(!SpaceRow::decode(muts[0].val.as_ref().unwrap()).unwrap().live());
         assert!(delete_space(&mut st, auth, sid, URI, "t3".into()).unwrap().is_none(), "already a tombstone");
         let e = record_writer(&mut st, auth, sid, URI, "did:plc:w", Tid(11), [1; 32], None, 1).err().unwrap();
@@ -1409,7 +1434,8 @@ mod tests {
             .unwrap();
         assert!(b.sequenced.is_none() && b.notify.is_none(), "not created yet: nothing to sequence");
         let muts = create_space(&mut st, auth, sid, SpaceRow::defaults(URI, "t"), 1).unwrap();
-        assert_eq!(muts.len(), 3, "sS, sQ, sW");
+        assert_eq!(muts.len(), 4, "sS, sL, sQ, sW");
+        assert_eq!(muts[1].key.to_vec(), state::space_list_key(auth, URI, SpaceListed::Governs));
         assert_eq!(st.hosts[&sid].writers[auth].unwrap().repo_rev, b.rev);
     }
 }
