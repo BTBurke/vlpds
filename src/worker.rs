@@ -451,10 +451,16 @@ pub struct RepoState {
     /// `G/{did}` at the in-memory head: a staged import, generations to sweep.
     pub imports: state::ImportState,
     /// The spaces the account writes to or governs, as loaded so far.
-    pub spaces: crate::space::repo::SpaceStates,
+    /// Allocated by the repo's first space request, so a repo that never
+    /// touches a space carries no space state.
+    pub spaces: Option<Box<crate::space::repo::SpaceStates>>,
 }
 
 impl RepoState {
+    pub fn spaces_mut(&mut self) -> &mut crate::space::repo::SpaceStates {
+        self.spaces.get_or_insert_with(Default::default)
+    }
+
     pub fn gen(&self) -> u64 {
         self.account.repo_gen
     }
@@ -493,9 +499,13 @@ fn retire_view(v: Arc<DurableView>) {
 /// Per-repo overhead outside the tree (account, key, head, views, maps).
 const REPO_BASE_BYTES: usize = 2048;
 
+fn spaces_bytes(st: &RepoState) -> usize {
+    st.spaces.as_ref().map_or(0, |s| std::mem::size_of::<crate::space::repo::SpaceStates>() + s.heap_bytes())
+}
+
 /// Approximate heap of a cached repo: what the cache budget counts.
 pub fn repo_bytes(st: &RepoState) -> usize {
-    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96 + st.backlinks.heap_bytes() + st.spaces.heap_bytes()
+    REPO_BASE_BYTES + st.mst.heap_bytes() + st.blob_refs.len() * 96 + st.backlinks.heap_bytes() + spaces_bytes(st)
 }
 
 /// A repo charged more than this is unloaded as soon as nothing of it is in
@@ -760,7 +770,9 @@ impl Worker {
                 let wrote = reqs.iter().any(|q| matches!(q, Queued::Write(_)));
                 let had_key = st.key.is_some();
                 let res = process(st, reqs, self.clock_id, &self.rt);
-                st.spaces.clear_fetched();
+                if let Some(ss) = &mut st.spaces {
+                    ss.clear_fetched();
+                }
                 let leftover = match res {
                     Ok(l) => l,
                     Err(e) => {
@@ -1075,7 +1087,7 @@ impl Worker {
             + st.heap.heap_bytes(&st.mst.tree.root)
             + st.blob_refs.len() * 96
             + st.backlinks.heap_bytes()
-            + st.spaces.heap_bytes();
+            + spaces_bytes(st);
         debug_assert_eq!(charge, repo_bytes(st));
         if charge > LAZY_REPO_MAX_BYTES {
             self.big.insert(did.clone());
@@ -1175,7 +1187,7 @@ impl Worker {
         st.fetching = false;
         let buffered = match res {
             Ok(f) => {
-                crate::space::repo::install(&mut st.spaces, f);
+                crate::space::repo::install(st.spaces_mut(), f);
                 buffered
             }
             // only the space requests fail; the rest go on
@@ -1571,11 +1583,12 @@ fn space_needs(
     if !reqs.iter().any(|q| matches!(q, Queued::Space(_))) {
         return Ok(reqs);
     }
-    st.spaces.prune();
+    let ss = st.spaces_mut();
+    ss.prune();
     let mut need = crate::space::repo::SpaceNeed::default();
     for q in &reqs {
         if let Queued::Space(r) = q {
-            need.add(&st.spaces, r);
+            need.add(ss, r);
         }
     }
     match need.is_empty() {
@@ -2453,11 +2466,11 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let delivered = spaces.outbox.take_delivered(&did);
             let max = spaces.limits.max_records;
-            let mut b = match sr::write(&mut st.spaces, &did, sid, &uri, writes, clock_id, &applied, delivered, max) {
+            let mut b = match sr::write(st.spaces_mut(), &did, sid, &uri, writes, clock_id, &applied, delivered, max) {
                 Err(e) => {
                     // fetched again (and its rows looked for) next time
                     if matches!(e, SpaceError::Unswept(_)) {
-                        st.spaces.repos.remove(&sid);
+                        st.spaces_mut().repos.remove(&sid);
                     }
                     let _ = reply.send(Err(e));
                     return Ok(());
@@ -2492,7 +2505,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             (b.muts, Box::new(ack))
         }
         SpaceOp::RecordWriter { writer, repo_rev, hash, managing_app } => {
-            let r = sr::record_writer(&mut st.spaces, &did, sid, &uri, &writer, repo_rev, hash, managing_app, clock_id);
+            let r = sr::record_writer(st.spaces_mut(), &did, sid, &uri, &writer, repo_rev, hash, managing_app, clock_id);
             match r {
                 Err(e) => {
                     let _ = reply.send(Err(e));
@@ -2532,7 +2545,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 let _ = reply.send(Err(WriteError::Invalid(m.into()).into()));
                 return Ok(());
             }
-            match sr::import_begin(&mut st.spaces, &did, sid, &uri, rev) {
+            match sr::import_begin(st.spaces_mut(), &did, sid, &uri, rev) {
                 Err(e) => {
                     spaces.end_import(&did, sid, nonce);
                     let _ = reply.send(Err(e));
@@ -2554,7 +2567,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                 let _ = reply.send(Err(SpaceError::Write(WriteError::Internal("space import not claimed".into()))));
                 return Ok(());
             }
-            let b = match sr::import_commit(&mut st.spaces, &did, sid, &uri, rev, *hash, records, clock_id) {
+            let b = match sr::import_commit(st.spaces_mut(), &did, sid, &uri, rev, *hash, records, clock_id) {
                 Ok(b) => b,
                 Err(e) => {
                     let _ = reply.send(Err(e));
@@ -2599,7 +2612,7 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             return Ok(());
         }
         op => {
-            let ss = &mut st.spaces;
+            let ss = st.spaces_mut();
             let r = match op {
                 SpaceOp::CreateSpace { row } => {
                     sr::create_space(ss, &did, sid, row, clock_id).map(|m| (m, SpaceAck::Created))
