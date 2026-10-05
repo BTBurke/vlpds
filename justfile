@@ -87,6 +87,10 @@ bench name rate *args:
     CARGO_TARGET_DIR=target cargo build --release --bins
     bench/step.sh {{name}} {{rate}} {{args}}
 
+# Spaces sync micro-bench, in process and alone (bench/results/spaces-sync.md; env SPACES_BENCH_*)
+spaces-microbench *args:
+    cargo test --profile dev-release --features bench-jemalloc --test all spaces_side::bench::spaces_microbench {{args}} -- --ignored --nocapture --test-threads=1
+
 # Account migration e2e (bench/migrate/README.md): local PLC, reference PDS and mail catcher in docker,
 # a local vlpds, then /migrate driven headlessly for several accounts and both sides verified (KEEP=1 leaves it up)
 migrate-e2e:

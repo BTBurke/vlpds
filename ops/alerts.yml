@@ -1175,3 +1175,62 @@ groups:
         annotations:
           summary: "{{ $value | humanize }} new-device sign-in alerts were not mailed in the last hour: the recipient's mail budget was spent"
           runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssigninalertssuppressed"
+
+  # ---------------------------------------------------------------------------
+  # Spaces (--spaces). Every vlpds_space_* series is registered on first use,
+  # so these stay silent on nodes without the flag.
+  # ---------------------------------------------------------------------------
+  - name: vlpds-spaces
+    rules:
+      # A node's oldest notifyWrite outbox row has waited over an hour: some
+      # authority hasn't acknowledged a write for that long. Retries back off
+      # from 1 min to 1 h and give up 24 h after the write, so an hour means
+      # several failed sends in a row (design: the retry schedule).
+      - alert: VlpdsSpaceOutboxBacklog
+        expr: max by (instance) (vlpds_space_outbox_oldest_seconds{job="vlpds"}) > 3600
+        for: 10m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: a space write has waited {{ $value | humanizeDuration }} for its authority's notifyWrite ack"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspaceoutboxbacklog"
+
+      # A space repo's stored head disagreed with the set hash recomputed
+      # from its records. That's an integrity bug, never load (design).
+      - alert: VlpdsSpaceDigestMismatch
+        expr: sum by (instance) (increase(vlpds_space_digest_mismatch_total{job="vlpds"}[1h])) > 0
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $value | humanize }} space repo digest mismatches in the last hour"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacedigestmismatch"
+
+      # Over half of the notifies forwarded to registered syncers fail, at
+      # over 0.1/s, for 30 min (guess). Syncers are third-party services, so
+      # a single dead one can do this on a small node.
+      - alert: VlpdsSpaceNotifyFanoutFailing
+        expr: >-
+          sum by (instance) (rate(vlpds_space_notify_total{job="vlpds",hop="fanout",result!="ok"}[15m]))
+            / sum by (instance) (rate(vlpds_space_notify_total{job="vlpds",hop="fanout"}[15m])) > 0.5
+          and on (instance) sum by (instance) (rate(vlpds_space_notify_total{job="vlpds",hop="fanout",result!="ok"}[15m])) > 0.1
+        for: 30m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of space notifies forwarded to syncers from {{ $labels.instance }} fail"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacenotifyfanoutfailing"
+
+      # Over a quarter of space credential reads are refused, at over 0.5/s,
+      # for 15 min (guess). Expired credentials are left out: clients fetch a
+      # new one when theirs runs out.
+      - alert: VlpdsSpaceCredentialRejectsHigh
+        expr: >-
+          sum by (instance) (rate(vlpds_space_credential_checks_total{job="vlpds",result!~"ok|expired"}[10m]))
+            / sum by (instance) (rate(vlpds_space_credential_checks_total{job="vlpds"}[10m])) > 0.25
+          and on (instance) sum by (instance) (rate(vlpds_space_credential_checks_total{job="vlpds",result!~"ok|expired"}[10m])) > 0.5
+        for: 15m
+        labels:
+          severity: ticket
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of space credential reads on {{ $labels.instance }} are refused"
+          runbook_url: "https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsspacecredentialrejectshigh"

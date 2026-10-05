@@ -1669,6 +1669,104 @@ requesting resets or codes for the account, the per-account buckets are already
 holding it. Lift the budget early only for a real user (a DID override in the
 Rate limits tab).
 
+### VlpdsSpaceOutboxBacklog
+
+**Means:** a node has owed some space authority a `notifyWrite` for over an
+hour (`vlpds_space_outbox_oldest_seconds`). Every space write is durable and
+readable at its 200. The outbox only tells the authority that the repo moved,
+so syncers find the write later than they should. Each (repo, space) has one
+row that always carries the newest rev. Sends retry from 1 min, doubling to
+1 h, and a row is dropped 24 h after its write. The row's `sP` key survives a
+restart or a takeover, and the next owner sends it again.
+
+**Causes:** the authority's PDS is down or answering 5xx, its DID doesn't
+resolve to an `#atproto_space_host` or `#atproto_pds` endpoint, or the writer's
+account is deactivated or taken down (its rows wait for a restore, and don't
+count as failures).
+
+**Confirm:** the internals dashboard's Spaces row: `notifyWrite by hop and
+result` shows `out retry` (the authority is failing) or `out wait` (inactive
+writers). The node logs `space notifyWrite retry: <why>` with the DID, space
+and rev on every failed send.
+
+**Do:**
+- One authority failing: nothing to fix on this side. Its PDS has to come back.
+  Once it does, the next retry (at most ~1 h away) delivers the newest rev.
+- Many authorities failing at once: look at this node's outbound path (DNS,
+  egress, `http::guarded` refusals in the logs).
+- Inactive writers: expected. Rows resume on reactivation or takedown reversal.
+- A row past 24 h is dropped. The authority's `listRepos` then lags for that
+  repo until its next write. Syncers still catch up from `listRepoOps`.
+
+### VlpdsSpaceDigestMismatch
+
+**Means:** a space repo's stored head (`sH`: set hash, record count, rev)
+didn't match what was recomputed from its records (`sR`)
+(`vlpds_space_digest_mismatch_total`). Syncers check every pull against the
+signed commit's hash, so a wrong head makes them refetch the whole repo with
+`getRepo`, and the mismatch never goes away on its own. This is a bug, not
+load. **(unverified: the counter lands with the phase 1 observability slice)**
+
+**Confirm:** run `vlpds admin check-space DID SPACE` (`vlpds.admin.checkSpace`)
+for the repo in the log line. It reports the recomputed hash and count against
+the head, any record newer than the head, and whether the oplog replays onto
+the records.
+
+**Do:**
+- Keep the check-space output and the node's logs around the repo's last
+  writes. Open an issue with both.
+- Don't delete or rewrite `s*` rows by hand. The repo's writes keep working,
+  and its syncers fall back to `getRepo`.
+
+### VlpdsSpaceNotifyFanoutFailing
+
+**Means:** over half of the notifies this node forwards to registered syncers
+fail, at over 0.1/s, for 30 min
+(`vlpds_space_notify_total{hop="fanout"}`). Syncers register with
+`registerNotify` and are third-party services. A failed fan-out only delays a
+syncer, since it pulls from its last rev on the next notify or poll and
+`listRepos` covers gaps. Fan-out runs off the write path, so writes aren't
+slowed by it.
+
+**Causes:** one big syncer down or refusing (the usual case on a small node),
+or this node's egress failing.
+
+**Confirm:** the Spaces row's `Fan-out queue depth and drops` and the failure
+ratio by hop. `out` failing at the same time points at egress. The logs name
+the syncer service DID per failure. **(unverified: fan-out hardening lands
+with the phase 1 sync slice)**
+
+**Do:**
+- One syncer down: nothing to do. Its registrations expire 24 h after their
+  last `registerNotify` and are pruned once they keep failing past that.
+- Egress: same as any outbound trouble (DNS, firewall, `http::guarded`
+  refusals in the logs).
+
+### VlpdsSpaceCredentialRejectsHigh
+
+**Means:** over a quarter of space credential reads are refused, at over
+0.5/s, for 15 min (`vlpds_space_credential_checks_total`, expired left out).
+The `result` label says why: `bad_sig` (the request or credential signature
+didn't verify), `audience` (the audience header isn't the repo being read),
+`space` (a credential for another space), `revoked` (the authority revoked it).
+
+**Causes:** a client app with a signing bug, an authority that rotated its
+key while members still hold credentials it signed, members still reading
+after an authority revoked their access, or someone probing.
+
+**Confirm:** `Credential checks by result` on the Spaces row. One result
+dominating is usually one client. The access log's route and client show
+which.
+
+**Do:**
+- `revoked` after an authority removed members: expected, and it stops when
+  those clients give up.
+- `bad_sig` right after an authority's key rotation: clients recover by
+  fetching a new credential. Nothing to do if it falls off within the hour.
+- A single client stuck on `bad_sig`, `audience` or `space`: it's that app's
+  bug. Reads stay refused, so there's no data exposure. Contact the app if it
+  keeps up.
+
 ---
 
 ## Procedures

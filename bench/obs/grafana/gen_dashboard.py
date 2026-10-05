@@ -696,6 +696,66 @@ ts("OAuth consents, handle checks", [t(f"sum by (result) (rate(vlpds_oauth_conse
    desc="Consent page answers (narrowed = some scopes unticked; refused = a forged post without atproto), and "
         "vlpds.identity.checkHandle answers with its per-DID rate-limit rejections.")
 
+# ============================================================== spaces
+# vlpds_space_* series are registered on first use, so nodes without --spaces export none
+row("Spaces (--spaces): writes, notify outbox and fan-out, sync reads, credentials")
+SPACE_NOTIFY = "vlpds_space_notify_total"
+ts("Space writes by method and result", [rate("vlpds_space_writes_total", by="op, result", legend="{{op}} {{result}}")], "reqps",
+   empty="no space writes",
+   desc="createRecord / putRecord / deleteRecord / applyWrites into space repos. refused = a 4xx (validation, scope, an inactive account); "
+        "error = a 5xx.")
+ts("Write → notify ack", quantiles("vlpds_space_notify_ack_seconds", qs=(0.5, 0.99)), "s", empty="no notifies to other authorities",
+   desc="A space write's ack to its authority's 200 for the notifyWrite. Writes into the author's own space carry the authority's "
+        "rows in the write's entry, so they send nothing and aren't counted here.")
+ts("notifyWrite outbox rows by node", [node_gauge("vlpds_space_outbox_rows")], "short", empty="no outbox rows",
+   desc="One row per (repo, space) this node still owes its authority a notify for. Writes made while a send is in flight only "
+        "move their row's rev, so the count follows the active (repo, space) pairs, not the write rate.")
+ts("notifyWrite outbox oldest row", [node_gauge("vlpds_space_outbox_oldest_seconds", agg="max")], "s", lines=[(3600, "orange")],
+   empty="no outbox rows",
+   desc=f"Age of each node's oldest undelivered row. Retries back off from 1 min to 1 h and give up 24 h after the write. "
+        f"Dashed: {rb('VlpdsSpaceOutboxBacklog')} (1 h).")
+ts("notifyWrite by hop and result", [rate(SPACE_NOTIFY, by="hop, result", legend="{{hop}} {{result}}")], "ops", empty="no notifies",
+   desc="out = this node's writes to their authorities; in = notifies received as an authority; fanout = forwarded to "
+        "registered syncers. ok = 200; retry = backing off; wait = the writer's account is inactive; refused / gone / "
+        "expired = the row was dropped.")
+ts("notifyWrite failure ratio by hop",
+   [t(f'sum by (hop) (rate({SPACE_NOTIFY}{{{I}, result!="ok"}}{RI})) / sum by (hop) (rate({SPACE_NOTIFY}{{{I}}}{RI}))', "{{hop}}")],
+   "percentunit", max_=1, lines=[(0.5, "orange")], empty="no notifies",
+   desc=f"Dashed: {rb('VlpdsSpaceNotifyFanoutFailing')} (fanout over 50%). A dead syncer or a remote authority that's down "
+        "shows up here first.")
+ts("listRepoOps: at-head polls vs scans", [rate("vlpds_space_list_repo_ops_total", by="path")], "reqps", stack=True,
+   empty="no listRepoOps",
+   desc="noop = since was the head, answered from the in-memory head with no state read (most syncer polls). scan = an oplog range scan.")
+ts("listRepoOps server time", [t(hq(q, "vlpds_space_list_repo_ops_seconds", by="path"), f"{QNAME[q]} {{{{path}}}}") for q in (0.5, 0.99)],
+   "s", empty="no listRepoOps",
+   desc="Handler time after auth, the commit signature included. Targets: noop well under 1 ms, a typical delta a few ms.")
+ts("Space reads by method and auth", [rate("vlpds_space_reads_total", by="method, auth", legend="{{method}} {{auth}}")], "reqps",
+   empty="no space reads",
+   desc="credential = an Atproto-Space credential (another member or a syncer). oauth = the account reading its own repo.")
+ts("Credential cache hit ratio",
+   [t(f'sum(rate(vlpds_space_credential_cache_total{{{I}, result="hit"}}{RI})) / sum(rate(vlpds_space_credential_cache_total{{{I}}}{RI}))', "hit ratio")],
+   "percentunit", max_=1, empty="no credential reads",
+   desc="A hit costs a hash lookup and the request's P-256 signature check. A miss verifies the whole chain and resolves the "
+        "authority's key. Low under steady polling means credentials churn faster than they expire, or the cache is too small.")
+ts("Credential checks by result", [rate("vlpds_space_credential_checks_total", by="result")], "reqps", stack=True,
+   empty="no credential reads",
+   desc=f"ok, or why a credential read was refused (bad_sig, expired, revoked, audience, space). {rb('VlpdsSpaceCredentialRejectsHigh')}")
+ts("Credentials and delegations issued", [rate("vlpds_space_credentials_issued_total", by="result", legend="credentials {{result}}"),
+                                         rate("vlpds_space_delegations_total", legend="delegation tokens")], "ops",
+   empty="none issued",
+   desc="getSpaceCredential answers as an authority (bad_token = the delegation token didn't verify), and delegation tokens "
+        "minted for this node's accounts.")
+ts("Fan-out queue depth and drops", [t(f"sum(vlpds_space_fanout_queue_depth{{{I}}})", "queued"),
+                                     rate("vlpds_space_fanout_dropped_total", by="reason", legend="dropped/s {{reason}}")], "short",
+   overrides=[right_axis("queued", "short")], empty="no fan-out",
+   desc="Notifies waiting for a syncer, and the ones dropped (a newer one for the same syncer superseded it, or a host's "
+        "queue was full). Superseded drops are normal. The syncer pulls from its last rev either way.")
+ts("Revocations held, digest mismatches", [t(f"max(vlpds_space_revocations{{{I}}})", "revocations held"),
+                                           t(f"sum(increase(vlpds_space_digest_mismatch_total{{{I}}}[1h])) > 0", "digest mismatches (1 h)")],
+   "short", decimals=0, empty="none",
+   desc=f"Revoked credential ids still in force (kept until their credential could have expired). Mismatches: "
+        f"{rb('VlpdsSpaceDigestMismatch')}.")
+
 # ============================================================== cluster: leases and ownership
 row("Cluster: leases, ownership, failover")
 ts("Lease renewal round trip by node (p99)", [node_quantile(0.99, "vlpds_lease_renew_seconds"),
