@@ -198,7 +198,9 @@ export function Firehose() {
                   <th>Client</th>
                   <th>State</th>
                   <th className="num">Lag</th>
-                  <th className="num" title="Events sent per second, against this PDS's firehose rate">Events/s</th>
+                  <th className="num" title="Events sent per second, against this PDS's firehose rate">
+                    Events/s{rates.pds !== undefined && <span className="muted"> (PDS {fmtSi(rates.pds)})</span>}
+                  </th>
                   <th className="num">Connected</th>
                   <th>Cursor</th>
                   <th>User agent</th>
@@ -219,31 +221,26 @@ export function Firehose() {
                             other
                           </span>
                         )}
-                        {multi && <div className="muted mono small">{s.node}</div>}
+                        {multi && <span className="muted mono small"> {s.node}</span>}
                       </td>
                       <td>
                         <span className="mono">{s.ip ?? 'unknown'}</span>
-                        {s.relay && (
-                          <div>
-                            <span className="pill accent">{s.relay}</span>
-                          </div>
-                        )}
+                        {s.relay && <span className="pill accent">{s.relay}</span>}
                       </td>
                       <td>{s.state === 'live' ? <Status kind="ok">Live</Status> : <Status kind="warn">Backfilling</Status>}</td>
                       <td className="num">
                         {lag(s)}
-                        {s.lagBytes ? <div className="muted small">{fmtBytes(s.lagBytes)} unsent</div> : null}
+                        {s.lagBytes ? <span className="muted small"> · {fmtBytes(s.lagBytes)} unsent</span> : null}
                       </td>
                       <td className="num">
                         {r !== undefined ? <span className={slow ? 'slow' : undefined}>{fmtSi(r)}</span> : '—'}
-                        {rates.pds !== undefined && <div className="muted small">of {fmtSi(rates.pds)}</div>}
                       </td>
                       <td className="num" title={new Date(s.connectedAt).toLocaleString()}>
                         {dur(d.time - s.connectedAt)}
                       </td>
                       <td className="mono">
                         {s.cursor == null ? <span className="muted">none</span> : <Cursor seq={s.cursor} />}
-                        {s.shard && <div className="muted small">shard {s.shard}</div>}
+                        {s.shard && <span className="muted small"> · shard {s.shard}</span>}
                       </td>
                       <td className="ua" title={s.userAgent}>
                         {s.userAgent || <span className="muted">none</span>}
@@ -281,15 +278,11 @@ export function Firehose() {
                   <tr key={key(s)}>
                     <td>
                       <span className="mono">#{s.conn}</span>
-                      {multi && <div className="muted mono small">{s.node}</div>}
+                      {multi && <span className="muted mono small"> {s.node}</span>}
                     </td>
                     <td>
                       <span className="mono">{s.ip ?? 'unknown'}</span>
-                      {s.relay && (
-                        <div>
-                          <span className="pill accent">{s.relay}</span>
-                        </div>
-                      )}
+                      {s.relay && <span className="pill accent">{s.relay}</span>}
                     </td>
                     <td>
                       {s.reason == 'too_slow' || s.reason === 'write_stalled' || s.reason === 'backfill_failed' ? (

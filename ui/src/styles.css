@@ -2816,6 +2816,10 @@ dialog.modal.mod-dialog {
 .mod-dialog textarea {
   width: 100%;
 }
+/* one line per consumer: details sit inline, the user agent truncates */
+table.data.firehose-subs td {
+  white-space: nowrap;
+}
 table.data.firehose-subs td.ua {
   max-width: 260px;
   overflow: hidden;
@@ -2825,7 +2829,7 @@ table.data.firehose-subs .slow {
   color: var(--amber);
   font-weight: 600;
 }
-table.data.firehose-subs td > .pill {
+table.data.firehose-subs td .pill {
   margin-left: 6px;
 }
 @media (max-width: 560px) {
