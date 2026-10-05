@@ -122,6 +122,9 @@ pub enum SpaceOp {
     },
     UnregisterNotify {
         service: String,
+        /// The expired-registration prune: deletes it only if it expired by
+        /// then, so a renewal that landed meanwhile is never undone.
+        expired_by: Option<u64>,
     },
     /// vlpds.space.importRepo: claims the space for an import (`nonce`),
     /// the account having no records there; its writes there wait it out.
@@ -287,6 +290,8 @@ pub struct HostHead {
     /// `sW` rows read so far (None: absent).
     pub writers: HashMap<String, Option<WriterRow>>,
     pub members: HashMap<String, Option<MemberRow>>,
+    /// `sN` expiries read so far, by service (None: absent).
+    pub registrations: HashMap<String, Option<u64>>,
 }
 
 impl HostHead {
@@ -295,7 +300,10 @@ impl HostHead {
     }
 
     fn heap_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.uri.len() + 256 + (self.writers.len() + self.members.len()) * 128
+        std::mem::size_of::<Self>()
+            + self.uri.len()
+            + 256
+            + (self.writers.len() + self.members.len() + self.registrations.len()) * 128
     }
 }
 
@@ -337,6 +345,7 @@ pub struct SpaceNeed {
     hosts: Vec<(SpaceId, Arc<str>)>,
     writers: Vec<(SpaceId, String)>,
     members: Vec<(SpaceId, String)>,
+    registrations: Vec<(SpaceId, String)>,
 }
 
 impl SpaceNeed {
@@ -346,6 +355,7 @@ impl SpaceNeed {
             && self.hosts.is_empty()
             && self.writers.is_empty()
             && self.members.is_empty()
+            && self.registrations.is_empty()
     }
 
     fn head(&mut self, st: &SpaceStates, sid: SpaceId, uri: &Arc<str>) {
@@ -363,6 +373,12 @@ impl SpaceNeed {
     fn writer(&mut self, st: &SpaceStates, sid: SpaceId, did: &str) {
         if !st.hosts.get(&sid).is_some_and(|h| h.writers.contains_key(did)) {
             self.writers.push((sid, did.to_string()));
+        }
+    }
+
+    fn registration(&mut self, st: &SpaceStates, sid: SpaceId, service: &str) {
+        if !st.hosts.get(&sid).is_some_and(|h| h.registrations.contains_key(service)) {
+            self.registrations.push((sid, service.to_string()));
         }
     }
 
@@ -413,6 +429,10 @@ impl SpaceNeed {
                     self.writer(st, sid, did);
                 }
             }
+            SpaceOp::UnregisterNotify { service, expired_by: Some(_) } => {
+                self.host(st, sid, uri);
+                self.registration(st, sid, service);
+            }
             SpaceOp::UpdateSpace { .. }
             | SpaceOp::PutMember { .. }
             | SpaceOp::RemoveMember { .. }
@@ -435,6 +455,7 @@ pub struct Fetched {
     hosts: Vec<(SpaceId, Arc<str>, Option<SpaceRow>, Option<Tid>)>,
     writers: Vec<(SpaceId, String, Option<WriterRow>)>,
     members: Vec<(SpaceId, String, Option<MemberRow>)>,
+    registrations: Vec<(SpaceId, String, Option<u64>)>,
 }
 
 /// Reads what `need` names. A head or space row naming another URI than
@@ -485,6 +506,11 @@ pub async fn fetch(db: &slatedb::Db, did: &str, need: SpaceNeed) -> anyhow::Resu
         let row = get(state::space_member_key(did, &sid, &m)).await?.map(|v| MemberRow::decode(&v)).transpose()?;
         f.members.push((sid, m, row));
     }
+    for (sid, service) in need.registrations {
+        let row =
+            get(state::space_notify_key(did, &sid, &service)).await?.map(|v| NotifyRow::decode(&v)).transpose()?;
+        f.registrations.push((sid, service, row.map(|r| r.expires)));
+    }
     Ok(f)
 }
 
@@ -510,6 +536,7 @@ pub fn install(st: &mut SpaceStates, f: Fetched) {
             max_space_rev: max,
             writers: HashMap::new(),
             members: HashMap::new(),
+            registrations: HashMap::new(),
         });
     }
     for (sid, w, row) in f.writers {
@@ -520,6 +547,11 @@ pub fn install(st: &mut SpaceStates, f: Fetched) {
     for (sid, m, row) in f.members {
         if let Some(h) = st.hosts.get_mut(&sid) {
             h.members.entry(m).or_insert(row);
+        }
+    }
+    for (sid, service, expires) in f.registrations {
+        if let Some(h) = st.hosts.get_mut(&sid) {
+            h.registrations.entry(service).or_insert(expires);
         }
     }
 }
@@ -962,20 +994,31 @@ pub fn set_member(
     })
 }
 
-/// registerNotify (`row` Some) and unregisterNotify.
+/// registerNotify (`row` Some) and unregisterNotify. With `expired_by`,
+/// a registration that is gone or expires after it is left alone (no
+/// mutation).
 pub fn set_registration(
     st: &mut SpaceStates,
     authority: &str,
     sid: SpaceId,
     service: &str,
     row: Option<NotifyRow>,
-) -> Result<Mutation, SpaceError> {
-    live_host(st, sid)?;
+    expired_by: Option<u64>,
+) -> Result<Option<Mutation>, SpaceError> {
+    let host = live_host(st, sid)?;
+    if let Some(t) = expired_by {
+        match host.registrations.get(service) {
+            Some(Some(expires)) if *expires <= t => {}
+            Some(_) => return Ok(None),
+            None => return Err(internal("space registration not loaded")),
+        }
+    }
+    host.registrations.insert(service.to_string(), row.as_ref().map(|r| r.expires));
     let key = state::space_notify_key(authority, &sid, service);
-    Ok(match row {
+    Ok(Some(match row {
         Some(r) => put(key, r.encode()),
         None => del(key),
-    })
+    }))
 }
 
 /// simplespace.deleteSpace: Ok(None) if it already was a tombstone. A

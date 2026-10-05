@@ -582,9 +582,9 @@ async fn one_slow_syncer_holds_up_nobody() {
     let p = s.app.partition(&owner.did).ok().unwrap();
     let sid = vlpds::state::space_id(&space);
     let nkey = vlpds::state::space_notify_key(&owner.did, &sid, &expired.service());
-    let row = vlpds::space::rows::NotifyRow::decode(&p.db.get(&nkey).await.unwrap().unwrap()).unwrap();
-    let aged = vlpds::space::rows::NotifyRow { expires: vlpds::tid::now_micros() - 1, ..row };
-    p.db.put(nkey.clone(), aged.encode().to_vec()).await.unwrap();
+    vlpds::xrpc::space::set_registration_expiry(&s.app, &space, &expired.service(), vlpds::tid::now_micros() - 1)
+        .await
+        .unwrap();
 
     // the slow one is stuck on the first write while 50 more land
     let mut acks = Vec::new();
@@ -743,4 +743,38 @@ async fn a_notify_to_an_authority_elsewhere_asks_the_owner_once() {
     }
     let peer = y.app.spaces.as_ref().unwrap().peer_notifies.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(peer, 1, "the owner was asked on every send");
+}
+
+/// The expired-registration prune deletes on the authority's worker only
+/// if the row is still expired there: a renewal between the prune's read
+/// and its delete stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_outlives_a_prune_that_read_it_expired() {
+    let s = spawn().await;
+    let owner = SpaceClient::new(&s, "ssprune", OWNER).await;
+    let space = owner.create_space(TYPE, "prune").await;
+    let cred = owner.credential(&space).await;
+    let sy = Syncer::start(Duration::ZERO).await;
+    let register = || async {
+        let body = json!({"space": space, "service": sy.service()});
+        owner.signed_post(&s.url, "com.atproto.space.registerNotify", body, &cred, &owner.did).await.ok();
+    };
+    register().await;
+    let p = s.app.partition(&owner.did).ok().unwrap();
+    let key = vlpds::state::space_notify_key(&owner.did, &vlpds::state::space_id(&space), &sy.service());
+    vlpds::xrpc::space::set_registration_expiry(&s.app, &space, &sy.service(), vlpds::tid::now_micros() - 1)
+        .await
+        .unwrap();
+    // a prune reads it expired, then the syncer renews before the delete
+    let read_at = vlpds::tid::now_micros();
+    register().await;
+    vlpds::xrpc::space::unregister_if_expired(&s.app, &space, &sy.service(), read_at).await.unwrap();
+    let row = vlpds::space::rows::NotifyRow::decode(&p.db.get(&key).await.unwrap().expect("renewed")).unwrap();
+    assert!(row.expires > read_at, "the renewal was deleted");
+    // one that's still expired goes
+    vlpds::xrpc::space::set_registration_expiry(&s.app, &space, &sy.service(), vlpds::tid::now_micros() - 1)
+        .await
+        .unwrap();
+    vlpds::xrpc::space::unregister_if_expired(&s.app, &space, &sy.service(), vlpds::tid::now_micros()).await.unwrap();
+    assert!(p.db.get(&key).await.unwrap().is_none());
 }

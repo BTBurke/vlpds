@@ -1630,10 +1630,33 @@ pub async fn prune_registration(app: &App, uri: &str, service: &str) -> anyhow::
     let Some(v) = p.db.get(state::space_notify_key(&space.authority, &space.sid, service)).await? else {
         return Ok(());
     };
-    if crate::space::rows::NotifyRow::decode(&v)?.expires > crate::tid::now_micros() {
+    let now = crate::tid::now_micros();
+    if crate::space::rows::NotifyRow::decode(&v)?.expires > now {
         return Ok(());
     }
-    let op = SpaceOp::UnregisterNotify { service: service.to_string() };
+    unregister_if_expired(app, uri, service, now).await
+}
+
+/// Deletes `service`'s registration for the space `uri` if it expired by
+/// `t`, checked on the authority's worker, so a renewal that lands between
+/// a prune's read and its delete survives.
+pub async fn unregister_if_expired(app: &App, uri: &str, service: &str, t: u64) -> anyhow::Result<()> {
+    let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let op = SpaceOp::UnregisterNotify { service: service.to_string(), expired_by: Some(t) };
+    submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    Ok(())
+}
+
+/// Tests: sets `service`'s registration for the space `uri` to expire at
+/// `expires` (Unix microseconds), through the authority's worker as a
+/// renewal would.
+pub async fn set_registration_expiry(app: &App, uri: &str, service: &str, expires: u64) -> anyhow::Result<()> {
+    let space = Space::parse(uri).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let p = app.partition(&space.authority).map_err(|e| anyhow::anyhow!("{}", e.message))?;
+    let key = state::space_notify_key(&space.authority, &space.sid, service);
+    let v = p.db.get(key).await?.ok_or_else(|| anyhow::anyhow!("not registered"))?;
+    let row = crate::space::rows::NotifyRow { expires, ..crate::space::rows::NotifyRow::decode(&v)? };
+    let op = SpaceOp::RegisterNotify { service: service.to_string(), row };
     submit_space(app, &space.authority, &space, op).await.map_err(|e| anyhow::anyhow!("{}", e.message))?;
     Ok(())
 }
@@ -2052,7 +2075,8 @@ async fn unregister_notify(
     let space = Space::parse(&inp.space)?;
     host_credential(&app, &headers, &space).await?;
     super::simplespace::assert_space_host(&app, &space).await?;
-    submit_space(&app, &space.authority, &space, SpaceOp::UnregisterNotify { service: inp.service }).await?;
+    submit_space(&app, &space.authority, &space, SpaceOp::UnregisterNotify { service: inp.service, expired_by: None })
+        .await?;
     Ok(StatusCode::OK)
 }
 

@@ -2615,10 +2615,12 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
                     sr::set_member(ss, &did, sid, &member, None).map(|m| (vec![m], SpaceAck::Host))
                 }
                 SpaceOp::RegisterNotify { service, row } => {
-                    sr::set_registration(ss, &did, sid, &service, Some(row)).map(|m| (vec![m], SpaceAck::Host))
+                    sr::set_registration(ss, &did, sid, &service, Some(row), None)
+                        .map(|m| (m.into_iter().collect(), SpaceAck::Host))
                 }
-                SpaceOp::UnregisterNotify { service } => {
-                    sr::set_registration(ss, &did, sid, &service, None).map(|m| (vec![m], SpaceAck::Host))
+                SpaceOp::UnregisterNotify { service, expired_by } => {
+                    sr::set_registration(ss, &did, sid, &service, None, expired_by)
+                        .map(|m| (m.into_iter().collect(), SpaceAck::Host))
                 }
                 SpaceOp::DeleteSpace { deleted_at } => match sr::delete_space(ss, &did, sid, &uri, deleted_at) {
                     Ok(Some(m)) => Ok((m, SpaceAck::Deleted { already: false })),

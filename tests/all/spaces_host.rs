@@ -796,7 +796,7 @@ async fn notify_write_from_another_vlpds() {
     assert!(eventually(Duration::from_secs(10), || async { repos().await[0]["repoRev"] == json!(rev3) }).await);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(syncer.calls("/xrpc/com.atproto.space.notifyWrite").len(), before);
-    // an expired registration gets nothing either (its row aged by hand)
+    // an expired registration gets nothing either
     member
         .signed_post(
             &b.url,
@@ -807,11 +807,7 @@ async fn notify_write_from_another_vlpds() {
         )
         .await
         .ok();
-    let p = b.app.partition(&owner.did).ok().unwrap();
-    let key = vlpds::state::space_notify_key(&owner.did, &vlpds::state::space_id(&space), &service);
-    let row = vlpds::space::rows::NotifyRow::decode(&p.db.get(&key).await.unwrap().unwrap()).unwrap();
-    let aged = vlpds::space::rows::NotifyRow { expires: vlpds::tid::now_micros() - 1, ..row };
-    p.db.put(key, aged.encode().to_vec()).await.unwrap();
+    vlpds::xrpc::space::set_registration_expiry(&b.app, &space, &service, vlpds::tid::now_micros() - 1).await.unwrap();
     member.create_record(&space, COLL, Some("4"), rec("four")).await.ok();
     let rev4 = head(&member, &space).await;
     assert!(eventually(Duration::from_secs(10), || async { repos().await[0]["repoRev"] == json!(rev4) }).await);

@@ -171,7 +171,7 @@ edges:
   up with `listRepos`.
 - A failed forward is retried with jittered backoff from 1 s, but only while nothing newer from its
   writer waits.
-- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned.
+- Registrations (`registerNotify`) last 24 h, and a space takes 256 at most. Expired ones are pruned. The prune's delete runs on the authority's worker and checks the expiry again there, so a syncer that renews while a prune is under way keeps its registration.
 - Lanes live in memory. When a shard opens on a new owner, each of its spaces with a live
   registration sends one catch-up forward of its newest writer, naming the spaceRev before it. A
   syncer that's current ignores it, and one that missed a forward sees the gap and pulls `listRepos`.
