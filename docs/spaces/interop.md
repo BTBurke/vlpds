@@ -19,7 +19,7 @@ diagram:
     - { from: s.t75, to: r.b, label: listRepoOps, tone: blue }
 facts:
   - { value: "5b95b2f2", label: reference pin, note: "bluesky-social/atproto PR #5187, Oct 1 wire" }
-  - { value: "211", unit: cases, label: of the reference's space suites mapped, note: "187 ported · 7 divergent · 17 N/A", tone: accent }
+  - { value: "211", unit: cases, label: of the reference's space suites mapped, note: "196 ported · 7 divergent · 8 N/A", tone: accent }
   - { value: in order, label: fan-out per syncer, note: "the reference's unordered sends leave ~3–5 gaps per ~80", tone: violet }
   - { value: OAuth, label: only, note: "the biggest divergence", tone: rust }
 ```

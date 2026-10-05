@@ -907,17 +907,17 @@ Divergences, also in DESIGN.md's Spaces section:
   `listSpaceRecords`, `getSpaceRecord`, `checkSpace`) have no upstream counterpart (`spaces_admin`). importRepo takes a
   deactivated account's own password session, the one exception to OAuth-only, which is still an open decision.
 
-Some N/A rows below are N/A only because a test can't wait out a real timer or backdate a row: the notification retry rows
-(1 min retry base) and the registration expiry row. `Outbox::set_retry_base` and `space::retention::prune_before` now exist as
-test hooks, so the retry rows could be ported. Registration expiry still needs a hook (the tests age `sN` rows with a direct
-`db.put`). Until then those rows are covered by the outbox's and fan-out's own unit tests.
+The notification retry rows and the registration expiry row run through test hooks: `Outbox::set_retry_base` shortens the
+1 min retry pause, and `xrpc::space::set_registration_expiry` expires a registration through the authority's worker (the
+tests no longer age `sN` rows with a direct `db.put`, which the worker's cached expiry would hide). The rows that still need
+minutes-to-hours timing or a mocked clock stay N/A and are covered by the outbox's own unit tests.
 
 | | Cases |
 |---|---:|
-| ported | 187 |
+| ported | 196 |
 | ported + divergent | 6 |
 | divergent | 1 |
-| N/A | 17 |
+| N/A | 8 |
 | **total** | **211** |
 
 Counted per `it()` case, with each `it.each` row counted once per value. Two more rows (marked "(vlpds)") are vlpds-only
@@ -1050,7 +1050,7 @@ tests of the 300 s cap and aren't counted.
 | managing-app: denies when the managing app cannot be resolved | ported | `..::managing_app_denies_when_unresolvable` (C3) |
 | managing-app: records a writer the managing app admits | ported | `..::managing_app_admits_a_writer` (C3) |
 | registers, forwards writes, and stops once withdrawn | ported | `..::registers_forwards_writes_and_stops_once_withdrawn` (C3) |
-| stops delivering to a registration past its expiry, and resumes on renewal | N/A | backdates the registration row in storage. No endpoint expires one, and `sN` expiry is the host's own test |
+| stops delivering to a registration past its expiry, and resumes on renewal | ported | `..::stops_past_expiry_and_resumes_on_renewal`. The row is expired through the authority's worker (`xrpc::space::set_registration_expiry`), and vlpds prunes it where the reference withholds it, so the renewal registers it again |
 | refuses a service that cannot be resolved | ported | `..::refuses_a_service_that_cannot_be_resolved` (C3) |
 | purges the authority own repo and keeps a tombstone | ported | `..::delete_purges_the_authority_repo_and_keeps_a_tombstone` (C5). Blob gone = space.getBlob refuses it |
 | answers SpaceDeleted on credential renewal | ported | `..::answers_space_deleted_on_credential_renewal` (C3) |
@@ -1145,14 +1145,14 @@ outbox, so these are outbox cases against a remote space host in `ref_space_sync
 | stops retrying HTTP 400/401/403/404/422/501 with an unfamiliar XRPC error name (6) | ported | same (not resent) |
 | retries local HTTP 429/503 failures (2) | N/A | mocks the actor store's reads. A local authority write is a worker op on the same node |
 | Forbidden/SpaceNotFound: does not queue a rejected notification (2) | ported | `..::outbox_keeps_retryable_refusals_and_drops_permanent_ones` |
-| Forbidden/SpaceNotFound: clears queued work when notify/retry is rejected (4) | N/A | needs a timed retry. A refusal dropping the row is covered by the case above, and a newer rev surviving an older refusal by `outbox_keeps_newer_work_when_an_older_send_finishes` |
+| Forbidden/SpaceNotFound: clears queued work when notify/retry is rejected (4) | ported | `..::outbox_clears_queued_work_when_a_send_is_refused`. The retry pause is shortened with `Outbox::set_retry_base` |
 | Forbidden/SpaceNotFound: stops on local authority rejections too (2) | ported | `..::outbox_stops_on_local_authority_rejections` (C3) |
 | persists failures before the HTTP request | ported | `..::outbox_persists_a_send_that_never_reached_the_host` (C1): the row is in the write's entry, so a restart sends it |
 | surfaces an error if the failed delivery cannot be queued | N/A | the row is part of the write. If its log PUT fails the write fails (`spaces_side::durability`) |
 | starts a fresh retry flow for a newer revision and ignores older or equal revisions | ported | `..::outbox_a_newer_write_sends_at_once_after_a_refusal` (the in-memory attempt counts aren't observable) |
 | keeps newer queued work when an older delivery finishes with 200/403/400 (3) | ported | `..::outbox_keeps_newer_work_when_an_older_send_finishes` (C1) |
 | backs off failed retries, caps the delay, and only reads due work | N/A | minutes-to-hours timing. The outbox's own unit tests |
-| preserves a fresh retry flow when an older retry finishes with 200/503/403/400 (4) | N/A | needs a due retry (1 min). The send path is the same as the case above |
+| preserves a fresh retry flow when an older retry finishes with 200/503/403/400 (4) | ported | `..::outbox_keeps_a_fresh_flow_when_an_older_retry_finishes`. The retry pause is shortened with `Outbox::set_retry_base` and the retry stalled at the mock host |
 | stops at the deadline and allows a later write to start a new retry window | N/A | the 24 h deadline. The outbox's own unit tests |
 | elects one retry worker and allows takeover after its lease expires | ported + divergent | no lease worker: the shard owner sends, and a takeover rescans `sP` (`spaces_side::durability`, and the restart cases above) |
 | defers retries for inactive accounts and resumes after activation | ported | `..::outbox_defers_inactive_accounts_and_resumes_on_activation` (C2) |

@@ -778,7 +778,7 @@ async fn notify_write_rejects_a_rev_that_is_not_a_tid() {
 // ---------------------------------------------------------------------------
 
 struct Outbox {
-    _net: Net,
+    net: Net,
     w: SpaceClient,
     host: MockService,
 }
@@ -787,7 +787,12 @@ impl Outbox {
     async fn new() -> Outbox {
         let net = Net::new(0).await;
         let w = net.actor("writer", 0).await;
-        Outbox { _net: net, w, host: MockService::space_host().await }
+        Outbox { net, w, host: MockService::space_host().await }
+    }
+
+    /// The writer node's first retry pause (the reference's is 1 min).
+    fn retry_after(&self, d: Duration) {
+        self.net.pds[0].app.spaces.as_ref().unwrap().outbox.set_retry_base(d);
     }
 
     fn space(&self, skey: &str) -> String {
@@ -932,6 +937,58 @@ async fn outbox_keeps_newer_work_when_an_older_send_finishes() {
         assert!(o.await_rev(&space, &newest).await, "HTTP {code}: the newest rev was dropped");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(o.sends(&space).len() <= 2, "HTTP {code}: coalesced: {:?}", o.sends(&space));
+    }
+}
+
+/// "clears queued work when notify/retry is rejected" (403 Forbidden, 400
+/// SpaceNotFound): a send fails with 503 and is queued for a retry; then
+/// either a newer write's send or the retry itself is refused, and nothing
+/// more is sent. The retry pause is shortened through the outbox's hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbox_clears_queued_work_when_a_send_is_refused() {
+    for (code, name) in [(403u16, "Forbidden"), (400, "SpaceNotFound")] {
+        for attempt in ["notify", "retry"] {
+            let o = Outbox::new().await;
+            let space = o.space("refused");
+            o.retry_after(match attempt {
+                "retry" => Duration::from_millis(300),
+                _ => Duration::from_secs(60),
+            });
+            o.host.respond(503, json!({}));
+            o.write(&space).await;
+            retry("the first send", || std::future::ready((!o.sends(&space).is_empty()).then_some(()))).await;
+            o.host.respond(code, json!({"error": name}));
+            if attempt == "notify" {
+                o.write(&space).await;
+            }
+            retry("the second send", || std::future::ready((o.sends(&space).len() >= 2).then_some(()))).await;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            assert_eq!(o.sends(&space).len(), 2, "HTTP {code} on the {attempt}: sent again after a refusal");
+            assert!(o.net.pds[0].app.spaces.as_ref().unwrap().outbox.is_empty(), "HTTP {code} on the {attempt}");
+        }
+    }
+}
+
+/// "preserves a fresh retry flow when an older retry finishes with $code"
+/// (200, 503, 403 Forbidden, 400 SpaceNotFound): a retry stalls at the
+/// host, a newer write lands, and whatever the stalled retry gets back,
+/// the newer rev is still delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbox_keeps_a_fresh_flow_when_an_older_retry_finishes() {
+    for (code, name) in [(200u16, None), (503, None), (403, Some("Forbidden")), (400, Some("SpaceNotFound"))] {
+        let o = Outbox::new().await;
+        let space = o.space("fresh");
+        o.retry_after(Duration::from_millis(200));
+        o.host.respond(503, json!({}));
+        o.write(&space).await;
+        retry("the first send", || std::future::ready((!o.sends(&space).is_empty()).then_some(()))).await;
+        let gate = o.host.gate.clone().lock_owned().await;
+        retry("the retry in flight", || std::future::ready((o.sends(&space).len() >= 2).then_some(()))).await;
+        let newer = o.write(&space).await;
+        o.host.respond(200, json!({}));
+        o.host.respond_once(code, name.map(|n| json!({"error": n})).unwrap_or(json!({})));
+        drop(gate);
+        assert!(o.await_rev(&space, &newer).await, "HTTP {code}: the newer rev was dropped");
     }
 }
 

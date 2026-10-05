@@ -519,6 +519,34 @@ async fn registers_forwards_writes_and_stops_once_withdrawn() {
     cred.post(pds1, "com.atproto.space.unregisterNotify", reg).await.ok();
 }
 
+/// notify registration: "stops delivering to a registration past its
+/// expiry, and resumes on renewal". The reference backdates the row in its
+/// store; here the test hook expires it through the authority's worker.
+/// vlpds prunes an expired registration rather than withholding it, and a
+/// renewal registers it again either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stops_past_expiry_and_resumes_on_renewal() {
+    let net = Net::new(2).await;
+    let (alice, bob, carol) = (net.actor("alice", 0).await, net.actor("bob", 1).await, net.actor("carol", 2).await);
+    let syncer = MockService::syncer().await;
+    let space = net.create_space(&alice, SpaceOpts { members: &[&bob, &carol], ..Default::default() }).await;
+    let cred = net.credential_for(&carol, &space).await;
+    let pds1 = &net.pds[0].url;
+    let reg = json!({"space": space, "service": syncer.service_ref()});
+    cred.post(pds1, "com.atproto.space.registerNotify", reg.clone()).await.ok();
+    let expired = vlpds::tid::now_micros() - 1_000_000;
+    vlpds::xrpc::space::set_registration_expiry(&net.pds[0].app, &space, &syncer.service_ref(), expired).await.unwrap();
+
+    write(&bob, &space, W::new().text("after expiry")).await.ok();
+    net.await_writer(&alice, &space, &bob.did).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(syncer.calls_to(NOTIFY_WRITE).len(), 0, "delivered past its expiry");
+
+    cred.post(pds1, "com.atproto.space.registerNotify", reg).await.ok();
+    write(&bob, &space, W::new().text("after renewal")).await.ok();
+    syncer.await_calls(NOTIFY_WRITE, 1, Duration::from_secs(10)).await.expect("forwarded after renewal");
+}
+
 /// notify registration: "refuses a service that cannot be resolved"
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn refuses_a_service_that_cannot_be_resolved() {
