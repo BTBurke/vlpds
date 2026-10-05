@@ -301,12 +301,12 @@ fn uri_path(uri: &str) -> String {
     format!("{}/{}", parts[4], parts[5])
 }
 
-fn bytes_field(v: &J) -> Vec<u8> {
+pub(super) fn bytes_field(v: &J) -> Vec<u8> {
     let b = v["$bytes"].as_str().unwrap_or_else(|| panic!("not $bytes: {v}"));
     base64::engine::general_purpose::STANDARD_NO_PAD.decode(b.trim_end_matches('=')).expect("base64")
 }
 
-fn signed_commit(j: &J) -> SignedCommit {
+pub(super) fn signed_commit(j: &J) -> SignedCommit {
     SignedCommit {
         ver: j["ver"].as_i64().expect("ver"),
         hash: bytes_field(&j["hash"]),
@@ -317,7 +317,7 @@ fn signed_commit(j: &J) -> SignedCommit {
     }
 }
 
-fn fold(set: &mut LtHash, op: &J) {
+pub(super) fn fold(set: &mut LtHash, op: &J) {
     let (c, k) = (op["collection"].as_str().unwrap(), op["rkey"].as_str().unwrap());
     if let Some(p) = op["prev"].as_str() {
         set.remove(&commit::element(c, k, p));
