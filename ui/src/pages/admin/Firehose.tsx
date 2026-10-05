@@ -1,6 +1,6 @@
 import { useRef } from 'react'
 import { Empty, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
-import { fmtBytes, fmtNum, fmtSi, relTime } from '../../lib/format'
+import { fmtBytes, fmtNum, fmtSi, relTime, seqMillis } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
 
@@ -13,10 +13,10 @@ type Subscriber = {
   userAgent: string
   relay: string | null
   connectedAt: number
-  cursor: number | null
+  cursor: string | null
   shard: string | null
   state: 'live' | 'backfilling'
-  lastSeq: number
+  lastSeq: string
   events: number
   bytes: number
   lagBytes: number | null
@@ -75,6 +75,12 @@ function lag(s: Subscriber): string {
   if (s.lagMs != null) return s.lagMs < 1000 ? 'caught up' : `${dur(s.lagMs)} behind`
   if (s.lagEvents != null) return s.lagEvents === 0 ? 'caught up' : `${fmtNum(s.lagEvents)} events behind`
   return '—'
+}
+
+/** A time-based seq reads as when it was assigned; small ones (0, renumbered streams) as they are. */
+function Cursor({ seq }: { seq: string }) {
+  const ms = seq.length > 12 ? seqMillis(seq) : undefined
+  return <span title={seq}>{ms !== undefined ? `from ${relTime(ms)}` : seq}</span>
 }
 
 const key = (s: Subscriber) => `${s.node}/${s.conn}`
@@ -190,12 +196,12 @@ export function Firehose() {
                 <tr>
                   <th>Conn</th>
                   <th>Client</th>
-                  <th>User agent</th>
-                  <th className="num">Connected</th>
-                  <th>Cursor</th>
                   <th>State</th>
                   <th className="num">Lag</th>
                   <th className="num" title="Events sent per second, against this PDS's firehose rate">Events/s</th>
+                  <th className="num">Connected</th>
+                  <th>Cursor</th>
+                  <th>User agent</th>
                   <th className="num">Events</th>
                   <th className="num">Bytes</th>
                 </tr>
@@ -203,7 +209,7 @@ export function Firehose() {
               <tbody>
                 {d.subscribers.map((s) => {
                   const r = rates.subs.get(key(s))
-                  const slow = s.state === 'live' && r !== undefined && rates.pds !== undefined && rates.pds > 1 && r < rates.pds * 0.9
+                  const slow = s.state === 'live' && !s.shard && r !== undefined && rates.pds !== undefined && rates.pds > 1 && r < rates.pds * 0.9
                   return (
                     <tr key={key(s)}>
                       <td>
@@ -223,16 +229,6 @@ export function Firehose() {
                           </div>
                         )}
                       </td>
-                      <td className="ua" title={s.userAgent}>
-                        {s.userAgent || <span className="muted">none</span>}
-                      </td>
-                      <td className="num" title={new Date(s.connectedAt).toLocaleString()}>
-                        {dur(d.time - s.connectedAt)}
-                      </td>
-                      <td className="mono">
-                        {s.cursor != null ? s.cursor : <span className="muted">live</span>}
-                        {s.shard && <div className="muted small">shard {s.shard}</div>}
-                      </td>
                       <td>{s.state === 'live' ? <Status kind="ok">Live</Status> : <Status kind="warn">Backfilling</Status>}</td>
                       <td className="num">
                         {lag(s)}
@@ -241,6 +237,16 @@ export function Firehose() {
                       <td className="num">
                         {r !== undefined ? <span className={slow ? 'slow' : undefined}>{fmtSi(r)}</span> : '—'}
                         {rates.pds !== undefined && <div className="muted small">of {fmtSi(rates.pds)}</div>}
+                      </td>
+                      <td className="num" title={new Date(s.connectedAt).toLocaleString()}>
+                        {dur(d.time - s.connectedAt)}
+                      </td>
+                      <td className="mono">
+                        {s.cursor == null ? <span className="muted">none</span> : <Cursor seq={s.cursor} />}
+                        {s.shard && <div className="muted small">shard {s.shard}</div>}
+                      </td>
+                      <td className="ua" title={s.userAgent}>
+                        {s.userAgent || <span className="muted">none</span>}
                       </td>
                       <td className="num">{fmtNum(s.events)}</td>
                       <td className="num">{fmtBytes(s.bytes)}</td>
@@ -263,11 +269,11 @@ export function Firehose() {
                 <tr>
                   <th>Conn</th>
                   <th>Client</th>
-                  <th>User agent</th>
                   <th>Reason</th>
+                  <th className="num">Left</th>
                   <th className="num">Stayed</th>
                   <th className="num">Events</th>
-                  <th className="num">Left</th>
+                  <th>User agent</th>
                 </tr>
               </thead>
               <tbody>
@@ -285,19 +291,19 @@ export function Firehose() {
                         </div>
                       )}
                     </td>
-                    <td className="ua" title={s.userAgent}>
-                      {s.userAgent || <span className="muted">none</span>}
-                    </td>
                     <td>
-                      {s.reason === 'too_slow' || s.reason === 'write_stalled' || s.reason === 'backfill_failed' ? (
+                      {s.reason == 'too_slow' || s.reason === 'write_stalled' || s.reason === 'backfill_failed' ? (
                         <Status kind="bad">{REASONS[s.reason]}</Status>
                       ) : (
                         <Status kind="idle">{REASONS[s.reason ?? ''] ?? s.reason}</Status>
                       )}
                     </td>
+                    <td className="num">{s.disconnectedAt ? relTime(s.disconnectedAt) : '—'}</td>
                     <td className="num">{dur((s.disconnectedAt ?? d.time) - s.connectedAt)}</td>
                     <td className="num">{fmtNum(s.events)}</td>
-                    <td className="num">{s.disconnectedAt ? relTime(s.disconnectedAt) : '—'}</td>
+                    <td className="ua" title={s.userAgent}>
+                      {s.userAgent || <span className="muted">none</span>}
+                    </td>
                   </tr>
                 ))}
               </tbody>

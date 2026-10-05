@@ -1527,11 +1527,12 @@ pub struct SubscriberView {
     pub user_agent: String,
     pub relay: Option<String>,
     pub connected_at: u64,
-    pub cursor: Option<i64>,
+    /// Seqs as strings: they're past 2^53, where JSON numbers lose digits.
+    pub cursor: Option<String>,
     pub shard: Option<String>,
     /// backfilling | live
     pub state: String,
-    pub last_seq: i64,
+    pub last_seq: String,
     pub events: u64,
     pub bytes: u64,
     /// Live only: bytes of the stream it hasn't been sent yet.
@@ -1566,10 +1567,10 @@ impl Firehose {
                 user_agent: e.user_agent.clone(),
                 relay: e.relay.clone(),
                 connected_at: e.connected_at_ms,
-                cursor: e.cursor,
+                cursor: e.cursor.map(|c| c.to_string()),
                 shard: e.shard.clone(),
                 state: if backfilling { "backfilling" } else { "live" }.into(),
-                last_seq,
+                last_seq: last_seq.to_string(),
                 events: s.events.load(Ordering::Relaxed),
                 bytes: s.bytes.load(Ordering::Relaxed),
                 lag_bytes: (!backfilling && sent_to > 0).then(|| head.saturating_sub(sent_to)),
@@ -2854,8 +2855,8 @@ mod tests {
         assert_eq!((live.len(), gone.len()), (1, 0));
         let v = &live[0];
         assert_eq!(
-            (v.conn.as_str(), v.ip.as_deref(), v.state.as_str(), v.cursor, v.shard.as_deref()),
-            ("7", Some("192.0.2.44"), "backfilling", Some(5), Some("1/4"))
+            (v.conn.as_str(), v.ip.as_deref(), v.state.as_str(), v.cursor.as_deref(), v.shard.as_deref()),
+            ("7", Some("192.0.2.44"), "backfilling", Some("5"), Some("1/4"))
         );
         assert_eq!(v.lag_bytes, None, "no byte lag while backfilling");
         conn.backfilling.store(false, Ordering::Relaxed);

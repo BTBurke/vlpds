@@ -47,7 +47,7 @@ async fn lists_subscribers_until_they_leave() {
     let by_relay = subs.iter().find(|v| v["relay"] == "relay.example.com").expect("the relay is named");
     assert_eq!(by_relay["userAgent"], "indigo-relay (relay.example.com)");
     assert!(by_relay["cursor"].is_null());
-    let backfill = subs.iter().find(|v| v["cursor"] == 0).expect("the cursor subscriber");
+    let backfill = subs.iter().find(|v| v["cursor"] == "0").expect("the cursor subscriber");
     assert!(backfill["relay"].is_null());
     assert_eq!(r["nodes"][0]["node"], "single");
     assert!(r["nodes"][0]["eventsEmitted"].as_u64().is_some());
@@ -57,7 +57,7 @@ async fn lists_subscribers_until_they_leave() {
     other.next(Duration::from_secs(10)).await.expect("an event");
     eventually(Duration::from_secs(10), || async {
         let r = list(&s).await;
-        let v = r["subscribers"].as_array().unwrap().iter().find(|v| v["cursor"] == 0).cloned()?;
+        let v = r["subscribers"].as_array().unwrap().iter().find(|v| v["cursor"] == "0").cloned()?;
         (v["events"].as_u64()? > 0 && v["bytes"].as_u64()? > 0 && v["state"] == "live").then_some(())
     })
     .await
