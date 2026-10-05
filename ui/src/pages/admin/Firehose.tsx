@@ -1,5 +1,5 @@
 import { useRef } from 'react'
-import { Empty, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
+import { CopyValue, Empty, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
 import { fmtBytes, fmtNum, fmtSi, relTime, seqMillis } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
@@ -97,7 +97,7 @@ function ClientCells({ s }: { s: Subscriber }) {
   return (
     <>
       <td>
-        <span className="mono">{s.ip ?? 'unknown'}</span>
+        {s.ip ? <CopyValue text={s.ip} label={`Copy IP ${s.ip}`} /> : <span className="mono">unknown</span>}
         {s.relay && <span className="pill accent">{s.relay}</span>}
       </td>
       <td className="net" title={as}>
@@ -113,10 +113,18 @@ function ClientCells({ s }: { s: Subscriber }) {
         )}
       </td>
       <td className="ptr" title={ptrTip}>
-        {s.ptr && s.ptrVerified ? <span className="trunc mono muted">{s.ptr}</span> : <span className="muted">—</span>}
+        {s.ptr && s.ptrVerified ? (
+          <CopyValue text={s.ptr} label={`Copy reverse DNS ${s.ptr}`} title={ptrTip} className="trunc muted" />
+        ) : (
+          <span className="muted">—</span>
+        )}
       </td>
     </>
   )
+}
+
+function UserAgent({ ua }: { ua: string }) {
+  return ua ? <CopyValue text={ua} label={`Copy user agent ${ua}`} title={ua} mono={false} /> : <span className="muted">none</span>
 }
 
 const key = (s: Subscriber) => `${s.node}/${s.conn}`
@@ -279,7 +287,7 @@ export function Firehose() {
                         {s.shard && <span className="muted small"> · shard {s.shard}</span>}
                       </td>
                       <td className="ua" title={s.userAgent}>
-                        {s.userAgent || <span className="muted">none</span>}
+                        <UserAgent ua={s.userAgent} />
                       </td>
                       <td className="num">{fmtNum(s.events)}</td>
                       <td className="num">{fmtBytes(s.bytes)}</td>
@@ -330,7 +338,7 @@ export function Firehose() {
                     <td className="num">{dur((s.disconnectedAt ?? d.time) - s.connectedAt)}</td>
                     <td className="num">{fmtNum(s.events)}</td>
                     <td className="ua" title={s.userAgent}>
-                      {s.userAgent || <span className="muted">none</span>}
+                      <UserAgent ua={s.userAgent} />
                     </td>
                   </tr>
                 ))}

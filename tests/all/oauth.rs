@@ -1688,6 +1688,27 @@ async fn sign_up_page_with_required_invites() {
         .await;
     assert_eq!(st, 400, "{html}");
     assert!(html.contains("invite code not available"), "{html}");
+
+    // a real code: the sign-up uses it, listed like a createAccount's use
+    let admin = |r: reqwest::RequestBuilder| async move {
+        let v: J = r.basic_auth("admin", Some("dev-admin-token")).send().await.unwrap().json().await.unwrap();
+        v
+    };
+    let code = admin(
+        s.http.post(format!("{}/xrpc/com.atproto.server.createInviteCode", s.base)).json(&json!({"useCount": 2})),
+    )
+    .await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (st, _, html) =
+        b.post(&s, "/oauth/authorize/sign-up", &sign_up_form(&ru, &csrf_of(&html), &name, &email, Some(&code))).await;
+    assert_eq!(st, 200, "{html}");
+    let did = hidden_field(&html, "did").expect("did on the consent form");
+    let all = admin(s.http.get(format!("{}/xrpc/com.atproto.admin.getInviteCodes?limit=500", s.base))).await;
+    let v = all["codes"].as_array().unwrap().iter().find(|c| c["code"] == code.as_str()).unwrap();
+    assert_eq!(v["available"], json!(2), "{v}");
+    assert_eq!(v["uses"].as_array().unwrap().iter().map(|u| u["usedBy"].clone()).collect::<Vec<_>>(), vec![json!(did)]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -230,6 +230,29 @@ async fn put_invite(app: &App, inv: &InviteCode) -> XResult<()> {
     app.put_private(&r, vec![pmut(&r, "c", Some(to_json_bytes(inv)))]).await
 }
 
+/// Read-modify-write of a code, conditional on the row read: signups record
+/// their uses from whichever node owns the new account, and a node-local lock
+/// let two nodes each write back a copy missing the other's use. `f` returns
+/// whether it changed anything. Ok(false): no such code.
+async fn update_invite(app: &App, code: &str, mut f: impl FnMut(&mut InviteCode) -> bool) -> XResult<bool> {
+    use super::cas::{Cond, Op};
+    let r = invite_routing(code);
+    for _ in 0..64 {
+        let Some(raw) = app.get_private(&r, "c").await? else {
+            return Ok(false);
+        };
+        let mut inv: InviteCode = serde_json::from_slice(&raw).map_err(XrpcError::from_err)?;
+        if !f(&mut inv) {
+            return Ok(true);
+        }
+        let val = Bytes::from(to_json_bytes(&inv));
+        if app.private_cas(&r, vec![Cond::eq("c", Some(raw))], vec![Op::put("c", Some(val))]).await?.applied {
+            return Ok(true);
+        }
+    }
+    Err(super::server::cas_conflict())
+}
+
 /// `account`: a DID or "admin". `created_by`: "admin", or the account itself
 /// for codes earned with `--invite-interval`.
 pub(super) async fn create_invites(
@@ -319,28 +342,31 @@ pub(super) async fn release_invite_use(app: &App, claim: InviteClaim) {
 }
 
 pub(super) async fn record_invite_use(app: &App, claim: &InviteClaim, did: &str) -> XResult<()> {
-    let code = claim.code.as_str();
-    let e = ext(app);
-    let _g = e.lock(&invite_routing(code)).await;
-    let mut inv = get_invite(app, code)
-        .await?
-        .ok_or_else(|| XrpcError::bad("InvalidInviteCode", "Provided invite code not available"))?;
-    inv.uses.push(InviteUse { used_by: did.to_string(), used_at: crate::events::now_rfc3339() });
-    put_invite(app, &inv).await?;
+    let used_at = crate::events::now_rfc3339();
+    let found = update_invite(app, &claim.code, |inv| {
+        // a retried request mustn't list the account twice
+        if inv.uses.iter().any(|u| u.used_by == did) {
+            return false;
+        }
+        inv.uses.push(InviteUse { used_by: did.to_string(), used_at: used_at.clone() });
+        true
+    })
+    .await?;
+    if !found {
+        return Err(XrpcError::bad("InvalidInviteCode", "Provided invite code not available"));
+    }
     crate::metrics::INVITE_CODES.with_label_values(&["used"]).inc();
     Ok(())
 }
 
 async fn set_invites_disabled(app: &App, codes: &[String], disabled: bool) -> XResult<()> {
-    let e = ext(app);
     for code in codes {
-        let _g = e.lock(&invite_routing(code)).await;
-        if let Some(mut inv) = get_invite(app, code).await? {
-            if inv.disabled != disabled {
-                inv.disabled = disabled;
-                put_invite(app, &inv).await?;
-            }
-        }
+        update_invite(app, code, |inv| {
+            let changed = inv.disabled != disabled;
+            inv.disabled = disabled;
+            changed
+        })
+        .await?;
     }
     Ok(())
 }

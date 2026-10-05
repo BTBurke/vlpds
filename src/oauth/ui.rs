@@ -22,6 +22,8 @@ main{max-width:480px;margin:6vh auto 8vh;padding:0 16px}
 .brand{display:flex;align-items:center;gap:10px;margin:0 0 18px;font-weight:800;font-size:17px;letter-spacing:-.01em}
 .brand svg{display:block}
 .brand span{color:var(--ink2);font-weight:500;font-size:14px}
+.gh{margin-left:auto;display:flex;padding:6px;border-radius:6px;color:var(--ink2)}
+.gh:hover{color:var(--ink);background:var(--sheet)}
 .card{background:var(--sheet);border:1px solid var(--rule);border-radius:8px;padding:26px 24px 22px;box-shadow:0 1px 0 var(--rule)}
 .strata{height:5px;margin:-26px -24px 22px;border-radius:7px 7px 0 0;background:linear-gradient(var(--accent) 0 2px,transparent 2px 3px,var(--amber) 3px 4px,transparent 4px)}
 h1{font-size:24px;line-height:1.2;letter-spacing:-.015em;margin:0 0 6px;font-weight:750}
@@ -130,6 +132,10 @@ const MARK: &str = "<svg width=\"22\" height=\"18\" viewBox=\"0 0 22 18\" aria-h
 <rect x=\"3\" y=\"7\" width=\"16\" height=\"4\" rx=\"1\" fill=\"currentColor\" opacity=\".6\"/>\
 <rect x=\"6\" y=\"14\" width=\"10\" height=\"4\" rx=\"1\" fill=\"currentColor\" opacity=\".35\"/></svg>";
 
+/// GitHub's mark, linking the source as the web UI's top bar does.
+const SOURCE_LINK: &str = "<a class=\"gh\" href=\"https://github.com/jazware/vlpds\" aria-label=\"Source on GitHub\" title=\"Source on GitHub\">\
+<svg width=\"18\" height=\"18\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z\"/></svg></a>";
+
 pub fn page(title: &str, body: &str) -> String {
     page_with_script(title, body, "")
 }
@@ -139,9 +145,8 @@ fn page_with_script(title: &str, body: &str, script: &str) -> String {
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <meta name=\"referrer\" content=\"no-referrer\"><title>{}</title><style>{STYLE}</style></head><body><main>\
-<div class=\"brand\">{MARK}vlpds<span>account security</span></div>\
-<div class=\"card\"><div class=\"strata\"></div>{body}</div>\
-<footer class=\"muted\"><a href=\"https://github.com/jazware/vlpds\">Source on GitHub</a></footer></main>{script}</body></html>",
+<div class=\"brand\">{MARK}vlpds<span>account security</span>{SOURCE_LINK}</div>\
+<div class=\"card\"><div class=\"strata\"></div>{body}</div></main>{script}</body></html>",
         e(title)
     )
 }

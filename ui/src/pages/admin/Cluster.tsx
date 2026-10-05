@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { CopyText, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
+import { CopyText, CopyValue, ErrorNotice, Loading, Notice, Panel, Status } from '../../components/ui'
 import { fmtNum, fmtTime, relTime, seqMillis } from '../../lib/format'
 import { useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
@@ -209,7 +209,9 @@ function NodesPanel({ d, ids, focus, onFocus }: { d: ClusterStatus; ids: string[
                       {n.self && <span className="pill accent">this node</span>}
                     </span>
                   </td>
-                  <td className="mono small muted">{n.addr.replace(/^https?:\/\//, '')}</td>
+                  <td className="small muted">
+                    <CopyValue text={n.addr.replace(/^https?:\/\//, '')} label={`Copy address ${n.addr}`} title={`${n.addr} (click to copy)`} />
+                  </td>
                   <td className="num mono">{n.writer}</td>
                   <td title={`Lease expires ${relTime(n.expiresMs)}`}>
                     {!n.reachable ? (
@@ -229,7 +231,7 @@ function NodesPanel({ d, ids, focus, onFocus }: { d: ClusterStatus; ids: string[
                   </td>
                   <td className="num">{n.owned ?? counts.get(n.node) ?? '—'}</td>
                   <td className="mono small" title={n.seenLevel ? `Last read active level ${n.seenLevel}` : undefined}>
-                    {n.rev ? n.rev.slice(0, 12) : '—'}{' '}
+                    {n.rev ? <CopyValue text={n.rev} display={n.rev.slice(0, 12)} label={`Copy build ${n.rev}`} title={`${n.rev} (click to copy)`} /> : '—'}{' '}
                     {n.maxLevel != null && (
                       <span className={n.maxLevel > (d.version?.active ?? n.maxLevel) ? 'pill amber' : 'muted'}>
                         L{n.minLevel === n.maxLevel ? n.maxLevel : `${n.minLevel}–${n.maxLevel}`}

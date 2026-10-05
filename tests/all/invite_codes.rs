@@ -75,6 +75,36 @@ async fn fails_on_used_up_invite_code() {
     signup(&s, Some(&code)).await.err(400, "InvalidInviteCode");
 }
 
+/// The admin listing's view of a code (the console's invites table).
+async fn listed(s: &TestServer, code: &str) -> J {
+    let r = s.xrpc.get("com.atproto.admin.getInviteCodes", &[("limit", "500")], &Auth::Admin).await.ok();
+    r["codes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["code"] == code)
+        .cloned()
+        .unwrap_or_else(|| panic!("{code} not listed: {r}"))
+}
+
+/// `available` is the code's total, as the reference's CodeDetail (its
+/// clients count `available - uses.length` as left), so a use shows as a
+/// new entry in `uses` and the total stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn listing_counts_a_use_against_the_total() {
+    let s = server().await;
+    let code = create_invite(&s, 2, None).await;
+    let acct = signup_ok(&s, &code).await;
+    let v = listed(&s, &code).await;
+    assert_eq!(v["available"], json!(2), "{v}");
+    let uses = v["uses"].as_array().unwrap();
+    assert_eq!(uses.len(), 1, "{v}");
+    assert_eq!(uses[0]["usedBy"], json!(acct.did));
+    signup_ok(&s, &code).await;
+    let v = listed(&s, &code).await;
+    assert_eq!((v["available"].clone(), v["uses"].as_array().unwrap().len()), (json!(2), 2), "{v}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn handles_racing_invite_code_uses() {
     let s = std::sync::Arc::new(server().await);
