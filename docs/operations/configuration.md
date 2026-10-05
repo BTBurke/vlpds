@@ -258,7 +258,7 @@ has the flags the sections above don't cover.
 | PLC | `--plc-url`, `--plc-mode` (`auto`, `directory`, `unregistered`), `--plc-rotation-key-file`, `--plc-rotation-key-old[-file]`, `--plc-recovery-did-key`, and the one-shot `--wrap-plc-rotation-key` and `--generate-did-key` |
 | Services | `--appview`, `--report-service` (`<url>,<did>`), `--bsky-app-view-cdn-url-pattern`, `--mod-service-did` |
 | Relays | `--crawlers` (`bsky.network`), `--crawl-interval-secs` (1,200). See [Relays and crawling](relays-and-crawling.md). |
-| Accounts | `--invite-required`, `--invite-interval-ms`, `--invite-epoch-ms`, `--resolve-lexicons`, `--privacy-policy-url`, `--terms-of-service-url`, `--contact-email-address` |
+| Accounts | `--invite-required`, `--invite-interval-ms`, `--invite-epoch-ms`, `--trusted-device-days` (30, 0 turns "Trust this browser" off), `--resolve-lexicons`, `--privacy-policy-url`, `--terms-of-service-url`, `--contact-email-address` |
 | Email | `--email-smtp-url[-file]`, `--email-from-address`, `--email-brand-name` and the other branding flags, `--moderation-email-smtp-url[-file]`, `--moderation-email-address` (see [Email and moderation](email-and-moderation.md)) |
 | SlateDB | `--sst-compression` (`zstd`), `--compaction-polling` (`adaptive`), `--compaction-poll` (30 s), `--slatedb-gc-min-age` (10 min), `--slatedb-checkpoint-lifetime` (1 h), `--slatedb-detach-interval` |
 | Resharding | `--reshard-split-mb`, `--reshard-split-writes`, `--reshard-gc-grace` (1 h), `--forced-detach-after` (5 min), `--full-compaction-every` (off) |
