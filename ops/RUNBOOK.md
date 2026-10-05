@@ -1712,7 +1712,8 @@ hour (`vlpds_space_outbox_oldest_seconds`). Every space write is durable and
 readable at its 200. The outbox only tells the authority that the repo moved,
 so syncers find the write later than they should. Each (repo, space) has one
 row that always carries the newest rev. Sends retry from 1 min, doubling to
-1 h, and a row is dropped 24 h after its write. The row's `sP` key survives a
+1 h, and a row is dropped 24 h after its rev was owed (written, renotified,
+or found when its shard opened). The row's `sP` key survives a
 restart or a takeover, and the next owner sends it again.
 
 **Causes:** the authority's PDS is down or answering 5xx, its DID doesn't

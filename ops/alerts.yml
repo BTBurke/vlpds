@@ -1199,7 +1199,7 @@ groups:
     rules:
       # A node's oldest notifyWrite outbox row has waited over an hour: some
       # authority hasn't acknowledged a write for that long. Retries back off
-      # from 1 min to 1 h and give up 24 h after the write, so an hour means
+      # from 1 min to 1 h and give up 24 h after the rev was owed, so an hour means
       # several failed sends in a row (design: the retry schedule).
       - alert: VlpdsSpaceOutboxBacklog
         expr: max by (instance) (vlpds_space_outbox_oldest_seconds{job="vlpds"}) > 3600

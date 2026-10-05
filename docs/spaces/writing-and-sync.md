@@ -123,7 +123,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 |---|---|
 | When it sends | as soon as nothing is in flight for that (repo, space), with no linger |
 | Where it sends | a local authority is told on its own worker with no HTTP. One on another cluster node gets `/internal/v1/space/notify`. When that node says the cluster doesn't host the authority, the sender remembers it for 5 min and goes straight to HTTP. Anything else gets `notifyWrite` at its `#atproto_space_host` (or `#atproto_pds`) with the writer's service auth, a 10 s timeout and the SSRF-guarded client |
-| Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was written. A permanent refusal drops the row |
+| Retries | from 1 min, doubling to 1 h with 50–100% jitter, until 24 h after the rev was owed (written, renotified after a takedown, or found when its shard opened), not 24 h after the rev's own time, so an old rev (an import, a writer back from deactivation) gets its retries too. A permanent refusal drops the row |
 | Inactive writers | a taken-down or deactivated account's rows wait and resume on reactivation |
 | Cleanup | a delivered row's `sP` delete rides the author's next space write, so delivery costs no PUT |
 | Bounds | 262,144 rows held in memory (the rest are rescanned once it drains to half) and 256 sends in flight. One authority gets 8 at most, and authorities whose last send failed share 32, so a slow one can't hold up the rest |

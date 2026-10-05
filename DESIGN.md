@@ -5365,8 +5365,10 @@ authority is told on its own worker, one on another node over
 `/internal/v1/space/notify`, anything else with `notifyWrite` and the
 writer's service auth. An authority hosted elsewhere whose DID lands in
 another node's shard would cost an internal call per send to learn that,
-so the answer is kept for 5 min (4,096 authorities at most). Retries run from 1 min to 1 h with jitter for 24 h,
-and a permanent refusal drops the row. A delivered row's delete rides the
+so the answer is kept for 5 min (4,096 authorities at most). Retries run from 1 min to 1 h with jitter for 24 h
+from when the rev was owed (as the reference's `expiresAt = now + DAY`;
+the rev's own time would give an imported or renotified old rev one
+try), and a permanent refusal drops the row. A delivered row's delete rides the
 author's next space write. When a shard opens, its `sP` rows are rescanned
 (retried with backoff until it scans or the shard moves, bad rows skipped)
 and the newest rev is sent. Rows of a taken-down or deactivated account
