@@ -1512,7 +1512,7 @@ async fn nudge_revocation_peers(app: &Arc<App>, block: Option<&str>) {
         let (app, block) = (app.clone(), block.clone());
         async move {
             if let Err(e) = nudge_revocation_peer(&app, &l.addr, block.as_deref()).await {
-                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (retrying): {e}");
+                tracing::warn!(peer = %l.node_id, "space revocation nudge failed (retrying): {}", e.without_url());
                 tokio::spawn(async move {
                     let mut wait = std::time::Duration::from_secs(1);
                     for _ in 0..REVOKE_NUDGE_RETRIES {
@@ -1683,7 +1683,7 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         Ok(r) if r.status().is_success() => Outcome::Delivered,
         Ok(r) if retryable_status(r.status().as_u16()) => Outcome::Retry(format!("{} from {url}", r.status())),
         Ok(r) => Outcome::Refused(format!("{} from {url}", r.status())),
-        Err(e) => Outcome::Retry(format!("{url}: {e}")),
+        Err(e) => Outcome::Retry(crate::space::host::http_error(&url, e)),
     }
 }
 

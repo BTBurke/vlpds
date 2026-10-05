@@ -575,7 +575,8 @@ pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
         .query(&[("did", did)])
         .send()
         .await
-        .map_err(upstream)?;
+        // the URL names the DID (a space's authority or member)
+        .map_err(|e| upstream(e.without_url()))?;
     if r.status().is_client_error() {
         // the owner's own error (AccountNotFound, ...)
         let status = r.status();
@@ -589,7 +590,7 @@ pub async fn account_anywhere(app: &App, did: &str) -> XResult<Account> {
     if !r.status().is_success() {
         return Err(upstream(format!("{}: {}", r.status(), r.text().await.unwrap_or_default())));
     }
-    r.json().await.map_err(upstream)
+    r.json().await.map_err(|e| upstream(e.without_url()))
 }
 
 /// Single-use claim of an OAuth replay `key` until `until` (unix secs), at

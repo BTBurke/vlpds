@@ -49,6 +49,12 @@ pub async fn resolve_service_endpoint(app: &App, service: &str) -> Option<String
     ep.filter(|e| e.len() <= MAX_ENDPOINT)
 }
 
+/// A send's error for the logs, without its URL: a query names the space
+/// and its members, which the logs must not (privacy.md).
+pub(crate) fn http_error(what: &str, e: reqwest::Error) -> String {
+    format!("{what}: {}", e.without_url())
+}
+
 /// A call to `service` at `endpoint` as `iss` (an account hosted here):
 /// Ok(status, JSON body) once it answered.
 #[allow(clippy::too_many_arguments)]
@@ -73,10 +79,10 @@ async fn call(
     if let Some(b) = body {
         rb = rb.json(b);
     }
-    let mut r = rb.send().await.map_err(|e| format!("{url}: {e}"))?;
+    let mut r = rb.send().await.map_err(|e| http_error(&url, e))?;
     let status = r.status().as_u16();
     let mut buf = Vec::new();
-    while let Some(c) = r.chunk().await.map_err(|e| format!("{url}: {e}"))? {
+    while let Some(c) = r.chunk().await.map_err(|e| http_error(&url, e))? {
         if buf.len() + c.len() > MAX_RESPONSE {
             return Err(format!("{url}: response too large"));
         }
@@ -303,12 +309,12 @@ pub async fn check_served_hash(
         .timeout(CHECK_TIMEOUT)
         .send()
         .await
-        .map_err(|e| format!("getLatestCommit: {e}"))?;
+        .map_err(|e| http_error("getLatestCommit", e))?;
     if !r.status().is_success() {
         return Err(format!("getLatestCommit: {}", r.status()));
     }
     let mut buf = Vec::new();
-    while let Some(c) = r.chunk().await.map_err(|e| format!("getLatestCommit: {e}"))? {
+    while let Some(c) = r.chunk().await.map_err(|e| http_error("getLatestCommit", e))? {
         if buf.len() + c.len() > MAX_RESPONSE {
             return Err("getLatestCommit: response too large".into());
         }
@@ -354,4 +360,23 @@ pub async fn check_served_hash(
         }
     }
     Err("the commit doesn't verify against the writer's key".into())
+}
+
+#[cfg(test)]
+mod tests {
+    /// An unreachable endpoint's error names neither the space nor the
+    /// member its query carried.
+    #[tokio::test]
+    async fn send_errors_leave_the_url_out() {
+        let space = "at://did:plc:secretauthority0000000000/space/com.example.group/skey";
+        let e = reqwest::Client::new()
+            .get("http://127.0.0.1:1/xrpc/com.atproto.space.getLatestCommit")
+            .query(&[("space", space), ("repo", "did:plc:secretmember")])
+            .send()
+            .await
+            .unwrap_err();
+        assert!(e.to_string().contains("secret"), "reqwest names the URL: {e}");
+        let logged = super::http_error("getLatestCommit", e);
+        assert!(!logged.contains("secret") && !logged.contains("did:plc"), "{logged}");
+    }
 }
