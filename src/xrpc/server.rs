@@ -1036,7 +1036,7 @@ pub(super) fn cas_conflict() -> XrpcError {
 /// the access token the restricted scope (the reference's createSession for
 /// a soft-deleted account). `epoch` ([`epoch_for_login`]) must still be
 /// current for the session to be created.
-async fn create_session_tokens(
+pub(super) async fn create_session_tokens(
     app: &App,
     did: &str,
     ap: Option<AppPassRef>,
@@ -1232,7 +1232,7 @@ fn refresh_claims(app: &App, headers: &HeaderMap, allow_expired: bool) -> XResul
     Ok(c)
 }
 
-async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
+pub(super) async fn session_info(app: &App, a: &Account, include_email: bool) -> J {
     let mut out = json!({"did": a.did, "handle": a.handle, "active": a.status.is_none()});
     // reference safeResolveDidDoc: omitted when it doesn't resolve
     if let Ok(doc) = super::identity::account_did_doc(app, a).await {
@@ -1689,7 +1689,7 @@ struct LoginStep {
 /// Fetch metadata can't be set by a cross-site page, so only those pages
 /// get to use the device cookie on createSession, and the OAuth-only switch
 /// lets them through to the second factor.
-fn own_page(headers: &HeaderMap) -> bool {
+pub(super) fn own_page(headers: &HeaderMap) -> bool {
     headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) == Some("same-origin")
 }
 
@@ -1710,6 +1710,7 @@ async fn create_session(
         Err(e) if e.error == "AccountTakedown" => "inactive",
         Err(e) if e.error == OAUTH_REQUIRED => "oauth_required",
         Err(e) if e.error == APP_PASSWORDS_BLOCKED => "app_passwords_blocked",
+        Err(e) if e.error == PASSKEY_REQUIRED => "passkey_required",
         Err(_) => "failed",
     };
     crate::metrics::login(step.method, result);
@@ -1717,6 +1718,19 @@ async fn create_session(
 }
 
 const OAUTH_REQUIRED: &str = "OAuthRequired";
+pub(super) const PASSKEY_REQUIRED: &str = "PasskeyRequired";
+
+/// A passkey is the account's only strong factor, and no browser vouched
+/// for this request's origin: its main password only works on this
+/// server's own pages, with the passkey. Not "Authentication Required",
+/// which the Bluesky app reads as a wrong password.
+fn passkey_required() -> XrpcError {
+    err(
+        StatusCode::UNAUTHORIZED,
+        PASSKEY_REQUIRED,
+        "This account signs in with a passkey. Sign in with OAuth on its server's sign-in page, or use an app password.",
+    )
+}
 const APP_PASSWORDS_BLOCKED: &str = "AppPasswordsBlocked";
 
 /// Not "Authentication Required" or "Invalid identifier or password": the
@@ -1790,21 +1804,22 @@ async fn create_session_inner(
         _ => false,
     };
     let code = inp.auth_factor_token.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let passkeys = app_pass.is_none() && super::passkeys::has_any(app, &acct.did).await?;
+    // a passkey can't be checked here (no browser vouches for the origin),
+    // and the email code doesn't stand in for it: only the account page,
+    // which runs the passkey itself, or with a recovery code
+    if passkeys && !trusted && !crate::totp::enabled_for(app, &acct).await? && (!own || code.is_none()) {
+        return Err(passkey_required());
+    }
     let factor = if trusted {
         Some("trusted")
     } else {
         step.second_factor = true;
-        super::email2fa::check_second_factor(
-            app,
-            &acct,
-            code,
-            app_pass.is_some(),
-            super::passkeys::has_any(app, &acct.did).await?,
-        )
-        .await?;
+        super::email2fa::check_second_factor(app, &acct, code, app_pass.is_some(), passkeys).await?;
         step.second_factor = false;
         match (&app_pass, code) {
             (None, Some(_)) if crate::totp::enabled_for(app, &acct).await? => Some("totp"),
+            (None, Some(_)) if passkeys => Some("recovery"),
             (None, Some(_)) if super::email2fa::enabled(&acct) => Some("email"),
             _ => None,
         }
@@ -1821,7 +1836,7 @@ async fn create_session_inner(
     // a new browser gets its device cookie here, as on the OAuth pages
     let mut set_cookie = None;
     let mut device_id = cookie_id;
-    if inp.trust_device && own && matches!(factor, Some("totp" | "email")) {
+    if inp.trust_device && own && matches!(factor, Some("totp" | "email" | "recovery")) {
         let oauth_err =
             |e: crate::oauth::OAuthError| XrpcError { status: e.status, error: e.error, message: e.description };
         let (mut d, _) = super::oauth::device_for(app, headers).await.map_err(oauth_err)?;

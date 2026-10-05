@@ -470,3 +470,187 @@ async fn account_page_passwordless() {
     assert_eq!(st, 303);
     assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=passkey", "another browser's challenge");
 }
+
+// ---------------------------------------------------------------- the account page (SPA)
+
+async fn start_sign_in(s: &TestServer, body: J) -> Resp {
+    s.xrpc.post("vlpds.server.startPasskeySignIn", &body, &Auth::None).await
+}
+
+async fn passkey_session(s: &TestServer, did: &str, credential: J) -> Resp {
+    s.xrpc.post("vlpds.server.createPasskeySession", &json!({"did": did, "credential": credential}), &Auth::None).await
+}
+
+/// Own-page createSession (same-origin fetch metadata), with a code.
+async fn own_login(s: &TestServer, a: &TestAccount, code: Option<&str>) -> Resp {
+    let mut body = json!({"identifier": a.handle, "password": a.password});
+    if let Some(c) = code {
+        body["authFactorToken"] = json!(c);
+    }
+    let rb = s
+        .xrpc
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.url))
+        .header("sec-fetch-site", "same-origin")
+        .json(&body);
+    s.xrpc.send(rb).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_page_sign_in() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkspa").await;
+    let mut key = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut key, "phone").await;
+
+    // passwordless: the options name no account
+    let opts = start_sign_in(&s, json!({})).await.ok();
+    assert_eq!((opts["userVerification"].as_str(), opts["allowCredentials"].clone()), (Some("required"), json!([])));
+    let cred = key.assert(opts["challenge"].as_str().unwrap(), &Lie::default());
+    let out = passkey_session(&s, &a.did, cred.clone()).await.ok();
+    assert_eq!(out["did"], json!(a.did));
+    let auth = Auth::Bearer(out["accessJwt"].as_str().unwrap().into());
+    s.get_session(&auth).await.ok();
+    // once only
+    passkey_session(&s, &a.did, cred).await.err(400, "PasskeyRefused");
+    // UV is required, and the user handle has to be the DID asked for
+    let opts = start_sign_in(&s, json!({})).await.ok();
+    let ch = opts["challenge"].as_str().unwrap();
+    passkey_session(&s, &a.did, key.assert(ch, &Lie { no_uv: true, ..Default::default() }))
+        .await
+        .err(400, "PasskeyRefused");
+    let b = s.create_account("pkspa2").await;
+    passkey_session(&s, &b.did, key.assert(ch, &Lie::default())).await.err(400, "PasskeyRefused");
+    let l = s.xrpc.get("vlpds.server.getSignInSecurity", &[], &a.auth()).await.ok();
+    let e = &l["recentSignIns"][0];
+    assert_eq!((e["method"].as_str(), e["factor"].as_str()), (Some("passkey"), Some("passkey")), "{l}");
+
+    // the password alone no longer makes a session: not for other apps,
+    // and not here without the passkey or a recovery code
+    s.login(&a.handle, &a.password, None).await.err(401, "PasskeyRequired");
+    own_login(&s, &a, None).await.err(401, "PasskeyRequired");
+    // app passwords keep working
+    let ap = s.xrpc.post("com.atproto.server.createAppPassword", &json!({"name": "bot"}), &a.auth()).await.ok();
+    s.login(&a.handle, ap["password"].as_str().unwrap(), None).await.ok();
+
+    // the second step after the password: wrong password, then right
+    start_sign_in(&s, json!({"identifier": a.handle, "password": "nope"})).await.err(401, "AuthenticationRequired");
+    let opts = start_sign_in(&s, json!({"identifier": a.handle, "password": a.password})).await.ok();
+    assert_eq!(opts["did"], json!(a.did));
+    assert_eq!(opts["allowCredentials"][0]["id"], json!(key.id_b64()));
+    let cred = key.assert(opts["challenge"].as_str().unwrap(), &Lie { no_uv: true, ..Default::default() });
+    let out = passkey_session(&s, &a.did, cred).await.ok();
+    let l = s.xrpc.get("vlpds.server.getSignInSecurity", &[], &a.auth()).await.ok();
+    let e = &l["recentSignIns"][0];
+    assert_eq!((e["method"].as_str(), e["factor"].as_str()), (Some("password"), Some("passkey")), "{l}");
+
+    // a password change voids a second-step challenge minted before it
+    let opts = start_sign_in(&s, json!({"identifier": a.handle, "password": a.password})).await.ok();
+    s.xrpc
+        .post("com.atproto.admin.updateAccountPassword", &json!({"did": a.did, "password": a.password}), &Auth::Admin)
+        .await
+        .ok();
+    let cred = key.assert(opts["challenge"].as_str().unwrap(), &Lie { no_uv: true, ..Default::default() });
+    passkey_session(&s, &a.did, cred).await.err(400, "PasskeyRefused");
+    // ... which also signed out the session above
+    s.get_session(&Auth::Bearer(out["accessJwt"].as_str().unwrap().into())).await.err_status(400);
+}
+
+/// Removing a passkey signs out the account-page sessions it made, and
+/// leaves the rest; "sign out everywhere" ends everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_ends_what_it_signed_in() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkrm").await;
+    let mut k1 = SoftKey::synced(&s.url);
+    let mut k2 = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k1, "one").await;
+    register_passkey(&s, &a, &mut k2, "two").await;
+    let sign_in = async |k: &mut SoftKey| {
+        let opts = start_sign_in(&s, json!({})).await.ok();
+        let out =
+            passkey_session(&s, &a.did, k.assert(opts["challenge"].as_str().unwrap(), &Lie::default())).await.ok();
+        (
+            Auth::Bearer(out["accessJwt"].as_str().unwrap().into()),
+            Auth::Bearer(out["refreshJwt"].as_str().unwrap().into()),
+        )
+    };
+    let (s1, r1) = sign_in(&mut k1).await;
+    let (s2, _) = sign_in(&mut k2).await;
+    let rm = json!({"id": k1.id_b64(), "password": a.password});
+    s.xrpc.post("vlpds.server.removePasskey", &rm, &a.auth()).await.ok();
+    s.get_session(&s1).await.err_status(400);
+    s.xrpc.post_empty("com.atproto.server.refreshSession", &r1).await.err_status(400);
+    s.get_session(&s2).await.ok();
+    s.get_session(&a.auth()).await.ok();
+    let rm = json!({"id": k2.id_b64(), "password": a.password, "signOutEverywhere": true});
+    s.xrpc.post("vlpds.server.removePasskey", &rm, &a.auth()).await.ok();
+    s.get_session(&s2).await.err_status(400);
+    s.get_session(&a.auth()).await.err_status(400);
+    // no passkeys left: the password works on its own again
+    s.login(&a.handle, &a.password, None).await.ok();
+}
+
+/// Passkeys join the trusted-browser fingerprint: a browser trusted before
+/// a passkey was added or removed is asked again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passkey_changes_void_trusted_browsers() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pktrust").await;
+    let (secret, step) = s.enable_totp(&a).await;
+    let code = vlpds::totp::code_for_step(&secret, step + 1);
+    let mut body =
+        json!({"identifier": a.handle, "password": a.password, "authFactorToken": code, "trustDevice": true});
+    let rb = s
+        .xrpc
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.url))
+        .header("sec-fetch-site", "same-origin");
+    let r = s.xrpc.send(rb.json(&body)).await;
+    r.ok();
+    let cookie = r.header("set-cookie").unwrap().split(';').next().unwrap().to_string();
+    body = json!({"identifier": a.handle, "password": a.password});
+    let trusted = async || {
+        let rb = s
+            .xrpc
+            .http
+            .post(format!("{}/xrpc/com.atproto.server.createSession", s.url))
+            .header("sec-fetch-site", "same-origin")
+            .header("cookie", &cookie)
+            .json(&body);
+        s.xrpc.send(rb).await
+    };
+    trusted().await.ok();
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "k").await;
+    trusted().await.err(401, "AuthFactorTokenRequired");
+    let sec = s.xrpc.get("vlpds.server.getSignInSecurity", &[], &a.auth()).await.ok();
+    assert_eq!(sec["trustedBrowsers"], json!([]));
+}
+
+/// Start on one node, finish on another: the challenge is stateless and the
+/// finish is routed to the account's owner by its DID.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn across_nodes() {
+    use std::sync::Arc;
+    let store = Arc::new(object_store::memory::InMemory::new());
+    let public = "https://pds.passkeys.test".to_string();
+    let p1 = public.clone();
+    let p2 = public.clone();
+    let n1 = cluster_node("pk-a", store.clone(), 8, move |c| c.public_url = p1).await;
+    let n2 = cluster_node("pk-b", store.clone(), 8, move |c| c.public_url = p2).await;
+    balanced(&[&n1, &n2]).await;
+    let a = n1.create_account("pkx").await;
+    let owner = owner_of(&[&n1, &n2], &a.did);
+    let other = if std::ptr::eq(owner, &n1) { &n2 } else { &n1 };
+    let mut k = SoftKey::synced(&public);
+    register_passkey(other, &a, &mut k, "k").await;
+    for (start, finish) in [(other, owner), (owner, other), (other, other)] {
+        let opts = start_sign_in(start, json!({})).await.ok();
+        let cred = k.assert(opts["challenge"].as_str().unwrap(), &Lie::default());
+        passkey_session(finish, &a.did, cred.clone()).await.ok();
+        // the claim is cluster-wide
+        passkey_session(owner, &a.did, cred.clone()).await.err(400, "PasskeyRefused");
+        passkey_session(other, &a.did, cred).await.err(400, "PasskeyRefused");
+    }
+}

@@ -1074,6 +1074,15 @@ dialog.modal h2 {
   font-size: 13.5px;
   margin-top: 16px;
 }
+.btn.wide {
+  width: 100%;
+  justify-content: center;
+}
+.signin .passkey-alt {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--rule);
+}
 /* An input with a fixed suffix (the handle domain on sign-up). */
 .affix {
   display: flex;

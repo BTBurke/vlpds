@@ -326,6 +326,8 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.server.finishPasskeyRegistration", post(finish_registration))
         .route("/xrpc/vlpds.server.renamePasskey", post(rename_passkey))
         .route("/xrpc/vlpds.server.removePasskey", post(remove_passkey))
+        .route("/xrpc/vlpds.server.startPasskeySignIn", post(start_sign_in))
+        .route("/xrpc/vlpds.server.createPasskeySession", post(create_session))
 }
 
 const TRANSPORTS: [&str; 6] = ["usb", "nfc", "ble", "internal", "hybrid", "smart-card"];
@@ -608,6 +610,182 @@ async fn remove_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json
     security_mail(&app, &did, &format!("The passkey \u{201c}{}\u{201d} was removed from your account.", gone.name))
         .await;
     Ok(Json(json!({"signedOutEverywhere": inp.sign_out_everywhere})))
+}
+
+// ---------------------------------------------------------------- the account page's sign-in
+
+#[derive(Deserialize, Default)]
+struct StartSignInIn {
+    /// With the password: the second factor after a `PasskeyRequired`
+    /// (or alongside TOTP). Without: passwordless.
+    #[serde(default)]
+    identifier: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// The second-factor challenge carries the credential epoch the password
+/// check read: a password change since voids it.
+fn spa_2fa_binding(did: &str, epoch: &str) -> String {
+    format!("{did}\0{epoch}")
+}
+
+/// `vlpds.server.startPasskeySignIn`: options for `navigator.credentials.get`.
+/// Passwordless options name no account; `allowCredentials` only comes after
+/// a correct password, so nothing here says whether an account has passkeys.
+async fn start_sign_in(State(app): AppState, Json(inp): Json<StartSignInIn>) -> XResult<Json<J>> {
+    use crate::ratelimit as rl;
+    rl::check_ip(&[&rl::PASSKEY_SIGN_IN_IP], 1)?;
+    let rp = rp(&app)?;
+    let key = challenge_key(&app);
+    let now = now_secs();
+    let (Some(ident), Some(password)) = (inp.identifier, inp.password) else {
+        let ch = webauthn::mint_challenge(&key, "spa-signin", "", now);
+        return Ok(Json(json!({
+            "challenge": b64u(ch),
+            "rpId": rp.id,
+            "timeout": webauthn::CHALLENGE_TTL * 1000,
+            "userVerification": "required",
+            "allowCredentials": [],
+        })));
+    };
+    let invalid = || XrpcError::auth("Invalid identifier or password");
+    let norm = ident.trim().trim_start_matches('@').to_lowercase();
+    rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &norm, 1)?;
+    let acct = super::server::login_account(&app, &norm).await?.ok_or_else(invalid)?;
+    rl::check(&[&rl::SIGN_IN_ACCOUNT], &acct.did, 1)?;
+    if password.len() > 512 || !super::server::verify_password(&acct, &password).await? {
+        return Err(invalid());
+    }
+    if super::server::is_takendown_account(&acct) {
+        return Err(super::takedown_error());
+    }
+    let epoch = super::server::epoch_for_login(&app, &acct).await?.ok_or_else(invalid)?;
+    let p = load(&app, &acct.did).await?;
+    if descriptors(&p).is_empty() {
+        return Err(bad("This account has no passkeys"));
+    }
+    let ch = webauthn::mint_challenge(&key, "spa-2fa", &spa_2fa_binding(&acct.did, &epoch), now);
+    Ok(Json(json!({
+        "did": acct.did,
+        "challenge": b64u(ch),
+        "rpId": rp.id,
+        "timeout": webauthn::CHALLENGE_TTL * 1000,
+        "userVerification": "preferred",
+        "allowCredentials": descriptors(&p),
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionIn {
+    /// The account: routes the call to its owner. Passwordless, it must be
+    /// the credential's user handle.
+    did: String,
+    credential: AssertionIn,
+    #[serde(default)]
+    trust_device: bool,
+}
+
+/// `vlpds.server.createPasskeySession`: the legacy session `createSession`
+/// would give, for an assertion over a `startPasskeySignIn` challenge.
+async fn create_session(
+    State(app): AppState,
+    super::moderation::ClientIp(ip): super::moderation::ClientIp,
+    headers: HeaderMap,
+    Json(inp): Json<CreateSessionIn>,
+) -> XResult<Response> {
+    let mut second = false;
+    let r = create_session_inner(&app, inp, ip, &headers, &mut second).await;
+    let result = match &r {
+        Ok(_) => "success",
+        Err(e) if e.status == StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        Err(e) if e.status.is_server_error() => "error",
+        Err(e) if e.error == "AccountTakedown" => "inactive",
+        Err(_) if second => "second_factor_failed",
+        Err(_) => "failed",
+    };
+    crate::metrics::login(if second { "password" } else { "passkey" }, result);
+    r
+}
+
+async fn create_session_inner(
+    app: &App,
+    inp: CreateSessionIn,
+    ip: Option<std::net::IpAddr>,
+    headers: &HeaderMap,
+    second: &mut bool,
+) -> XResult<Response> {
+    use crate::ratelimit as rl;
+    rl::check_ip(&[&rl::PASSKEY_SIGN_IN_IP], 1)?;
+    let did = inp.did.trim().to_string();
+    if !did.starts_with("did:") || did.len() > 2048 {
+        return Err(bad("did is required"));
+    }
+    rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1)?;
+    rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1)?;
+    let not_recognized = |f: Fail| {
+        count_failure(f);
+        refused(f)
+    };
+    let acct = match super::server::account_if_exists(app, &did).await? {
+        Some(a) => a,
+        None => return Err(not_recognized(Fail::UnknownCredential)),
+    };
+    // read before the check: a revoke-all racing this sign-in lands first
+    // (and voids it) or after
+    let epoch = super::server::auth_epoch(app, &did).await?;
+    let cdj = decode_capped(&inp.credential.client_data_json, MAX_CDJ_B64).map_err(not_recognized)?;
+    let challenge = webauthn::client_data_challenge(&cdj).map_err(not_recognized)?;
+    let key = challenge_key(app);
+    *second = webauthn::open_challenge(&key, "spa-2fa", &spa_2fa_binding(&did, &epoch), &challenge, now_secs()).is_ok();
+    let ex = if *second {
+        Expect { purpose: "spa-2fa", binding: spa_2fa_binding(&did, &epoch), require_uv: false }
+    } else {
+        let handle = inp.credential.user_handle.as_deref().and_then(did_from_user_handle);
+        if handle.as_deref() != Some(did.as_str()) {
+            return Err(not_recognized(Fail::UnknownCredential));
+        }
+        Expect { purpose: "spa-signin", binding: String::new(), require_uv: true }
+    };
+    let used = match use_passkey(app, &did, &inp.credential, &ex).await {
+        Ok(u) => u,
+        Err(UseErr::Server(e)) => return Err(e),
+        Err(UseErr::Refused(f)) => return Err(refused(f)),
+    };
+    if super::server::is_takendown_account(&acct) {
+        return Err(super::takedown_error());
+    }
+    let auth_ref = used.cred.auth_ref();
+    let (access, refresh) =
+        super::server::create_session_tokens(app, &did, None, false, Some(&epoch), Some(auth_ref)).await?;
+    let ua = super::signin::user_agent(headers);
+    let own = super::server::own_page(headers);
+    let mut set_cookie = None;
+    let mut device_id = if own { super::oauth::device_cookie_id(headers) } else { None };
+    if *second && inp.trust_device && own {
+        let oauth_err =
+            |e: crate::oauth::OAuthError| XrpcError { status: e.status, error: e.error, message: e.description };
+        let (mut d, _) = super::oauth::device_for(app, headers).await.map_err(oauth_err)?;
+        let ctx = super::signin::Ctx { ip, user_agent: ua, device_id: Some(&d.id) };
+        if let Some(until) = super::signin::trust(app, &acct, &epoch, &d.id.clone(), &ctx).await? {
+            d.trusted_until = d.trusted_until.max(until as i64);
+            crate::oauth::store::put_device(app, &d).await.map_err(oauth_err)?;
+            set_cookie = Some(super::oauth::device_cookie(app, &d));
+        }
+        device_id = Some(d.id);
+    }
+    let ctx = super::signin::Ctx { ip, user_agent: ua, device_id: device_id.as_deref() };
+    let method = if *second { super::signin::Method::Password } else { super::signin::Method::Passkey(None) };
+    super::signin::record(app, &acct, method, Some("passkey"), &ctx).await;
+    let mut out = super::server::session_info(app, &acct, true).await;
+    out["accessJwt"] = json!(access);
+    out["refreshJwt"] = json!(refresh);
+    let mut r = Json(out).into_response();
+    if let Some(c) = set_cookie {
+        r.headers_mut().insert(header::SET_COOKIE, c);
+    }
+    Ok(r)
 }
 
 /// Whether the passkey a sign-in recorded is still on the account; true

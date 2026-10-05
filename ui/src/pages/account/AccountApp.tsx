@@ -1,8 +1,9 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
 import { useSession } from '../../lib/hooks'
 import { Link, match, navigate, useSearch } from '../../lib/router'
 import { call, setSession, signOut, XrpcError, errText } from '../../lib/xrpc'
+import { cancelled, conditionalAvailable, didOfUserHandle, getPasskey, passkeysHere, type AssertionJson } from '../../lib/webauthn'
 import { Overview } from './Overview'
 import { Identity } from './Identity'
 import { Security } from './Security'
@@ -76,37 +77,94 @@ export function AccountApp({ path }: { path: string }) {
   )
 }
 
+type Step = 'password' | 'code' | 'passkey'
+
 function SignIn() {
   const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
   const [code, setCode] = useState('')
-  const [needCode, setNeedCode] = useState(false)
+  const [step, setStep] = useState<Step>('password')
   const [trust, setTrust] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
+  const canPasskey = passkeysHere()
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault()
+  // autofill: offer this site's passkeys in the identifier field's suggestions
+  useEffect(() => {
+    if (!canPasskey || step !== 'password') return
+    const ctl = new AbortController()
+    ;(async () => {
+      if (!(await conditionalAvailable())) return
+      const opts = await call('vlpds.server.startPasskeySignIn', { body: {} })
+      const a = await getPasskey(opts, 'conditional', ctl.signal)
+      await finishPasskey(a)
+    })().catch((e) => {
+      if (!cancelled(e) && !ctl.signal.aborted) setError(e)
+    })
+    return () => ctl.abort()
+  }, [canPasskey, step])
+
+  const finishPasskey = async (credential: AssertionJson, did?: string) => {
+    const owner = did ?? didOfUserHandle(credential.userHandle)
+    if (!owner) throw new Error('Passkey not recognized')
+    const out = await call('vlpds.server.createPasskeySession', {
+      body: { did: owner, credential, trustDevice: did && trust ? true : undefined },
+    })
+    setSession(out)
+  }
+
+  const run = async (fn: () => Promise<void>) => {
     setBusy(true)
     setError(undefined)
     try {
-      const out = await call('com.atproto.server.createSession', {
-        body: {
-          identifier: identifier.trim().replace(/^@/, ''),
-          password,
-          authFactorToken: needCode ? code.trim() : undefined,
-          trustDevice: needCode && trust ? true : undefined,
-        },
-      })
-      setSession(out)
+      await fn()
     } catch (err) {
-      if (err instanceof XrpcError && err.error === 'AuthFactorTokenRequired') {
-        if (needCode) setError(err)
-        setNeedCode(true)
-      } else setError(err)
+      if (!cancelled(err)) setError(err)
     } finally {
       setBusy(false)
     }
+  }
+
+  /** The button: passwordless, or after the password the account's passkeys as the second step. */
+  const usePasskey = () =>
+    run(async () => {
+      const afterPassword = step !== 'password'
+      const opts = await call('vlpds.server.startPasskeySignIn', {
+        body: afterPassword ? { identifier: identifier.trim().replace(/^@/, ''), password } : {},
+      })
+      const a = await getPasskey(opts)
+      await finishPasskey(a, afterPassword ? opts.did : undefined)
+    })
+
+  const submit = (e: FormEvent) => {
+    e.preventDefault()
+    run(async () => {
+      try {
+        const out = await call('com.atproto.server.createSession', {
+          body: {
+            identifier: identifier.trim().replace(/^@/, ''),
+            password,
+            authFactorToken: step !== 'password' ? code.trim() : undefined,
+            trustDevice: step !== 'password' && trust ? true : undefined,
+          },
+        })
+        setSession(out)
+      } catch (err) {
+        if (err instanceof XrpcError && err.error === 'AuthFactorTokenRequired') {
+          if (step !== 'password') throw err
+          setStep('code')
+        } else if (err instanceof XrpcError && err.error === 'PasskeyRequired') {
+          if (step !== 'password') throw err
+          setStep('passkey')
+        } else throw err
+      }
+    })
+  }
+
+  const back = () => {
+    setStep('password')
+    setCode('')
+    setError(undefined)
   }
 
   return (
@@ -116,7 +174,7 @@ function SignIn() {
         <div className="card">
           <div className="inner">
             <form onSubmit={submit}>
-              {!needCode ? (
+              {step === 'password' ? (
                 <>
                   <h1>Sign in</h1>
                   <p className="sub">Manage your handle, security settings and data on {location.hostname}.</p>
@@ -126,7 +184,7 @@ function SignIn() {
                       type="text"
                       value={identifier}
                       onChange={(e) => setIdentifier(e.target.value)}
-                      autoComplete="username"
+                      autoComplete={canPasskey ? 'username webauthn' : 'username'}
                       autoCapitalize="none"
                       spellCheck={false}
                       required
@@ -141,12 +199,26 @@ function SignIn() {
                 <>
                   <h1>Two-factor check</h1>
                   <p className="sub">
-                    Enter the 6-digit code from your authenticator app for <b>{identifier}</b>, or one of your recovery codes.
+                    {step === 'passkey' ? (
+                      <>
+                        Use your passkey for <b>{identifier}</b>. Lost it? Enter one of your recovery codes instead.
+                      </>
+                    ) : (
+                      <>
+                        Enter the 6-digit code from your authenticator app for <b>{identifier}</b>, use your passkey, or enter one of your recovery codes.
+                      </>
+                    )}
                   </p>
                   {!!error && <Notice kind="err">{errText(error)}</Notice>}
+                  {canPasskey && (
+                    <button type="button" className="btn primary wide" onClick={usePasskey} disabled={busy} style={{ marginBottom: 14 }}>
+                      {busy && <Spinner />}
+                      Use your passkey
+                    </button>
+                  )}
                   {/* password managers pick the account's one-time code by the username beside it */}
                   <input type="text" className="sr-only" autoComplete="username" value={identifier} readOnly tabIndex={-1} aria-hidden="true" />
-                  <Field label="Authentication code">
+                  <Field label={step === 'passkey' ? 'Recovery code' : 'Authentication code'}>
                     <input
                       type="text"
                       id="totp"
@@ -154,10 +226,10 @@ function SignIn() {
                       className="code"
                       value={code}
                       onChange={(e) => setCode(e.target.value)}
-                      inputMode="numeric"
+                      inputMode={step === 'passkey' ? undefined : 'numeric'}
                       autoComplete="one-time-code"
                       required
-                      autoFocus
+                      autoFocus={step === 'code'}
                     />
                   </Field>
                   <label className="check">
@@ -165,23 +237,15 @@ function SignIn() {
                     <span>
                       Trust this browser
                       <span className="small muted" style={{ display: 'block' }}>
-                        Skip the code here for a while. Leave it unticked on a shared computer.
+                        Skip this step here for a while. Leave it unticked on a shared computer.
                       </span>
                     </span>
                   </label>
                 </>
               )}
               <div className="row between">
-                {needCode ? (
-                  <button
-                    type="button"
-                    className="btn quiet"
-                    onClick={() => {
-                      setNeedCode(false)
-                      setCode('')
-                      setError(undefined)
-                    }}
-                  >
+                {step !== 'password' ? (
+                  <button type="button" className="btn quiet" onClick={back}>
                     Use a different account
                   </button>
                 ) : (
@@ -189,13 +253,20 @@ function SignIn() {
                     Forgot your password?
                   </Link>
                 )}
-                <button type="submit" className="btn primary" disabled={busy}>
+                <button type="submit" className={`btn ${step === 'password' || !canPasskey ? 'primary' : ''}`} disabled={busy}>
                   {busy && <Spinner />}
-                  {needCode ? 'Verify and sign in' : 'Sign in'}
+                  {step !== 'password' ? 'Verify and sign in' : 'Sign in'}
                 </button>
               </div>
             </form>
-            {!needCode && (
+            {step === 'password' && canPasskey && (
+              <div className="passkey-alt">
+                <button type="button" className="btn wide" onClick={usePasskey} disabled={busy}>
+                  Sign in with a passkey
+                </button>
+              </div>
+            )}
+            {step === 'password' && (
               <p className="alt">
                 New here? <Link to="/account/signup">Create an account</Link>
               </p>

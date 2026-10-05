@@ -258,7 +258,7 @@ lazy!(PASSKEY_COUNTER_REGRESSIONS: IntCounterVec = register_int_counter_vec!("vl
 lazy!(TRUSTED_BROWSERS: IntCounterVec = register_int_counter_vec!("vlpds_trusted_browsers_total", "Trusted browsers (skip the second factor for --trusted-device-days): granted (\"trust this browser\" after a code), revoked (one, or all, from the account page)", &["event"]));
 lazy!(HANDLE_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_handle_checks_total", "vlpds.identity.checkHandle answers by kind (service: a name under the handle domain; external: the caller's own domain) and status (invalid, reserved, current, taken, available, verified, unverified)", &["kind", "status"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
-lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), rate_limited, error (server-side failure)", &["method", "result"]));
+lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page; passkey: a passkey in place of the password, on the OAuth page or the account page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), passkey_required (a passkey is the account's only strong factor: createSession refused its main password outside this server's own pages), rate_limited, error (server-side failure)", &["method", "result"]));
 lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), unknown_email (asked for an address with no account; answered the same), completed (a new password set with its token)", &["step"]));
 lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
 lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
@@ -457,7 +457,7 @@ pub fn request_crawl(relay: &str, result: &str) {
     }
 }
 
-const LOGIN_RESULTS: [&str; 9] = [
+const LOGIN_RESULTS: [&str; 10] = [
     "success",
     "failed",
     "second_factor_required",
@@ -465,6 +465,7 @@ const LOGIN_RESULTS: [&str; 9] = [
     "inactive",
     "oauth_required",
     "app_passwords_blocked",
+    "passkey_required",
     "rate_limited",
     "error",
 ];
