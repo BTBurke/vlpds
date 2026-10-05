@@ -13,7 +13,11 @@ It checks, in order:
    passkey". No emailed code is offered in its place.
 3. The OAuth page without a password: "Sign in with a passkey", with autofill offered on the handle field.
 4. The account page without a password.
-5. `createSession` with the password alone answers `PasskeyRequired`.
+5. Enter in the password field signs in like the button while autofill's passkey request is pending: on
+   the account page (straight in, or to the passkey step), the OAuth page (Sign in, not Cancel) and
+   `/oauth/account`. A second vlpds whose public URL is `http://127.0.0.1:2791`, an IP address that can't
+   be a WebAuthn RP ID, shows no passkey button and no error, and Enter still signs in.
+6. `createSession` with the password alone answers `PasskeyRequired`.
 
 Any CSP violation or page error in the console fails the run. Screenshots go to `out/shots/` (`SHOTS`
 overrides it), and `HEADED=1` shows the browser. It isn't part of `cargo test`: the Rust suite covers the

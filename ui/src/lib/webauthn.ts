@@ -15,8 +15,14 @@ export function bytesToB64u(buf: ArrayBuffer | Uint8Array): string {
   return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+/** An IP address can't be a WebAuthn RP ID: the browser refuses any request there with a SecurityError. */
+export const ipHost = (host = location.hostname) => /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')
+
 /** Passkeys only work on the public origin (the relying party's); the operator's tailnet address can't use them. */
-export const passkeysHere = (origin?: string) => typeof window.PublicKeyCredential === 'function' && (!origin || origin === location.origin)
+export const passkeysHere = (origin?: string) => typeof window.PublicKeyCredential === 'function' && !ipHost() && (!origin || origin === location.origin)
+
+/** vlpds's RP ID is its public URL's host, so a page on any other host can't use it. */
+export const rpIdHere = (rpId: string) => !ipHost() && rpId === location.hostname
 
 type Desc = { type: 'public-key'; id: string; transports?: string[] }
 

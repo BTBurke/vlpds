@@ -4,7 +4,7 @@ import { Download } from '../../components/icons'
 import { fmtTime } from '../../lib/format'
 import { useAction, useLoad, useSession } from '../../lib/hooks'
 import { acall } from '../../lib/xrpc'
-import { cancelled, createPasskey, passkeysHere } from '../../lib/webauthn'
+import { cancelled, createPasskey, ipHost, passkeysHere } from '../../lib/webauthn'
 
 type Passkey = {
   id: string
@@ -150,7 +150,9 @@ export function Passkeys({ onChange, totpOn }: { onChange: () => void; totpOn?: 
               <p className="small muted" style={{ margin: 0 }}>
                 {typeof window.PublicKeyCredential !== 'function'
                   ? "This browser doesn't support passkeys."
-                  : `Passkeys only work at ${d.origin}. Open the account page there to add one.`}
+                  : ipHost(new URL(d.origin).hostname)
+                    ? `Passkeys need a hostname, and this server's public URL (${d.origin}) is an IP address.`
+                    : `Passkeys only work at ${d.origin}. Open the account page there to add one.`}
               </p>
             ) : adding ? (
               <form

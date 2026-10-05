@@ -3,7 +3,7 @@ import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui
 import { useSession } from '../../lib/hooks'
 import { Link, match, navigate, useSearch } from '../../lib/router'
 import { call, setSession, signOut, XrpcError, errText } from '../../lib/xrpc'
-import { cancelled, conditionalAvailable, didOfUserHandle, getPasskey, passkeysHere, type AssertionJson } from '../../lib/webauthn'
+import { cancelled, conditionalAvailable, didOfUserHandle, getPasskey, ipHost, passkeysHere, rpIdHere, type AssertionJson } from '../../lib/webauthn'
 import { Overview } from './Overview'
 import { Identity } from './Identity'
 import { Security } from './Security'
@@ -79,6 +79,9 @@ export function AccountApp({ path }: { path: string }) {
 
 type Step = 'password' | 'code' | 'passkey'
 
+// production serves HTTPS; plain HTTP is a dev server, where a note on why passkeys are missing helps
+const devHost = import.meta.env.DEV || location.protocol === 'http:'
+
 function SignIn() {
   const [identifier, setIdentifier] = useState('')
   const [password, setPassword] = useState('')
@@ -87,24 +90,35 @@ function SignIn() {
   const [trust, setTrust] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
-  const canPasskey = passkeysHere()
+  // the server's RP ID, once it turns out not to be this page's host
+  const [otherRp, setOtherRp] = useState<string>()
+  const canPasskey = passkeysHere() && !otherRp
   const autofill = useRef<AbortController | undefined>(undefined)
+  const [autofillRun, setAutofillRun] = useState(0)
 
-  // autofill: offer this site's passkeys in the identifier field's suggestions
+  // autofill: offer this site's passkeys in the identifier field's suggestions.
+  // Nobody asked for this request, so its failures (aborted, dismissed, a host
+  // that can't be the RP ID) stay quiet; only a passkey picked from it can fail
+  // out loud.
   useEffect(() => {
     if (!canPasskey || step !== 'password') return
     const ctl = new AbortController()
     autofill.current = ctl
     ;(async () => {
-      if (!(await conditionalAvailable())) return
-      const opts = await call('vlpds.server.startPasskeySignIn', { body: {} })
-      const a = await getPasskey(opts, 'conditional', ctl.signal)
-      await finishPasskey(a)
-    })().catch((e) => {
-      if (!cancelled(e) && !ctl.signal.aborted) setError(e)
-    })
+      let a: AssertionJson
+      try {
+        const opts = await call('vlpds.server.startPasskeySignIn', { body: {} })
+        if (ctl.signal.aborted) return
+        if (!rpIdHere(opts.rpId)) return setOtherRp(opts.rpId)
+        if (!(await conditionalAvailable()) || ctl.signal.aborted) return
+        a = await getPasskey(opts, 'conditional', ctl.signal)
+      } catch {
+        return
+      }
+      if (!ctl.signal.aborted) await run(() => finishPasskey(a))
+    })()
     return () => ctl.abort()
-  }, [canPasskey, step])
+  }, [canPasskey, step, autofillRun])
 
   const finishPasskey = async (credential: AssertionJson, did?: string) => {
     const owner = did ?? didOfUserHandle(credential.userHandle)
@@ -142,7 +156,9 @@ function SignIn() {
 
   const submit = (e: FormEvent) => {
     e.preventDefault()
-    run(async () => {
+    // a passkey picked from autofill mid-request would race the password's session
+    autofill.current?.abort()
+    void run(async () => {
       try {
         const out = await call('com.atproto.server.createSession', {
           body: {
@@ -162,7 +178,7 @@ function SignIn() {
           setStep('passkey')
         } else throw err
       }
-    })
+    }).then(() => setAutofillRun((n) => n + 1))
   }
 
   const back = () => {
@@ -269,6 +285,11 @@ function SignIn() {
                   Sign in with a passkey
                 </button>
               </div>
+            )}
+            {step === 'password' && !canPasskey && devHost && (ipHost() || otherRp) && (
+              <p className="small muted passkey-alt">
+                Passkeys are off on {location.hostname}: {otherRp ? `they belong to ${otherRp}, the public URL's host.` : 'an IP address can’t hold them. Use a hostname such as localhost.'}
+              </p>
             )}
             {step === 'password' && (
               <p className="alt">
