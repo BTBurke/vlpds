@@ -31,6 +31,10 @@ single-node deployment (one 4-vCPU VPS with its data on Cloudflare R2), and it s
   with DPoP, the merged firehose, the account pages, a `/migrate` page for moving an existing
   account in, the operator console and these docs. → [Migration](docs/migration.md),
   [OAuth and 2FA](docs/oauth-2fa.md)
+- Users get account controls the reference doesn't have: trusted browsers, sign-in alerts, OAuth
+  only, scoped app passwords and a guided handle change. vlpds also acts on the `deleteAfter` an
+  app passes to `deactivateAccount`, after a 3-day hold. → [The account page](docs/oauth-2fa.md#the-account-page),
+  [Scheduled deletion](docs/operations/email-and-moderation.md#scheduled-deletion)
 - The operator console covers accounts, invites, takedowns and moderation cases, rate limits,
   relays, cluster ownership and live metrics. An admin CLI makes the same calls.
   → [Admin console and CLI](docs/operations/admin-console.md)

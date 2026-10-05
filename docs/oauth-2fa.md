@@ -3,7 +3,7 @@ title: OAuth and 2FA
 section: vlPDS
 order: 9
 status: ready
-summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, and how auth state stays correct under concurrency."
+summary: "Signing in: the OAuth authorization server, DPoP, app passwords and legacy sessions, TOTP and email second factors, trusted browsers, sign-in alerts, the OAuth-only switch, the account page, and how auth state stays correct under concurrency."
 ---
 
 ```hero
@@ -201,7 +201,7 @@ once they expire.
 
 ## Sign-in alerts and recent sign-ins
 
-| | Recent sign-ins | New-device alert |
+| | Recent sign-ins | Sign-in alert |
 |---|---|---|
 | Recorded or sent for | every successful sign-in · OAuth page, `createSession` with the password or an app password | a sign-in from a device the account hasn't used in 180 days |
 | Kept | the last 50, at most 30 days old, in `signin/log` | at most 3 a day per account (`ALERTS_PER_DAY`) |
@@ -223,19 +223,22 @@ other. The cap of 3 a day keeps them to a tenth of the recipient's 30 a day, so 
 sign-in codes. If a budget is spent the alert is dropped (`vlpds_mail_suppressed_total`) and the
 sign-in still works. The first sign-in vlpds records for an account sets the baseline without an
 alert, so a new account, or an existing one the first time it signs in after an upgrade, doesn't get
-one for the device it already uses. A sign-in that just used an emailed code doesn't alert either, since the code went to
-the same inbox.
+one for the device it already uses. A sign-in that just used an emailed code doesn't alert either,
+since the code went to the same inbox.
 
-Users turn alerts off per kind (password sign-ins and app-password sign-ins) on the Security tab.
-That's `vlpds.server.updateSignInSecurity` with `alerts: {password, appPassword}`.
+Users turn sign-in alerts off per kind on the Security tab. The two kinds are password sign-ins (the
+OAuth sign-in page included) and app-password sign-ins. That's `vlpds.server.updateSignInSecurity`
+with `alerts: {password, appPassword}`.
 
 ## OAuth only
 
 Some apps still take a handle and password and call `createSession`. The OAuth-only switch on the
 Security tab makes `createSession` refuse the account's main password with 401 `OAuthRequired`, so
-the password only works on this server's sign-in page. App passwords keep working unless the user
+the password only works on this server's own pages. App passwords keep working unless the user
 also blocks them (401 `AppPasswordsBlocked`). The switch is only offered with a second factor on,
 and it only applies while one is. Without a factor there's no second step to get around.
+Blocking app passwords doesn't depend on a factor. It only refuses new sign-ins, so an app that's
+already signed in with an app password stays signed in until the user revokes that password.
 
 The checks run after the password is verified, so they don't tell a guesser anything, and before a
 code is mailed. The error names aren't the reference's. The Bluesky app turns
@@ -244,6 +247,22 @@ message that isn't "Authentication Required" or "Invalid identifier or password"
 messages say what to do instead. This server's account page signs in with `createSession` too, so
 same-origin requests from it still go through, and they still need the second factor (or a trusted
 browser).
+
+`ops/RUNBOOK.md` "A user locked out by OAuth only" covers a user an app refuses.
+
+## The account page
+
+| Tab | What a user can do | Details |
+|---|---|---|
+| Overview | see the handle, DID, status (with the date of a scheduled deletion), repo counts and the DID document | |
+| Handle and email | change the handle to a name on this server or to their own domain, with a guided check · change and confirm the email | [Changing a handle](operations/email-and-moderation.md#changing-a-handle-on-the-account-page) |
+| Security | TOTP and recovery codes · recent sign-ins · trusted browsers · sign-in alerts · OAuth only · the recovery key · app passwords, scoped or not · connected OAuth apps · the password | [Second factors](#second-factors), [Trusted browsers](#trusted-browsers), [Sign-in alerts](#sign-in-alerts-and-recent-sign-ins), [OAuth only](#oauth-only), [Scoped app passwords](#scoped-app-passwords), [Recovery keys](keys-security.md#plc-rotation-key-and-recovery-keys) |
+| Repository, Media | browse records and delete one · preview blobs | |
+| Export, Preferences | download a full backup or the repo CAR · view and edit stored app preferences | [Backups](migration.md#backups) |
+| Deactivate or delete | deactivate, reactivate (which cancels a scheduled deletion) · delete with an emailed token | [Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion) |
+
+Users manage their account at `/account` on this server. The page signs in with `createSession`, so
+the second factor applies there too, unless the browser is trusted.
 
 ## Auth state under concurrency
 

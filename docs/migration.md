@@ -146,7 +146,7 @@ data".
 | `identity/did.json`, `identity/plc-audit-log.json` | `resolveDid` and `vlpds.identity.getPlcAuditLog` on this server (the directory's log, for accounts hosted here) |
 | `account.json` | DID, handle, email, server, the latest commit, dates and counts |
 | `README.txt` | what each file is and how to restore it on any PDS |
-| `vlpds/*.json` | account page only. App password names and dates, connected OAuth apps and the PLC rotation keys (all public, no secrets) |
+| `vlpds/*.json` | account page only. App password names, dates and scopes, connected OAuth apps and the PLC rotation keys (all public, no secrets) |
 | `keys/recovery-key.txt` | only if the user generated a recovery key in this tab (advanced mode) and ticked "include my recovery private key" (off by default) |
 
 The backup never contains a password, app password secret or session token. The server's repo
