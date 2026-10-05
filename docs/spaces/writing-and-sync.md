@@ -144,7 +144,7 @@ or a takeover. The sending side lives in memory on the shard's owner.
 ## Fan-out
 
 ```diagram
-caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address), per dispatcher (8 of them, 4,096 queued each) and 512 sends in flight in all."
+caption: "Each (space, service) gets its own lane, which sends one forward at a time in spaceRev order. A slow syncer holds up only its own lane. Bounds are per lane (256), per service host (4,096 queued, 16 sends in flight, with a host counted by its registrable domain or IP address, and each tenant of a hosting platform like fly.dev or github.io counted as its own host), per dispatcher (8 of them, 4,096 queued each) and 512 sends in flight in all."
 nodes:
   - { id: hw, label: Authority's worker, sub: acks in spaceRev order, at: [0, 4], size: [9, 3], tone: violet }
   - { id: d, label: Dispatcher, sub: reads `sN` registrations, at: [12.5, 4], size: [9, 3], tone: violet }

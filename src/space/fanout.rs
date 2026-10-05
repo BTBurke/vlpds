@@ -175,12 +175,42 @@ pub struct Fanout {
 /// (`example.co.uk`), so the registrable domain is one label longer.
 const SECOND_LEVELS: &[&str] = &["co", "com", "net", "org", "gov", "edu", "ac", "ne", "or", "go"];
 
+/// Hosting platforms that give each tenant its own subdomain, from the
+/// Public Suffix List's private section: one more label is the tenant's,
+/// so one noisy app doesn't hold up every other app on the platform. A
+/// platform missing here only makes its tenants share one cap.
+const SHARED_SUFFIXES: &[&str] = &[
+    "a.run.app",
+    "appspot.com",
+    "azurewebsites.net",
+    "blogspot.com",
+    "cloudfront.net",
+    "deno.dev",
+    "firebaseapp.com",
+    "fly.dev",
+    "github.io",
+    "gitlab.io",
+    "glitch.me",
+    "herokuapp.com",
+    "netlify.app",
+    "ngrok-free.app",
+    "ngrok.io",
+    "onrender.com",
+    "pages.dev",
+    "repl.co",
+    "trycloudflare.com",
+    "up.railway.app",
+    "vercel.app",
+    "web.app",
+    "workers.dev",
+];
+
 /// What sends to `endpoint` share a host cap by: its registrable domain
 /// (approximately: the last two labels, three under a ccTLD's `co.`-style
-/// second level), an IPv4 address, or an IPv6 /64. Ports don't count. So
-/// many service ids under one domain, or one machine on many ports,
-/// can't multiply what a write sends one victim. Grouping is coarse on
-/// shared suffixes (`x.github.io`), which only makes the cap stricter.
+/// second level, one past a [`SHARED_SUFFIXES`] platform), an IPv4
+/// address, or an IPv6 /64. Ports don't count. So many service ids under
+/// one domain, or one machine on many ports, can't multiply what a write
+/// sends one victim.
 fn host_of(endpoint: &str) -> String {
     let Some(host) = reqwest::Url::parse(endpoint).ok().and_then(|u| u.host_str().map(str::to_ascii_lowercase)) else {
         return endpoint.to_string();
@@ -194,7 +224,12 @@ fn host_of(endpoint: &str) -> String {
     if host.parse::<std::net::Ipv4Addr>().is_ok() {
         return host;
     }
-    let labels: Vec<&str> = host.trim_end_matches('.').split('.').collect();
+    let host = host.trim_end_matches('.');
+    if let Some(sfx) = SHARED_SUFFIXES.iter().find(|s| host.strip_suffix(**s).is_some_and(|h| h.ends_with('.'))) {
+        let tenant = host[..host.len() - sfx.len() - 1].rsplit('.').next().unwrap_or_default();
+        return format!("{tenant}.{sfx}");
+    }
+    let labels: Vec<&str> = host.split('.').collect();
     let n = labels.len();
     let keep = match n {
         0..=2 => n,
@@ -454,6 +489,18 @@ mod tests {
         assert_eq!(h("http://[2001:db8:1:2::5]:80"), h("http://[2001:db8:1:2:ffff::9]"));
         assert_ne!(h("http://[2001:db8:1:2::5]"), h("http://[2001:db8:1:3::5]"));
         assert_eq!(h("http://localhost:1234"), "localhost");
+        // a hosting platform's tenants are separate hosts
+        assert_eq!(h("https://app1.fly.dev"), "app1.fly.dev");
+        assert_ne!(h("https://app1.fly.dev"), h("https://app2.fly.dev"));
+        assert_eq!(h("https://api.app1.fly.dev:443/x"), "app1.fly.dev");
+        assert_eq!(h("https://Sync.Alice.GitHub.io."), "alice.github.io");
+        assert_ne!(h("https://a.workers.dev"), h("https://b.workers.dev"));
+        assert_ne!(h("https://x.up.railway.app"), h("https://y.up.railway.app"));
+        assert_eq!(h("https://svc-abc.a.run.app"), "svc-abc.a.run.app");
+        // the platform itself, and lookalikes, group as before
+        assert_eq!(h("https://fly.dev"), "fly.dev");
+        assert_eq!(h("https://app.evilfly.dev"), "evilfly.dev");
+        assert_eq!(h("https://x.railway.app"), "railway.app");
     }
 
     fn fanout() -> Arc<Fanout> {
