@@ -307,7 +307,7 @@ impl IntoResponse for XrpcError {
     }
 }
 
-type XResult<T> = Result<T, XrpcError>;
+pub type XResult<T> = Result<T, XrpcError>;
 
 fn no_partitions() -> XrpcError {
     XrpcError::unavailable("PartitionUnavailable", "this node owns no partitions yet")

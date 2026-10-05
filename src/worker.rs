@@ -2458,38 +2458,112 @@ fn process_space(st: &mut RepoState, r: crate::space::repo::SpaceReq, clock_id: 
             b.head.shard = st.partition.id;
             b.head.epoch = st.partition.epoch;
             let (head, notify, rev, results) = (Arc::new(b.head), b.notify, b.rev, b.results);
+            let fanout = b.sequenced.map(|seq| crate::space::fanout::Job {
+                authority: did.clone(),
+                uri: uri.clone(),
+                sid,
+                writer: did.to_string(),
+                repo_rev: rev,
+                hash: head.hash.digest(),
+                seq,
+            });
             let (sp, d) = (spaces.clone(), did.clone());
             let ack = move || {
                 sp.heads.publish(&d, &sid, head);
                 if let Some(n) = notify {
                     sp.outbox.enqueue(&d, sid, &n.uri, n.repo_rev, n.hash, true);
                 }
+                if let Some(job) = fanout {
+                    sp.fanout.notify(job);
+                }
                 applied.store(true, Ordering::Release);
                 SpaceAck::Write { rev: Some(rev), results }
             };
             (b.muts, Box::new(ack))
         }
-        SpaceOp::RecordWriter { writer, repo_rev, hash } => {
-            match sr::record_writer(&mut st.spaces, &did, sid, &uri, &writer, repo_rev, hash, clock_id) {
+        SpaceOp::RecordWriter { writer, repo_rev, hash, managing_app } => {
+            let r = sr::record_writer(&mut st.spaces, &did, sid, &uri, &writer, repo_rev, hash, managing_app, clock_id);
+            match r {
                 Err(e) => {
                     let _ = reply.send(Err(e));
                     return Ok(());
                 }
                 Ok(None) => return space_noop(st, reply, SpaceAck::Writer(None)),
-                Ok(Some((muts, seq))) => (muts, Box::new(move || SpaceAck::Writer(Some(seq)))),
+                Ok(Some((muts, seq))) => {
+                    let job = crate::space::fanout::Job {
+                        authority: did.clone(),
+                        uri: uri.clone(),
+                        sid,
+                        writer,
+                        repo_rev,
+                        hash,
+                        seq,
+                    };
+                    let sp = spaces.clone();
+                    let ack = move || {
+                        sp.fanout.notify(job);
+                        SpaceAck::Writer(Some(seq))
+                    };
+                    (muts, Box::new(ack))
+                }
             }
         }
-        SpaceOp::CreateSpace { row } => {
-            if let Some(s) = status {
-                let _ = reply.send(Err(WriteError::RepoInactive(s).into()));
-                return Ok(());
-            }
-            match sr::create_space(&mut st.spaces, &did, sid, row) {
+        // the space host's management ops are the authority's own: refused
+        // while its account is inactive
+        SpaceOp::CreateSpace { .. }
+        | SpaceOp::UpdateSpace { .. }
+        | SpaceOp::PutMember { .. }
+        | SpaceOp::RemoveMember { .. }
+        | SpaceOp::DeleteSpace { .. }
+            if status.is_some() =>
+        {
+            let _ = reply.send(Err(WriteError::RepoInactive(status.unwrap_or_default()).into()));
+            return Ok(());
+        }
+        op => {
+            let ss = &mut st.spaces;
+            let r = match op {
+                SpaceOp::CreateSpace { row } => {
+                    sr::create_space(ss, &did, sid, row, clock_id).map(|m| (m, SpaceAck::Created))
+                }
+                SpaceOp::UpdateSpace { read_policy, write_policy, app_access } => {
+                    sr::update_space(ss, &did, sid, read_policy, write_policy, app_access)
+                        .map(|m| (m.into_iter().collect(), SpaceAck::Host))
+                }
+                SpaceOp::PutMember { member, access } => {
+                    sr::set_member(ss, &did, sid, &member, Some(access)).map(|m| (vec![m], SpaceAck::Host))
+                }
+                SpaceOp::RemoveMember { member } => {
+                    sr::set_member(ss, &did, sid, &member, None).map(|m| (vec![m], SpaceAck::Host))
+                }
+                SpaceOp::RegisterNotify { service, row } => {
+                    sr::set_registration(ss, &did, sid, &service, Some(row)).map(|m| (vec![m], SpaceAck::Host))
+                }
+                SpaceOp::UnregisterNotify { service } => {
+                    sr::set_registration(ss, &did, sid, &service, None).map(|m| (vec![m], SpaceAck::Host))
+                }
+                SpaceOp::DeleteSpace { deleted_at } => match sr::delete_space(ss, &did, sid, &uri, deleted_at) {
+                    Ok(Some(m)) => Ok((m, SpaceAck::Deleted { already: false })),
+                    Ok(None) => Ok((Vec::new(), SpaceAck::Deleted { already: true })),
+                    Err(e) => Err(e),
+                },
+                SpaceOp::Write { .. } | SpaceOp::RecordWriter { .. } => unreachable!("matched above"),
+            };
+            match r {
                 Err(e) => {
                     let _ = reply.send(Err(e));
                     return Ok(());
                 }
-                Ok(m) => (vec![m], Box::new(|| SpaceAck::Created)),
+                Ok((muts, ack)) if muts.is_empty() => return space_noop(st, reply, ack),
+                Ok((muts, SpaceAck::Deleted { already })) => {
+                    let (sp, d) = (spaces.clone(), did.clone());
+                    let ack = move || {
+                        sp.forget_space(&d, &sid);
+                        SpaceAck::Deleted { already }
+                    };
+                    (muts, Box::new(ack))
+                }
+                Ok((muts, ack)) => (muts, Box::new(move || ack)),
             }
         }
     };

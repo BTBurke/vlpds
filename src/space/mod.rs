@@ -17,12 +17,18 @@
 //! - [`repo`]: space writes and space host ops on the repo worker.
 //! - [`heads`]: durable space repo heads for reads.
 //! - [`outbox`]: delivery of notifyWrite to space authorities.
+//! - [`host`]: the space host role (simplespace policies, notifyWrite).
+//! - [`fanout`]: forwarding of sequenced writes to registered services.
+//! - [`attestation`]: client attestations for `appAccess` allow lists.
 //! - [`revocations`]: revoked credentials.
 //! - [`credcache`]: verified credentials, until they expire.
 
+pub mod attestation;
 pub mod commit;
 pub mod credcache;
+pub mod fanout;
 pub mod heads;
+pub mod host;
 pub mod httpsig;
 pub mod lthash;
 pub mod outbox;
@@ -38,6 +44,7 @@ use std::sync::Arc;
 pub struct Spaces {
     pub heads: heads::Heads,
     pub outbox: Arc<outbox::Outbox>,
+    pub fanout: Arc<fanout::Fanout>,
     pub revocations: revocations::Revocations,
     pub credentials: credcache::CredCache,
 }
@@ -51,6 +58,7 @@ impl Spaces {
         Spaces {
             heads: heads::Heads::new(heads::DEFAULT_HEADS_BYTES),
             outbox: Default::default(),
+            fanout: Arc::new(fanout::Fanout::new(fanout::QUEUE)),
             revocations: Default::default(),
             credentials: credcache::CredCache::new(credcache::DEFAULT_ENTRIES),
         }
@@ -102,6 +110,11 @@ impl Spaces {
                 };
             }
         });
+    }
+
+    /// A space `did` governed is deleted: its own repo there is gone.
+    pub fn forget_space(&self, did: &str, sid: &crate::state::SpaceId) {
+        self.heads.drop_space(did, sid);
     }
 
     /// An account deleted: nothing of it is served or sent any more.

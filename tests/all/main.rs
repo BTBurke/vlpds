@@ -147,6 +147,7 @@ mod smtp_mail;
 mod spaces;
 mod spaces_auth;
 mod spaces_e2e;
+mod spaces_host;
 mod staged_import;
 mod subscribe_repos;
 mod sync;

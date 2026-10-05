@@ -104,6 +104,13 @@ impl Heads {
         }
     }
 
+    pub fn drop_space(&self, did: &str, sid: &SpaceId) {
+        let mut g = self.inner.lock();
+        if let Some(old) = g.map.pop(&(did.into(), *sid)) {
+            g.bytes -= old.bytes();
+        }
+    }
+
     pub fn drop_did(&self, did: &str) {
         let mut g = self.inner.lock();
         let gone: Vec<Key> = g.map.iter().filter(|(k, _)| &*k.0 == did).map(|(k, _)| k.clone()).collect();

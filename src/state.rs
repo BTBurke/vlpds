@@ -41,6 +41,7 @@
 //! sM/{auth}\0{sid}{member}          -> member access
 //! sW/{auth}\0{sid}{writer}          -> writer state: repoRev, hash, spaceRev
 //! sQ/{auth}\0{sid}{spaceRev u64}    -> writer DID (listRepos order; latest state per writer only)
+//! sN/{auth}\0{sid}{service}         -> notify registration: endpoint, expiry
 
 use crate::cid::{Cid, CID_BYTES_LEN};
 use crate::tid::Tid;
@@ -230,9 +231,10 @@ pub const SPACE_FAMILY: &[u8] = b"sS/";
 pub const SPACE_MEMBER_FAMILY: &[u8] = b"sM/";
 pub const SPACE_WRITER_FAMILY: &[u8] = b"sW/";
 pub const SPACE_SEQ_FAMILY: &[u8] = b"sQ/";
+pub const SPACE_NOTIFY_FAMILY: &[u8] = b"sN/";
 
 /// Every Spaces family: rows that must never reach a firehose frame.
-pub const SPACE_FAMILIES: [&[u8]; 8] = [
+pub const SPACE_FAMILIES: [&[u8]; 9] = [
     SPACE_HEAD_FAMILY,
     SPACE_RECORD_FAMILY,
     SPACE_OPLOG_FAMILY,
@@ -241,6 +243,7 @@ pub const SPACE_FAMILIES: [&[u8]; 8] = [
     SPACE_MEMBER_FAMILY,
     SPACE_WRITER_FAMILY,
     SPACE_SEQ_FAMILY,
+    SPACE_NOTIFY_FAMILY,
 ];
 
 pub const SPACE_ID_LEN: usize = 16;
@@ -294,6 +297,10 @@ pub fn space_writer_key(authority: &str, sid: &SpaceId, writer: &str) -> Vec<u8>
 
 pub fn space_seq_key(authority: &str, sid: &SpaceId, space_rev: u64) -> Vec<u8> {
     keyed(authority, SPACE_SEQ_FAMILY, &[authority.as_bytes(), b"\0", sid, &space_rev.to_be_bytes()])
+}
+
+pub fn space_notify_key(authority: &str, sid: &SpaceId, service: &str) -> Vec<u8> {
+    keyed(authority, SPACE_NOTIFY_FAMILY, &[authority.as_bytes(), b"\0", sid, service.as_bytes()])
 }
 
 /// A repo generation in keys: LEB128, which is prefix-free, so no

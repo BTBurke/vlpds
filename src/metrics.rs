@@ -639,6 +639,8 @@ lazy!(SPACE_DELEGATIONS: IntCounter = register_int_counter!("vlpds_space_delegat
 lazy!(SPACE_CREDENTIAL_CACHE: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_cache_total", "Space credential verifications by cache result (hit: a verified credential, only the request signature checked; miss: the whole chain)", &["result"]));
 lazy!(SPACE_CREDENTIAL_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_space_credential_checks_total", "Space credential checks by result (ok, bad_sig, expired, revoked, audience, space)", &["result"]));
 lazy!(SPACE_REVOCATIONS: IntGauge = register_int_gauge!("vlpds_space_revocations", "Revoked space credentials this node enforces (until they would have expired)"));
+lazy!(SPACE_FANOUT_DEPTH: IntGauge = register_int_gauge!("vlpds_space_fanout_queue_depth", "Write notifications waiting to be forwarded to registered services, across lanes"));
+lazy!(SPACE_FANOUT_DROPPED: IntCounterVec = register_int_counter_vec!("vlpds_space_fanout_dropped_total", "Write notifications not forwarded to a registered service, by reason (queue_full: the dispatcher's queue; lane_full: the oldest of a service's lane)", &["reason"]));
 lazy!(SPACE_CREDENTIALS_ISSUED: IntCounterVec = register_int_counter_vec!("vlpds_space_credentials_issued_total", "getSpaceCredential answers as a space authority, by result", &["result"]));
 
 pub fn space_write(op: &str, result: &str) {
@@ -681,6 +683,14 @@ pub fn space_credential_check(result: &str) {
 
 pub fn space_revocations(n: usize) {
     SPACE_REVOCATIONS.set(n as i64);
+}
+
+pub fn space_fanout_depth(delta: i64) {
+    SPACE_FANOUT_DEPTH.add(delta);
+}
+
+pub fn space_fanout_dropped(reason: &str) {
+    SPACE_FANOUT_DROPPED.with_label_values(&[reason]).inc();
 }
 
 pub fn space_credential_issued(result: &str) {

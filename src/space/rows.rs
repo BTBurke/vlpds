@@ -240,6 +240,31 @@ impl MemberRow {
     }
 }
 
+/// `sN`: a service registered for the space's write notifications.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotifyRow {
+    pub endpoint: String,
+    /// Unix microseconds.
+    pub expires: u64,
+}
+
+impl NotifyRow {
+    pub fn encode(&self) -> Bytes {
+        let mut b = Vec::with_capacity(10 + self.endpoint.len());
+        put_str(&mut b, &self.endpoint);
+        b.put_u64(self.expires);
+        b.into()
+    }
+
+    pub fn decode(v: &[u8]) -> anyhow::Result<NotifyRow> {
+        let mut r = Reader::new(v);
+        let endpoint = r.str()?.to_string();
+        let expires = r.u64()?;
+        r.end()?;
+        Ok(NotifyRow { endpoint, expires })
+    }
+}
+
 /// A simplespace user policy (`readPolicy`, `writePolicy`).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
@@ -333,6 +358,8 @@ mod tests {
         }
         let o = OutboxRow { uri: "at://x".into(), repo_rev: Tid(5), hash: [3; 32] };
         assert_eq!(OutboxRow::decode(&o.encode()).unwrap(), o);
+        let n = NotifyRow { endpoint: "https://syncer.example".into(), expires: 9 };
+        assert_eq!(NotifyRow::decode(&n.encode()).unwrap(), n);
         let w = WriterRow { repo_rev: Tid(1), hash: [2; 32], space_rev: Tid(3) };
         assert_eq!(WriterRow::decode(&w.encode()).unwrap(), w);
         for m in [MemberRow { read: true, write: false }, MemberRow { read: true, write: true }] {

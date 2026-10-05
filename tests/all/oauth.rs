@@ -143,21 +143,21 @@ impl DpopKey {
         self.proof_with(htm, htu, ath, n.as_deref())
     }
 
-    fn update_nonce(&self, h: &HeaderMap) {
+    pub(crate) fn update_nonce(&self, h: &HeaderMap) {
         if let Some(n) = h.get("dpop-nonce").and_then(|v| v.to_str().ok()) {
             *self.nonce.lock() = Some(n.to_string());
         }
     }
 }
 
-fn sign_jwt(sk: &SigningKey, header: &J, payload: &J) -> String {
+pub(crate) fn sign_jwt(sk: &SigningKey, header: &J, payload: &J) -> String {
     let input = format!("{}.{}", b64(serde_json::to_vec(header).unwrap()), b64(serde_json::to_vec(payload).unwrap()));
     let sig: Signature = sk.sign(input.as_bytes());
     format!("{input}.{}", b64(sig.to_bytes()))
 }
 
 /// A client signing key and its public JWK (kid "k1").
-fn client_key() -> (SigningKey, J) {
+pub(crate) fn client_key() -> (SigningKey, J) {
     let sk = SigningKey::generate();
     let pt = sk.verifying_key().to_sec1_point(false);
     let jwk = json!({"kty": "EC", "crv": "P-256", "x": b64(pt.x().unwrap()), "y": b64(pt.y().unwrap()), "kid": "k1", "alg": "ES256", "use": "sig"});
@@ -495,7 +495,7 @@ async fn refresh(s: &Srv, f: &Flow<'_>, rt: &str, extra: &[(&str, &str)]) -> Res
 }
 
 /// Serves a client metadata document built from its own client_id.
-async fn serve_metadata(build: impl FnOnce(&str) -> J) -> String {
+pub(crate) async fn serve_metadata(build: impl FnOnce(&str) -> J) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let client_id = format!("http://{}/client-metadata.json", listener.local_addr().unwrap());
     let md = build(&client_id);
@@ -506,7 +506,7 @@ async fn serve_metadata(build: impl FnOnce(&str) -> J) -> String {
 }
 
 /// Metadata of a confidential web client authenticating with `jwk`.
-fn confidential_metadata(id: &str, redirect: &str, jwk: &J) -> J {
+pub(crate) fn confidential_metadata(id: &str, redirect: &str, jwk: &J) -> J {
     json!({
         "client_id": id,
         "client_name": "Test App",

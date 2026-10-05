@@ -132,6 +132,33 @@ impl SpaceClient {
         oauth_resp(oauth::xrpc_dpop(&self.srv, &self.key, &self.access, "GET", nsid, None).await)
     }
 
+    /// A GET whose answer isn't JSON (getRepo's CAR): status, content type
+    /// and body.
+    pub async fn get_raw(&self, nsid: &str, query: &[(&str, &str)]) -> (u16, String, Vec<u8>) {
+        let url = xrpc_url(&self.srv.base, nsid, query);
+        for attempt in 0..2 {
+            let r = self
+                .srv
+                .http
+                .get(&url)
+                .header("dpop", self.key.proof("GET", &url, Some(&self.access)))
+                .header("authorization", format!("DPoP {}", self.access))
+                .send()
+                .await
+                .unwrap();
+            let status = r.status().as_u16();
+            self.key.update_nonce(r.headers());
+            let ctype = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let body = r.bytes().await.unwrap().to_vec();
+            let nonce = serde_json::from_slice::<J>(&body).is_ok_and(|j| j["error"] == "use_dpop_nonce");
+            if attempt == 0 && nonce {
+                continue;
+            }
+            return (status, ctype, body);
+        }
+        unreachable!()
+    }
+
     pub async fn post(&self, nsid: &str, body: J) -> Resp {
         oauth_resp(oauth::xrpc_dpop(&self.srv, &self.key, &self.access, "POST", nsid, Some(body)).await)
     }
@@ -186,11 +213,35 @@ impl SpaceClient {
     }
 
     pub async fn exchange_as(&self, holder: &Holder, host: &str, space: &str, token: &str) -> Resp {
+        self.exchange_with(holder, host, space, token, None).await
+    }
+
+    /// getSpaceCredential with a client attestation (an `appAccess` allow
+    /// list's proof of which app asks).
+    pub async fn exchange_with(
+        &self,
+        holder: &Holder,
+        host: &str,
+        space: &str,
+        token: &str,
+        attestation: Option<&str>,
+    ) -> Resp {
         let mut rb = self.srv.http.post(format!("{host}/xrpc/com.atproto.space.getSpaceCredential"));
         for (k, v) in holder.headers(&format!("Bearer {token}"), None) {
             rb = rb.header(k, v);
         }
-        resp(rb.json(&json!({"space": space})).send().await.unwrap()).await
+        let mut body = json!({"space": space});
+        if let Some(a) = attestation {
+            body["clientAttestation"] = json!(a);
+        }
+        resp(rb.json(&body).send().await.unwrap()).await
+    }
+
+    /// A fresh delegation token for `space` exchanged at `host`, with an
+    /// optional client attestation; the response as is.
+    pub async fn try_credential_at(&self, host: &str, space: &str, attestation: Option<&str>) -> Resp {
+        let token = self.delegation_token(space).await.ok()["token"].as_str().unwrap().to_string();
+        self.exchange_with(&self.holder, host, space, &token, attestation).await
     }
 
     /// A credential for `space` from the authority at `host`: the whole
@@ -219,6 +270,28 @@ impl SpaceClient {
     ) -> Resp {
         signed_get_as(&self.srv.http, &self.holder, base, nsid, query, credential, audience).await
     }
+
+    pub async fn signed_post(&self, base: &str, nsid: &str, body: J, credential: &str, audience: &str) -> Resp {
+        signed_post_as(&self.srv.http, &self.holder, base, nsid, body, credential, audience).await
+    }
+}
+
+/// A credential call with a JSON body (registerNotify, unregisterNotify),
+/// signed by `holder`.
+pub async fn signed_post_as(
+    http: &reqwest::Client,
+    holder: &Holder,
+    base: &str,
+    nsid: &str,
+    body: J,
+    credential: &str,
+    audience: &str,
+) -> Resp {
+    let mut rb = http.post(xrpc_url(base, nsid, &[]));
+    for (k, v) in holder.headers(&format!("Atproto-Space {credential}"), Some(audience)) {
+        rb = rb.header(k, v);
+    }
+    resp(rb.json(&body).send().await.unwrap()).await
 }
 
 /// A credential read signed by `holder`.

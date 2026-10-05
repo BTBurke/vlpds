@@ -35,6 +35,11 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/com.atproto.space.getSpaceCredential", post(get_space_credential))
         .route("/xrpc/com.atproto.space.listSpaces", get(list_spaces))
         .route("/xrpc/com.atproto.space.notifyCredentialRevoked", post(notify_credential_revoked))
+        .route("/xrpc/com.atproto.space.getRepo", get(get_repo))
+        .route("/xrpc/com.atproto.space.notifyWrite", post(notify_write))
+        .route("/xrpc/com.atproto.space.listRepos", get(list_repos))
+        .route("/xrpc/com.atproto.space.registerNotify", post(register_notify))
+        .route("/xrpc/com.atproto.space.unregisterNotify", post(unregister_notify))
 }
 
 pub fn internal_routes() -> Router<Arc<App>> {
@@ -89,6 +94,7 @@ fn space_error(e: SpaceError) -> XrpcError {
         SpaceError::RecordAlreadyExists(m) => XrpcError::bad("RecordAlreadyExists", m),
         SpaceError::ScopeMissing(scope) => super::authn::scope_refused("oauth", &scope),
         SpaceError::SpaceNotFound => XrpcError::bad("SpaceNotFound", "Space not found"),
+        SpaceError::SpaceDeleted => XrpcError::bad("SpaceDeleted", "Space has been deleted"),
         SpaceError::SpaceAlreadyExists => XrpcError::bad("SpaceAlreadyExists", "Space already exists"),
         SpaceError::NotAuthorized(m) => forbidden(m),
     }
@@ -851,18 +857,28 @@ async fn issue_credential(app: &App, headers: &HeaderMap, inp: CredentialIn) -> 
         ));
     }
     let space = Space::parse(&inp.space)?;
+    super::simplespace::assert_space_host(app, &space).await?;
+    let client_id = match &inp.client_attestation {
+        Some(a) => {
+            let aud = token::space_host_aud(&space.authority);
+            Some(crate::space::attestation::verify(app, a, &aud, &space.authority).await?)
+        }
+        None => None,
+    };
     let row = super::simplespace::space_row(app, &space).await?;
-    if row.deleted_at.is_some() {
+    if !row.live() {
+        // the durable signal that a space is gone, for a syncer that missed
+        // notifySpaceDeleted
         return Err(XrpcError::bad("SpaceDeleted", "Space has been deleted"));
     }
-    // the app perimeter first: a refused app is never disclosed further
-    if let crate::space::rows::AppAccess::AllowList { .. } = row.app_access {
-        // client attestations come with the space host (until then, none is
-        // accepted)
-        let _ = inp.client_attestation;
-        return Err(XrpcError::bad("AppNotAuthorized", "Application not authorized for this space"));
+    // the app perimeter first: decided from the config alone, so a refused
+    // app is never disclosed to a managing app
+    if let crate::space::rows::AppAccess::AllowList { allowed } = &row.app_access {
+        if !client_id.as_ref().is_some_and(|c| allowed.contains(c)) {
+            return Err(XrpcError::bad("AppNotAuthorized", "Application not authorized for this space"));
+        }
     }
-    if !super::simplespace::may_read(app, &space, &row, &d.user).await? {
+    if !super::simplespace::authorize_user(app, &space, &row, &d.user, "read", client_id.as_deref()).await? {
         return Err(XrpcError::bad("UserNotAuthorized", "User not authorized for this space"));
     }
     let (key, _) = super::proxy::account_key_status(app, &space.authority).await?;
@@ -1073,8 +1089,9 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         && app.remote_owner(&space.authority).is_none()
         && super::server::account_if_exists(app, &space.authority).await.is_ok_and(|a| a.is_some());
     if local {
-        let op = SpaceOp::RecordWriter { writer: p.did.to_string(), repo_rev: p.repo_rev, hash: p.hash };
-        return match submit_space(app, &space.authority, &space, op).await {
+        let r = process_notify_write(app, &space, &p.did, p.repo_rev, p.hash).await;
+        metrics::space_notify("in", notify_in_result(&r));
+        return match r {
             Ok(_) => Outcome::Delivered,
             Err(e) if e.status.is_server_error() => Outcome::Retry(format!("{}: {}", e.error, e.message)),
             Err(e) => Outcome::Refused(format!("{}: {}", e.error, e.message)),
@@ -1109,5 +1126,362 @@ pub async fn deliver(app: &App, p: &Pending) -> Outcome {
         Ok(r) if retryable_status(r.status().as_u16()) => Outcome::Retry(format!("{} from {url}", r.status())),
         Ok(r) => Outcome::Refused(format!("{} from {url}", r.status())),
         Err(e) => Outcome::Retry(format!("{url}: {e}")),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetRepoQ {
+    space: String,
+    repo: String,
+    exclude_values: Option<bool>,
+}
+
+/// A signed commit as a CAR block (dag-cbor; the reference's `SignedCommit`
+/// with byte fields as bytes).
+fn commit_block(c: &crate::space::commit::SignedCommit) -> Vec<u8> {
+    let mut b = Vec::with_capacity(256);
+    crate::cbor::write_map_head(&mut b, 6);
+    // canonical key order: by length, then bytes
+    for (k, v) in [("ikm", &c.ikm), ("mac", &c.mac)] {
+        crate::cbor::write_text(&mut b, k);
+        crate::cbor::write_bytes(&mut b, v);
+    }
+    crate::cbor::write_text(&mut b, "rev");
+    crate::cbor::write_text(&mut b, &c.rev);
+    crate::cbor::write_text(&mut b, "sig");
+    crate::cbor::write_bytes(&mut b, &c.sig);
+    crate::cbor::write_text(&mut b, "ver");
+    crate::cbor::write_int(&mut b, c.ver);
+    crate::cbor::write_text(&mut b, "hash");
+    crate::cbor::write_bytes(&mut b, &c.hash);
+    b
+}
+
+/// Reference getRepo (`serializeRepo`): a CAR whose two roots are the
+/// signed commit and the index (path -> CID, in dag-cbor key order), then
+/// one block per record in the index's order; with `excludeValues` only
+/// the roots. Built in memory from one snapshot (bounded by the space repo
+/// record cap); a record taken down keeps its index entry (the commit's
+/// hash covers it) but not its block.
+async fn get_repo(State(app): AppState, SpaceAuth(creds): SpaceAuth, Query(q): Query<GetRepoQ>) -> XResult<Response> {
+    spaces(&app)?;
+    let space = Space::parse(&q.space)?;
+    let self_read = assert_space_read(&creds, &space, &q.repo)?;
+    let key = available(&app, &q.repo, self_read).await?;
+    metrics::space_read("getRepo", auth_label(&creds));
+    let p = app.partition(&q.repo)?;
+    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let not_found = || XrpcError::bad("RepoNotFound", format!("Could not find repo for space: {}", space.uri));
+    let v = snap.get(state::space_head_key(&q.repo, &space.sid)).await.map_err(XrpcError::from_err)?;
+    let head = head_of(HeadRow::decode(&v.ok_or_else(not_found)?).map_err(XrpcError::from_err)?, &space, &p)?;
+    let values = !q.exclude_values.unwrap_or(false);
+    let takedowns = match values {
+        true => Some(super::server::ctl(&app, &q.repo).await?),
+        false => None,
+    };
+    let prefix = state::space_prefix(state::SPACE_RECORD_FAMILY, &q.repo, &space.sid);
+    let opts = slatedb::config::ScanOptions::default();
+    let mut iter =
+        snap.scan_with_options(prefix.clone()..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
+    let mut records: Vec<(String, Cid, Option<Bytes>)> = Vec::new();
+    while let Some(kv) = iter.next().await.map_err(XrpcError::from_err)? {
+        let path = std::str::from_utf8(&kv.key[prefix.len()..]).map_err(XrpcError::from_err)?.to_string();
+        let (cid, bytes) = state::record_value_parts(&kv.value).map_err(XrpcError::from_err)?;
+        let keep = takedowns.as_ref().is_some_and(|td| !td.has_takedown(&takedown_name(&space.sid, &path)));
+        let bytes = keep.then(|| kv.value.slice_ref(bytes));
+        records.push((path, cid, bytes));
+    }
+    records.sort_by(|a, b| crate::cbor::key_cmp(&a.0, &b.0));
+    let mut index = Vec::with_capacity(records.len() * 96 + 8);
+    crate::cbor::write_map_head(&mut index, records.len());
+    for (path, cid, _) in &records {
+        crate::cbor::write_text(&mut index, path);
+        crate::cbor::write_cid(&mut index, cid);
+    }
+    let rev = head.rev.to_string();
+    let ctx = crate::space::commit::CommitCtx { space: &space.uri, author: &q.repo, rev: &rev };
+    let commit = crate::space::commit::sign(&head.hash, &ctx, rand::random(), |b| {
+        Ok::<_, std::convert::Infallible>(key.sign(b))
+    })
+    .map_err(|_| XrpcError::internal("space commit context too long"))?;
+    let commit = commit_block(&commit);
+    let (commit_cid, index_cid) = (Cid::dag_cbor(&commit), Cid::dag_cbor(&index));
+    let body_len: usize = records.iter().filter_map(|r| r.2.as_ref()).map(|b| b.len() + 48).sum();
+    let mut out = Vec::with_capacity(commit.len() + index.len() + body_len + 256);
+    let mut h = Vec::with_capacity(96);
+    crate::cbor::write_map_head(&mut h, 2);
+    crate::cbor::write_text(&mut h, "roots");
+    crate::cbor::write_array_head(&mut h, 2);
+    crate::cbor::write_cid(&mut h, &commit_cid);
+    crate::cbor::write_cid(&mut h, &index_cid);
+    crate::cbor::write_text(&mut h, "version");
+    crate::cbor::write_uint(&mut h, 1);
+    crate::car::write_varint(&mut out, h.len() as u64);
+    out.extend_from_slice(&h);
+    crate::car::write_block(&mut out, &commit_cid, &commit);
+    crate::car::write_block(&mut out, &index_cid, &index);
+    if values {
+        for (_, cid, bytes) in &records {
+            if let Some(b) = bytes {
+                crate::car::write_block(&mut out, cid, b);
+            }
+        }
+    }
+    Ok(([(header::CONTENT_TYPE, "application/vnd.ipld.car")], out).into_response())
+}
+
+/// How far ahead of this host's clock a notified repoRev may be.
+const FUTURE_REV: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Reference `processNotifyWrite` at the space's authority: the space must
+/// be live here, the writer admitted by the write policy (the authority
+/// always), and its repoRev newer than the one recorded (Ok(None) if not).
+/// Recorded through the authority's worker, which assigns the spaceRev and
+/// queues the forward to registered services once it's durable.
+pub(super) async fn process_notify_write(
+    app: &App,
+    space: &Space,
+    writer: &str,
+    repo_rev: Tid,
+    hash: [u8; 32],
+) -> XResult<Option<crate::space::repo::Sequenced>> {
+    super::simplespace::assert_space_host(app, space).await?;
+    if repo_rev.micros() > crate::tid::now_micros() + FUTURE_REV.as_micros() as u64 {
+        return Err(XrpcError::bad("FutureRev", "Repo revision is in the future"));
+    }
+    let row = super::simplespace::live_space(app, space).await?;
+    let managing_app = match &row.write_policy {
+        crate::space::rows::Policy::ManagingApp { .. } if writer != space.authority => {
+            Some(super::simplespace::authorize_user(app, space, &row, writer, "write", None).await?)
+        }
+        _ => None,
+    };
+    let op = SpaceOp::RecordWriter { writer: writer.to_string(), repo_rev, hash, managing_app };
+    match submit_space(app, &space.authority, space, op).await? {
+        SpaceAck::Writer(seq) => Ok(seq),
+        _ => Err(XrpcError::internal("unexpected space ack")),
+    }
+}
+
+fn notify_in_result(r: &XResult<Option<crate::space::repo::Sequenced>>) -> &'static str {
+    match r {
+        Ok(Some(_)) => "ok",
+        Ok(None) => "noop",
+        Err(e) if e.status.is_server_error() => "error",
+        Err(_) => "refused",
+    }
+}
+
+/// `$bytes` of exactly `n` bytes.
+fn bytes_field<const N: usize>(v: &J) -> Option<[u8; N]> {
+    let s = v.get("$bytes")?.as_str()?;
+    let b = base64::engine::general_purpose::STANDARD_NO_PAD.decode(s.trim_end_matches('=')).ok()?;
+    b.try_into().ok()
+}
+
+/// Reference notifyWrite at a space host: the writer's repo host, by
+/// service auth from the writer (`iss` is the claimed `repo`, so no host
+/// notifies for another's account) addressed to the space's authority. The
+/// repoRev is checked before auth, as the reference's input validation is.
+async fn notify_write(State(app): AppState, headers: HeaderMap, Json(inp): Json<J>) -> XResult<StatusCode> {
+    spaces(&app)?;
+    let r = notify_write_inner(&app, &headers, &inp).await;
+    metrics::space_notify("in", notify_in_result(&r));
+    r.map(|_| StatusCode::OK)
+}
+
+async fn notify_write_inner(app: &App, headers: &HeaderMap, inp: &J) -> XResult<Option<crate::space::repo::Sequenced>> {
+    let field = |k: &str| inp.get(k).and_then(|v| v.as_str());
+    let repo_rev = field("repoRev")
+        .and_then(Tid::parse)
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Input/repoRev must be a valid TID"))?;
+    let space = Space::parse(field("space").unwrap_or(""))?;
+    let repo = field("repo")
+        .filter(|d| super::syntax::valid_did(d))
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Input/repo must be a valid did"))?;
+    let hash = inp
+        .get("hash")
+        .and_then(bytes_field::<32>)
+        .ok_or_else(|| XrpcError::bad("InvalidRequest", "Input/hash must be 32 bytes"))?;
+    let auth = super::authn::verify_space_service_jwt(app, headers, "com.atproto.space.notifyWrite").await?;
+    if auth.iss != repo {
+        return Err(forbidden("notifyWrite iss does not match claimed writer"));
+    }
+    if auth.aud != space.authority && auth.aud != token::space_host_aud(&space.authority) {
+        return Err(forbidden("notifyWrite aud does not match the space authority"));
+    }
+    process_notify_write(app, &space, repo, repo_rev, hash).await
+}
+
+/// A request the space host answers for a credential holder only: the
+/// credential is this space's and addressed to the authority.
+async fn host_credential(app: &App, headers: &HeaderMap, space: &Space) -> XResult<()> {
+    match super::authn::verify_space_credential(app, headers).await? {
+        Credentials::SpaceCredential { audience, space: s, .. } => {
+            assert_credential_space(&audience, &s, space, &space.authority)
+        }
+        _ => Err(XrpcError::internal("not a space credential")),
+    }
+}
+
+#[derive(Deserialize)]
+struct ListReposQ {
+    space: String,
+    limit: Option<i64>,
+    cursor: Option<String>,
+}
+
+/// The first spaceRev a listRepos cursor admits. The reference compares it
+/// with spaceRevs as a plain string; a TID's string order is its numeric
+/// order, so the first TID whose string is greater is found by bisection.
+fn space_rev_after(cursor: &str) -> Option<u64> {
+    if let Some(t) = Tid::parse(cursor) {
+        return t.0.checked_add(1);
+    }
+    let (mut lo, mut hi) = (0u64, 1u64 << 63);
+    if Tid(hi - 1).to_string().as_str() <= cursor {
+        return None;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if Tid(mid).to_string().as_str() > cursor {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    Some(lo)
+}
+
+/// Reference listRepos: each writer's latest state, in spaceRev order after
+/// the cursor (`sQ` joined to `sW` in one snapshot). A writer updated while
+/// a client pages may show up again, as the lexicon says.
+async fn list_repos(State(app): AppState, headers: HeaderMap, Query(q): Query<ListReposQ>) -> XResult<Json<J>> {
+    spaces(&app)?;
+    let space = Space::parse(&q.space)?;
+    let limit = super::extract::limit_param(q.limit, 100, 1, 1000)?;
+    host_credential(&app, &headers, &space).await?;
+    super::simplespace::live_space(&app, &space).await?;
+    metrics::space_read("listRepos", "credential");
+    let p = app.partition(&space.authority)?;
+    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let prefix = state::space_prefix(state::SPACE_SEQ_FAMILY, &space.authority, &space.sid);
+    let lo = match q.cursor.as_deref() {
+        None => prefix.clone(),
+        Some(c) => match space_rev_after(c) {
+            Some(rev) => [&prefix[..], &rev.to_be_bytes()].concat(),
+            None => return Ok(Json(json!({"repos": []}))),
+        },
+    };
+    let opts = slatedb::config::ScanOptions::default();
+    let mut iter = snap.scan_with_options(lo..state::prefix_end(&prefix), &opts).await.map_err(XrpcError::from_err)?;
+    let mut repos = Vec::with_capacity(limit.min(256));
+    let mut last = None;
+    while repos.len() < limit {
+        let rows = iter.next_batch(limit - repos.len()).await.map_err(XrpcError::from_err)?;
+        if rows.is_empty() {
+            break;
+        }
+        for kv in rows {
+            let space_rev =
+                crate::space::rows::seq_rev(&kv.key).ok_or_else(|| XrpcError::internal("malformed space seq key"))?;
+            let writer = std::str::from_utf8(&kv.value).map_err(XrpcError::from_err)?;
+            let k = state::space_writer_key(&space.authority, &space.sid, writer);
+            let Some(v) = snap.get(k).await.map_err(XrpcError::from_err)? else { continue };
+            let w = crate::space::rows::WriterRow::decode(&v).map_err(XrpcError::from_err)?;
+            repos.push(json!({
+                "did": writer,
+                "repoRev": w.repo_rev.to_string(),
+                "hash": b64(&w.hash),
+                "spaceRev": space_rev.to_string(),
+            }));
+            last = Some(space_rev);
+        }
+    }
+    let mut out = json!({"repos": repos});
+    if let Some(rev) = last {
+        out["cursor"] = json!(rev.to_string());
+    }
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+struct RegisterIn {
+    space: String,
+    service: String,
+}
+
+/// Reference registerNotify: a credential holder subscribes a service (a DID
+/// with an optional fragment) to the space's write notifications for a
+/// day. Registering again replaces the endpoint and extends the expiry.
+async fn register_notify(State(app): AppState, headers: HeaderMap, Json(inp): Json<RegisterIn>) -> XResult<Json<J>> {
+    spaces(&app)?;
+    let space = Space::parse(&inp.space)?;
+    host_credential(&app, &headers, &space).await?;
+    super::simplespace::assert_space_host(&app, &space).await?;
+    let Some(endpoint) = crate::space::host::resolve_service_endpoint(&app, &inp.service).await else {
+        return Err(XrpcError::bad(
+            "ServiceNotResolvable",
+            format!("Could not resolve a service endpoint for {}", inp.service),
+        ));
+    };
+    let expires = crate::tid::now_micros() + crate::space::host::REGISTRATION_TTL.as_micros() as u64;
+    let row = crate::space::rows::NotifyRow { endpoint, expires };
+    submit_space(&app, &space.authority, &space, SpaceOp::RegisterNotify { service: inp.service, row }).await?;
+    let at =
+        chrono::DateTime::from_timestamp_micros(expires as i64).ok_or_else(|| XrpcError::internal("bad expiry"))?;
+    Ok(Json(json!({"expiresAt": at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)})))
+}
+
+/// Reference unregisterNotify: not resolved again (a subscriber whose DID
+/// document changed can still withdraw); fine when nothing was registered.
+async fn unregister_notify(
+    State(app): AppState,
+    headers: HeaderMap,
+    Json(inp): Json<RegisterIn>,
+) -> XResult<StatusCode> {
+    spaces(&app)?;
+    let space = Space::parse(&inp.space)?;
+    host_credential(&app, &headers, &space).await?;
+    super::simplespace::assert_space_host(&app, &space).await?;
+    submit_space(&app, &space.authority, &space, SpaceOp::UnregisterNotify { service: inp.service }).await?;
+    Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_repos_cursors_compare_as_strings() {
+        let t = Tid::from_parts(1_790_000_000_000_000, 3);
+        assert_eq!(space_rev_after(&t.to_string()), Some(t.0 + 1));
+        for c in ["", "0", "2", "3jzfcijpj2z2", "3jzfcijpj2z2a0", "abc", "b", "bzzzzzzzzzzz"] {
+            let first = space_rev_after(c).unwrap();
+            assert!(Tid(first).to_string().as_str() > c, "{c}");
+            if first > 0 {
+                assert!(Tid(first - 1).to_string().as_str() <= c, "{c}");
+            }
+        }
+        // past every TID
+        assert_eq!(space_rev_after("c"), None);
+        assert_eq!(space_rev_after("zzz"), None);
+    }
+
+    #[test]
+    fn commit_blocks_are_canonical() {
+        let c = crate::space::commit::SignedCommit {
+            ver: 1,
+            hash: vec![1; 32],
+            ikm: vec![2; 32],
+            sig: vec![3; 64],
+            mac: vec![4; 32],
+            rev: "3jzfcijpj2z2a".into(),
+        };
+        let b = commit_block(&c);
+        let v = crate::cbor::Value::decode(&b).unwrap();
+        assert_eq!(v.to_cbor(), b, "decodes and re-encodes to the same bytes");
+        assert_eq!(v.get("rev").and_then(|r| r.as_str()), Some("3jzfcijpj2z2a"));
     }
 }
