@@ -1123,6 +1123,8 @@ struct Pending {
     totp: bool,
     /// `allowCredentials` for the passkey button; empty without passkeys.
     passkeys: Vec<J>,
+    /// It has passkeys, every one flagged as copied.
+    flagged: bool,
 }
 
 impl Pending {
@@ -1131,16 +1133,14 @@ impl Pending {
             super::email2fa::Factor::Email { hint } => Some(hint.clone()),
             _ => None,
         };
-        let passkeys = if email_hint.is_some() {
-            Vec::new()
-        } else {
-            super::passkeys::descriptors(&super::passkeys::load(app, &acct.did).await?)
-        };
+        let all = if email_hint.is_some() { Default::default() } else { super::passkeys::load(app, &acct.did).await? };
+        let passkeys = super::passkeys::descriptors(&all);
         Ok(Pending {
             did: acct.did.clone(),
             handle: acct.handle.clone(),
             totp: email_hint.is_none() && crate::totp::enabled_for(app, acct).await?,
             email_hint,
+            flagged: !all.creds.is_empty() && passkeys.is_empty(),
             passkeys,
         })
     }
@@ -1442,7 +1442,6 @@ async fn passwordless_sign_in(
     f: &HashMap<String, String>,
     req: &SignInReq<'_>,
 ) -> Result<SignIn, OAuthError> {
-    use crate::ratelimit as rl;
     use crate::webauthn::Fail;
     let refused = |f: Fail| {
         super::passkeys::count_failure(f);
@@ -1452,9 +1451,8 @@ async fn passwordless_sign_in(
     let Some(did) = a.user_handle.as_deref().and_then(super::passkeys::did_from_user_handle) else {
         return refused(Fail::Malformed);
     };
-    if rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err() {
-        return Ok(SignIn::Failed(String::new(), LoginError::RateLimited));
-    }
+    // no per-account charge: anyone can name any DID here, and a passkey
+    // can't be guessed; the IP buckets above bound the posts
     let Ok(acct) = account_any(app, &did).await else { return refused(Fail::UnknownCredential) };
     // read before the check: a password change or revoke-all racing this
     // sign-in either lands first or voids it
@@ -1513,6 +1511,7 @@ fn second_factor_form<'a>(p: &'a Pending, pk: &'a Option<(String, String, String
         totp: p.totp,
         trust_days,
         passkey: pk.as_ref().map(|(c, r, a)| ui::PasskeyUi { challenge: c, rp_id: r, allow: a }),
+        flagged: p.flagged,
     }
 }
 
@@ -1871,7 +1870,14 @@ async fn code_grant(
     super::cas::pause_point("oauth_code", &did).await;
     // a password change or takedown since the approval voids the code
     let guard = store::SessionGuard::New { auth_epoch: req.auth_epoch.clone() };
-    issue_tokens(app, client, &mut s, guard).await
+    let out = issue_tokens(app, client, &mut s, guard).await?;
+    // a removal writes the passkeys row before it looks for sessions, so a
+    // session it missed (made after its scan) sees the passkey gone here
+    if !super::passkeys::still_registered(app, &did, req.auth_cred.as_deref()).await? {
+        store::delete_session(app, &did, &s.id).await?;
+        return Err(fail("The passkey that approved this code was removed"));
+    }
+    Ok(out)
 }
 
 /// A session revoked meanwhile is not brought back (`guard`).

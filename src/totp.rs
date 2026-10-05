@@ -199,7 +199,7 @@ pub async fn load_both(app: &App, did: &str) -> Result<(TotpState, Option<Bytes>
     Ok((st, read, m, mread))
 }
 
-/// [`save_if`] over both rows in one write.
+/// [`save_if`] over both rows in one write, and only while `extra` holds.
 pub async fn save_both(
     app: &App,
     did: &str,
@@ -207,12 +207,14 @@ pub async fn save_both(
     read: Option<Bytes>,
     m: &Mfa,
     mread: Option<Bytes>,
+    extra: Vec<crate::xrpc::cas::Cond>,
 ) -> Result<bool, XrpcError> {
     use crate::xrpc::cas::{Cond, Op};
     let (mc, mop) = mfa::cas_parts(m, mread);
     let val = stored(app, did, st).await?;
-    let out =
-        app.private_cas(did, vec![Cond::eq(PRIVATE_NAME, read), mc], vec![Op::put(PRIVATE_NAME, val), mop]).await?;
+    let mut conds = vec![Cond::eq(PRIVATE_NAME, read), mc];
+    conds.extend(extra);
+    let out = app.private_cas(did, conds, vec![Op::put(PRIVATE_NAME, val), mop]).await?;
     Ok(out.applied)
 }
 
@@ -344,7 +346,7 @@ pub async fn check_second_factor(app: &App, account: &Account, code: Option<&str
         // shared by both login paths
         let r = attempt(&mut st, &mut m, did, code, now);
         crate::xrpc::cas::pause_point("totp", did).await;
-        if save_both(app, did, &st, raw, &m, mraw).await? {
+        if save_both(app, did, &st, raw, &m, mraw, Vec::new()).await? {
             return r;
         }
     }

@@ -766,7 +766,7 @@ async fn operator_reset() {
         .await
         .err(400, "InvalidRequest");
     let r = s.xrpc.post("vlpds.admin.resetSecondFactors", &body, &Auth::Admin).await.ok();
-    assert_eq!(r["result"], json!({"passkeys": 1, "totp": true, "trustedBrowsers": 0}), "{r}");
+    assert_eq!(r["result"], json!({"passkeys": 1, "totp": true, "trustedBrowsers": 0, "signedOut": false}), "{r}");
 
     // the password alone works again, the passkey doesn't, its session is gone
     s.login(&a.handle, &a.password, None).await.ok();
@@ -817,4 +817,277 @@ async fn new_device_alert_names_the_passkey() {
     assert_eq!(alerts.len(), 1, "the first sign-in is the baseline: {mail}");
     let body = alerts[0]["body"].as_str().unwrap();
     assert!(body.contains("Signed in with a passkey") && body.contains("second-device/1.0"), "{body}");
+}
+
+// ---------------------------------------------------------------- review fixes
+
+/// Holds requests for one account at a named pause point
+/// (`vlpds::xrpc::cas::pause_point`) until released.
+struct Gate {
+    did: String,
+    reached: tokio::sync::mpsc::UnboundedReceiver<()>,
+    open: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl Gate {
+    fn new(did: &str, point: &'static str) -> Gate {
+        let (tx, reached) = tokio::sync::mpsc::unbounded_channel();
+        let open = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        let o = open.clone();
+        vlpds::xrpc::cas::set_pause_hook(
+            did,
+            Some(std::sync::Arc::new(move |p: &str| {
+                let (hit, tx, o) = (p == point, tx.clone(), o.clone());
+                Box::pin(async move {
+                    if hit {
+                        let _ = tx.send(());
+                        o.acquire().await.expect("gate").forget();
+                    }
+                })
+            })),
+        );
+        Gate { did: did.to_string(), reached, open }
+    }
+
+    async fn reached(&mut self) {
+        tokio::time::timeout(std::time::Duration::from_secs(20), self.reached.recv())
+            .await
+            .expect("request never reached the pause point");
+    }
+
+    fn release(&self) {
+        vlpds::xrpc::cas::set_pause_hook(&self.did, None);
+        self.open.add_permits(1_000);
+    }
+}
+
+/// A passkey removed while a code it approved is being exchanged: the
+/// exchange fails and leaves no session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_racing_a_code_exchange() {
+    let s = o::spawn().await;
+    let acct = o::create_account(&s, "pkrace").await;
+    let mut key = SoftKey::synced(&s.base);
+    oauth_register(&s, &acct, &mut key).await;
+    let dk = o::DpopKey::new();
+    let f = o::Flow::loopback("atproto", &dk);
+    let p = o::pkce();
+    let ru = f.request_uri(&s, &p, "st").await;
+    let mut b = o::Browser::default();
+    let (_, _, html) = b.authorize(&s, &f, &ru).await;
+    let csrf = o::csrf_of(&html);
+    let a = key.assert(&attr(&html, "data-challenge"), &Lie::default());
+    let hidden = [("request_uri", ru.as_str()), ("csrf", csrf.as_str())];
+    let (_, _, html) = post_assertion(&s, &mut b, "/oauth/authorize/sign-in", &hidden, "passkey", &a).await;
+    let csrf2 = o::csrf_of(&html);
+    let consent = [("request_uri", ru.as_str()), ("csrf", &csrf2), ("did", &acct.did), ("action", "allow")];
+    let (_, h, _) = b.post(&s, "/oauth/authorize/consent", &consent).await;
+    let (_, q) = o::location_params(&h);
+    let code = q["code"].clone();
+
+    let mut gate = Gate::new(&acct.did, "oauth_code");
+    let (r, ()) = tokio::join!(o::exchange(&s, &f, &code, &p, &[]), async {
+        // the exchange checked the passkey and is about to make the session
+        gate.reached().await;
+        let rm = json!({"id": key.id_b64(), "password": o::PASSWORD});
+        let (st, j) = s.bearer(&acct.jwt, "vlpds.server.removePasskey", true, Some(rm)).await;
+        assert_eq!(st, 200, "{j}");
+        gate.release();
+    });
+    assert_eq!(r.status, 400, "{}", r.body);
+    assert!(vlpds::oauth::store::list_sessions(&s.app, &acct.did).await.unwrap().is_empty(), "no session left");
+}
+
+/// The same on the account page: the session made in the window is ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removal_racing_an_account_page_sign_in() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkrace2").await;
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "k").await;
+    let opts = start_sign_in(&s, json!({})).await.ok();
+    let cred = k.assert(opts["challenge"].as_str().unwrap(), &Lie::default());
+    let mut gate = Gate::new(&a.did, "passkey_session");
+    let (r, ()) = tokio::join!(passkey_session(&s, &a.did, cred), async {
+        gate.reached().await;
+        let rm = json!({"id": k.id_b64(), "password": a.password});
+        s.xrpc.post("vlpds.server.removePasskey", &rm, &a.auth()).await.ok();
+        gate.release();
+    });
+    r.err(400, "PasskeyRefused");
+}
+
+/// TOTP turned off while the last passkey goes: the codes go too, whichever
+/// lands second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_factors_removed_together_take_the_codes() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkcross").await;
+    let mut k = SoftKey::synced(&s.url);
+    let first = register_passkey(&s, &a, &mut k, "k").await;
+    let codes = first["recoveryCodes"].as_array().unwrap().clone();
+    s.enable_totp(&a).await;
+    let mut gate = Gate::new(&a.did, "totp_off");
+    let off = json!({"password": a.password, "recoveryCode": codes[0]});
+    let auth = a.auth();
+    let (r, ()) = tokio::join!(s.xrpc.post("vlpds.server.disableTotp", &off, &auth), async {
+        // TOTP's removal read "a passkey is left" and is about to write; the
+        // last passkey goes meanwhile, as a removal on another node would
+        // (this process's lock would hold one here)
+        gate.reached().await;
+        let del = vec![vlpds::xrpc::cas::Op::put("passkeys", None)];
+        assert!(s.app.private_cas(&a.did, Vec::new(), del).await.ok().unwrap().applied);
+        gate.release();
+    });
+    r.ok();
+    assert_eq!(list(&s, &a).await["recoveryCodesRemaining"], json!(0), "no codes without a factor");
+}
+
+async fn set_limit(s: &TestServer, name: &str, points: u32, v: u64) {
+    let config = json!({"limiters": {name: {"points": points}}});
+    let body = json!({"config": config, "ifVersion": v, "actor": "test", "note": "passkeys"});
+    s.xrpc.post("vlpds.admin.updateRateLimits", &body, &Auth::Admin).await.ok();
+}
+
+/// Password re-checks spend the account's sign-in bucket; passwordless
+/// posts naming the account don't; a wrong password doesn't spend a
+/// registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn password_rechecks_are_rate_limited() {
+    let s = TestServer::spawn_with(|c| c.rate_limits_enabled = true).await;
+    let a = s.create_account("pkrl").await;
+    set_limit(&s, "passkey-register-account", 1, 0).await;
+    for _ in 0..3 {
+        s.xrpc
+            .post("vlpds.server.startPasskeyRegistration", &json!({"password": "wrong"}), &a.auth())
+            .await
+            .err(401, "AuthenticationRequired");
+    }
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "k").await;
+    // garbage passkey sign-ins naming the account cost it nothing
+    // 4 spent: the registration attempts above
+    set_limit(&s, "sign-in-account", 9, 1).await;
+    for _ in 0..10 {
+        let opts = start_sign_in(&s, json!({})).await.ok();
+        let junk = SoftKey::synced(&s.url).assert(
+            opts["challenge"].as_str().unwrap(),
+            &Lie { user_handle: Some(a.did.as_bytes().to_vec()), ..Default::default() },
+        );
+        passkey_session(&s, &a.did, junk).await.err(400, "PasskeyRefused");
+    }
+    // each re-check is a sign-in attempt
+    let guess = |nsid: &'static str, body: J| {
+        let (s, a) = (&s, &a);
+        async move { s.xrpc.post(nsid, &body, &a.auth()).await }
+    };
+    for _ in 0..2 {
+        guess("vlpds.server.removePasskey", json!({"id": k.id_b64(), "password": "x"})).await.err_status(401);
+        guess("vlpds.server.regenerateRecoveryCodes", json!({"password": "x"})).await.err_status(401);
+    }
+    guess("vlpds.server.disableTotp", json!({"password": "x", "code": "000000"})).await.err_status(401);
+    guess("vlpds.server.removePasskey", json!({"id": k.id_b64(), "password": "x"})).await.err(429, "RateLimitExceeded");
+}
+
+/// The mails a reviewer asked for: recovery codes replaced, TOTP on and
+/// off, a rename, and what to do about a passkey someone else added.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn security_mails() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkmail").await;
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "k").await;
+    s.xrpc.post("vlpds.server.renamePasskey", &json!({"id": k.id_b64(), "name": "laptop"}), &a.auth()).await.ok();
+    s.xrpc.post("vlpds.server.regenerateRecoveryCodes", &json!({"password": a.password}), &a.auth()).await.ok();
+    let (secret, step) = s.enable_totp(&a).await;
+    let off = json!({"password": a.password, "code": vlpds::totp::code_for_step(&secret, step + 1)});
+    s.xrpc.post("vlpds.server.disableTotp", &off, &a.auth()).await.ok();
+    let mail = s.dev_mail(&a.email).await.ok().to_string();
+    for want in [
+        "remove it on the Security page, then change your password",
+        "was renamed",
+        "recovery codes were replaced",
+        "authenticator app was turned on",
+        "authenticator app was turned off",
+    ] {
+        assert!(mail.contains(want), "no mail saying {want:?}: {mail}");
+    }
+}
+
+/// A registration challenge only finishes with the session that started it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn registration_is_bound_to_its_session() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkbind").await;
+    let opts =
+        s.xrpc.post("vlpds.server.startPasskeyRegistration", &json!({"password": a.password}), &a.auth()).await.ok();
+    let cred = SoftKey::synced(&s.url).register(&opts, &Lie::default());
+    let other = s.create_session(&a.handle, &a.password).await.ok();
+    let other = Auth::Bearer(other["accessJwt"].as_str().unwrap().into());
+    s.xrpc
+        .post("vlpds.server.finishPasskeyRegistration", &json!({"name": "x", "credential": cred}), &other)
+        .await
+        .err(400, "PasskeyRefused");
+    s.xrpc
+        .post("vlpds.server.finishPasskeyRegistration", &json!({"name": "x", "credential": cred}), &a.auth())
+        .await
+        .ok();
+}
+
+/// The operator's reset is audited before it changes anything, and can sign
+/// the account out everywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_reset_audit_first_and_revoke() {
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkrst2").await;
+    let mut k = SoftKey::synced(&s.url);
+    register_passkey(&s, &a, &mut k, "k").await;
+    let body = json!({"did": a.did, "reason": "stolen phone", "revokeSessions": true});
+    let r = s.xrpc.post("vlpds.admin.resetSecondFactors", &body, &Auth::Admin).await.ok();
+    assert_eq!(r["result"]["signedOut"], json!(true));
+    s.get_session(&a.auth()).await.err_status(400);
+    let log = s.xrpc.get("vlpds.admin.getAuditLog", &[], &Auth::Admin).await.ok();
+    let mine: Vec<&J> = log["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "second_factors.reset" && e["subject"]["did"] == json!(a.did))
+        .collect();
+    let statuses: Vec<&str> = mine.iter().map(|e| e["detail"]["status"].as_str().unwrap()).collect();
+    assert!(statuses.contains(&"started") && statuses.contains(&"done"), "{statuses:?}");
+    let done = mine.iter().find(|e| e["detail"]["status"] == "done").unwrap();
+    let started = mine.iter().find(|e| e["detail"]["status"] == "started").unwrap();
+    assert_eq!(done["detail"]["started"], started["id"]);
+    assert!(started["id"].as_str() < done["id"].as_str(), "written first");
+}
+
+/// Every passkey flagged as copied: the pages say so and point to a
+/// recovery code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flagged_passkeys_point_to_recovery_codes() {
+    let s = o::spawn().await;
+    let acct = o::create_account(&s, "pkflag").await;
+    let mut hw = SoftKey::new(&s.base);
+    oauth_register(&s, &acct, &mut hw).await;
+    let dk = o::DpopKey::new();
+    let f = o::Flow::loopback("atproto", &dk);
+    for count in [Some(5), Some(1)] {
+        let mut b = o::Browser::default();
+        let (ru, csrf, html) = to_second_step(&s, &mut b, &f, &acct).await;
+        let a = hw.assert(&attr(&html, "data-challenge"), &Lie { count, ..Default::default() });
+        let hidden = [("request_uri", ru.as_str()), ("csrf", csrf.as_str())];
+        post_assertion(&s, &mut b, "/oauth/authorize/sign-in", &hidden, "2fa", &a).await;
+    }
+    let (_, _, html) = to_second_step(&s, &mut o::Browser::default(), &f, &acct).await;
+    assert!(html.contains("may have been copied") && html.contains("details class=\"alt-code\" open"), "{html}");
+    assert!(!html.contains("Use your passkey") && !html.contains("Authenticator code"), "{html}");
+    let r = s
+        .http
+        .post(format!("{}/xrpc/vlpds.server.startPasskeySignIn", s.base))
+        .json(&json!({"identifier": acct.handle, "password": o::PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    let j: J = r.json().await.unwrap();
+    assert_eq!(j["error"], json!("PasskeyFlagged"), "{j}");
 }

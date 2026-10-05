@@ -323,13 +323,15 @@ function Invites({ did, a, onDone }: { did: string; a: AccountView; onDone: () =
 /** For a user who lost every factor. Audited, and the user is mailed. */
 function SecondFactors({ did, handle }: { did: string; handle: string }) {
   const [reason, setReason] = useState('')
+  const [revoke, setRevoke] = useState(false)
   const [open, setOpen] = useState(false)
-  const [done, setDone] = useState<{ passkeys: number; totp: boolean; trustedBrowsers: number }>()
+  const [done, setDone] = useState<{ passkeys: number; totp: boolean; trustedBrowsers: number; signedOut: boolean }>()
   const act = useAction(async () => {
-    const r = await admin('vlpds.admin.resetSecondFactors', { body: { did, reason: reason.trim() } })
+    const r = await admin('vlpds.admin.resetSecondFactors', { body: { did, reason: reason.trim(), revokeSessions: revoke } })
     setDone(r.result)
     setOpen(false)
     setReason('')
+    setRevoke(false)
   })
   return (
     <Panel
@@ -339,7 +341,8 @@ function SecondFactors({ did, handle }: { did: string; handle: string }) {
       {done && (
         <Notice kind="ok">
           Reset: {done.passkeys} passkey{done.passkeys === 1 ? '' : 's'}, {done.totp ? 'the authenticator app, ' : ''}
-          {done.trustedBrowsers} trusted browser{done.trustedBrowsers === 1 ? '' : 's'}.
+          {done.trustedBrowsers} trusted browser{done.trustedBrowsers === 1 ? '' : 's'}
+          {done.signedOut ? ', and every session signed out' : ''}.
         </Notice>
       )}
       <ErrorNotice error={act.error} />
@@ -352,6 +355,15 @@ function SecondFactors({ did, handle }: { did: string; handle: string }) {
         <Field label="Reason" hint="Kept in the audit log, e.g. how you checked it was them." action={<button className="btn danger">Reset</button>}>
           <input type="text" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={2000} required />
         </Field>
+        <label className="check">
+          <input type="checkbox" checked={revoke} onChange={(e) => setRevoke(e.target.checked)} />
+          <span>
+            Also sign out everywhere
+            <span className="small muted" style={{ display: 'block' }}>
+              If someone other than the owner may be signed in to the account now.
+            </span>
+          </span>
+        </label>
       </form>
       <Confirm open={open} title={`Reset two-factor sign-in for @${handle}?`} action="Reset" danger busy={act.busy} onConfirm={() => act.run()} onClose={() => setOpen(false)}>
         Their passkeys, authenticator app, recovery codes and trusted browsers are removed, and anything their passkeys signed in to is signed out. Until they set up two-factor again, they sign in with the password (and an emailed code, if they turned that on).

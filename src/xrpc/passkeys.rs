@@ -348,7 +348,11 @@ fn owner(creds: &super::authn::Credentials) -> XResult<String> {
     super::server::full_access(creds)
 }
 
-async fn check_password(app: &App, did: &str, password: &str) -> XResult<Account> {
+/// The password again, for a change to how the account signs in. Charged to
+/// the account's sign-in bucket before Argon2, so a stolen session can't
+/// guess it any faster than a sign-in could.
+pub(super) async fn check_password(app: &App, did: &str, password: &str) -> XResult<Account> {
+    crate::ratelimit::check(&[&crate::ratelimit::SIGN_IN_ACCOUNT], did, 1)?;
     let acct = app.account(did).await?;
     if password.is_empty() || !super::server::verify_password(&acct, password).await? {
         return Err(XrpcError::auth("Invalid password"));
@@ -414,16 +418,23 @@ struct StartIn {
 
 /// The password is checked here, so a stolen session token alone can't add
 /// a passkey. Returns `PublicKeyCredentialCreationOptions` as JSON.
-async fn start_registration(State(app): AppState, Auth(creds): Auth, Json(inp): Json<StartIn>) -> XResult<Json<J>> {
+async fn start_registration(
+    State(app): AppState,
+    Auth(creds): Auth,
+    headers: HeaderMap,
+    Json(inp): Json<StartIn>,
+) -> XResult<Json<J>> {
     let did = owner(&creds)?;
-    crate::ratelimit::check(&[&crate::ratelimit::PASSKEY_REGISTER_ACCOUNT], &did, 1)?;
     let acct = check_password(&app, &did, &inp.password).await?;
+    // after the password, so a wrong one doesn't spend the day's additions
+    crate::ratelimit::check(&[&crate::ratelimit::PASSKEY_REGISTER_ACCOUNT], &did, 1)?;
     let p = load(&app, &did).await?;
     if p.creds.len() >= MAX_PASSKEYS {
         return Err(bad("This account has the most passkeys it can have. Remove one first."));
     }
     let rp = rp(&app)?;
-    let challenge = webauthn::mint_challenge(&challenge_key(&app), "register", &did, now_secs());
+    let challenge =
+        webauthn::mint_challenge(&challenge_key(&app), "register", &register_binding(&did, &headers), now_secs());
     let (user_id, resident) = match user_handle(&did) {
         Some(h) => (b64u(h), "preferred"),
         // too long to be the user handle: a second factor only, so it needn't be discoverable
@@ -481,10 +492,22 @@ struct FinishIn {
     credential: RegistrationIn,
 }
 
-async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp): Json<FinishIn>) -> XResult<Json<J>> {
+/// A registration challenge finishes only for its account, with the
+/// credential (the session token) that started it.
+fn register_binding(did: &str, headers: &HeaderMap) -> String {
+    let token = headers.get(header::AUTHORIZATION).map(|v| v.as_bytes()).unwrap_or_default();
+    format!("{did}\0{}", hex::encode(&Sha256::digest(token)[..16]))
+}
+
+async fn finish_registration(
+    State(app): AppState,
+    Auth(creds): Auth,
+    headers: HeaderMap,
+    Json(inp): Json<FinishIn>,
+) -> XResult<Json<J>> {
     let did = owner(&creds)?;
     let name = clean_name(&inp.name)?;
-    let (cred, ch) = match verify_new(&app, &did, &inp.credential) {
+    let (cred, ch) = match verify_new(&app, &register_binding(&did, &headers), &inp.credential) {
         Ok(x) => x,
         Err(f) => {
             count_failure(f);
@@ -513,8 +536,11 @@ async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp):
         let ops = vec![Op::put(ROW, Some(Bytes::from(to_json_bytes(&p)))), mop];
         if app.private_cas(&did, vec![Cond::eq(ROW, raw), mc], ops).await?.applied {
             crate::metrics::PASSKEYS.with_label_values(&["registered"]).inc();
-            security_mail(&app, &did, &format!("A passkey \u{201c}{}\u{201d} was added to your account.", cred.name))
-                .await;
+            let what = format!(
+                "A passkey \u{201c}{}\u{201d} was added to your account. If you didn't add it, remove it on the Security page, then change your password: changing the password alone doesn't remove a passkey.",
+                cred.name
+            );
+            security_mail(&app, &did, &what).await;
             return Ok(Json(json!({
                 "id": cred.id,
                 "name": cred.name,
@@ -527,13 +553,13 @@ async fn finish_registration(State(app): AppState, Auth(creds): Auth, Json(inp):
 }
 
 /// Every check of a new credential; nothing written.
-fn verify_new(app: &App, did: &str, c: &RegistrationIn) -> Result<(Cred, webauthn::Challenge), Fail> {
+fn verify_new(app: &App, binding: &str, c: &RegistrationIn) -> Result<(Cred, webauthn::Challenge), Fail> {
     let raw_id = decode_capped(&c.raw_id, MAX_ID_B64)?;
     let cdj = decode_capped(&c.response.client_data_json, MAX_CDJ_B64)?;
     let att = decode_capped(&c.response.attestation_object, MAX_ATT_B64)?;
     let now = now_secs();
     let challenge = webauthn::client_data_challenge(&cdj)?;
-    let ch = webauthn::open_challenge(&challenge_key(app), "register", did, &challenge, now)?;
+    let ch = webauthn::open_challenge(&challenge_key(app), "register", binding, &challenge, now)?;
     let rp = rp(app).map_err(|_| Fail::RpId)?;
     let r = webauthn::verify_registration(&rp, &challenge, &raw_id, &cdj, &att, false)?;
     let mut transports: Vec<String> = Vec::new();
@@ -585,8 +611,12 @@ async fn rename_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json
     for _ in 0..CAS_ROUNDS {
         let (mut p, raw) = load_raw(&app, &did).await?;
         let c = p.creds.iter_mut().find(|c| c.id == inp.id).ok_or_else(|| bad("No such passkey"))?;
-        c.name = name.clone();
+        let old = std::mem::replace(&mut c.name, name.clone());
         if save_if(&app, &did, &p, raw).await? {
+            if old != name {
+                let what = format!("Your passkey \u{201c}{old}\u{201d} was renamed \u{201c}{name}\u{201d}.");
+                security_mail(&app, &did, &what).await;
+            }
             return Ok(StatusCode::OK);
         }
     }
@@ -608,8 +638,7 @@ struct RemoveIn {
 /// are checked against the row when they're used), or everything.
 async fn remove_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RemoveIn>) -> XResult<Json<J>> {
     let did = owner(&creds)?;
-    let acct = check_password(&app, &did, &inp.password).await?;
-    let totp = crate::totp::enabled_for(&app, &acct).await?;
+    check_password(&app, &did, &inp.password).await?;
     let gone = 'cas: {
         let _g = crate::totp::lock(&did).await;
         for _ in 0..CAS_ROUNDS {
@@ -618,7 +647,15 @@ async fn remove_passkey(State(app): AppState, Auth(creds): Auth, Json(inp): Json
             let gone = p.creds.remove(i);
             let mut conds = vec![Cond::eq(ROW, raw)];
             let mut ops = vec![Op::put(ROW, (!p.creds.is_empty()).then(|| Bytes::from(to_json_bytes(&p))))];
-            // the last strong factor takes the recovery codes with it
+            // the last strong factor takes the recovery codes with it; TOTP
+            // read in this round and held to it, so a TOTP change racing
+            // this can't leave a factor without codes
+            let traw = app.get_private(&did, crate::totp::PRIVATE_NAME).await?;
+            let totp = traw
+                .as_deref()
+                .and_then(|v| serde_json::from_slice::<crate::totp::TotpState>(v).ok())
+                .is_some_and(|t| t.enabled());
+            conds.push(Cond::eq(crate::totp::PRIVATE_NAME, traw));
             if p.creds.is_empty() && !totp {
                 let (_, mraw) = super::mfa::load_raw(&app, &did).await?;
                 let (mc, mop) = super::mfa::cas_parts(&super::mfa::Mfa::default(), mraw);
@@ -693,6 +730,12 @@ async fn start_sign_in(State(app): AppState, Json(inp): Json<StartSignInIn>) -> 
     let epoch = super::server::epoch_for_login(&app, &acct).await?.ok_or_else(invalid)?;
     let p = load(&app, &acct.did).await?;
     if descriptors(&p).is_empty() {
+        if !p.creds.is_empty() {
+            return Err(XrpcError::bad(
+                "PasskeyFlagged",
+                "Your passkey was refused because it may have been copied. Sign in with a recovery code, then remove it on the Security page.",
+            ));
+        }
         return Err(bad("This account has no passkeys"));
     }
     let ch = webauthn::mint_challenge(&key, "spa-2fa", &spa_2fa_binding(&acct.did, &epoch), now);
@@ -752,8 +795,9 @@ async fn create_session_inner(
     if !did.starts_with("did:") || did.len() > 2048 {
         return Err(bad("did is required"));
     }
+    // no per-account charge: anyone can name any DID here (it would let them
+    // spend the account's password sign-ins), and a passkey can't be guessed
     rl::check_with_ip(&[&rl::CREATE_SESSION_DAY, &rl::CREATE_SESSION_5MIN], &did, 1)?;
-    rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1)?;
     let refuse = |f: Fail| {
         count_failure(f);
         not_recognized()
@@ -787,8 +831,15 @@ async fn create_session_inner(
         return Err(super::takedown_error());
     }
     let auth_ref = used.cred.auth_ref();
+    super::cas::pause_point("passkey_session", &did).await;
     let (access, refresh) =
-        super::server::create_session_tokens(app, &did, None, false, Some(&epoch), Some(auth_ref)).await?;
+        super::server::create_session_tokens(app, &did, None, false, Some(&epoch), Some(auth_ref.clone())).await?;
+    // a removal racing this either found the session above or left the
+    // passkey gone for this check (it writes the row before its scan)
+    if !still_registered(app, &did, Some(&auth_ref)).await? {
+        super::server::revoke_signed_in_with(app, &did, &auth_ref).await?;
+        return Err(not_recognized());
+    }
     let ua = super::signin::user_agent(headers);
     let own = super::server::own_page(headers);
     let mut set_cookie = None;
@@ -880,5 +931,12 @@ mod tests {
         assert_eq!(did_from_user_handle(&b64u("not a did")), None);
         assert_eq!(did_from_user_handle("!!"), None);
         assert_eq!(auth_ref("AAEC").len(), 3 + 24);
+    }
+
+    #[test]
+    fn challenge_claims_have_their_own_cache() {
+        use crate::oauth::util::ClaimKind;
+        let ch = webauthn::Challenge { nonce: [1; 16], exp: 0 };
+        assert_eq!(ClaimKind::of(&ch.replay_key(), true), ClaimKind::Passkey);
     }
 }

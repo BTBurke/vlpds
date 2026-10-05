@@ -232,7 +232,7 @@ async fn attempt_elsewhere(s: &TestServer, did: &str, code: &str) -> Result<(), 
     loop {
         let (mut st, raw, mut m, mraw) = vlpds::totp::load_both(&s.app, did).await.map_err(|e| e.message).unwrap();
         let r = vlpds::totp::attempt(&mut st, &mut m, did, code, vlpds::totp::now_secs());
-        if vlpds::totp::save_both(&s.app, did, &st, raw, &m, mraw).await.map_err(|e| e.message).unwrap() {
+        if vlpds::totp::save_both(&s.app, did, &st, raw, &m, mraw, Vec::new()).await.map_err(|e| e.message).unwrap() {
             return r.map_err(|e| e.error);
         }
     }

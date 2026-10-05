@@ -150,10 +150,7 @@ pub fn routes() -> Router<Arc<App>> {
 /// factor is on.
 async fn regenerate(State(app): AppState, Auth(creds): Auth, Json(inp): Json<RegenerateIn>) -> XResult<Json<J>> {
     let did = super::server::full_access(&creds)?;
-    let acct = app.account(&did).await?;
-    if inp.password.is_empty() || !super::server::verify_password(&acct, &inp.password).await? {
-        return Err(XrpcError::auth("Invalid password"));
-    }
+    let acct = super::passkeys::check_password(&app, &did, &inp.password).await?;
     if !crate::totp::enabled_for(&app, &acct).await? && !super::passkeys::has_any(&app, &did).await? {
         return Err(XrpcError::bad("InvalidRequest", "Recovery codes come with an authenticator app or a passkey"));
     }
@@ -163,6 +160,12 @@ async fn regenerate(State(app): AppState, Auth(creds): Auth, Json(inp): Json<Reg
         let codes = m.issue(&did, crate::totp::now_secs());
         let (c, op) = cas_parts(&m, raw);
         if app.private_cas(&did, vec![c], vec![op]).await?.applied {
+            super::passkeys::security_mail(
+                &app,
+                &did,
+                "Your recovery codes were replaced with a new set. The old ones no longer work.",
+            )
+            .await;
             return Ok(Json(json!({"recoveryCodes": codes})));
         }
     }

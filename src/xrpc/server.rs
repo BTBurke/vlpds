@@ -3100,7 +3100,7 @@ async fn set_totp_flag(app: &App, did: &str, enabled: bool) -> XResult<()> {
 /// the shared recovery codes and lockout, and trusted browsers, in one
 /// write; what the passkeys signed in is ended as a removal would. What
 /// was removed, for the audit entry.
-pub(super) async fn reset_second_factors(app: &App, did: &str) -> XResult<J> {
+pub(super) async fn reset_second_factors(app: &App, did: &str, revoke_sessions: bool) -> XResult<J> {
     use super::cas::Op;
     let passkeys = super::passkeys::load(app, did).await?;
     let totp = crate::totp::load(app, did).await?.enabled();
@@ -3113,8 +3113,12 @@ pub(super) async fn reset_second_factors(app: &App, did: &str) -> XResult<J> {
     ];
     app.private_cas(did, Vec::new(), ops).await?;
     set_totp_flag(app, did, false).await?;
-    for c in &passkeys.creds {
-        revoke_signed_in_with(app, did, &c.auth_ref()).await?;
+    if revoke_sessions {
+        revoke_everything(app, did).await?;
+    } else {
+        for c in &passkeys.creds {
+            revoke_signed_in_with(app, did, &c.auth_ref()).await?;
+        }
     }
     if !passkeys.creds.is_empty() {
         crate::metrics::PASSKEYS.with_label_values(&["reset"]).inc();
@@ -3125,7 +3129,9 @@ pub(super) async fn reset_second_factors(app: &App, did: &str) -> XResult<J> {
         "This server's operator reset your two-factor sign-in: your passkeys, authenticator app, recovery codes and trusted browsers were removed. Set them up again on the Security page.",
     )
     .await;
-    Ok(json!({"passkeys": passkeys.creds.len(), "totp": totp, "trustedBrowsers": trusted}))
+    Ok(
+        json!({"passkeys": passkeys.creds.len(), "totp": totp, "trustedBrowsers": trusted, "signedOut": revoke_sessions}),
+    )
 }
 
 async fn setup_totp(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
@@ -3182,12 +3188,13 @@ async fn confirm_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<C
             // flag first: a crash between the two writes must not leave TOTP
             // enabled with the login fast path (totpEnabled=false) skipping it
             set_totp_flag(&app, &did, true).await?;
-            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw).await? {
+            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw, Vec::new()).await? {
                 break 'cas codes;
             }
         }
         return Err(crate::totp::conflict());
     };
+    super::passkeys::security_mail(&app, &did, "An authenticator app was turned on for two-factor sign-in.").await;
     Ok(Json(json!({"enabled": true, "recoveryCodes": codes})))
 }
 
@@ -3201,15 +3208,16 @@ struct DisableTotpIn {
 
 async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<DisableTotpIn>) -> XResult<StatusCode> {
     let did = full_access(&creds)?;
-    let acct = app.account(&did).await?;
-    if !verify_password(&acct, &inp.password).await? {
-        return Err(XrpcError::auth("Invalid password"));
-    }
-    let passkeys = super::passkeys::has_any(&app, &did).await?;
+    super::passkeys::check_password(&app, &did, &inp.password).await?;
     'cas: {
         let _g = crate::totp::lock(&did).await;
         for _ in 0..crate::totp::CAS_ROUNDS {
             let (mut st, raw, mut m, mraw) = crate::totp::load_both(&app, &did).await?;
+            // read in this round and held to it: a passkey removed meanwhile
+            // can't leave the account with a factor and no codes
+            let (pk, pkraw) = super::passkeys::load_raw(&app, &did).await?;
+            let passkeys = !pk.creds.is_empty();
+            super::cas::pause_point("totp_off", &did).await;
             if !st.enabled() {
                 return Err(invalid_request("TOTP is not enabled"));
             }
@@ -3228,7 +3236,8 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
                     m = super::mfa::Mfa::default();
                 }
             }
-            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw).await? {
+            let extra = vec![super::cas::Cond::eq(super::passkeys::ROW, pkraw)];
+            if crate::totp::save_both(&app, &did, &st, raw, &m, mraw, extra).await? {
                 r?;
                 break 'cas;
             }
@@ -3236,6 +3245,7 @@ async fn disable_totp(State(app): AppState, Auth(creds): Auth, Json(inp): Json<D
         return Err(crate::totp::conflict());
     }
     set_totp_flag(&app, &did, false).await?;
+    super::passkeys::security_mail(&app, &did, "The authenticator app was turned off for two-factor sign-in.").await;
     Ok(StatusCode::OK)
 }
 

@@ -1074,10 +1074,15 @@ async fn update_case(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ResetFactorsIn {
     did: String,
     reason: String,
     actor: Option<String>,
+    /// Also sign out everywhere (a revoke-all): for when whoever has the
+    /// account now may not be its owner.
+    #[serde(default)]
+    revoke_sessions: bool,
 }
 
 /// For a user who lost every factor: removes their passkeys, TOTP,
@@ -1102,18 +1107,28 @@ async fn reset_second_factors(
             e
         }
     })?;
-    let result = super::server::reset_second_factors(&app, &inp.did).await?;
     let who = Who { actor: actor_of(inp.actor), ip: ip.map(|i| i.to_string()) };
-    let e = audit(
+    let subject = SubjectRef::account(&inp.did);
+    // recorded before anything changes: no reset without its audit entry
+    let started = audit(
         &app,
         &who,
         "second_factors.reset",
-        Some(&SubjectRef::account(&inp.did)),
+        Some(&subject),
         Some(&reason),
         None,
-        Some(result.clone()),
+        Some(json!({"status": "started", "revokeSessions": inp.revoke_sessions})),
     )
     .await?;
+    let r = super::server::reset_second_factors(&app, &inp.did, inp.revoke_sessions).await;
+    let mut detail = match &r {
+        Ok(result) => json!({"status": "done", "result": result}),
+        Err(e) => json!({"status": "failed", "error": e.message}),
+    };
+    detail["started"] = json!(started.id);
+    detail["revokeSessions"] = json!(inp.revoke_sessions);
+    let e = audit(&app, &who, "second_factors.reset", Some(&subject), Some(&reason), None, Some(detail)).await?;
+    let result = r?;
     Ok(Json(json!({"did": inp.did, "result": result, "auditId": e.id})))
 }
 

@@ -179,15 +179,18 @@ pub enum ClaimKind {
     RequestObject = 3,
     /// Released right after (PKCE code_challenge claims).
     Guard = 4,
+    /// WebAuthn challenges (`xrpc::passkeys`), at the account's owner.
+    Passkey = 5,
 }
 
 impl ClaimKind {
-    const ALL: [ClaimKind; 5] = [
+    const ALL: [ClaimKind; 6] = [
         ClaimKind::ResourceProof,
         ClaimKind::AsProof,
         ClaimKind::Assertion,
         ClaimKind::RequestObject,
         ClaimKind::Guard,
+        ClaimKind::Passkey,
     ];
 
     /// By the prefix its maker gives `key`.
@@ -202,6 +205,8 @@ impl ClaimKind {
             ClaimKind::Assertion
         } else if key.starts_with("jar:") {
             ClaimKind::RequestObject
+        } else if key.starts_with("wa:") {
+            ClaimKind::Passkey
         } else {
             ClaimKind::Guard
         }
@@ -213,6 +218,7 @@ impl ClaimKind {
             ClaimKind::ResourceProof => (2_000_000, 50_000),
             ClaimKind::AsProof | ClaimKind::Assertion | ClaimKind::RequestObject => (500_000, 50_000),
             ClaimKind::Guard => (100_000, 1_000),
+            ClaimKind::Passkey => (200_000, 10_000),
         }
     }
 }
@@ -220,7 +226,7 @@ impl ClaimKind {
 /// Per `App`, not per process, so in-process test clusters behave like
 /// separate machines.
 pub(crate) struct NodeState {
-    replays: [ReplayCache; 5],
+    replays: [ReplayCache; 6],
     pub(crate) locks: Vec<std::sync::Arc<tokio::sync::Mutex<()>>>,
 }
 

@@ -188,6 +188,8 @@ pub struct Second<'a> {
     pub trust_days: u32,
     /// The account's passkeys.
     pub passkey: Option<PasskeyUi<'a>>,
+    /// The account has passkeys, but every one is flagged as copied.
+    pub flagged: bool,
 }
 
 /// What [`PASSKEY_JS`] reads from the passkey form's `data-*` attributes.
@@ -296,9 +298,14 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
     let mut recovery_only = false;
     if let Some(s) = &f.second {
         b.push_str(&format!("<p>Two-factor authentication is enabled for <b>{}</b>.</p>", e(f.identifier)));
+        recovery_only = !s.totp && s.email_hint.is_none() && (s.passkey.is_some() || s.flagged);
+        if s.flagged {
+            b.push_str(
+                "<p class=\"warn\">Your passkey was refused because it may have been copied. Sign in with a recovery code, then remove it on the Security page.</p>",
+            );
+        }
         if let Some(pk) = &s.passkey {
             script = true;
-            recovery_only = !s.totp;
             b.push_str(&passkey_form(&hidden_fields, f.action, pk, true));
             b.push_str("<noscript><p class=\"muted\">Turn on JavaScript to use your passkey.</p></noscript>");
         }
@@ -316,11 +323,12 @@ pub fn login(ctx: Option<&Ctx>, f: &LoginForm, csrf_only: &str) -> String {
         )),
         Some(s) if recovery_only => b.push_str(&format!(
             "{username}{}<input type=\"hidden\" name=\"step\" value=\"2fa\">\
-<details class=\"alt-code\"><summary>Use a recovery code instead</summary>\
+<details class=\"alt-code\"{}><summary>Use a recovery code instead</summary>\
 <label for=\"code\">Recovery code</label>\
 <input type=\"text\" id=\"code\" name=\"code\" autocomplete=\"one-time-code\" autocapitalize=\"none\" spellcheck=\"false\" required>\
 <div class=\"row\"><button type=\"submit\" class=\"primary\" name=\"action\" value=\"sign-in\">Sign in</button></div></details>",
-            trust_choice(s.trust_days)
+            trust_choice(s.trust_days),
+            if s.passkey.is_none() { " open" } else { "" }
         )),
         Some(s) => b.push_str(&format!(
             "{}{username}\
