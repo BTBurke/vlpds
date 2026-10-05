@@ -11,6 +11,7 @@ mod bench;
 mod check;
 mod cluster;
 mod cluster_leak;
+mod cluster_reshard;
 mod durability;
 mod fuzz;
 mod hooks;

@@ -34,7 +34,7 @@ const NOTIFY: &str = "com.atproto.space.notifyWrite";
 type Bucket = Arc<object_store::memory::InMemory>;
 
 /// path -> (cid, value)
-type Records = BTreeMap<String, (String, J)>;
+pub(super) type Records = BTreeMap<String, (String, J)>;
 
 fn tag() -> String {
     random_bytes(5).iter().map(|b| format!("{b:02x}")).collect()
@@ -47,13 +47,13 @@ fn names() -> (String, String) {
 
 /// Every space right this harness needs; `authority=*` so the same grant
 /// writes into a space someone else governs.
-fn scope(space_type: &str, collection: &str) -> String {
+pub(super) fn scope(space_type: &str, collection: &str) -> String {
     format!(
         "space:{space_type}?authority=*&collection={collection}&action=read&action=create&action=update&action=delete&manage=create&manage=update&manage=delete"
     )
 }
 
-fn note(collection: &str, text: &str) -> J {
+pub(super) fn note(collection: &str, text: &str) -> J {
     json!({"$type": collection, "text": text, "createdAt": now_iso()})
 }
 
@@ -77,12 +77,12 @@ async fn owns_all(s: &TestServer) {
     wait_until("the shards are open", Duration::from_secs(30), || owned(s) == SHARDS as usize).await;
 }
 
-async fn create(sc: &SpaceClient, space: &str, collection: &str, rkey: &str, text: &str) -> Resp {
+pub(super) async fn create(sc: &SpaceClient, space: &str, collection: &str, rkey: &str, text: &str) -> Resp {
     sc.create_record(space, collection, Some(rkey), note(collection, text)).await
 }
 
 /// The account's own repo in `space`, read with its OAuth grant.
-async fn records(sc: &SpaceClient, space: &str, ctx: &str) -> Records {
+pub(super) async fn records(sc: &SpaceClient, space: &str, ctx: &str) -> Records {
     let (mut out, mut cursor) = (Records::new(), None::<String>);
     loop {
         let mut q = vec![("space", space), ("repo", sc.did.as_str()), ("limit", "100")];
@@ -103,7 +103,7 @@ async fn records(sc: &SpaceClient, space: &str, ctx: &str) -> Records {
     }
 }
 
-async fn latest(sc: &SpaceClient, space: &str, ctx: &str) -> SignedCommit {
+pub(super) async fn latest(sc: &SpaceClient, space: &str, ctx: &str) -> SignedCommit {
     let r = sc.get("com.atproto.space.getLatestCommit", &[("space", space), ("repo", sc.did.as_str())]).await;
     assert_eq!(r.status, 200, "{ctx}: getLatestCommit: {}", r.text());
     signed_commit(&r.json["commit"])
@@ -111,7 +111,7 @@ async fn latest(sc: &SpaceClient, space: &str, ctx: &str) -> SignedCommit {
 
 /// listRepoOps from empty to the head with `credential`: every op and the
 /// commit of the last page.
-async fn replay(sc: &SpaceClient, space: &str, credential: &str, ctx: &str) -> (Vec<J>, SignedCommit) {
+pub(super) async fn replay(sc: &SpaceClient, space: &str, credential: &str, ctx: &str) -> (Vec<J>, SignedCommit) {
     let (mut ops, mut cursor) = (Vec::new(), None::<String>);
     let base = sc.srv.base.clone();
     for _ in 0..10_000 {
@@ -135,7 +135,7 @@ async fn replay(sc: &SpaceClient, space: &str, credential: &str, ctx: &str) -> (
 /// client's host), and
 /// check-space finds nothing wrong (once vlpds.admin.checkSpace is routed;
 /// the client-side checks stand alone until then).
-async fn consistent(
+pub(super) async fn consistent(
     s: &TestServer,
     sc: &SpaceClient,
     space: &str,
@@ -170,7 +170,7 @@ async fn consistent(
 }
 
 /// A space read/host call with `credential`, signed for `audience`.
-async fn signed_post(sc: &SpaceClient, nsid: &str, body: J, credential: &str, audience: &str) -> Resp {
+pub(super) async fn signed_post(sc: &SpaceClient, nsid: &str, body: J, credential: &str, audience: &str) -> Resp {
     let mut rb = sc.srv.http.post(format!("{}/xrpc/{nsid}", sc.srv.base));
     for (k, v) in sc.holder.headers(&format!("Atproto-Space {credential}"), Some(audience)) {
         rb = rb.header(k, v);
@@ -179,7 +179,7 @@ async fn signed_post(sc: &SpaceClient, nsid: &str, body: J, credential: &str, au
 }
 
 /// listRepos at the authority `auth`, every page.
-async fn list_repos(auth: &SpaceClient, space: &str, credential: &str) -> Result<Vec<J>, String> {
+pub(super) async fn list_repos(auth: &SpaceClient, space: &str, credential: &str) -> Result<Vec<J>, String> {
     let (mut out, mut cursor) = (Vec::new(), None::<String>);
     let base = auth.srv.base.clone();
     loop {
@@ -201,7 +201,7 @@ async fn list_repos(auth: &SpaceClient, space: &str, credential: &str) -> Result
 }
 
 /// The latest listRepos row of each repo (a repo may reappear across pages).
-fn by_did(repos: &[J]) -> BTreeMap<String, J> {
+pub(super) fn by_did(repos: &[J]) -> BTreeMap<String, J> {
     repos.iter().map(|r| (r["did"].as_str().unwrap().to_string(), r.clone())).collect()
 }
 
@@ -446,13 +446,13 @@ async fn outbox_redelivers_the_newest_rev_from_the_peer_that_takes_over() {
 
 /// What one writer's burst got answered.
 #[derive(Default)]
-struct Burst {
-    acked: BTreeMap<String, String>,
+pub(super) struct Burst {
+    pub acked: BTreeMap<String, String>,
     /// Timed out or refused while the shard moved: there whole or not at all.
-    unacked: BTreeSet<String>,
+    pub unacked: BTreeSet<String>,
 }
 
-async fn burst(sc: &SpaceClient, space: &str, coll: &str, prefix: &str, stop: &AtomicBool) -> Burst {
+pub(super) async fn burst(sc: &SpaceClient, space: &str, coll: &str, prefix: &str, stop: &AtomicBool) -> Burst {
     let mut b = Burst::default();
     for i in 0.. {
         if stop.load(Ordering::SeqCst) {
