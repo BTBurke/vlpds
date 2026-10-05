@@ -113,6 +113,9 @@ ALERT_NAMES = {
     "VlpdsPeerTlsCertExpiring": "Server certificates expire soon (renew them)",
     "VlpdsPeerTlsReloadFailing": "A server couldn't load its new certificate",
     "VlpdsPeerTlsHandshakeFailures": "Servers are refusing each other's certificates",
+    "VlpdsScheduledDeletionFailing": "Scheduled account deletions are failing",
+    "VlpdsScheduledDeletionsSurge": "Many accounts were just scheduled for deletion",
+    "VlpdsSignInAlertsSuppressed": "New sign-in alert emails aren't going out",
 }
 
 # Object-store ops by S3/R2 price class (bench/results/tiny-pds-idle-2026-10-02/analyze.py)
@@ -279,12 +282,79 @@ def build(g):
        [t(f"sum by (result) (increase(vlpds_logins_total{{{C}}}[1h])) > 0", "{{result}}")],
        "short", w=12, empty="no sign-ins",
        overrides=names({"success": "succeeded", "failed": "wrong password", "second_factor_required": "2FA code asked for",
-                        "second_factor_failed": "wrong 2FA code", "blocked": "account taken down / inactive",
+                        "second_factor_failed": "wrong 2FA code", "inactive": "account taken down / inactive",
+                        "oauth_required": "password refused (account is OAuth only)",
+                        "app_passwords_blocked": "app password refused (turned off by the owner)",
                         "rate_limited": "too many attempts (blocked)", "error": "server error"})
        + [color("succeeded", "green"), color("wrong password", "yellow"), color("wrong 2FA code", "orange"),
           color("too many attempts (blocked)", "purple"), color("server error", "red")],
        desc="Password, app-password and sign-in-page (OAuth) sign-ins, each point counting the hour before it. "
-            "Lots of wrong passwords from one place get blocked by rate limits (purple).")
+            "Lots of wrong passwords from one place get blocked by rate limits (purple). Refused because of the "
+            "account's own settings: the owner chose 'OAuth only' or turned app passwords off.")
+
+    # ================================================================ account security
+    row("Sign-in security and account deletions", collapsed=False)
+    stat("Second step at sign-in (24 h)",
+         [t(day("vlpds_sign_in_factors_total", 'factor="totp"'), "authenticator code"),
+          t(day("vlpds_sign_in_factors_total", 'factor="email"'), "emailed code"),
+          t(day("vlpds_sign_in_factors_total", 'factor="trusted"'), "trusted browser"),
+          t(day("vlpds_sign_in_factors_total", 'factor="none"'), "none")],
+         w=8, h=4, text_mode="value_and_name", spark=False,
+         desc="Successful sign-ins in the last day by their second step: a code from an authenticator app, a code "
+              "sent by email, a browser the user chose to trust (it skips the code for --trusted-device-days), or "
+              "none (no two-factor sign-in set up, or an app password, which never asks for one).")
+    stat("New-device alerts (24 h)",
+         [t(day("vlpds_sign_in_alerts_total", 'result="mailed"'), "emailed"),
+          t(day("vlpds_sign_in_alerts_total", 'result="account_limit"'), "over the daily 3"),
+          t(day("vlpds_sign_in_alerts_total", 'result="budget"'), "held back (email limits)")],
+         w=8, h=4, text_mode="value_and_name", spark=False,
+         overrides=[stat_colors("held back (email limits)", [(1, "orange")])],
+         desc="Sign-ins from a device an account hadn't used before, and whether the owner was emailed about it. "
+              "Each account gets at most 3 a day. Held back: an email limit (per address, per server or for the "
+              "whole PDS) was spent, so the user wasn't told.")
+    stat("Accounts scheduled for deletion",
+         [t(f'sum(vlpds_scheduled_deletion_accounts{{{C}, state="scheduled"}})', "scheduled"),
+          t(f'sum(vlpds_scheduled_deletion_accounts{{{C}, state="held"}})', "on hold (taken down)"),
+          t(day("vlpds_account_deletions_total", 'reason="delete_after"'), "deleted (24 h)")],
+         w=8, h=4, text_mode="value_and_name", spark=False, no_value="none",
+         desc="Deactivated accounts whose owner (or an app they allowed) asked for them to be deleted later. "
+              "They're deleted once that date and at least 3 days of deactivation have passed; reactivating "
+              "cancels it. Taken-down accounts wait until the takedown is reversed. As of each server's last "
+              "check (every 10 minutes).")
+    ts("Sign-ins by second step, per hour",
+       [t(f"sum by (factor) (increase(vlpds_sign_in_factors_total{{{C}}}[1h])) > 0", "{{factor}}"),
+        t(inc("vlpds_trusted_browsers_total", 'event="granted"') + " > 0", "browsers newly trusted")],
+       "short", w=12, empty="no sign-ins",
+       overrides=names({"totp": "authenticator code", "email": "emailed code", "trusted": "trusted browser",
+                        "none": "no second step"}) + [color("trusted browser", "blue"), color("browsers newly trusted", "purple")],
+       desc="Successful sign-ins by their second step, and browsers users chose to trust, each point counting the "
+            "hour before it.")
+    ts("Account protection changes, per hour",
+       [t(f"sum by (setting, value) (increase(vlpds_sign_in_settings_total{{{C}}}[1h])) > 0", "{{setting}} turned {{value}}"),
+        t(inc("vlpds_trusted_browsers_total", 'event="revoked"') + " > 0", "trusted browsers removed"),
+        t(f'sum by (result) (increase(vlpds_logins_total{{{C}, result=~"oauth_required|app_passwords_blocked"}}[1h])) > 0', "refused: {{result}}")],
+       "short", w=12, empty="no changes",
+       desc="Users changing their Security settings (OAuth only, blocking app passwords, new-sign-in emails), "
+            "removing trusted browsers, and sign-ins those settings refused (oauth_required: the main password "
+            "outside the sign-in page; app_passwords_blocked). Each point counts the hour before it.")
+    ts("Account deletions per hour",
+       [t(f"sum by (reason) (increase(vlpds_account_deletions_total{{{C}}}[1h])) > 0", "{{reason}}"),
+        t(f'sum(vlpds_scheduled_deletion_accounts{{{C}, state="scheduled"}})', "scheduled (right)")],
+       "short", w=12, empty="no deletions",
+       overrides=names({"user": "deleted by the owner", "admin": "deleted by an admin", "delete_after": "deleted as scheduled"})
+       + [g.right_axis("scheduled (right)", "short"), g.dashed("scheduled (right)", "text")],
+       desc="Accounts deleted, by who asked, each point counting the hour before it; and accounts waiting for a "
+            "scheduled deletion (right, dashed). A sudden jump in scheduled accounts is the 'Many accounts were just "
+            "scheduled for deletion' alert: you have at least 3 days to look.")
+    ts("App permissions, per hour",
+       [t(f"sum by (result) (increase(vlpds_oauth_consents_total{{{C}}}[1h])) > 0", "{{result}}"),
+        t(f"sum by (credential) (increase(vlpds_scope_rejections_total{{{C}}}[1h])) > 0", "refused beyond its permission: {{credential}}")],
+       "short", w=12, empty="no app authorizations",
+       overrides=names({"full": "allowed everything asked", "narrowed": "allowed some", "denied": "refused by the user",
+                        "refused": "refused (required permission unticked)"}),
+       desc="What users answered when an app asked for access (all it asked for, some of it, or no), and requests an "
+            "app or a limited app password made beyond what it was allowed (403). The latter is usually an app "
+            "asking for more than it should, not an attack. Each point counts the hour before it.")
 
     # ================================================================ content
     row("Content", collapsed=False)
@@ -338,11 +408,13 @@ def build(g):
        [t(f"sum by (kind) (increase(vlpds_identity_events_total{{{C}}}[1h])) > 0", "{{kind}} updates announced"),
         t(f"sum by (result) (increase(vlpds_plc_requests_total{{{C}}}[1h])) > 0", "PLC directory: {{result}}"),
         t(f"sum by (result) (increase(vlpds_handle_resolutions_total{{{C}}}[1h])) > 0", "custom handle lookup: {{result}}"),
+        t(f"sum by (status) (increase(vlpds_handle_checks_total{{{C}}}[1h])) > 0", "handle change check: {{status}}"),
         t(f"sum by (result) (increase(vlpds_request_crawl_total{{{C}}}[1h])) > 0", "crawl request: {{result}}")],
        "short", w=24, h=7, empty="nothing yet",
        desc="Identity updates announced to the network (identity: new account or handle change; account: status "
             "change), PLC directory calls by result (rejected / unavailable are failures), custom-domain handle lookups, "
-            "and requestCrawl calls to relays (rejected / failed are failures).")
+            "the account page's checks of a new handle (available / taken for a name here; verified / unverified for "
+            "the user's own domain), and requestCrawl calls to relays (rejected / failed are failures).")
 
     # ================================================================ safety
     row("Moderation and safety", collapsed=False)
@@ -380,7 +452,8 @@ def build(g):
         t(f'sum(increase(vlpds_mail_messages_total{{{C}, result=~"failed|dropped"}}[1h])) > 0', "not delivered")],
        "short", w=12, empty="no email sent",
        overrides=names({"reset_password": "password reset", "delete_account": "account deletion", "confirm_email": "email confirmation",
-                        "update_email": "email change", "plc_operation": "identity change", "auth_factor": "sign-in code (2FA)"})
+                        "update_email": "email change", "plc_operation": "identity change", "auth_factor": "sign-in code (2FA)",
+                        "sign_in_alert": "new sign-in alert"})
        + [color("not delivered", "red")],
        desc="Emails sent by kind, and ones that failed or were dropped (red), each point counting the hour before it.")
 
@@ -460,8 +533,8 @@ def template(g, panels):
     return {
         "uid": "vlpds",
         "title": "vlpds",
-        "description": "vlpds PDS for its operator: is it up, who uses it, what they post, how it federates, "
-                       "moderation, email, resources and cost. Engineers: the 'vlpds internals' dashboard. Generated by "
+        "description": "vlpds PDS for its operator: is it up, who uses it, sign-in security, what they post, how it "
+                       "federates, moderation, email, resources and cost. Engineers: the 'vlpds internals' dashboard. Generated by "
                        "bench/obs/grafana/gen_dashboard.py (also printed by `vlpds dashboards`).",
         "tags": ["vlpds"],
         "timezone": "browser",

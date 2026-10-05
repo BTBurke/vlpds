@@ -652,6 +652,39 @@ ts("Stalled bodies, accept errors, firehose per-IP", [rate("vlpds_http_stalled_b
         "Accept errors: usually out of file descriptors (retried every 50 ms). "
         f"{rb('tools-endpoints-cli-logs-exit-codes', 'Serving limits')}")
 
+# ============================================================== accounts
+row("Accounts: scheduled deletion, sign-in security, OAuth scopes")
+ts("Scheduled-deletion sweeps", [rate("vlpds_scheduled_deletion_passes_total", by="result", legend="passes {{result}}"),
+                                 t(hq(0.99, "vlpds_scheduled_deletion_pass_seconds", window="[30m]"), "pass p99")], "ops",
+   overrides=[right_axis("pass p99", "s")], empty="no sweeps (--delete-after false?)",
+   desc=f"Every node sweeps its own shards' D/ rows every 10 min. error = a shard scan or an account's deletion "
+        f"failed (retried next sweep). {rb('VlpdsScheduledDeletionFailing')}")
+ts("Scheduled-deletion accounts", [t(f"sum by (result) (increase(vlpds_scheduled_deletion_accounts_total{{{I}}}[30m])) > 0", "{{result}} (30 m)"),
+                                   t(f"sum by (state) (vlpds_scheduled_deletion_accounts{{{I}}})", "{{state}}")], "short",
+   empty="nothing scheduled",
+   desc="Per sweep outcome: deleted, finished (a deletion that stopped partway), raced (reactivated first; kept), failed. "
+        "States as of each node's last sweep: scheduled (D/ rows), held (taken down or suspended), deferred (over the "
+        f"100 per-pass cap: next sweep). A jump in scheduled: {rb('VlpdsScheduledDeletionsSurge')}")
+ts("Sign-in factors and alerts", [rate("vlpds_sign_in_factors_total", by="method, factor", legend="{{method}} / {{factor}}"),
+                                  t(f"sum by (result) (rate(vlpds_sign_in_alerts_total{{{I}}}{RI})) > 0", "new device: {{result}}")], "ops",
+   empty="no sign-ins",
+   desc="Successful sign-ins by method and second factor (trusted = a trusted browser skipped it), and new-device "
+        f"sign-ins by what became of their alert mail. budget: {rb('VlpdsSignInAlertsSuppressed')}")
+ts("Sign-in refusals and settings", [t(f'sum by (method, result) (rate(vlpds_logins_total{{{I}, result=~"inactive|oauth_required|app_passwords_blocked"}}{RI})) > 0', "{{method}} {{result}}"),
+                                     t(f"sum by (setting, value) (rate(vlpds_sign_in_settings_total{{{I}}}{RI})) > 0", "{{setting}} -> {{value}}"),
+                                     t(f"sum by (event) (rate(vlpds_trusted_browsers_total{{{I}}}{RI})) > 0", "trusted browser {{event}}")], "ops",
+   empty="none", desc="createSession refused by the account (taken down, OAuth-only, app passwords off), and owners changing those settings.")
+ts("Scope rejections (ScopeMissingError)", [t(f"sum by (credential, kind) (rate(vlpds_scope_rejections_total{{{I}}}{RI})) > 0", "{{credential}} {{kind}}")], "reqps",
+   empty="none",
+   desc="403s for a scope the OAuth token or scoped app password lacks, by the missing scope's kind. A steady rate from "
+        "one kind is usually one client asking for less than it uses; the access log's route and client tell which.")
+ts("OAuth consents, handle checks", [t(f"sum by (result) (rate(vlpds_oauth_consents_total{{{I}}}{RI})) > 0", "consent {{result}}"),
+                                     t(f"sum by (kind, status) (rate(vlpds_handle_checks_total{{{I}}}{RI})) > 0", "checkHandle {{kind}} {{status}}"),
+                                     t(f'sum by (limiter) (rate(vlpds_rate_limit_rejections_total{{{I}, limiter=~"vlpds.identity.checkHandle-.*"}}{RI})) > 0', "429 {{limiter}}")], "ops",
+   empty="none",
+   desc="Consent page answers (narrowed = some scopes unticked; refused = a forged post without atproto), and "
+        "vlpds.identity.checkHandle answers with its per-DID rate-limit rejections.")
+
 # ============================================================== cluster: leases and ownership
 row("Cluster: leases, ownership, failover")
 ts("Lease renewal round trip by node (p99)", [node_quantile(0.99, "vlpds_lease_renew_seconds"),

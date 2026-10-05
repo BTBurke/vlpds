@@ -7735,7 +7735,7 @@
   {
    "type": "row",
    "id": 90,
-   "title": "Cluster: leases, ownership, failover",
+   "title": "Accounts: scheduled deletion, sign-in security, OAuth scopes",
    "collapsed": true,
    "gridPos": {
     "x": 0,
@@ -7747,6 +7747,473 @@
     {
      "type": "timeseries",
      "id": 91,
+     "title": "Scheduled-deletion sweeps",
+     "description": "Every node sweeps its own shards' D/ rows every 10 min. error = a shard scan or an account's deletion failed (retried next sweep). [VlpdsScheduledDeletionFailing](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsscheduleddeletionfailing)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 205,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (result) (rate(vlpds_scheduled_deletion_passes_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "passes {{result}}",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "histogram_quantile(0.99, sum by (le) (rate(vlpds_scheduled_deletion_pass_seconds_bucket{cluster=~\"$cluster\", instance=~\"$instance\"}[30m])))",
+       "legendFormat": "pass p99",
+       "range": true,
+       "refId": "B"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "ops",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "no sweeps (--delete-after false?)"
+      },
+      "overrides": [
+       {
+        "matcher": {
+         "id": "byName",
+         "options": "pass p99"
+        },
+        "properties": [
+         {
+          "id": "unit",
+          "value": "s"
+         },
+         {
+          "id": "custom.axisPlacement",
+          "value": "right"
+         }
+        ]
+       }
+      ]
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 92,
+     "title": "Scheduled-deletion accounts",
+     "description": "Per sweep outcome: deleted, finished (a deletion that stopped partway), raced (reactivated first; kept), failed. States as of each node's last sweep: scheduled (D/ rows), held (taken down or suspended), deferred (over the 100 per-pass cap: next sweep). A jump in scheduled: [VlpdsScheduledDeletionsSurge](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsscheduleddeletionssurge)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 205,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (result) (increase(vlpds_scheduled_deletion_accounts_total{cluster=~\"$cluster\", instance=~\"$instance\"}[30m])) > 0",
+       "legendFormat": "{{result}} (30 m)",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (state) (vlpds_scheduled_deletion_accounts{cluster=~\"$cluster\", instance=~\"$instance\"})",
+       "legendFormat": "{{state}}",
+       "range": true,
+       "refId": "B"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "nothing scheduled"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 93,
+     "title": "Sign-in factors and alerts",
+     "description": "Successful sign-ins by method and second factor (trusted = a trusted browser skipped it), and new-device sign-ins by what became of their alert mail. budget: [VlpdsSignInAlertsSuppressed](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssigninalertssuppressed)",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 205,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (method, factor) (rate(vlpds_sign_in_factors_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval]))",
+       "legendFormat": "{{method}} / {{factor}}",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (result) (rate(vlpds_sign_in_alerts_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "new device: {{result}}",
+       "range": true,
+       "refId": "B"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "ops",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "no sign-ins"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 94,
+     "title": "Sign-in refusals and settings",
+     "description": "createSession refused by the account (taken down, OAuth-only, app passwords off), and owners changing those settings.",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 0,
+      "y": 213,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (method, result) (rate(vlpds_logins_total{cluster=~\"$cluster\", instance=~\"$instance\", result=~\"inactive|oauth_required|app_passwords_blocked\"}[$__rate_interval])) > 0",
+       "legendFormat": "{{method}} {{result}}",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (setting, value) (rate(vlpds_sign_in_settings_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "{{setting}} -> {{value}}",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (event) (rate(vlpds_trusted_browsers_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "trusted browser {{event}}",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "ops",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "none"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 95,
+     "title": "Scope rejections (ScopeMissingError)",
+     "description": "403s for a scope the OAuth token or scoped app password lacks, by the missing scope's kind. A steady rate from one kind is usually one client asking for less than it uses; the access log's route and client tell which.",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 8,
+      "y": 213,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (credential, kind) (rate(vlpds_scope_rejections_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "{{credential}} {{kind}}",
+       "range": true,
+       "refId": "A"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "reqps",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "none"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    },
+    {
+     "type": "timeseries",
+     "id": 96,
+     "title": "OAuth consents, handle checks",
+     "description": "Consent page answers (narrowed = some scopes unticked; refused = a forged post without atproto), and vlpds.identity.checkHandle answers with its per-DID rate-limit rejections.",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${ds_prometheus}"
+     },
+     "gridPos": {
+      "x": 16,
+      "y": 213,
+      "w": 8,
+      "h": 8
+     },
+     "targets": [
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (result) (rate(vlpds_oauth_consents_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "consent {{result}}",
+       "range": true,
+       "refId": "A"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (kind, status) (rate(vlpds_handle_checks_total{cluster=~\"$cluster\", instance=~\"$instance\"}[$__rate_interval])) > 0",
+       "legendFormat": "checkHandle {{kind}} {{status}}",
+       "range": true,
+       "refId": "B"
+      },
+      {
+       "datasource": {
+        "type": "prometheus",
+        "uid": "${ds_prometheus}"
+       },
+       "expr": "sum by (limiter) (rate(vlpds_rate_limit_rejections_total{cluster=~\"$cluster\", instance=~\"$instance\", limiter=~\"vlpds.identity.checkHandle-.*\"}[$__rate_interval])) > 0",
+       "legendFormat": "429 {{limiter}}",
+       "range": true,
+       "refId": "C"
+      }
+     ],
+     "fieldConfig": {
+      "defaults": {
+       "unit": "ops",
+       "custom": {
+        "lineWidth": 1,
+        "fillOpacity": 8,
+        "showPoints": "never",
+        "spanNulls": false,
+        "gradientMode": "none",
+        "stacking": {
+         "mode": "none",
+         "group": "A"
+        },
+        "axisSoftMin": 0
+       },
+       "color": {
+        "mode": "palette-classic"
+       },
+       "noValue": "none"
+      },
+      "overrides": []
+     },
+     "options": {
+      "legend": {
+       "displayMode": "list",
+       "placement": "bottom",
+       "showLegend": true
+      },
+      "tooltip": {
+       "mode": "multi",
+       "sort": "desc"
+      }
+     }
+    }
+   ]
+  },
+  {
+   "type": "row",
+   "id": 97,
+   "title": "Cluster: leases, ownership, failover",
+   "collapsed": true,
+   "gridPos": {
+    "x": 0,
+    "y": 221,
+    "w": 24,
+    "h": 1
+   },
+   "panels": [
+    {
+     "type": "timeseries",
+     "id": 98,
      "title": "Lease renewal round trip by node (p99)",
      "description": "One CAS PUT of nodes/{node_id} every TTL/5. A round trip over 0.4 x TTL (4 s at the default 10 s TTL) lapses the lease and the node fail-stops (exit 5). p99 over 500 ms for 10 min: [VlpdsLeaseRenewalSlow](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewalslow).",
      "datasource": {
@@ -7755,7 +8222,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 205,
+      "y": 222,
       "w": 8,
       "h": 8
      },
@@ -7853,7 +8320,7 @@
     },
     {
      "type": "timeseries",
-     "id": 92,
+     "id": 99,
      "title": "Lease validity left by node",
      "description": "Seconds until each node's lease validity ends, at scrape: a sawtooth between TTL - skew - one renew interval and TTL - skew. Dips toward 0 = renewals overdue; below the dashed line: [VlpdsLeaseValidityLow](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleasevaliditylow).",
      "datasource": {
@@ -7862,7 +8329,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 205,
+      "y": 222,
       "w": 8,
       "h": 8
      },
@@ -7960,7 +8427,7 @@
     },
     {
      "type": "timeseries",
-     "id": 93,
+     "id": 100,
      "title": "Renew errors, takeovers",
      "description": "renew conflict/lapsed = fail-stop; timeout/error retry ([VlpdsLeaseRenewErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsleaserenewerrors)). takeover peer: a dead peer's log fenced before taking its shards; restart: our own previous incarnation's at startup ([VlpdsUncleanNodeExit](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsuncleannodeexit)).",
      "datasource": {
@@ -7969,7 +8436,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 205,
+      "y": 222,
       "w": 8,
       "h": 8
      },
@@ -8031,7 +8498,7 @@
     },
     {
      "type": "timeseries",
-     "id": 94,
+     "id": 101,
      "title": "Lease events/s",
      "description": "opened/closed: shard moves (many per hour: [VlpdsOwnershipFlapping](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsownershipflapping)); peer_refused: a peer presumed dead ([VlpdsPeerPresumedDead](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeerpresumeddead)); history_full: a shard not taken because its history is at its span cap with no clean open (investigate: its log can't be trimmed); lost / shutdown_fence_failed: fail-stop paths.",
      "datasource": {
@@ -8040,7 +8507,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 213,
+      "y": 230,
       "w": 8,
       "h": 8
      },
@@ -8092,7 +8559,7 @@
     },
     {
      "type": "timeseries",
-     "id": 95,
+     "id": 102,
      "title": "Shard opens (time to serve, p99)",
      "description": "replay: the batch replayed a dead owner's log tail (takeover after a crash; over 20 s: [VlpdsTakeoverReplaySlow](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdstakeoverreplayslow)); clean: nothing to replay (handback).",
      "datasource": {
@@ -8101,7 +8568,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 213,
+      "y": 230,
       "w": 8,
       "h": 8
      },
@@ -8163,7 +8630,7 @@
     },
     {
      "type": "timeseries",
-     "id": 96,
+     "id": 103,
      "title": "Shards opened / segments replayed per s",
      "description": "opened error: [VlpdsShardOpenErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsshardopenerrors).",
      "datasource": {
@@ -8172,7 +8639,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 213,
+      "y": 230,
       "w": 8,
       "h": 8
      },
@@ -8234,7 +8701,7 @@
     },
     {
      "type": "table",
-     "id": 97,
+     "id": 104,
      "title": "Exit state and versions",
      "description": "Per node: how its previous process ended and when, the cluster feature level it last read and the max this build runs (binary max > active everywhere = a finalize is available: [VlpdsFeatureLevelUnfinalized](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsfeaturelevelunfinalized)), shard layout version.",
      "datasource": {
@@ -8243,7 +8710,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 221,
+      "y": 238,
       "w": 16,
       "h": 7
      },
@@ -8399,7 +8866,7 @@
     },
     {
      "type": "timeseries",
-     "id": 98,
+     "id": 105,
      "title": "Integrity: format errors, signature faults",
      "description": "Should be empty. Format errors: a newer-level node writing early, or corruption ([VlpdsFormatErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsformaterrors), page). Signature faults: suspect hardware ([VlpdsSignatureFault](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssignaturefault), page).",
      "datasource": {
@@ -8408,7 +8875,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 221,
+      "y": 238,
       "w": 8,
       "h": 7
      },
@@ -8470,7 +8937,7 @@
     },
     {
      "type": "timeseries",
-     "id": 99,
+     "id": 106,
      "title": "Peer TLS: days until certificate expiry",
      "description": "Per node, its own server certificate (cert=node) and the CA it trusts (cert=ca), as days until notAfter. Only nodes running peer TLS export it. An expired node cert is refused by every peer and the node won't start or reload with one. Dashed: 14 days = [VlpdsPeerTlsCertExpiring](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlscertexpiring) (ticket); 3 days = out of time, renew now (renewal procedure in the same section).",
      "datasource": {
@@ -8479,7 +8946,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 228,
+      "y": 245,
       "w": 8,
       "h": 7
      },
@@ -8552,7 +9019,7 @@
     },
     {
      "type": "timeseries",
-     "id": 100,
+     "id": 107,
      "title": "Peer TLS: handshake failures/s by side",
      "description": "Peer connections refused at the TLS handshake: server = a peer was refused by this node, client = this node was refused by (or refused) a peer. Cause: a cert from another CA, an expired cert, or an address whose lease names another node. Over 0.1/s for 10 min: [VlpdsPeerTlsHandshakeFailures](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlshandshakefailures).",
      "datasource": {
@@ -8561,7 +9028,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 228,
+      "y": 245,
       "w": 8,
       "h": 7
      },
@@ -8613,7 +9080,7 @@
     },
     {
      "type": "timeseries",
-     "id": 101,
+     "id": 108,
      "title": "Peer TLS: certificate reloads by result",
      "description": "Reloads of the CA/cert/key set (file change or SIGHUP). error = the new set failed to load and the node keeps the previous one, which the rotation meant to replace: [VlpdsPeerTlsReloadFailing](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdspeertlsreloadfailing).",
      "datasource": {
@@ -8622,7 +9089,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 228,
+      "y": 245,
       "w": 8,
       "h": 7
      },
@@ -8676,19 +9143,19 @@
   },
   {
    "type": "row",
-   "id": 102,
+   "id": 109,
    "title": "Cluster: forwarding, control plane, resharding",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 235,
+    "y": 252,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 103,
+     "id": 110,
      "title": "Forwards/s by owner status",
      "description": "5xx includes owner unreachable / past its TTFB deadline (503 PartitionUnavailable). Over 5%: [VlpdsForwardErrorsHigh](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforwarderrorshigh).",
      "datasource": {
@@ -8697,7 +9164,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 236,
+      "y": 253,
       "w": 8,
       "h": 8
      },
@@ -8748,7 +9215,7 @@
     },
     {
      "type": "timeseries",
-     "id": 104,
+     "id": 111,
      "title": "Forward latency (to the owner's response head)",
      "description": "Deadline 3 s. Dashed: [VlpdsForwardLatencyHigh](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforwardlatencyhigh) (p99 1 s).",
      "datasource": {
@@ -8757,7 +9224,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 236,
+      "y": 253,
       "w": 8,
       "h": 8
      },
@@ -8890,7 +9357,7 @@
     },
     {
      "type": "timeseries",
-     "id": 105,
+     "id": 112,
      "title": "Forwards/s by node",
      "description": "",
      "datasource": {
@@ -8899,7 +9366,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 236,
+      "y": 253,
       "w": 8,
       "h": 8
      },
@@ -8950,7 +9417,7 @@
     },
     {
      "type": "timeseries",
-     "id": 106,
+     "id": 113,
      "title": "Control-plane requests/s by op",
      "description": "",
      "datasource": {
@@ -8959,7 +9426,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 244,
+      "y": 261,
       "w": 8,
       "h": 8
      },
@@ -9010,7 +9477,7 @@
     },
     {
      "type": "timeseries",
-     "id": 107,
+     "id": 114,
      "title": "Control-plane latency",
      "description": "Lease, assignment and fence reads/writes. Dashed: [VlpdsControlPlaneLatencyHigh](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanelatencyhigh) (p99 1 s).",
      "datasource": {
@@ -9019,7 +9486,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 244,
+      "y": 261,
       "w": 8,
       "h": 8
      },
@@ -9127,7 +9594,7 @@
     },
     {
      "type": "timeseries",
-     "id": 108,
+     "id": 115,
      "title": "Control-plane timeouts, nudges, lone skips",
      "description": "Timeouts: [VlpdsControlPlaneTimeouts](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdscontrolplanetimeouts).",
      "datasource": {
@@ -9136,7 +9603,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 244,
+      "y": 261,
       "w": 8,
       "h": 8
      },
@@ -9208,7 +9675,7 @@
     },
     {
      "type": "timeseries",
-     "id": 109,
+     "id": 116,
      "title": "Resharding",
      "description": "",
      "datasource": {
@@ -9217,7 +9684,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 252,
+      "y": 269,
       "w": 8,
       "h": 8
      },
@@ -9295,7 +9762,7 @@
     },
     {
      "type": "timeseries",
-     "id": 110,
+     "id": 117,
      "title": "Retired-state GC",
      "description": "[VlpdsReshardGcFailing](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsreshardgcfailing); retired dirs referenced > 0: [VlpdsRetiredStateReferenced](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsretiredstatereferenced).",
      "datasource": {
@@ -9304,7 +9771,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 252,
+      "y": 269,
       "w": 8,
       "h": 8
      },
@@ -9376,7 +9843,7 @@
     },
     {
      "type": "timeseries",
-     "id": 111,
+     "id": 118,
      "title": "Forced compactions, inherited SSTs",
      "description": "[VlpdsForcedDetachFailing](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsforceddetachfailing)",
      "datasource": {
@@ -9385,7 +9852,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 252,
+      "y": 269,
       "w": 8,
       "h": 8
      },
@@ -9449,19 +9916,19 @@
   },
   {
    "type": "row",
-   "id": 112,
+   "id": 119,
    "title": "Object store (vlpds clients, per pool and lane)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 260,
+    "y": 277,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 113,
+     "id": 120,
      "title": "Permits in use / limit",
      "description": "Busiest node's in-flight requests per pool (log, state, ctl) and lane (main; reserved = log writes / ctl lease writes) over its permits (--store-inflight, --log-store-inflight). At 100% requests queue: [VlpdsObjectStorePermitsSaturated](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorepermitssaturated).",
      "datasource": {
@@ -9470,7 +9937,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 261,
+      "y": 278,
       "w": 8,
       "h": 8
      },
@@ -9538,7 +10005,7 @@
     },
     {
      "type": "timeseries",
-     "id": 114,
+     "id": 121,
      "title": "Permit waits/s",
      "description": "Dashed: [VlpdsObjectStorePermitsSaturated](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorepermitssaturated) (1/s per pool and lane for 10 min).",
      "datasource": {
@@ -9547,7 +10014,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 261,
+      "y": 278,
       "w": 8,
       "h": 8
      },
@@ -9615,7 +10082,7 @@
     },
     {
      "type": "timeseries",
-     "id": 115,
+     "id": 122,
      "title": "Permit wait p99",
      "description": "",
      "datasource": {
@@ -9624,7 +10091,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 261,
+      "y": 278,
       "w": 8,
       "h": 8
      },
@@ -9676,7 +10143,7 @@
     },
     {
      "type": "timeseries",
-     "id": 116,
+     "id": 123,
      "title": "Requests/s by client",
      "description": "",
      "datasource": {
@@ -9685,7 +10152,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 269,
+      "y": 286,
       "w": 8,
       "h": 8
      },
@@ -9736,7 +10203,7 @@
     },
     {
      "type": "timeseries",
-     "id": 117,
+     "id": 124,
      "title": "Requests/s by op",
      "description": "Billable ops (put, put_cas, get, get_range, head, list pages, delete, ...): cost tracks this mix.",
      "datasource": {
@@ -9745,7 +10212,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 269,
+      "y": 286,
       "w": 8,
       "h": 8
      },
@@ -9796,7 +10263,7 @@
     },
     {
      "type": "timeseries",
-     "id": 118,
+     "id": 125,
      "title": "Non-ok results/s",
      "description": "not_found / precondition are normal answers (misses, lost CAS races); timeout / error failed; cancelled = the caller gave up.",
      "datasource": {
@@ -9805,7 +10272,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 269,
+      "y": 286,
       "w": 8,
       "h": 8
      },
@@ -9856,7 +10323,7 @@
     },
     {
      "type": "timeseries",
-     "id": 119,
+     "id": 126,
      "title": "p99 latency by component",
      "description": "To the response head (GET), first page (LIST); deletes are not timed. [VlpdsObjectStoreLatencyHigh](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstorelatencyhigh)",
      "datasource": {
@@ -9865,7 +10332,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 277,
+      "y": 294,
       "w": 12,
       "h": 8
      },
@@ -9922,7 +10389,7 @@
     },
     {
      "type": "timeseries",
-     "id": 120,
+     "id": 127,
      "title": "Bytes/s by client and direction",
      "description": "",
      "datasource": {
@@ -9931,7 +10398,7 @@
      },
      "gridPos": {
       "x": 12,
-      "y": 277,
+      "y": 294,
       "w": 12,
       "h": 8
      },
@@ -9984,19 +10451,19 @@
   },
   {
    "type": "row",
-   "id": 121,
+   "id": 128,
    "title": "SlateDB (summed over each node's shard DBs)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 285,
+    "y": 302,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 122,
+     "id": 129,
      "title": "Block cache hit rate by entry kind",
      "description": "",
      "datasource": {
@@ -10005,7 +10472,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 286,
+      "y": 303,
       "w": 8,
       "h": 8
      },
@@ -10057,7 +10524,7 @@
     },
     {
      "type": "timeseries",
-     "id": 123,
+     "id": 130,
      "title": "DB requests/s",
      "description": "",
      "datasource": {
@@ -10066,7 +10533,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 286,
+      "y": 303,
       "w": 8,
       "h": 8
      },
@@ -10137,7 +10604,7 @@
     },
     {
      "type": "timeseries",
-     "id": 124,
+     "id": 131,
      "title": "Memtables / L0",
      "description": "",
      "datasource": {
@@ -10146,7 +10613,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 286,
+      "y": 303,
       "w": 8,
       "h": 8
      },
@@ -10224,7 +10691,7 @@
     },
     {
      "type": "timeseries",
-     "id": 125,
+     "id": 132,
      "title": "Flushes, backpressure, stalls",
      "description": "L0 stalls block writes: [VlpdsSlateDbL0Stalls](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsslatedbl0stalls).",
      "datasource": {
@@ -10233,7 +10700,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 294,
+      "y": 311,
       "w": 8,
       "h": 8
      },
@@ -10314,7 +10781,7 @@
     },
     {
      "type": "timeseries",
-     "id": 126,
+     "id": 133,
      "title": "Flush / compaction bytes/s",
      "description": "",
      "datasource": {
@@ -10323,7 +10790,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 294,
+      "y": 311,
       "w": 8,
       "h": 8
      },
@@ -10394,7 +10861,7 @@
     },
     {
      "type": "timeseries",
-     "id": 127,
+     "id": 134,
      "title": "Object store requests/s and errors (SlateDB)",
      "description": "SlateDB's own view of its store calls. Its error count includes normal answers (GETs of objects that don't exist yet, e.g. compactor polls; lost CAS races), so a steady rate here is not trouble by itself: real failures are result=error|timeout in the Object store row, where [VlpdsObjectStoreErrors](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsobjectstoreerrors) counts them for the state_* components (no alert reads this counter).",
      "datasource": {
@@ -10403,7 +10870,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 294,
+      "y": 311,
       "w": 8,
       "h": 8
      },
@@ -10482,19 +10949,19 @@
   },
   {
    "type": "row",
-   "id": 128,
+   "id": 135,
    "title": "Process and runtime",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 302,
+    "y": 319,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 129,
+     "id": 136,
      "title": "CPU by mode",
      "description": "CPU cores, summed over the selected nodes.",
      "datasource": {
@@ -10503,7 +10970,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 303,
+      "y": 320,
       "w": 8,
       "h": 8
      },
@@ -10555,7 +11022,7 @@
     },
     {
      "type": "timeseries",
-     "id": 130,
+     "id": 137,
      "title": "RSS by node",
      "description": "Resident set size. As a share of the node's memory limit: Health \u2192 Memory used / limit.",
      "datasource": {
@@ -10564,7 +11031,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 303,
+      "y": 320,
       "w": 8,
       "h": 8
      },
@@ -10615,7 +11082,7 @@
     },
     {
      "type": "timeseries",
-     "id": 131,
+     "id": 138,
      "title": "jemalloc",
      "description": "allocated = live heap; resident - allocated = fragmentation and retained pages.",
      "datasource": {
@@ -10624,7 +11091,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 303,
+      "y": 320,
       "w": 8,
       "h": 8
      },
@@ -10675,7 +11142,7 @@
     },
     {
      "type": "timeseries",
-     "id": 132,
+     "id": 139,
      "title": "Tokio worker utilization by node",
      "description": "Busy / workers. Dashed: [VlpdsRuntimeSaturated](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimesaturated) (90% for 15 min).",
      "datasource": {
@@ -10684,7 +11151,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 311,
+      "y": 328,
       "w": 8,
       "h": 8
      },
@@ -10752,7 +11219,7 @@
     },
     {
      "type": "timeseries",
-     "id": 133,
+     "id": 140,
      "title": "Runtime lateness by node",
      "description": "Share of time a 10 ms ticker woke late: ready tasks waited for a worker (blocking code on the runtime, or CPU starvation). Dashed: [VlpdsRuntimeStalls](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsruntimestalls) (5%).",
      "datasource": {
@@ -10761,7 +11228,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 311,
+      "y": 328,
       "w": 8,
       "h": 8
      },
@@ -10828,7 +11295,7 @@
     },
     {
      "type": "timeseries",
-     "id": 134,
+     "id": 141,
      "title": "Tasks, injection queue, threads",
      "description": "",
      "datasource": {
@@ -10837,7 +11304,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 311,
+      "y": 328,
       "w": 8,
       "h": 8
      },
@@ -10910,19 +11377,19 @@
   },
   {
    "type": "row",
-   "id": 135,
+   "id": 142,
    "title": "Key service, PLC directory, mail",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 319,
+    "y": 336,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 136,
+     "id": 143,
      "title": "KMS requests/s by result",
      "description": "unavailable: [VlpdsKeyServiceUnavailable](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdskeyserviceunavailable) (page: cold writes fail); unwrap rejected: [VlpdsSecretUnwrapRejected](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdssecretunwraprejected).",
      "datasource": {
@@ -10931,7 +11398,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 320,
+      "y": 337,
       "w": 8,
       "h": 8
      },
@@ -10982,7 +11449,7 @@
     },
     {
      "type": "timeseries",
-     "id": 137,
+     "id": 144,
      "title": "KMS latency p99, signing-key cache",
      "description": "",
      "datasource": {
@@ -10991,7 +11458,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 320,
+      "y": 337,
       "w": 8,
       "h": 8
      },
@@ -11070,7 +11537,7 @@
     },
     {
      "type": "timeseries",
-     "id": 138,
+     "id": 145,
      "title": "PLC directory requests/s",
      "description": "Write ops unavailable: [VlpdsPlcDirectoryUnavailable](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcdirectoryunavailable) (page); rejected: [VlpdsPlcOpsRejected](https://github.com/jazware/vlpds/blob/main/ops/RUNBOOK.md#vlpdsplcopsrejected).",
      "datasource": {
@@ -11079,7 +11546,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 320,
+      "y": 337,
       "w": 8,
       "h": 8
      },
@@ -11173,7 +11640,7 @@
     },
     {
      "type": "timeseries",
-     "id": 139,
+     "id": 146,
      "title": "Mail",
      "description": "",
      "datasource": {
@@ -11182,7 +11649,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 328,
+      "y": 345,
       "w": 8,
       "h": 8
      },
@@ -11256,19 +11723,19 @@
   },
   {
    "type": "row",
-   "id": 140,
+   "id": 147,
    "title": "MinIO (bench only; 5 s scrape)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 336,
+    "y": 353,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "timeseries",
-     "id": 141,
+     "id": 148,
      "title": "S3 requests/s by API",
      "description": "",
      "datasource": {
@@ -11277,7 +11744,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 337,
+      "y": 354,
       "w": 8,
       "h": 8
      },
@@ -11328,7 +11795,7 @@
     },
     {
      "type": "timeseries",
-     "id": 142,
+     "id": 149,
      "title": "S3 TTFB p99 by API",
      "description": "",
      "datasource": {
@@ -11337,7 +11804,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 337,
+      "y": 354,
       "w": 8,
       "h": 8
      },
@@ -11388,7 +11855,7 @@
     },
     {
      "type": "timeseries",
-     "id": 143,
+     "id": 150,
      "title": "S3 traffic",
      "description": "",
      "datasource": {
@@ -11397,7 +11864,7 @@
      },
      "gridPos": {
       "x": 16,
-      "y": 337,
+      "y": 354,
       "w": 8,
       "h": 8
      },
@@ -11458,7 +11925,7 @@
     },
     {
      "type": "timeseries",
-     "id": 144,
+     "id": 151,
      "title": "S3 errors / in flight",
      "description": "",
      "datasource": {
@@ -11467,7 +11934,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 345,
+      "y": 362,
       "w": 8,
       "h": 8
      },
@@ -11538,7 +12005,7 @@
     },
     {
      "type": "timeseries",
-     "id": 145,
+     "id": 152,
      "title": "Bucket usage",
      "description": "",
      "datasource": {
@@ -11547,7 +12014,7 @@
      },
      "gridPos": {
       "x": 8,
-      "y": 345,
+      "y": 362,
       "w": 8,
       "h": 8
      },
@@ -11600,19 +12067,19 @@
   },
   {
    "type": "row",
-   "id": 146,
+   "id": 153,
    "title": "CPU profile (Pyroscope; nodes run with --pyroscope-url)",
    "collapsed": true,
    "gridPos": {
     "x": 0,
-    "y": 353,
+    "y": 370,
     "w": 24,
     "h": 1
    },
    "panels": [
     {
      "type": "flamegraph",
-     "id": 147,
+     "id": 154,
      "title": "CPU flamegraph (dashboard time range, selected nodes)",
      "datasource": {
       "type": "grafana-pyroscope-datasource",
@@ -11620,7 +12087,7 @@
      },
      "gridPos": {
       "x": 0,
-      "y": 354,
+      "y": 371,
       "w": 24,
       "h": 16
      },
