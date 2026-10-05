@@ -528,7 +528,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let host: Arc<dyn ShardHost> = node.clone();
     let node_handle = node.clone();
     // first membership step inline, so a lone node serves with all its shards
-    cluster.step(&host).await?;
+    cluster.first_step(&host).await?;
     // Only now merge: the step registered a follower for every live peer, so
     // the merger never settles past the start floor on our own log's
     // watermark alone (a peer followed after that would owe only its events

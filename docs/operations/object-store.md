@@ -207,6 +207,11 @@ Here's what happens when the store slows down or fails:
   body: "The supervisor restarts the nodes. When the store answers again, they rejoin, fence the dead incarnations' logs, replay and serve."
 ```
 
+A node whose store is slow or failing at boot keeps trying for up to 60 s. Before its lease exists it
+retries failed control-plane reads, and then it retries its first cluster step with backoff (each try
+keeps its usual deadline). On R2 one GET at cluster start once took over 3 s, which used to stop the
+node. Once the node serves, renewals and every other control-plane call keep their deadlines.
+
 Don't lower `--lease-ttl-ms` during an incident (it lowers the ceiling), and don't delete anything.
 A store shared with other heavy tenants can slow vlpds' renewals the same way. The alerts are
 `VlpdsObjectStoreBrownout`, `VlpdsSegmentPutLatencyHigh` and the lease alerts, and their steps are in

@@ -132,6 +132,9 @@ pub struct ClusterConfig {
     pub levels: version::Window,
     /// Where the lease is renewed. None: the caller's runtime and `store`.
     pub lease_plane: Option<LeasePlane>,
+    /// How long startup keeps retrying control-plane reads and its first
+    /// step that fail or time out, before the node gives up.
+    pub startup_deadline: Duration,
 }
 
 /// A runtime and an object-store client for lease renewal alone. A node
@@ -181,8 +184,32 @@ impl Default for ClusterConfig {
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
             lease_plane: None,
+            startup_deadline: STARTUP_DEADLINE,
         }
     }
+}
+
+/// [`ClusterConfig::startup_deadline`]'s default. A store that answers late
+/// for a few seconds at boot (one R2 GET took over 3 s) otherwise kills a
+/// node that would have served a moment later.
+pub const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Startup's first retry waits about this long; later ones double, capped
+/// at `renew_every`.
+const STARTUP_BACKOFF_FLOOR: Duration = Duration::from_millis(200);
+
+/// Exponential backoff with equal jitter: attempt `n` (from 0) waits
+/// between half and all of `min(cap, floor * 2^n)`, `unit` (in [0, 1))
+/// picking where.
+pub(crate) fn jittered_backoff(attempt: u32, floor: Duration, cap: Duration, unit: f64) -> Duration {
+    let full = floor.saturating_mul(1u32 << attempt.min(16)).min(cap);
+    full / 2 + full.mul_f64(unit.clamp(0.0, 1.0) / 2.0)
+}
+
+/// Startup retries a store error that may pass (a 5xx past object_store's
+/// retries, a transport error, a deadline), never a refusal or an answer.
+fn transient(e: &object_store::Error) -> bool {
+    matches!(e, object_store::Error::Generic { .. })
 }
 
 /// What the cluster asks the node to do with shards.
@@ -1110,22 +1137,43 @@ impl Cluster {
         self.with_deadline(op, f, |m| object_store::Error::Generic { store: "cluster", source: m.into() }).await
     }
 
+    /// Before our lease is written, a transient error is retried with
+    /// backoff until `startup_deadline`: there is no lease yet to lapse.
     pub(crate) async fn get_json<T: for<'de> Deserialize<'de>>(
         &self,
         path: &Path,
     ) -> anyhow::Result<Option<(T, Option<String>)>> {
-        self.count("get");
-        let got = self
-            .bounded("get", async {
-                let r = self.store.raw.get(path).await?;
-                let etag = r.meta.e_tag.clone();
-                Ok((r.bytes().await?, etag))
-            })
-            .await;
-        match got {
-            Ok((b, etag)) => Ok(Some((serde_json::from_slice(&b)?, etag))),
-            Err(object_store::Error::NotFound { .. }) => Ok(None),
-            Err(e) => Err(e.into()),
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            self.count("get");
+            let got = self
+                .bounded("get", async {
+                    let r = self.store.raw.get(path).await?;
+                    let etag = r.meta.e_tag.clone();
+                    Ok((r.bytes().await?, etag))
+                })
+                .await;
+            match got {
+                Ok((b, etag)) => return Ok(Some((serde_json::from_slice(&b)?, etag))),
+                Err(object_store::Error::NotFound { .. }) => return Ok(None),
+                Err(e) if transient(&e) && self.expires_local_ms.load(Ordering::Acquire) == 0 => {
+                    let wait = jittered_backoff(attempt, STARTUP_BACKOFF_FLOOR, self.cfg.renew_every, rand::random());
+                    if started.elapsed() + wait >= self.cfg.startup_deadline {
+                        return Err(anyhow::Error::from(e)
+                            .context(format!("reading {path} at startup, retried for {:?}", started.elapsed())));
+                    }
+                    attempt += 1;
+                    tracing::warn!(
+                        %path,
+                        attempt,
+                        retry_in_ms = wait.as_millis() as u64,
+                        "control-plane read failed at startup (retrying): {e:#}"
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
     }
 
@@ -1997,6 +2045,35 @@ impl Cluster {
     /// One control-plane round, renewing first.
     pub async fn step(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
         self.step_inner(host, true).await
+    }
+
+    /// The node's first step, before it serves, retried with backoff until
+    /// `startup_deadline`. The step loop retries a failed step next tick
+    /// anyway; a store slow at boot must not kill a node that never got
+    /// that far. Each attempt keeps the per-call deadline and renews first,
+    /// and no wait exceeds `renew_every`, so our lease never lapses between
+    /// attempts.
+    pub async fn first_step(&self, host: &Arc<dyn ShardHost>) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let mut attempt = 0;
+        loop {
+            let e = match self.step(host).await {
+                Ok(()) => return Ok(()),
+                Err(e) if e.is::<version::Refused>() => return Err(e),
+                Err(e) => e,
+            };
+            let wait = jittered_backoff(attempt, STARTUP_BACKOFF_FLOOR, self.cfg.renew_every, rand::random());
+            if started.elapsed() + wait >= self.cfg.startup_deadline {
+                return Err(e.context(format!("first cluster step, retried for {:?}", started.elapsed())));
+            }
+            attempt += 1;
+            tracing::warn!(
+                attempt,
+                retry_in_ms = wait.as_millis() as u64,
+                "first cluster step failed at startup (retrying): {e:#}"
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     async fn step_inner(&self, host: &Arc<dyn ShardHost>, renew: bool) -> anyhow::Result<()> {
@@ -2912,6 +2989,7 @@ mod tests {
             clock_offset_ms: 0,
             levels: version::Window::BUILD,
             lease_plane: None,
+            startup_deadline: STARTUP_DEADLINE,
         }
     }
 
@@ -3566,7 +3644,8 @@ mod tests {
     /// ret3): the next call of `op` ("get", "put", "list") on a path
     /// containing a substring waits 30 s first. "vanish": the next GET is
     /// answered, then the object deleted. "conflict": the next PUT fails
-    /// its precondition. "fail": the next PUT fails (a store error).
+    /// its precondition. "fail": the next PUT fails (a store error),
+    /// "getfail" the next GET.
     #[derive(Debug, Default)]
     struct Stalls {
         inner: object_store::memory::InMemory,
@@ -3640,6 +3719,9 @@ mod tests {
         ) -> object_store::Result<object_store::GetResult> {
             if self.take("get", location.as_ref()) {
                 tokio::time::sleep(STALL).await;
+            }
+            if self.take("getfail", location.as_ref()) {
+                return Err(object_store::Error::Generic { store: "Stalls", source: "armed failure".into() });
             }
             if self.take("vanish", location.as_ref()) {
                 // answered, then deleted (a peer's delete right after our read)
@@ -4425,5 +4507,100 @@ mod tests {
             (&serde_json::Value::Null, &serde_json::json!({"zone": "b"})),
             "released: {got}"
         );
+    }
+
+    #[test]
+    fn startup_backoff_doubles_with_jitter_under_its_cap() {
+        let (floor, cap) = (Duration::from_millis(200), Duration::from_secs(2));
+        let lo: Vec<u128> = (0..6).map(|n| jittered_backoff(n, floor, cap, 0.0).as_millis()).collect();
+        let hi: Vec<u128> = (0..6).map(|n| jittered_backoff(n, floor, cap, 0.999_999).as_millis()).collect();
+        assert_eq!(lo, [100, 200, 400, 800, 1000, 1000]);
+        assert_eq!(hi, [199, 399, 799, 1599, 1999, 1999]);
+        assert_eq!(jittered_backoff(40, floor, cap, 0.5), Duration::from_millis(1500));
+        // a cap under the floor (a short test TTL) wins
+        assert_eq!(jittered_backoff(0, floor, Duration::from_millis(100), 0.0), Duration::from_millis(50));
+    }
+
+    /// R2 at cluster start: one control-plane GET took over 3 s against a
+    /// 3 s TTL and the node exited instead of retrying. A read that fails
+    /// before our lease exists and a first step whose LIST outlives the
+    /// call deadline are retried, and the node comes up with its shards.
+    #[tokio::test]
+    async fn startup_retries_failing_and_slow_control_plane_reads() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        stalls.arm("getfail", "cluster/version");
+        stalls.arm("getfail", "cluster/version");
+        let c = lone_join(cfg("a"), store).await.unwrap();
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 2, "both failing reads retried");
+        stalls.arm("list", "nodes");
+        stalls.arm("list", "nodes");
+        let (h, d) = host();
+        let t = Instant::now();
+        c.first_step(&d).await.unwrap();
+        assert_eq!(stalls.stalled.load(Ordering::SeqCst), 4);
+        assert!(t.elapsed() >= c.cfg.ttl * 2, "each stalled LIST waited out the call deadline: {:?}", t.elapsed());
+        assert_eq!(c.owned().len(), 8);
+        assert!(c.lease_valid());
+        assert_eq!(h.lost.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn startup_gives_up_at_its_deadline() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let short = || ClusterConfig { startup_deadline: Duration::from_millis(1500), ..cfg("a") };
+        for _ in 0..100 {
+            stalls.arm("getfail", "cluster/version");
+        }
+        let t = Instant::now();
+        let e = lone_join(short(), store.clone()).await.err().expect("join gives up");
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(format!("{e:#}").contains("at startup"), "{e:#}");
+        stalls.armed.lock().clear();
+
+        let c = lone_join(short(), store).await.unwrap();
+        for _ in 0..100 {
+            stalls.arm("list", "nodes");
+        }
+        let (_h, d) = host();
+        let t = Instant::now();
+        let e = c.first_step(&d).await.unwrap_err();
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(format!("{e:#}").contains("timed out after"), "{e:#}");
+    }
+
+    /// Startup's retries end with startup. Afterwards a control-plane call
+    /// fails at its deadline (min(TTL, 5 s)) or on its first error, and a
+    /// renewal stalled past the lease's validity still fail-stops the node.
+    #[tokio::test]
+    async fn after_startup_calls_keep_their_deadline_and_renewals_fail_stop() {
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = lone_join(cfg("a"), store).await.unwrap();
+        let (_h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert_eq!(c.call_deadline(), Some(c.cfg.ttl));
+
+        stalls.arm("get", "nodes/b");
+        let t = Instant::now();
+        let e = c.read_lease("b").await.unwrap_err();
+        assert!(format!("{e:#}").contains("timed out after 600ms"), "{e:#}");
+        assert!(t.elapsed() < c.cfg.ttl * 2, "{:?}", t.elapsed());
+        stalls.arm("getfail", "nodes/b");
+        let gets = c.store_requests();
+        assert!(c.read_lease("b").await.is_err());
+        assert_eq!(c.store_requests(), gets + 1, "no retry once our lease exists");
+
+        let stalls = Arc::new(Stalls::default());
+        let store = Store { raw: stalls.clone(), ..Store::memory(None) };
+        let c = lone_join(cfg("r"), store).await.unwrap();
+        let (h, d) = host();
+        c.first_step(&d).await.unwrap();
+        assert!(c.lease_valid());
+        stalls.arm("put", "nodes/r");
+        c.spawn(d);
+        tokio::time::sleep(c.cfg.ttl + c.cfg.skew * 3 + Duration::from_millis(300)).await;
+        assert!(h.lost.load(Ordering::SeqCst) >= 1, "a stalled renewal must still fail-stop");
     }
 }
