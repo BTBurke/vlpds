@@ -133,7 +133,12 @@ pub async fn route_key(app: &App, path: &str, query: Option<&str>, headers: &Hea
         // device's pending one
         "/oauth/authorize/sign-in" | "/oauth/account/sign-in" => {
             let p = params();
-            let did = if p.get("step").map(String::as_str) == Some("2fa") {
+            let step = p.get("step").map(String::as_str);
+            if step == Some("passkey") {
+                let did = p.get("user_handle").and_then(|h| super::passkeys::did_from_user_handle(h));
+                return did.or_else(|| request(p.get("request_uri")));
+            }
+            let did = if step == Some("2fa") {
                 let id = cookie(headers, DEVICE_COOKIE).filter(|i| store::valid_device_id(i))?;
                 store::get_device(app, &id).await.ok()??.pending_2fa.map(|(did, _)| did)
             } else {
@@ -921,14 +926,31 @@ async fn consent_required(app: &App, flow: &Flow, did: &str) -> Result<bool, OAu
 fn login_page(app: &App, flow: &Flow, identifier: &str, error: Option<&str>, status: StatusCode) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
+    let pk = passwordless_ui(app, &passkey_binding(&flow.device.id, &flow.id, None));
     let body = ui::login(
         Some(&flow.ctx(&csrf, &name)),
-        &ui::LoginForm { action: "/oauth/authorize/sign-in", identifier, error, second: None, passkey: None },
+        &ui::LoginForm {
+            action: "/oauth/authorize/sign-in",
+            identifier,
+            error,
+            second: None,
+            passkey: pk.as_ref().map(|(c, r)| ui::PasskeyUi { challenge: c, rp_id: r, allow: "[]" }),
+        },
         "",
     );
     let mut r = flow.page(app, body);
+    set_passkey_csp(&mut r, &flow.form_action());
     *r.status_mut() = status;
     r
+}
+
+/// A passwordless challenge for the sign-in page: (challenge, RP ID).
+/// Stateless, so rendering the page writes nothing.
+fn passwordless_ui(app: &App, binding: &str) -> Option<(String, String)> {
+    let rp = super::passkeys::rp(app).ok()?;
+    let ch =
+        crate::webauthn::mint_challenge(&super::passkeys::challenge_key(app), "signin", binding, now_secs() as u64);
+    Some((ou::b64u(ch), rp.id))
 }
 
 /// Approves directly when the user already granted these scopes to this
@@ -1197,6 +1219,7 @@ async fn sign_in(
     f: &HashMap<String, String>,
     req: &SignInReq<'_>,
 ) -> Result<SignIn, OAuthError> {
+    let passwordless = f.get("step").map(String::as_str) == Some("passkey");
     let r = sign_in_inner(app, device, f, req).await;
     let result = match &r {
         Ok(SignIn::Ok(_)) => "success",
@@ -1209,7 +1232,7 @@ async fn sign_in(
         Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout | LoginError::Passkey)) => "failed",
         Err(_) => "error",
     };
-    crate::metrics::login("oauth", result);
+    crate::metrics::login(if passwordless { "passkey" } else { "oauth" }, result);
     r
 }
 
@@ -1258,6 +1281,9 @@ async fn sign_in_inner(
     let limited = |ident: String| Ok(SignIn::Failed(ident, LoginError::RateLimited));
     if rl::check_ip(&[&rl::GLOBAL_IP, &rl::OAUTH_SIGN_IN_IP], 1).is_err() {
         return limited(ident);
+    }
+    if f.get("step").map(String::as_str) == Some("passkey") {
+        return passwordless_sign_in(app, device, f, req).await;
     }
     let password_step = f.get("step").map(String::as_str) != Some("2fa");
     let (acct, ident, epoch) = if !password_step {
@@ -1404,6 +1430,53 @@ async fn sign_in_inner(
     let method = super::signin::Method::OAuth(req.client_id.map(String::from));
     super::signin::record(app, &acct, method, factor, &ctx).await;
     finish_device_sign_in(app, device, acct.did, epoch, auth_cred).await
+}
+
+/// A discoverable passkey with user verification in place of the password
+/// and second factor. Its user handle names the account (routing sent the
+/// post to that account's owner); every failure is the same "Passkey not
+/// recognized", so nothing says which accounts have passkeys.
+async fn passwordless_sign_in(
+    app: &App,
+    device: &mut Device,
+    f: &HashMap<String, String>,
+    req: &SignInReq<'_>,
+) -> Result<SignIn, OAuthError> {
+    use crate::ratelimit as rl;
+    use crate::webauthn::Fail;
+    let refused = |f: Fail| {
+        super::passkeys::count_failure(f);
+        Ok(SignIn::Failed(String::new(), LoginError::Passkey))
+    };
+    let Some(a) = posted_assertion(f) else { return refused(Fail::Malformed) };
+    let Some(did) = a.user_handle.as_deref().and_then(super::passkeys::did_from_user_handle) else {
+        return refused(Fail::Malformed);
+    };
+    if rl::check(&[&rl::SIGN_IN_ACCOUNT], &did, 1).is_err() {
+        return Ok(SignIn::Failed(String::new(), LoginError::RateLimited));
+    }
+    let Ok(acct) = account_any(app, &did).await else { return refused(Fail::UnknownCredential) };
+    // read before the check: a password change or revoke-all racing this
+    // sign-in either lands first or voids it
+    let epoch = crate::xrpc::auth_epoch(app, &did).await?;
+    let ex = super::passkeys::Expect {
+        purpose: "signin",
+        binding: passkey_binding(&device.id, req.flow_key, None),
+        require_uv: true,
+    };
+    let used = match super::passkeys::use_passkey(app, &did, &a, &ex).await {
+        Ok(u) => u,
+        Err(super::passkeys::UseErr::Server(e)) => return Err(e.into()),
+        Err(super::passkeys::UseErr::Refused(_)) => return Ok(SignIn::Failed(String::new(), LoginError::Passkey)),
+    };
+    if acct.status.is_some() {
+        return Ok(SignIn::Failed(String::new(), LoginError::Inactive));
+    }
+    let device_id = device.id.clone();
+    let ctx = super::signin::Ctx { ip: req.ip, user_agent: req.user_agent, device_id: Some(&device_id) };
+    let method = super::signin::Method::Passkey(req.client_id.map(String::from));
+    super::signin::record(app, &acct, method, Some("passkey"), &ctx).await;
+    finish_device_sign_in(app, device, did, epoch, Some(used.cred.auth_ref())).await
 }
 
 /// The device's account list gains this sign-in.
@@ -2150,6 +2223,8 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
         let pk = pending
             .as_ref()
             .and_then(|p| passkey_ui(&app, &passkey_binding(&device.id, "account", Some(&p.did)), &p.passkeys));
+        let pwless =
+            if pending.is_none() { passwordless_ui(&app, &passkey_binding(&device.id, "account", None)) } else { None };
         let body = ui::login(
             None,
             &ui::LoginForm {
@@ -2157,7 +2232,7 @@ async fn account_page(State(app): AppState, headers: HeaderMap, Query(q): Query<
                 identifier: pending.as_ref().map_or("", |p| p.handle.as_str()),
                 error,
                 second: pending.as_ref().map(|p| second_factor_form(p, &pk, super::signin::trust_days(&app))),
-                passkey: None,
+                passkey: pwless.as_ref().map(|(c, r)| ui::PasskeyUi { challenge: c, rp_id: r, allow: "[]" }),
             },
             &csrf,
         );

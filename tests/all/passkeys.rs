@@ -346,3 +346,127 @@ async fn counter_regression() {
     // the synced one still works
     assert_eq!(go(&s, &f, &acct, &mut synced, Lie::default()).await, 200);
 }
+
+/// Passwordless on the OAuth sign-in page: autofill and a button, through
+/// the code exchange; one message for every refusal (no UV, an unknown or
+/// another account's credential, a forged user handle); the log and the
+/// new-device alert say "with a passkey".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn oauth_passwordless() {
+    let before = count(&vlpds::metrics::LOGINS, &["passkey", "success"]);
+    let s = o::spawn().await;
+    let acct = o::create_account(&s, "pkpwl").await;
+    let other = o::create_account(&s, "pkpwl2").await;
+    let mut key = SoftKey::synced(&s.base);
+    oauth_register(&s, &acct, &mut key).await;
+    let mut other_key = SoftKey::synced(&s.base);
+    oauth_register(&s, &other, &mut other_key).await;
+    let dk = o::DpopKey::new();
+    let f = o::Flow::loopback("atproto", &dk);
+
+    let mut b = o::Browser::default();
+    let p = o::pkce();
+    let ru = f.request_uri(&s, &p, "st").await;
+    let (_, h, html) = b.authorize(&s, &f, &ru).await;
+    assert!(html.contains("autocomplete=\"username webauthn\""), "{html}");
+    assert!(html.contains("Sign in with a passkey") && html.contains("data-mode=\"signin\""), "{html}");
+    assert_eq!(attr(&html, "data-uv"), "required");
+    assert!(h.get("content-security-policy").unwrap().to_str().unwrap().contains("script-src 'sha256-"));
+    // the page lists no credentials: it names no account
+    assert_eq!(attr(&html, "data-allow"), "[]");
+    let csrf = o::csrf_of(&html);
+    let challenge = attr(&html, "data-challenge");
+    let hidden = [("request_uri", ru.as_str()), ("csrf", csrf.as_str())];
+    let refusals = [
+        // no PIN or biometric: a second factor at most
+        key.assert(&challenge, &Lie { no_uv: true, ..Default::default() }),
+        // the user handle of another account: the key isn't in its row
+        key.assert(&challenge, &Lie { user_handle: Some(other.did.as_bytes().to_vec()), ..Default::default() }),
+        // an account with no passkeys at all, and a DID with no account
+        key.assert(
+            &challenge,
+            &Lie { user_handle: Some(b"did:plc:nobodyhereatall2345678".to_vec()), ..Default::default() },
+        ),
+        // a key this server never saw
+        SoftKey::synced(&s.base)
+            .assert(&challenge, &Lie { user_handle: Some(acct.did.as_bytes().to_vec()), ..Default::default() }),
+        // another account's own key, sent as this one
+        other_key.assert(&challenge, &Lie { user_handle: Some(acct.did.as_bytes().to_vec()), ..Default::default() }),
+    ];
+    for a in &refusals {
+        let (st, _, html) = post_assertion(&s, &mut b, "/oauth/authorize/sign-in", &hidden, "passkey", a).await;
+        assert_eq!(st, 401, "{html}");
+        assert!(html.contains("Passkey not recognized"), "{html}");
+    }
+    let a = key.assert(&challenge, &Lie::default());
+    let (st, _, html) = post_assertion(&s, &mut b, "/oauth/authorize/sign-in", &hidden, "passkey", &a).await;
+    assert_eq!(st, 200, "{html}");
+    assert!(html.contains("Authorize access") && html.contains(&acct.handle), "{html}");
+    let csrf2 = o::csrf_of(&html);
+    let consent = [("request_uri", ru.as_str()), ("csrf", &csrf2), ("did", &acct.did), ("action", "allow")];
+    let (st, h, _) = b.post(&s, "/oauth/authorize/consent", &consent).await;
+    assert_eq!(st, 303);
+    let (_, q) = o::location_params(&h);
+    let t = o::tokens(&o::exchange(&s, &f, &q["code"], &p, &[]).await);
+    let r = o::xrpc_dpop(&s, &dk, &t.access, "GET", "com.atproto.server.getSession", None).await;
+    assert_eq!(r.body["did"], json!(acct.did));
+    assert!(count(&vlpds::metrics::LOGINS, &["passkey", "success"]) > before);
+
+    let (_, j) = s.bearer(&acct.jwt, "vlpds.server.getSignInSecurity", false, None).await;
+    let e = &j["recentSignIns"][0];
+    assert_eq!((e["method"].as_str(), e["factor"].as_str()), (Some("passkey"), Some("passkey")), "{j}");
+    assert_eq!(e["clientId"], json!(f.client_id));
+
+    // a code approved by a passkey that's removed before the exchange fails
+    let p2 = o::pkce();
+    let ru = f.request_uri(&s, &p2, "st").await;
+    let mut b2 = o::Browser::default();
+    let (_, _, html) = b2.authorize(&s, &f, &ru).await;
+    let csrf = o::csrf_of(&html);
+    let a = key.assert(&attr(&html, "data-challenge"), &Lie::default());
+    let hidden = [("request_uri", ru.as_str()), ("csrf", csrf.as_str())];
+    let (_, _, html) = post_assertion(&s, &mut b2, "/oauth/authorize/sign-in", &hidden, "passkey", &a).await;
+    let csrf2 = o::csrf_of(&html);
+    let consent = [("request_uri", ru.as_str()), ("csrf", &csrf2), ("did", &acct.did), ("action", "allow")];
+    let (_, h, _) = b2.post(&s, "/oauth/authorize/consent", &consent).await;
+    let (_, q) = o::location_params(&h);
+    let rm = json!({"id": key.id_b64(), "password": o::PASSWORD});
+    let (st, _) = s.bearer(&acct.jwt, "vlpds.server.removePasskey", true, Some(rm)).await;
+    assert_eq!(st, 200);
+    let r = o::exchange(&s, &f, &q["code"], &p2, &[]).await;
+    assert_eq!(r.status, 400, "{}", r.body);
+    // and the browser's sign-in is gone: the next request asks again
+    let ru = f.request_uri(&s, &o::pkce(), "st").await;
+    let (_, _, html) = b2.authorize(&s, &f, &ru).await;
+    assert!(html.contains("name=\"password\""), "{html}");
+}
+
+/// `/oauth/account` signs in with a passkey too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn account_page_passwordless() {
+    let s = o::spawn().await;
+    let acct = o::create_account(&s, "pkacc").await;
+    let mut key = SoftKey::synced(&s.base);
+    oauth_register(&s, &acct, &mut key).await;
+    let mut b = o::Browser::default();
+    let (_, h, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    assert!(html.contains("Sign in with a passkey"), "{html}");
+    assert!(h.get("content-security-policy").unwrap().to_str().unwrap().contains("script-src 'sha256-"));
+    let csrf = o::csrf_of(&html);
+    let a = key.assert(&attr(&html, "data-challenge"), &Lie::default());
+    let (st, h, _) = post_assertion(&s, &mut b, "/oauth/account/sign-in", &[("csrf", &csrf)], "passkey", &a).await;
+    assert_eq!(st, 303);
+    assert_eq!(h.get("location").unwrap(), "/oauth/account");
+    let (_, _, html) = b.get(&s, &format!("{}/oauth/account", s.base)).await;
+    assert!(html.contains("Connected apps") && html.contains(&acct.handle), "{html}");
+    // a challenge from the authorize page doesn't work here, nor the reverse
+    let mut b2 = o::Browser::default();
+    let (_, _, html) = b2.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let csrf = o::csrf_of(&html);
+    let mut b3 = o::Browser::default();
+    let (_, _, other_page) = b3.get(&s, &format!("{}/oauth/account", s.base)).await;
+    let a = key.assert(&attr(&other_page, "data-challenge"), &Lie::default());
+    let (st, h, _) = post_assertion(&s, &mut b2, "/oauth/account/sign-in", &[("csrf", &csrf)], "passkey", &a).await;
+    assert_eq!(st, 303);
+    assert_eq!(h.get("location").unwrap(), "/oauth/account?add=1&error=passkey", "another browser's challenge");
+}

@@ -7,12 +7,12 @@ import { acall } from '../../lib/xrpc'
 type Browser = { id: string; device: string; ip?: string; createdAt: string; lastUsedAt: string; expiresAt: string; current: boolean }
 type SignInEntry = {
   at: string
-  method: 'password' | 'app_password' | 'oauth'
+  method: 'password' | 'app_password' | 'oauth' | 'passkey'
   appPassword?: string
   clientId?: string
   device: string
   ip?: string
-  factor?: 'totp' | 'email' | 'trusted'
+  factor?: 'totp' | 'email' | 'passkey' | 'recovery' | 'trusted'
   newDevice: boolean
   alerted: boolean
 }
@@ -38,10 +38,11 @@ function host(id: string) {
 function how(e: SignInEntry) {
   if (e.method === 'app_password') return `App password “${e.appPassword ?? ''}”`
   if (e.method === 'oauth') return e.clientId ? `Password, to connect ${host(e.clientId)}` : 'Password, on the sign-in page'
+  if (e.method === 'passkey') return e.clientId ? `Passkey, to connect ${host(e.clientId)}` : 'Passkey'
   return 'Password'
 }
 
-const FACTOR: Record<string, string> = { totp: 'authenticator code', email: 'emailed code', trusted: 'trusted browser' }
+const FACTOR: Record<string, string> = { totp: 'authenticator code', email: 'emailed code', passkey: 'passkey', recovery: 'recovery code', trusted: 'trusted browser' }
 
 /** Recent sign-ins, trusted browsers, sign-in emails and the OAuth-only switch. `ver` reloads it (two-factor changed). */
 export function SignInSecurity({ ver }: { ver: number }) {
@@ -94,7 +95,7 @@ function RecentSignIns({ list }: { list: SignInEntry[] }) {
                   </td>
                   <td className="hide-sm">
                     {how(e)}
-                    {e.factor && <div className="small muted">with {FACTOR[e.factor] ?? e.factor}</div>}
+                    {e.factor && e.method !== 'passkey' && <div className="small muted">with {FACTOR[e.factor] ?? e.factor}</div>}
                   </td>
                 </tr>
               ))}

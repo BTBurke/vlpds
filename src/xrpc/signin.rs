@@ -62,7 +62,8 @@ pub(super) struct Entry {
     /// Minted once per sign-in: a resent write finds it and adds nothing.
     pub id: String,
     pub at: u64,
-    /// "password" | "app_password" | "oauth"
+    /// "password" | "app_password" | "oauth" | "passkey" (in place of the
+    /// password)
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_password: Option<String>,
@@ -73,7 +74,8 @@ pub(super) struct Entry {
     pub user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
-    /// "totp" | "email" | "trusted" (a trusted browser skipped it)
+    /// "totp" | "email" | "passkey" | "recovery" | "trusted" (a trusted
+    /// browser skipped it)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub factor: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -315,6 +317,9 @@ pub(crate) enum Method {
     AppPassword(String),
     /// The OAuth sign-in page, for this client (None: `/oauth/account`).
     OAuth(Option<String>),
+    /// A passkey in place of the password: on the OAuth page for this
+    /// client, or (None) on this server's own pages.
+    Passkey(Option<String>),
 }
 
 impl Method {
@@ -323,6 +328,7 @@ impl Method {
             Method::Password => "password",
             Method::AppPassword(_) => "app_password",
             Method::OAuth(_) => "oauth",
+            Method::Passkey(_) => "passkey",
         }
     }
 
@@ -339,6 +345,8 @@ impl Method {
             Method::AppPassword(n) => format!("with the app password \u{201c}{n}\u{201d}"),
             Method::OAuth(Some(c)) => format!("with your password, for {}", client_name(c)),
             Method::OAuth(None) => "with your password, on the sign-in page".into(),
+            Method::Passkey(Some(c)) => format!("with a passkey, for {}", client_name(c)),
+            Method::Passkey(None) => "with a passkey".into(),
         }
     }
 }
@@ -372,7 +380,7 @@ async fn record_inner(app: &App, acct: &Account, method: &Method, factor: Option
             _ => None,
         },
         client_id: match method {
-            Method::OAuth(c) => c.clone(),
+            Method::OAuth(c) | Method::Passkey(c) => c.clone(),
             _ => None,
         },
         device: ctx.device_key(),

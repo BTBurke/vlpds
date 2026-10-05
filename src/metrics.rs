@@ -249,7 +249,7 @@ lazy!(SCHEDULED_DELETION_ACCOUNTS: IntCounterVec = register_int_counter_vec!("vl
 lazy!(SCHEDULED_DELETION_STATE: IntGaugeVec = register_int_gauge_vec!("vlpds_scheduled_deletion_accounts", "Accounts with a deleteAfter on this node's shards as of its last sweep, by state: scheduled (all of them), held (due but taken down or suspended: never deleted while so), deferred (left for the next sweep by its per-pass cap); sum over nodes", &["state"]));
 lazy!(OAUTH_CONSENTS: IntCounterVec = register_int_counter_vec!("vlpds_oauth_consents_total", "OAuth consent page answers by result: full (every requested scope granted), narrowed (the user unticked some), denied (the user refused), refused (a required scope was unticked: access_denied)", &["result"]));
 lazy!(SCOPE_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_scope_rejections_total", "Requests refused 403 ScopeMissingError, by credential (oauth: an OAuth token; app_password: a scoped app password) and the missing scope's kind (repo, rpc, blob, account, identity)", &["credential", "kind"]));
-lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth, passkey: passwordless with a passkey, on the OAuth page or the account page) and second factor (none, totp, email, passkey, trusted: a trusted browser skipped it; a passwordless sign-in counts as passkey)", &["method", "factor"]));
+lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth, passkey: passwordless with a passkey, on the OAuth page or the account page) and second factor (none, totp, email, passkey, recovery: a recovery code, trusted: a trusted browser skipped it; a passwordless sign-in counts as passkey)", &["method", "factor"]));
 lazy!(SIGN_IN_ALERTS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_alerts_total", "Sign-ins from a new device, by what became of their alert mail: mailed (handed to the mailer), budget (a mail budget refused it: vlpds_mail_suppressed_total{purpose=\"sign_in_alert\"}), account_limit (the account's 3 alerts a day are spent), muted (the owner turned alerts off), no_email, email_code (an emailed code just went to the same inbox), baseline (the account's first recorded sign-in)", &["result"]));
 lazy!(SIGN_IN_SETTINGS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_settings_total", "Sign-in security settings changed by account owners, by setting (oauth_only, block_app_passwords, password_alerts, app_password_alerts) and new value (on, off)", &["setting", "value"]));
 lazy!(PASSKEYS: IntCounterVec = register_int_counter_vec!("vlpds_passkeys_total", "Passkey changes by event: registered (an owner added one on the Security page), removed (an owner removed one), reset (the operator's resetSecondFactors removed them; counts accounts)", &["event"]));
@@ -386,7 +386,7 @@ pub fn init_counters() {
             }
         }
         for method in ["password", "app_password", "oauth", "passkey"] {
-            for factor in ["none", "totp", "email", "passkey", "trusted"] {
+            for factor in ["none", "totp", "email", "passkey", "recovery", "trusted"] {
                 SIGN_IN_FACTORS.with_label_values(&[method, factor]);
             }
         }
