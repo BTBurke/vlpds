@@ -34,7 +34,7 @@ facts:
   - { value: "2 vCPU", unit: "/ 4 GB", label: runs a personal PDS, note: "a small VPS with a 3 GiB container limit" }
   - { value: "$0", unit: /mo, label: object store on R2, note: "tiny profile idles at ~0.3 M Class A/mo (measured)", tone: amber }
   - { value: "60 s", label: lease TTL on tiny, note: "a crash waits ~53 s to write again; SIGTERM ~1 s", tone: violet }
-  - { value: "~4.5 s", label: of 502s per upgrade, note: "measured on a single-node production deploy (2026-10-05). vlpds stops in ~0.1–0.25 s and starts in ~1.3 s. The rest is docker compose recreating the container plus Caddy's upstream retry", tone: rust }
+  - { value: "~4.5 s", label: of 502s per upgrade, note: "measured on a single-node production deploy (2026-10-05). vlpds stops in ~0.1–0.25 s and starts in ~1.3 s. The rest is docker compose recreating the container plus Caddy's upstream retry. Caddy now retries a failed connection for up to 10 s, so requests should wait through it instead (not measured yet)", tone: rust }
 ```
 
 The worked example here is one vlpds node on a small VPS serving `pds.example.com`, set up with the
@@ -142,9 +142,12 @@ at any TTL. Details: [Configuration](configuration.md#shards-and-lease-ttl).
 
 Restarts are graceful, and they only happen when the compose file, a secret file or the image
 changed (or with `-e vlpds_force_restart=true`). Compose sends SIGTERM and waits 90 s
-(`vlpds_stop_grace_period`). The node hands its shards back, fences its own log and exits 0. Never
-`docker kill` it, and never run a second copy with the same `--node-id`, because two processes with one
-node id fence each other.
+(`vlpds_stop_grace_period`). The node hands its shards back, fences its own log and exits 0. While
+the container is down, Caddy retries the connection every 250 ms for up to 10 s (`lb_try_duration`),
+so requests wait instead of getting a 502. Caddy only retries a connection that failed, which vlpds
+never saw, so a write can't run twice. Never `docker kill` it, and never run a second copy with the
+same `--node-id`, because two processes with one node id fence each other. That's also why an upgrade
+can't start the new container before stopping the old one.
 
 ## Verify
 
