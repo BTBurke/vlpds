@@ -5,11 +5,13 @@
 //! (its nudge never arrived), and one that joins afterwards.
 
 use super::cluster::Plc;
+use super::hooks::{kill9, HookedStore, StubDid};
 use super::ref_net::{post_service, service_jwt};
-use crate::common::spaces::{signed_get_as, SpaceClient};
+use crate::common::spaces::{signed_get_as, Holder, SpaceClient};
 use crate::common::*;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use vlpds::space::token::{self, Mint, TokenType};
 
 const SHARDS: u32 = 6;
 const REVOKE: &str = "com.atproto.space.notifyCredentialRevoked";
@@ -186,5 +188,135 @@ async fn revocations_hold_across_restarts_missed_nudges_and_joins() {
         refused(&fx.read(n, &first).await, &format!("{id}: first"));
         refused(&fx.read(n, &second).await, &format!("{id}: second"));
         fx.read(n, &kept).await.ok();
+    }
+}
+
+/// A member on one node of three, in a space a remote authority (a stub)
+/// governs, holding one record; the authority's credentials sign by hand.
+struct Remote {
+    stub: StubDid,
+    member: SpaceClient,
+    space: String,
+    collection: String,
+    holder: Holder,
+    http: reqwest::Client,
+}
+
+impl Remote {
+    async fn new(owner: &TestServer) -> Remote {
+        let t = tag();
+        let (st, collection) = (format!("com.example.rr{t}.space"), format!("com.example.rr{t}.note"));
+        let scope = format!("space:{st}?authority=*&collection={collection}&action=read&action=create");
+        let stub = StubDid::spawn().await;
+        let member = SpaceClient::new(owner, &unique_name("rrm"), &scope).await;
+        let space = format!("at://{}/space/{st}/main", stub.did);
+        let rec = json!({"$type": collection, "text": "revocation target", "createdAt": now_iso()});
+        member.create_record(&space, &collection, Some("r"), rec).await.ok();
+        Remote { stub, member, space, collection, holder: Holder::new(), http: reqwest::Client::new() }
+    }
+
+    fn credential(&self, jti: &str) -> String {
+        let m = Mint {
+            iss: &self.stub.did,
+            sub: &self.space,
+            key_id: Some(&self.holder.did),
+            expires_in_secs: Some(600),
+            ..Default::default()
+        };
+        let now = chrono::Utc::now().timestamp();
+        token::encode(TokenType::Credential, &m, "ES256K", now, jti, |b| {
+            Ok::<_, std::convert::Infallible>(self.stub.key.sign(b))
+        })
+        .unwrap()
+    }
+
+    async fn read(&self, node: &TestServer, credential: &str) -> Resp {
+        let q = [
+            ("space", self.space.as_str()),
+            ("repo", self.member.did.as_str()),
+            ("collection", self.collection.as_str()),
+            ("rkey", "r"),
+        ];
+        let get = "com.atproto.space.getRecord";
+        signed_get_as(&self.http, &self.holder, &node.url, get, &q, credential, &self.member.did).await
+    }
+
+    async fn revoke(&self, at: &TestServer, jtis: &[&str]) -> Resp {
+        let jwt = self.stub.service_jwt(&self.member.did, REVOKE);
+        post_service(&at.url, REVOKE, &jwt, json!({"space": self.space, "credentials": jtis})).await
+    }
+
+    fn revoked_at(&self, n: &TestServer, jti: &str) -> bool {
+        let now = chrono::Utc::now().timestamp();
+        n.app.spaces.as_ref().unwrap().revocations.is_revoked(&self.space, jti, now)
+    }
+}
+
+/// A remote authority's revocation, sent to a node that doesn't hold the
+/// member's repo (nor the authority, which isn't here at all), has its
+/// stake checked at the repo's owner: stored, and refused on every node
+/// within the SLA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_remote_authoritys_revocation_at_another_node_is_refused_everywhere() {
+    let (bucket, plc) = (Bucket::default(), Plc::start().await);
+    let node = |id: &'static str| super::cluster::node(id, &bucket, SHARDS, &plc);
+    let (n1, n2, n3) = (node("rrv-1").await, node("rrv-2").await, node("rrv-3").await);
+    let nodes = [&n1, &n2, &n3];
+    balanced(&nodes).await;
+    let fx = Remote::new(&n2).await;
+    assert!(std::ptr::eq(owner_of(&nodes, &fx.member.did), &n2), "the member's repo is on rrv-2");
+    let (revoked, kept) = (fx.credential("rrv-gone"), fx.credential("rrv-kept"));
+    for n in nodes {
+        fx.read(n, &revoked).await.ok();
+        fx.read(n, &kept).await.ok();
+    }
+    fx.revoke(&n3, &["rrv-gone"]).await.ok();
+    let acked = Instant::now();
+    for n in nodes {
+        let id = &cluster(n).cfg.node_id;
+        loop {
+            let r = fx.read(n, &revoked).await;
+            if r.error_name() == Some("CredentialRevoked") {
+                break;
+            }
+            assert_eq!(r.status, 200, "{id}: {}", r.text());
+            assert!(
+                acked.elapsed() <= SLA,
+                "{id}: the revoked credential was served {:?} after the 200",
+                acked.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        fx.read(n, &kept).await.ok();
+    }
+}
+
+/// With the owner of the member's shard unreachable (killed, its lease
+/// not yet expired), the stake can't be checked: the revocation is stored
+/// rather than dropped, and every live node holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_revocation_whose_stake_cant_be_checked_is_stored() {
+    let (bucket, plc) = (Bucket::default(), Plc::start().await);
+    let node = |id: &'static str, store: Arc<HookedStore>| {
+        cluster_node(id, store, SHARDS, |c| {
+            plc.apply(c);
+            c.spaces = true;
+            lease(c).ttl = Duration::from_secs(30);
+        })
+    };
+    let stores = [HookedStore::new(&bucket), HookedStore::new(&bucket), HookedStore::new(&bucket)];
+    let n1 = node("rru-1", stores[0].clone()).await;
+    let n2 = node("rru-2", stores[1].clone()).await;
+    let n3 = node("rru-3", stores[2].clone()).await;
+    balanced(&[&n1, &n2, &n3]).await;
+    let fx = Remote::new(&n2).await;
+    assert!(std::ptr::eq(owner_of(&[&n1, &n2, &n3], &fx.member.did), &n2), "the member's repo is on rru-2");
+    kill9(&n2, &stores[1]);
+    let r = fx.revoke(&n3, &["rru-gone"]).await;
+    assert_eq!(n3.app.remote_owner(&fx.member.did), Some(n2.peer_url.clone()), "rru-2 was still the owner");
+    assert_eq!(r.status, 200, "{}", r.text());
+    for n in [&n1, &n3] {
+        let id = &cluster(n).cfg.node_id;
+        assert!(fx.revoked_at(n, "rru-gone"), "{id}: the revocation was dropped");
     }
 }

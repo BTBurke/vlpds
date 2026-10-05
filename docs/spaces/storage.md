@@ -131,10 +131,10 @@ memory first:
 - A rev more than 5 min in the future gets `FutureRev`.
 - A key the DID has rotated away from verifies only a commit whose rev is from before the rotation
   (5 min of slack), so a former host can't keep signing importable commits for the account.
-- When the space's authority is hosted here, the rev can't be from before the space was created
-  (2 min of slack for clocks). A space deleted and made again is a new space, and a repo from the
+- When the space's authority is hosted here (on any node of the cluster), the rev can't be from
+  before the space was created (2 min of slack for clocks). A space deleted and made again is a new space, and a repo from the
   old one doesn't come back into it.
-- When the space's authority is hosted on the same node, the account must be allowed to write in the
+- When the space's authority is hosted here, the account must be allowed to write in the
   space (`NotAuthorized` otherwise). An authority elsewhere refuses a non-writer's notify as it
   would any write's.
 - An import that fails clears what it staged. If the node dies part way, the rows it left have no

@@ -221,6 +221,56 @@ fn record_blobs(path: &str, bytes: &[u8]) -> XResult<Vec<Cid>> {
     crate::cbor::scan_blob_refs(bytes).map_err(|_| invalid(format!("Could not parse record at '{path}'")))
 }
 
+/// An authority hears of an import as of any write and refuses a
+/// non-writer then, but by that time the repo is in; when this cluster
+/// hosts the authority, it's refused up front. Run at the owner of the
+/// authority's shard (a shard nobody holds right now is refused for a
+/// retry, never skipped).
+async fn authority_check(app: &App, space: &Space, did: &str, rev: Tid) -> XResult<()> {
+    app.partition(&space.authority)?;
+    // (no row: the authority moved in without its spaces, which aren't
+    // migrated; its own repos come first)
+    if super::server::account_if_exists(app, &space.authority).await?.is_none() {
+        return Ok(());
+    }
+    let Some(row) = super::simplespace::space_row_opt(app, space).await? else {
+        return Ok(());
+    };
+    if !row.live() {
+        return Err(super::simplespace::space_not_found());
+    }
+    // a repo from before the space was (re)created belongs to an
+    // incarnation that was deleted: importing it would bring that back,
+    // signed by a key the account held then
+    if rev.micros() + CREATED_SLACK_MICROS < created_micros(&row.created_at)? {
+        return Err(invalid("the imported commit predates the space (it was deleted and made again since)"));
+    }
+    if !super::simplespace::authorize_user(app, space, &row, did, "write", None).await? {
+        return Err(bad("NotAuthorized", "Not a member allowed to write in this space"));
+    }
+    Ok(())
+}
+
+#[derive(Deserialize)]
+pub(super) struct CheckQ {
+    space: String,
+    did: String,
+    rev: String,
+}
+
+/// [`authority_check`] for an import on another node of the cluster.
+pub(super) async fn internal_import_check(
+    State(app): AppState,
+    headers: HeaderMap,
+    Query(q): Query<CheckQ>,
+) -> XResult<Json<J>> {
+    super::internal::check(&app, &headers)?;
+    let space = Space::parse(&q.space)?;
+    let rev = Tid::parse(&q.rev).ok_or_else(|| invalid("rev must be a TID"))?;
+    authority_check(&app, &space, &q.did, rev).await?;
+    Ok(Json(json!({})))
+}
+
 /// How far a repo's rev may be before its space's `createdAt`: the
 /// writer's clock and the authority's needn't agree.
 const CREATED_SLACK_MICROS: u64 = 120_000_000;
@@ -375,29 +425,13 @@ async fn import(app: &Arc<App>, creds: &Credentials, q: &ImportQ, headers: &Head
         creds.need_space(&space.target(), SpaceAccess::Write("create", c))?;
     }
     drop(collections);
-    // an authority hears of the import as of any write and refuses a
-    // non-writer then, but by that time the repo is in; when it's hosted on
-    // this node, refuse up front
     let rev = Tid::parse(&commit.rev).ok_or_else(|| invalid("commit.rev must be a TID"))?;
-    let authority_here = app.partitions.for_key(&space.authority).is_some()
-        && super::server::account_if_exists(app, &space.authority).await?.is_some();
-    // (no row: the authority moved in without its spaces, which aren't
-    // migrated; its own repos come first)
-    if authority_here {
-        if let Some(row) = super::simplespace::space_row_opt(app, &space).await? {
-            if !row.live() {
-                return Err(super::simplespace::space_not_found());
-            }
-            // a repo from before the space was (re)created belongs to an
-            // incarnation that was deleted: importing it would bring that
-            // back, signed by a key the account held then
-            if rev.micros() + CREATED_SLACK_MICROS < created_micros(&row.created_at)? {
-                return Err(invalid("the imported commit predates the space (it was deleted and made again since)"));
-            }
-            if !super::simplespace::authorize_user(app, &space, &row, &did, "write", None).await? {
-                return Err(bad("NotAuthorized", "Not a member allowed to write in this space"));
-            }
+    match app.remote_owner(&space.authority) {
+        Some(owner) => {
+            let q = [("space", space.uri.as_str()), ("did", did.as_str()), ("rev", commit.rev.as_str())];
+            super::internal::owner_get(app, &owner, "/internal/v1/space/importCheck", &q).await?;
         }
+        None => authority_check(app, &space, &did, rev).await?,
     }
     // every later write's rev follows it, and an authority refuses a
     // notify this far ahead (FutureRev), so the account would go unheard

@@ -146,6 +146,10 @@ Every node reads the object whole, so anyone with a DID could grow it if nothing
   space, or the space's authority is hosted here. Any other gets a 200 and is dropped, since no
   credential for that space reads anything here through that account. An authority should tell
   each member's host, addressed to that member.
+- In a cluster, "here" is the cluster. The node that gets the revocation asks the node that holds
+  the account's repo. When it can't get an answer (that node is down, or the repo is moving), it
+  stores the revocation anyway: an extra entry costs little, and a dropped one would leave the
+  credential readable.
 - Stored ones are capped at 2,000 live entries per authority, 1,000 per space, 5,000 per account
   here, and 50,000 in all (~7 MB). Each is rate-limited per authority (`space-revoke`) and per
   account (`space-revoke-aud`). The limits count only `jti`s that aren't revoked yet, so an

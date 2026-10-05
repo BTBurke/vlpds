@@ -1009,3 +1009,32 @@ async fn a_repo_from_before_the_space_was_made_again_is_refused() {
     let now = records(RepoBuilder::new(&o.space, &o.alice.did, &rev_ago(Duration::from_secs(1))), 2).build(&key);
     import_repo(&o.alice, &o.space, &now.car()).await.ok();
 }
+
+/// The same with the authority on another node of a cluster: the check
+/// runs at the owner of the authority's shard, not skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_repo_from_before_the_space_was_made_again_is_refused_across_a_cluster() {
+    let (bucket, plc) = (Arc::new(object_store::memory::InMemory::new()), super::cluster::Plc::start().await);
+    let n1 = super::cluster::node("imr-1", &bucket, 6, &plc).await;
+    let n2 = super::cluster::node("imr-2", &bucket, 6, &plc).await;
+    balanced(&[&n1, &n2]).await;
+    let alice = SpaceClient::new(&n1, &unique_name("imra"), FULL_SCOPE).await;
+    let bob = SpaceClient::new(&n2, &unique_name("imrb"), FULL_SCOPE).await;
+    let make = || async {
+        let body = json!({"spaceType": TEST_SPACE_TYPE, "skey": "again", "readPolicy": member_list(), "writePolicy": member_list(), "appAccess": open()});
+        let space =
+            alice.post("com.atproto.simplespace.createSpace", body).await.ok()["uri"].as_str().unwrap().to_string();
+        put_member(&alice, &space, &bob, true, true).await.ok();
+        space
+    };
+    let space = make().await;
+    let key = account_key(&n2, &bob.did).await;
+    let old = records(RepoBuilder::new(&space, &bob.did, &rev_ago(Duration::from_secs(600))), 2).build(&key);
+    alice.post("com.atproto.simplespace.deleteSpace", json!({"space": space})).await.ok();
+    assert_eq!(make().await, space);
+    let r = import_repo(&bob, &space, &old.car()).await;
+    refused_mentioning(&r, &["predates the space"]);
+    nothing_written(&bob, &space, "a repo from before, across the cluster").await;
+    let now = records(RepoBuilder::new(&space, &bob.did, &rev_ago(Duration::from_secs(1))), 2).build(&key);
+    import_repo(&bob, &space, &now.car()).await.ok();
+}
