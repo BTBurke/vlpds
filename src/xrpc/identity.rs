@@ -547,7 +547,10 @@ async fn check_handle(State(app): AppState, Auth(creds): Auth, Query(q): Query<C
     let handle = q.name.trim().trim_start_matches('@').trim_end_matches('.').to_ascii_lowercase();
     let service = handle.ends_with(&format!(".{}", app.handle_domain));
     let kind = if service { "service" } else { "external" };
-    let base = |status: &str, message: Option<String>| json!({"handle": handle, "kind": kind, "status": status, "message": message, "proofRequired": !app.config.dev_mode});
+    let base = |status: &str, message: Option<String>| {
+        crate::metrics::HANDLE_CHECKS.with_label_values(&[kind, status]).inc();
+        json!({"handle": handle, "kind": kind, "status": status, "message": message, "proofRequired": !app.config.dev_mode})
+    };
     if let Some((status, message)) = handle_problem(&app, &handle) {
         return Ok(Json(base(status, Some(message))));
     }

@@ -46,6 +46,8 @@ async fn past_delete_after_is_deleted_by_one_sweep() {
     assert!(exists(&s, &a.did).await);
 
     let before = vlpds::metrics::ACCOUNT_DELETIONS.with_label_values(&["delete_after"]).get();
+    let swept = vlpds::metrics::SCHEDULED_DELETION_ACCOUNTS.with_label_values(&["deleted"]).get();
+    let passes = vlpds::metrics::SCHEDULED_DELETION_PASSES.with_label_values(&["ok"]).get();
     let mut sub = s.subscribe_from_now().await;
     assert_eq!(sweep(&s.app, after_hold(), MAX_PER_PASS).await, deleted(1));
     assert!(!exists(&s, &a.did).await);
@@ -53,6 +55,8 @@ async fn past_delete_after_is_deleted_by_one_sweep() {
     let ev = sub.wait_for(FH_TIMEOUT, &a.did, "#account").await.pop().unwrap();
     assert_eq!(ev.str("status"), Some("deleted"));
     assert!(vlpds::metrics::ACCOUNT_DELETIONS.with_label_values(&["delete_after"]).get() > before);
+    assert!(vlpds::metrics::SCHEDULED_DELETION_ACCOUNTS.with_label_values(&["deleted"]).get() > swept);
+    assert!(vlpds::metrics::SCHEDULED_DELETION_PASSES.with_label_values(&["ok"]).get() > passes);
     // the D/ row went with it: nothing left to do
     assert_eq!(sweep(&s.app, after_hold(), MAX_PER_PASS).await, Swept::default());
 }
@@ -108,10 +112,14 @@ async fn a_deletion_stopped_partway_is_finished_by_the_next_pass() {
     let s = TestServer::spawn().await;
     let a = s.create_account("sdcrash").await;
     deactivate(&s, &a, PAST).await;
+    let errors = vlpds::metrics::SCHEDULED_DELETION_PASSES.with_label_values(&["error"]).get();
+    let failed = vlpds::metrics::SCHEDULED_DELETION_ACCOUNTS.with_label_values(&["failed"]).get();
     vlpds::xrpc::set_delete_crash_hook(&a.did, Some(Arc::new(|p: &str| p == "deleted")));
     let first = sweep(&s.app, after_hold(), MAX_PER_PASS).await;
     vlpds::xrpc::set_delete_crash_hook(&a.did, None);
     assert_eq!(first, Swept { failed: 1, ..Default::default() });
+    assert!(vlpds::metrics::SCHEDULED_DELETION_PASSES.with_label_values(&["error"]).get() > errors);
+    assert!(vlpds::metrics::SCHEDULED_DELETION_ACCOUNTS.with_label_values(&["failed"]).get() > failed);
     assert!(!exists(&s, &a.did).await);
     assert_eq!(s.app.resolve_handle(&a.handle).await.ok().unwrap().as_deref(), Some(a.did.as_str()));
     assert_eq!(sweep(&s.app, after_hold(), MAX_PER_PASS).await, Swept { finished: 1, ..Default::default() });

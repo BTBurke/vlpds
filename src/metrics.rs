@@ -240,8 +240,19 @@ lazy!(RETENTION_DEAD_LOGS: IntGaugeVec = register_int_gauge_vec!("vlpds_retentio
 lazy!(SIGNUPS: IntCounterVec = register_int_counter_vec!("vlpds_signups_total", "Sign-up attempts (createAccount, the OAuth sign-up form) by result: created, or refused for invite (missing or unusable invite code), email_policy (unsupported or disposable address), handle_policy (reserved or inappropriate handle), taken (handle or email already in use), invalid (other bad input), error (server-side failure)", &["result"]));
 lazy!(ACCOUNT_EVENTS: IntCounterVec = register_int_counter_vec!("vlpds_account_events_total", "Account lifecycle events: created (sign-ups and migrations in; not vlpds.admin.bulkCreate), deleted, deactivated, reactivated", &["event"]));
 lazy!(ACCOUNT_DELETIONS: IntCounterVec = register_int_counter_vec!("vlpds_account_deletions_total", "Accounts deleted, by reason: user (deleteAccount with an emailed token), admin (com.atproto.admin.deleteAccount), delete_after (the sweep, once a deactivated account's deleteAfter passed)", &["reason"]));
+lazy!(SCHEDULED_DELETION_PASSES: IntCounterVec = register_int_counter_vec!("vlpds_scheduled_deletion_passes_total", "Scheduled-deletion sweeps (deactivated accounts whose deleteAfter passed; every node, every 10 min, over its own shards) by result: ok, or error (a shard's scan or an account's deletion failed)", &["result"]));
+lazy!(SCHEDULED_DELETION_PASS_SECONDS: Histogram = register_histogram!("vlpds_scheduled_deletion_pass_seconds", "One scheduled-deletion sweep, ok or failed", exponential_buckets(0.01, 2.0, 14).unwrap()));
+lazy!(SCHEDULED_DELETION_ACCOUNTS: IntCounterVec = register_int_counter_vec!("vlpds_scheduled_deletion_accounts_total", "Accounts the scheduled-deletion sweep acted on, by result: deleted, finished (a deletion that had stopped partway, completed), raced (reactivated as the sweep deleted it; kept), failed (retried next sweep)", &["result"]));
+lazy!(SCHEDULED_DELETION_STATE: IntGaugeVec = register_int_gauge_vec!("vlpds_scheduled_deletion_accounts", "Accounts with a deleteAfter on this node's shards as of its last sweep, by state: scheduled (all of them), held (due but taken down or suspended: never deleted while so), deferred (left for the next sweep by its per-pass cap); sum over nodes", &["state"]));
+lazy!(OAUTH_CONSENTS: IntCounterVec = register_int_counter_vec!("vlpds_oauth_consents_total", "OAuth consent page answers by result: full (every requested scope granted), narrowed (the user unticked some), denied (the user refused), refused (a required scope was unticked: access_denied)", &["result"]));
+lazy!(SCOPE_REJECTIONS: IntCounterVec = register_int_counter_vec!("vlpds_scope_rejections_total", "Requests refused 403 ScopeMissingError, by credential (oauth: an OAuth token; app_password: a scoped app password) and the missing scope's kind (repo, rpc, blob, account, identity)", &["credential", "kind"]));
+lazy!(SIGN_IN_FACTORS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_factors_total", "Successful sign-ins by method (password, app_password, oauth) and second factor (none, totp, email, trusted: a trusted browser skipped it)", &["method", "factor"]));
+lazy!(SIGN_IN_ALERTS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_alerts_total", "Sign-ins from a new device, by what became of their alert mail: mailed (handed to the mailer), budget (a mail budget refused it: vlpds_mail_suppressed_total{purpose=\"sign_in_alert\"}), account_limit (the account's 3 alerts a day are spent), muted (the owner turned alerts off), no_email, email_code (an emailed code just went to the same inbox), baseline (the account's first recorded sign-in)", &["result"]));
+lazy!(SIGN_IN_SETTINGS: IntCounterVec = register_int_counter_vec!("vlpds_sign_in_settings_total", "Sign-in security settings changed by account owners, by setting (oauth_only, block_app_passwords, password_alerts, app_password_alerts) and new value (on, off)", &["setting", "value"]));
+lazy!(TRUSTED_BROWSERS: IntCounterVec = register_int_counter_vec!("vlpds_trusted_browsers_total", "Trusted browsers (skip the second factor for --trusted-device-days): granted (\"trust this browser\" after a code), revoked (one, or all, from the account page)", &["event"]));
+lazy!(HANDLE_CHECKS: IntCounterVec = register_int_counter_vec!("vlpds_handle_checks_total", "vlpds.identity.checkHandle answers by kind (service: a name under the handle domain; external: the caller's own domain) and status (invalid, reserved, current, taken, available, verified, unverified)", &["kind", "status"]));
 lazy!(MODERATION_ACTIONS: IntCounterVec = register_int_counter_vec!("vlpds_moderation_actions_total", "Takedowns applied or reversed (com.atproto.admin.updateSubjectStatus), by subject (account, record, blob) and action (takedown, reversed)", &["subject", "action"]));
-lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), blocked (taken-down or inactive account), rate_limited, error (server-side failure)", &["method", "result"]));
+lazy!(LOGINS: IntCounterVec = register_int_counter_vec!("vlpds_logins_total", "Sign-ins by method (password: createSession with the account password; app_password: createSession with an app password; oauth: the OAuth sign-in page) and result: success, failed (wrong identifier or password, or a timed-out step), second_factor_required (a 2FA code was asked for or mailed), second_factor_failed (wrong or locked-out 2FA code), inactive (a taken-down or suspended account; on the OAuth sign-in page also a deactivated one), oauth_required (the account's OAuth-only switch refused its main password), app_passwords_blocked (the account turned app passwords off), rate_limited, error (server-side failure)", &["method", "result"]));
 lazy!(PASSWORD_RESETS: IntCounterVec = register_int_counter_vec!("vlpds_password_resets_total", "Password resets: requested (a reset email asked for), unknown_email (asked for an address with no account; answered the same), completed (a new password set with its token)", &["step"]));
 lazy!(INVITE_CODES: IntCounterVec = register_int_counter_vec!("vlpds_invite_codes_total", "Invite codes: created (admin or earned), used (by a sign-up)", &["event"]));
 lazy!(RECORDS_WRITTEN: IntCounterVec = register_int_counter_vec!("vlpds_records_written_total", "Record ops committed by collection (the well-known app.bsky / chat.bsky collections; any other is `other`) and action (create, update, delete)", &["collection", "action"]));
@@ -368,6 +379,27 @@ pub fn init_counters() {
                 LOGINS.with_label_values(&[method, r]);
             }
         }
+        for method in ["password", "app_password", "oauth"] {
+            for factor in ["none", "totp", "email", "trusted"] {
+                SIGN_IN_FACTORS.with_label_values(&[method, factor]);
+            }
+        }
+        for credential in ["oauth", "app_password"] {
+            for kind in SCOPE_KINDS {
+                SCOPE_REJECTIONS.with_label_values(&[credential, kind]);
+            }
+        }
+        for setting in ["oauth_only", "block_app_passwords", "password_alerts", "app_password_alerts"] {
+            for value in ["on", "off"] {
+                SIGN_IN_SETTINGS.with_label_values(&[setting, value]);
+            }
+        }
+        for status in ["invalid", "reserved", "current", "taken", "available"] {
+            HANDLE_CHECKS.with_label_values(&["service", status]);
+        }
+        for status in ["invalid", "current", "taken", "verified", "unverified"] {
+            HANDLE_CHECKS.with_label_values(&["external", status]);
+        }
         for subject in ["account", "record", "blob"] {
             for action in ["takedown", "reversed"] {
                 MODERATION_ACTIONS.with_label_values(&[subject, action]);
@@ -418,8 +450,17 @@ pub fn request_crawl(relay: &str, result: &str) {
     }
 }
 
-const LOGIN_RESULTS: [&str; 7] =
-    ["success", "failed", "second_factor_required", "second_factor_failed", "blocked", "rate_limited", "error"];
+const LOGIN_RESULTS: [&str; 9] = [
+    "success",
+    "failed",
+    "second_factor_required",
+    "second_factor_failed",
+    "inactive",
+    "oauth_required",
+    "app_passwords_blocked",
+    "rate_limited",
+    "error",
+];
 
 pub fn login(method: &str, result: &str) {
     LOGINS.with_label_values(&[method, result]).inc();
@@ -510,6 +551,9 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
     (&SIGNUPS, &["created", "invite", "email_policy", "handle_policy", "taken", "invalid", "error"]),
     (&ACCOUNT_EVENTS, &["created", "deleted", "deactivated", "reactivated"]),
     (&ACCOUNT_DELETIONS, &["user", "admin", "delete_after"]),
+    (&OAUTH_CONSENTS, &["full", "narrowed", "denied", "refused"]),
+    (&SIGN_IN_ALERTS, &["mailed", "budget", "account_limit", "muted", "no_email", "email_code", "baseline"]),
+    (&TRUSTED_BROWSERS, &["granted", "revoked"]),
     (&PASSWORD_RESETS, &["requested", "unknown_email", "completed"]),
     (&INVITE_CODES, &["created", "used"]),
     (&BLOB_UPLOADS, &["image", "video", "other"]),
@@ -525,6 +569,27 @@ static LABELLED_COUNTERS: &[(&LazyLock<IntCounterVec>, &[&str])] = &[
 pub fn init_retention_counters() {
     for r in ["ok", "error"] {
         RETENTION_TICKS.with_label_values(&[r]);
+    }
+}
+
+/// Only nodes that run the scheduled-deletion sweep (--delete-after).
+pub fn init_scheduled_deletion_counters() {
+    for r in ["ok", "error"] {
+        SCHEDULED_DELETION_PASSES.with_label_values(&[r]);
+    }
+    for r in ["deleted", "finished", "raced", "failed"] {
+        SCHEDULED_DELETION_ACCOUNTS.with_label_values(&[r]);
+    }
+    LazyLock::force(&SCHEDULED_DELETION_PASS_SECONDS);
+}
+
+pub const SCOPE_KINDS: [&str; 5] = ["repo", "rpc", "blob", "account", "identity"];
+
+/// `scope`: the missing one (`repo:...`, `rpc:...`); labelled by its kind.
+pub fn scope_rejected(credential: &str, scope: &str) {
+    let kind = scope.split(':').next().unwrap_or("");
+    if let Some(kind) = SCOPE_KINDS.iter().find(|k| **k == kind) {
+        SCOPE_REJECTIONS.with_label_values(&[credential, kind]).inc();
     }
 }
 

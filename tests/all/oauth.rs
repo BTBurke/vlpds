@@ -1738,6 +1738,10 @@ async fn consent_scope_narrowing() {
         consent(s, b, f, acct, &extra).await
     }
 
+    // process-wide counters other tests move too: check growth
+    let consents = |r: &str| vlpds::metrics::OAUTH_CONSENTS.with_label_values(&[r]).get();
+    let before = ["full", "narrowed", "refused"].map(consents);
+
     // no scope field: allowed as requested
     assert_eq!(consent(&s, &mut b, &f, &acct, &[]).await.1.as_deref(), Some(scope));
 
@@ -1777,6 +1781,9 @@ async fn consent_scope_narrowing() {
         let (q, sc) = post(&s, &mut b, &f, &acct, forged).await;
         assert_eq!(sc, None, "{forged:?}");
         assert_eq!(q["error"], "access_denied", "{forged:?}");
+    }
+    for ((r, n), b) in [("full", 2), ("narrowed", 3), ("refused", 3)].into_iter().zip(before) {
+        assert!(consents(r) >= b + n, "vlpds_oauth_consents_total{{result={r}}} grew by {n}");
     }
 
     // transition scopes: broad grants with a warning, each droppable whole;

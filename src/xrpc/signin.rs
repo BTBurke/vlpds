@@ -298,6 +298,9 @@ pub(super) async fn trust(
     let out = app
         .private_cas(&acct.did, vec![super::auth_epoch_cond(epoch)], vec![Op::put(&name, Some(json_bytes(&t)))])
         .await?;
+    if out.applied {
+        crate::metrics::TRUSTED_BROWSERS.with_label_values(&["granted"]).inc();
+    }
     Ok(out.applied.then_some(t.expires_at))
 }
 
@@ -347,6 +350,7 @@ fn client_name(client_id: &str) -> String {
 /// Never fails the sign-in: a lost record is logged. `factor`: "totp",
 /// "email", "trusted" or None.
 pub(crate) async fn record(app: &App, acct: &Account, method: Method, factor: Option<&str>, ctx: &Ctx<'_>) {
+    crate::metrics::SIGN_IN_FACTORS.with_label_values(&[method.name(), factor.unwrap_or("none")]).inc();
     if let Err(e) = record_inner(app, acct, &method, factor, ctx).await {
         tracing::warn!(did = %acct.did, error = %e.message, "sign-in not recorded");
     }
@@ -375,7 +379,7 @@ async fn record_inner(app: &App, acct: &Account, method: &Method, factor: Option
         alerted: false,
     };
     let prefs = prefs(app, did).await?;
-    let mut alert = false;
+    let mut alert = None;
     'cas: {
         for _ in 0..CAS_ROUNDS {
             let raw = app.get_private(did, LOG).await?;
@@ -396,16 +400,22 @@ async fn record_inner(app: &App, acct: &Account, method: &Method, factor: Option
         }
         return Err(super::server::cas_conflict());
     }
-    if alert {
-        if let Some(email) = &acct.email {
-            send_alert(app, acct, email, method, &entry).await;
-        }
+    let result = match (alert, &acct.email) {
+        (Some(MAILED), Some(email)) => send_alert(app, acct, email, method, &entry).await,
+        (r, _) => r,
+    };
+    if let Some(r) = result {
+        crate::metrics::SIGN_IN_ALERTS.with_label_values(&[r]).inc();
     }
     Ok(())
 }
 
-/// Prunes `log`, adds `e` and decides whether it is mailed (and counts it).
-fn apply(log: &mut Log, e: &mut Entry, now: u64, first: bool, muted: bool, has_email: bool) -> bool {
+/// [`apply`]'s answer for a sign-in that is mailed (`vlpds_sign_in_alerts_total`).
+const MAILED: &str = "mailed";
+
+/// Prunes `log`, adds `e` and decides whether it is mailed (and counts it):
+/// None for a known device, else [`MAILED`] or why not.
+fn apply(log: &mut Log, e: &mut Entry, now: u64, first: bool, muted: bool, has_email: bool) -> Option<&'static str> {
     log.entries.retain(|x| now.saturating_sub(x.at) <= LOG_MAX_AGE);
     log.known.retain(|k| now.saturating_sub(k.last) <= KNOWN_MAX_AGE);
     e.new_device = !log.known.iter().any(|k| k.device == e.device);
@@ -419,13 +429,23 @@ fn apply(log: &mut Log, e: &mut Entry, now: u64, first: bool, muted: bool, has_e
         log.alert_day = today;
         log.alerts = 0;
     }
-    // an emailed code just went to the same inbox
-    let alert = e.new_device
-        && !first
-        && !muted
-        && has_email
-        && e.factor.as_deref() != Some("email")
-        && log.alerts < ALERTS_PER_DAY;
+    let result = if !e.new_device {
+        None
+    } else if first {
+        Some("baseline")
+    } else if muted {
+        Some("muted")
+    } else if !has_email {
+        Some("no_email")
+    } else if e.factor.as_deref() == Some("email") {
+        // an emailed code just went to the same inbox
+        Some("email_code")
+    } else if log.alerts >= ALERTS_PER_DAY {
+        Some("account_limit")
+    } else {
+        Some(MAILED)
+    };
+    let alert = result == Some(MAILED);
     if alert {
         log.alerts += 1;
     }
@@ -434,14 +454,15 @@ fn apply(log: &mut Log, e: &mut Entry, now: u64, first: bool, muted: bool, has_e
     if log.entries.len() > LOG_MAX {
         log.entries.drain(..log.entries.len() - LOG_MAX);
     }
-    alert
+    result
 }
 
-async fn send_alert(app: &App, acct: &Account, email: &str, method: &Method, e: &Entry) {
+/// [`MAILED`], or "budget" when a mail budget refused it.
+async fn send_alert(app: &App, acct: &Account, email: &str, method: &Method, e: &Entry) -> Option<&'static str> {
     // no RateLimit headers: the caller is whoever just signed in
     let permit = match super::server::mail_permit(app, Some(&acct.did), email, ALERT_PURPOSE, false).await {
         Ok(p) => p,
-        Err(_) => return,
+        Err(_) => return Some("budget"),
     };
     let device = describe_user_agent(e.user_agent.as_deref());
     let ip = e.ip.clone().unwrap_or_else(|| "an unknown address".into());
@@ -455,6 +476,7 @@ async fn send_alert(app: &App, acct: &Account, email: &str, method: &Method, e: 
         email,
         crate::mail::Email::SignInAlert { handle: &acct.handle, device: &device, ip: &ip, method: &how, at: &at },
     );
+    Some(MAILED)
 }
 
 /// Golden fixtures (`super::private_rows`).
@@ -628,6 +650,7 @@ async fn update_sign_in_security(
                 "Turn on two-factor sign-in before requiring OAuth: without it the switch doesn't protect anything",
             ));
         }
+        let before = p.clone();
         if let Some(v) = inp.oauth_only {
             p.oauth_only = v;
         }
@@ -642,10 +665,25 @@ async fn update_sign_in_security(
         }
         let val = (p != Prefs::default()).then(|| json_bytes(&p));
         if app.private_cas(&did, vec![Cond::eq(PREFS, raw)], vec![Op::put(PREFS, val)]).await?.applied {
+            count_settings(&before, &p);
             return Ok(StatusCode::OK);
         }
     }
     Err(super::server::cas_conflict())
+}
+
+/// `vlpds_sign_in_settings_total`: the settings that changed, and to what.
+fn count_settings(before: &Prefs, after: &Prefs) {
+    for (setting, was, now) in [
+        ("oauth_only", before.oauth_only, after.oauth_only),
+        ("block_app_passwords", before.block_app_passwords, after.block_app_passwords),
+        ("password_alerts", !before.mute_password_alerts, !after.mute_password_alerts),
+        ("app_password_alerts", !before.mute_app_password_alerts, !after.mute_app_password_alerts),
+    ] {
+        if was != now {
+            crate::metrics::SIGN_IN_SETTINGS.with_label_values(&[setting, if now { "on" } else { "off" }]).inc();
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -669,6 +707,7 @@ async fn revoke_trusted_browser(
         _ => return Err(XrpcError::bad("InvalidRequest", "id (a trusted browser's) or all: true is required")),
     };
     app.private_cas(&did, Vec::new(), vec![op]).await?;
+    crate::metrics::TRUSTED_BROWSERS.with_label_values(&["revoked"]).inc();
     Ok(StatusCode::OK)
 }
 
@@ -690,20 +729,20 @@ mod tests {
         let mut log = Log::default();
         let day = 20_000 * 86_400;
         // the baseline sign-in mails nothing
-        assert!(!apply(&mut log, &mut entry("b:1", None), day, true, false, true));
-        assert!(!apply(&mut log, &mut entry("b:1", None), day + 1, false, false, true));
-        assert!(apply(&mut log, &mut entry("b:2", None), day + 2, false, false, true));
-        assert!(!apply(&mut log, &mut entry("b:2", None), day + 3, false, false, true));
+        assert_eq!(apply(&mut log, &mut entry("b:1", None), day, true, false, true), Some("baseline"));
+        assert_eq!(apply(&mut log, &mut entry("b:1", None), day + 1, false, false, true), None);
+        assert_eq!(apply(&mut log, &mut entry("b:2", None), day + 2, false, false, true), Some(MAILED));
+        assert_eq!(apply(&mut log, &mut entry("b:2", None), day + 3, false, false, true), None);
         // muted, no address, or right after an emailed code
-        assert!(!apply(&mut log, &mut entry("b:3", None), day + 4, false, true, true));
-        assert!(!apply(&mut log, &mut entry("b:4", None), day + 5, false, false, false));
-        assert!(!apply(&mut log, &mut entry("b:5", Some("email")), day + 6, false, false, true));
-        assert!(apply(&mut log, &mut entry("b:6", None), day + 7, false, false, true));
-        assert!(apply(&mut log, &mut entry("b:7", None), day + 8, false, false, true));
+        assert_eq!(apply(&mut log, &mut entry("b:3", None), day + 4, false, true, true), Some("muted"));
+        assert_eq!(apply(&mut log, &mut entry("b:4", None), day + 5, false, false, false), Some("no_email"));
+        assert_eq!(apply(&mut log, &mut entry("b:5", Some("email")), day + 6, false, false, true), Some("email_code"));
+        assert_eq!(apply(&mut log, &mut entry("b:6", None), day + 7, false, false, true), Some(MAILED));
+        assert_eq!(apply(&mut log, &mut entry("b:7", None), day + 8, false, false, true), Some(MAILED));
         assert_eq!(log.alerts, ALERTS_PER_DAY);
-        assert!(!apply(&mut log, &mut entry("b:8", None), day + 9, false, false, true));
+        assert_eq!(apply(&mut log, &mut entry("b:8", None), day + 9, false, false, true), Some("account_limit"));
         // a new UTC day starts a new count
-        assert!(apply(&mut log, &mut entry("b:9", None), day + 86_400, false, false, true));
+        assert_eq!(apply(&mut log, &mut entry("b:9", None), day + 86_400, false, false, true), Some(MAILED));
         assert_eq!(log.alerts, 1);
     }
 

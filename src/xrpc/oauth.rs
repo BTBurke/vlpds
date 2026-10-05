@@ -1166,7 +1166,7 @@ async fn sign_in(
             "second_factor_failed"
         }
         Ok(SignIn::Failed(_, LoginError::RateLimited)) => "rate_limited",
-        Ok(SignIn::Failed(_, LoginError::Inactive)) => "blocked",
+        Ok(SignIn::Failed(_, LoginError::Inactive)) => "inactive",
         Ok(SignIn::Failed(_, LoginError::Invalid | LoginError::Timeout)) => "failed",
         Err(_) => "error",
     };
@@ -1483,6 +1483,7 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
         Err(r) => return r,
     };
     if f.get("action").map(String::as_str) != Some("allow") {
+        crate::metrics::OAUTH_CONSENTS.with_label_values(&["denied"]).inc();
         let _ = store::put_request(&app, &flow.id, None).await;
         return redirect_error(&app, &flow.req.params, "access_denied", "Access denied");
     }
@@ -1493,8 +1494,14 @@ async fn authorize_consent(State(app): AppState, headers: HeaderMap, body: AxByt
     }
     let mut flow = flow;
     match granted_scope(&flow.req.params.scope, consent_scopes(&body).as_deref()) {
-        Some(scope) => flow.req.params.scope = scope,
+        Some(scope) => {
+            let narrowed =
+                scope.split(' ').count() < flow.req.params.scope.split(' ').filter(|s| !s.is_empty()).count();
+            crate::metrics::OAUTH_CONSENTS.with_label_values(&[if narrowed { "narrowed" } else { "full" }]).inc();
+            flow.req.params.scope = scope;
+        }
         None => {
+            crate::metrics::OAUTH_CONSENTS.with_label_values(&["refused"]).inc();
             let _ = store::put_request(&app, &flow.id, None).await;
             return redirect_error(&app, &flow.req.params, "access_denied", "The \"atproto\" scope is required");
         }

@@ -322,7 +322,7 @@ fn standard_or_oauth_account(creds: &Credentials, attr: &str, action: &str) -> X
         // an unscoped app password may, so the scopes alone decide
         Credentials::AppPassword { did, scopes: Some(s), .. } => match s.allows_account(attr, action) {
             true => Ok(did.clone()),
-            false => Err(super::authn::scope_missing(&super::authn::account_scope(attr, action))),
+            false => Err(super::authn::scope_refused("app_password", &super::authn::account_scope(attr, action))),
         },
         _ => standard_no_oauth(creds),
     }
@@ -1678,9 +1678,9 @@ async fn create_session(
         Err(e) if e.status.is_server_error() => "error",
         Err(e) if e.error == "AuthFactorTokenRequired" => "second_factor_required",
         Err(_) if step.second_factor => "second_factor_failed",
-        Err(e) if e.error == "AccountTakedown" || e.error == OAUTH_REQUIRED || e.error == APP_PASSWORDS_BLOCKED => {
-            "blocked"
-        }
+        Err(e) if e.error == "AccountTakedown" => "inactive",
+        Err(e) if e.error == OAUTH_REQUIRED => "oauth_required",
+        Err(e) if e.error == APP_PASSWORDS_BLOCKED => "app_passwords_blocked",
         Err(_) => "failed",
     };
     crate::metrics::login(step.method, result);

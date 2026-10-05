@@ -9,6 +9,11 @@ use std::sync::Arc;
 
 const ALERT: &str = "sign_in_alert";
 
+/// A process-wide counter: other tests move it too, so check growth.
+fn count(v: &prometheus::IntCounterVec, labels: &[&str]) -> u64 {
+    v.with_label_values(labels).get()
+}
+
 /// A createSession as a client would send it: `ua` as its User-Agent,
 /// `own` as this server's account page (same-origin fetch metadata), with
 /// the browser's device `cookie`.
@@ -86,6 +91,8 @@ fn alerts(ms: &[J]) -> Vec<J> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn alerts_once_per_new_device_with_opt_outs_and_a_daily_cap() {
+    use vlpds::metrics::SIGN_IN_ALERTS as M;
+    let before: Vec<u64> = ["baseline", "mailed", "muted", "account_limit"].map(|r| count(&M, &[r])).into();
     let s = TestServer::spawn().await;
     let a = s.create_account("alert").await;
     let pw = a.password.clone();
@@ -148,10 +155,17 @@ async fn alerts_once_per_new_device_with_opt_outs_and_a_daily_cap() {
     let alerted: Vec<&str> =
         recent.iter().filter(|e| e["alerted"] == true).map(|e| e["userAgent"].as_str().unwrap()).collect();
     assert_eq!(alerted, ["ua-d", "ua-g", "ua-b"]);
+    for ((r, n), b) in [("baseline", 1), ("mailed", 3), ("muted", 2), ("account_limit", 1)].iter().zip(before) {
+        assert!(count(&M, &[r]) >= b + n, "vlpds_sign_in_alerts_total{{result={r}}} grew by {n}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn trusted_browser_on_the_account_page() {
+    use vlpds::metrics::{SIGN_IN_FACTORS, TRUSTED_BROWSERS};
+    let skipped = count(&SIGN_IN_FACTORS, &["password", "trusted"]);
+    let granted = count(&TRUSTED_BROWSERS, &["granted"]);
+    let revoked = count(&TRUSTED_BROWSERS, &["revoked"]);
     let s = TestServer::spawn().await;
     let a = s.create_account("trust").await;
     let (secret, step, recovery) = enable_totp(&s, &a).await;
@@ -195,6 +209,8 @@ async fn trusted_browser_on_the_account_page() {
     let factors: Vec<&str> =
         st["recentSignIns"].as_array().unwrap().iter().filter_map(|e| e["factor"].as_str()).collect();
     assert_eq!(factors, ["trusted", "totp", "trusted", "totp"]);
+    assert!(count(&SIGN_IN_FACTORS, &["password", "trusted"]) >= skipped + 2);
+    assert!(count(&TRUSTED_BROWSERS, &["granted"]) >= granted + 2);
 
     // revoke one: only that browser is asked again
     let id = first["id"].as_str().unwrap();
@@ -205,6 +221,7 @@ async fn trusted_browser_on_the_account_page() {
     s.xrpc.post("vlpds.server.revokeTrustedBrowser", &json!({"all": true}), &a.auth()).await.ok();
     login(&s, &a.handle, &pw, own(Some(&b2))).await.err(401, "AuthFactorTokenRequired");
     assert_eq!(security(&s, &a).await["trustedBrowsers"], json!([]));
+    assert!(count(&TRUSTED_BROWSERS, &["revoked"]) >= revoked + 2);
 
     // expiry: a trust past its end is ignored
     let r = login(&s, &a.handle, &pw, Login { code: Some(&recovery[1]), trust: true, ..own(Some(&b2)) }).await;
@@ -273,6 +290,10 @@ async fn put_row(s: &TestServer, did: &str, name: &str, v: &J) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oauth_only_refuses_the_main_password() {
+    use vlpds::metrics::{LOGINS, SIGN_IN_SETTINGS};
+    let refused = count(&LOGINS, &["password", "oauth_required"]);
+    let blocked = count(&LOGINS, &["app_password", "app_passwords_blocked"]);
+    let (on, off) = (count(&SIGN_IN_SETTINGS, &["oauth_only", "on"]), count(&SIGN_IN_SETTINGS, &["oauth_only", "off"]));
     let s = TestServer::spawn().await;
     let a = s.create_account("oauthonly").await;
     let pw = a.password.clone();
@@ -309,6 +330,10 @@ async fn oauth_only_refuses_the_main_password() {
     update(&s, &a, json!({"oauthOnly": false, "blockAppPasswords": false})).await.ok();
     login(&s, &a.handle, &ap, Login::default()).await.ok();
     login(&s, &a.handle, &pw, Login::default()).await.err(401, "AuthFactorTokenRequired");
+    assert!(count(&LOGINS, &["password", "oauth_required"]) >= refused + 2);
+    assert!(count(&LOGINS, &["app_password", "app_passwords_blocked"]) > blocked);
+    assert!(count(&SIGN_IN_SETTINGS, &["oauth_only", "on"]) > on);
+    assert!(count(&SIGN_IN_SETTINGS, &["oauth_only", "off"]) > off);
 }
 
 /// createSession reaching a node that doesn't own the account is forwarded

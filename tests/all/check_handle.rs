@@ -59,6 +59,8 @@ async fn proving_server(dns: &Arc<StubTxt>, web: &Arc<StubWeb>) -> TestServer {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn server_domain_availability() {
+    let checks = |status: &str| vlpds::metrics::HANDLE_CHECKS.with_label_values(&["service", status]).get();
+    let before = ["available", "taken", "current", "reserved"].map(checks);
     let s = TestServer::spawn().await;
     let a = s.create_account("alice").await;
     let b = s.create_account("bob").await;
@@ -74,6 +76,11 @@ async fn server_domain_availability() {
     assert_eq!(check(&s, &a, &b.handle).await["status"], json!("taken"));
     assert_eq!(check(&s, &a, &a.handle).await["status"], json!("current"));
     assert_eq!(check(&s, &a, &h("postmaster")).await["status"], json!("reserved"));
+    let after = ["available", "taken", "current", "reserved"].map(checks);
+    assert!(
+        after.iter().zip(&before).all(|(a, b)| a > b),
+        "vlpds_handle_checks_total by status: {before:?} -> {after:?}"
+    );
 
     for (label, says) in [
         ("ab", "too short"),

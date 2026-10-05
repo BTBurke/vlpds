@@ -182,6 +182,8 @@ async fn post_only_app_password() {
     s.xrpc.post("com.atproto.repo.deleteRecord", &del, &sess.auth()).await.ok();
 
     // withheld by the scopes
+    let rejected = |kind: &str| vlpds::metrics::SCOPE_REJECTIONS.with_label_values(&["app_password", kind]).get();
+    let (repo, account, rpc) = (rejected("repo"), rejected("account"), rejected("rpc"));
     let profile = json!({"repo": a.did, "collection": "app.bsky.actor.profile", "rkey": "self", "record": {"$type": "app.bsky.actor.profile", "displayName": "pwned"}});
     s.xrpc.post("com.atproto.repo.putRecord", &profile, &sess.auth()).await.err(403, "ScopeMissingError");
     let edit = json!({"repo": a.did, "collection": "app.bsky.feed.post", "rkey": "3l3qo2vutsw2b", "record": post_record("edit")});
@@ -190,6 +192,7 @@ async fn post_only_app_password() {
     s.xrpc.post_empty("com.atproto.server.requestEmailConfirmation", &sess.auth()).await.err(403, "ScopeMissingError");
     service_auth(&s, &sess.auth(), None).await.err(403, "ScopeMissingError");
     service_auth(&s, &sess.auth(), Some("com.atproto.repo.uploadBlob")).await.err(403, "ScopeMissingError");
+    assert!(rejected("repo") >= repo + 2 && rejected("account") > account && rejected("rpc") >= rpc + 2);
     s.xrpc.get("com.atproto.server.listAppPasswords", &[], &sess.auth()).await.err(403, "InsufficientScope");
     // withheld from any app password
     create_app_password(&s, &sess.auth(), "another-one", false).await.client_err();

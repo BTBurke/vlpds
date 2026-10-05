@@ -52,6 +52,8 @@ pub struct Swept {
     pub finished: usize,
     /// Due but taken down or suspended.
     pub held: usize,
+    /// Reactivated while being deleted: kept.
+    pub raced: usize,
     pub failed: usize,
 }
 
@@ -59,6 +61,7 @@ enum Outcome {
     Deleted,
     Finished,
     Held,
+    Raced,
     Kept,
 }
 
@@ -66,8 +69,10 @@ enum Outcome {
 pub async fn sweep(app: &App, now: DateTime<Utc>, max: usize) -> Swept {
     let mut out = Swept::default();
     let Some(min_hold) = app.config.delete_after_min_hold else { return out };
+    let started = std::time::Instant::now();
     let fam = state::DELETE_AFTER_FAMILY;
     let mut found = Vec::new();
+    let mut scan_failed = false;
     for p in app.partitions.owned() {
         let scan = async {
             let mut it = state::FamilyScan::new(p.db.as_ref(), fam, None, &Default::default()).await?;
@@ -77,33 +82,55 @@ pub async fn sweep(app: &App, now: DateTime<Utc>, max: usize) -> Swept {
             Ok::<_, slatedb::Error>(())
         };
         if let Err(e) = scan.await {
-            tracing::warn!(shard = %p.id, "scheduled deletions: scan failed: {e}");
+            scan_failed = true;
+            tracing::warn!(shard = %p.id, error = %e, "scheduled deletions: scan failed");
         }
     }
+    let scheduled = found.len();
+    let mut visited = 0;
     for did in found {
         if out.deleted + out.finished >= max {
             break;
         }
+        visited += 1;
         match sweep_one(app, &did, now, min_hold).await {
-            Ok(Outcome::Deleted) => out.deleted += 1,
+            Ok(Outcome::Deleted) => {
+                out.deleted += 1;
+                tracing::info!(%did, "scheduled deletion: account deleted");
+            }
             Ok(Outcome::Finished) => out.finished += 1,
             Ok(Outcome::Held) => out.held += 1,
+            Ok(Outcome::Raced) => {
+                out.raced += 1;
+                tracing::info!(%did, "scheduled deletion: reactivated first, kept");
+            }
             Ok(Outcome::Kept) => {}
             Err(e) => {
                 out.failed += 1;
-                tracing::warn!(%did, "scheduled deletion: {}", e.message);
+                tracing::warn!(%did, error = %e.message, "scheduled deletion failed (retried next sweep)");
             }
         }
     }
-    if out.deleted + out.finished + out.failed > 0 {
+    if out.deleted + out.finished + out.raced + out.failed > 0 {
         tracing::info!(
             deleted = out.deleted,
             finished = out.finished,
             held = out.held,
+            raced = out.raced,
             failed = out.failed,
             "scheduled deletions"
         );
     }
+    use crate::metrics as m;
+    for (r, n) in [("deleted", out.deleted), ("finished", out.finished), ("raced", out.raced), ("failed", out.failed)] {
+        m::SCHEDULED_DELETION_ACCOUNTS.with_label_values(&[r]).inc_by(n as u64);
+    }
+    for (state, n) in [("scheduled", scheduled), ("held", out.held), ("deferred", scheduled - visited)] {
+        m::SCHEDULED_DELETION_STATE.with_label_values(&[state]).set(n as i64);
+    }
+    let result = if scan_failed || out.failed > 0 { "error" } else { "ok" };
+    m::SCHEDULED_DELETION_PASSES.with_label_values(&[result]).inc();
+    m::SCHEDULED_DELETION_PASS_SECONDS.observe(started.elapsed().as_secs_f64());
     out
 }
 
@@ -142,7 +169,10 @@ async fn sweep_one(app: &App, did: &str, now: DateTime<Utc>, min_hold: Duration)
                 Some(t) if t <= now => Ok(()),
                 _ => Err(WriteError::Invalid("no longer scheduled for deletion".into())),
             });
-            finish_delete(app, did, from, "delete_after", Some(check)).await?;
+            match finish_delete(app, did, from, "delete_after", Some(check)).await {
+                Err(e) if e.error == "InvalidRequest" => return Ok(Outcome::Raced),
+                r => r?,
+            }
             drop_row(app, did).await?;
             Ok(Outcome::Deleted)
         }
@@ -162,6 +192,7 @@ pub fn spawn(app: Arc<App>) -> tokio::task::JoinHandle<()> {
         if app.config.delete_after_min_hold.is_none() {
             return;
         }
+        crate::metrics::init_scheduled_deletion_counters();
         let mut tick = tokio::time::interval(INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

@@ -186,8 +186,8 @@ impl Credentials {
             return Ok(());
         }
         match self {
-            Credentials::OAuth { .. } => Err(scope_missing(&scope())),
-            Credentials::AppPassword { scopes: Some(_), .. } if base => Err(scope_missing(&scope())),
+            Credentials::OAuth { .. } => Err(scope_refused("oauth", &scope())),
+            Credentials::AppPassword { scopes: Some(_), .. } if base => Err(scope_refused("app_password", &scope())),
             _ => self.require(false),
         }
     }
@@ -235,7 +235,9 @@ impl Credentials {
     }
 }
 
-pub fn scope_missing(scope: &str) -> XrpcError {
+/// `credential` labels `vlpds_scope_rejections_total`.
+pub fn scope_refused(credential: &str, scope: &str) -> XrpcError {
+    crate::metrics::scope_rejected(credential, scope);
     XrpcError {
         status: StatusCode::FORBIDDEN,
         error: "ScopeMissingError".into(),
