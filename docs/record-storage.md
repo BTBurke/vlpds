@@ -227,9 +227,10 @@ few rules apply to a batch:
 The worker doesn't wait for a commit to be durable before building the next one. `swapCommit`
 and `swapRecord` compare against the in-memory head (pending commits included). That's safe
 because the log keeps their order. Acks go out in log order, so a client never sees N+1 acked
-before N. A commit costs ~20 µs on the worker thread with warm paths and ~100 µs of node CPU end
-to end. When too many writes are queued, new ones get 503 `Overloaded` (`VlpdsWritesShed`). For
-what happens after the commit leaves the worker, see [Architecture](architecture.md#components-of-a-node).
+before N. A commit costs ~44 µs of CPU on the worker thread with warm paths (measured with
+`worker::bench_commit_cpu` on a 16-core Linux box). On the same box, the whole process spends
+~185–240 µs of CPU per commit at 25–50k commits/s, counting HTTP and cold repo loads (measured).
+When too many writes are queued, new ones get 503 `Overloaded` (`VlpdsWritesShed`). For what happens after the commit leaves the worker, see [Architecture](architecture.md#components-of-a-node).
 
 ## Reads: getRecord, getRepo, getBlocks
 

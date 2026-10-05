@@ -30,7 +30,7 @@ diagram:
     - { from: bf.r, to: subs.b, label: catch up }
 facts:
   - { value: "1", unit: order, label: on every node, note: "cursors work on any node; no global sequencer" }
-  - { value: "~5 ms", label: write to a peer's firehose, note: "p50 after the durable ack (laptop)", tone: blue }
+  - { value: "~5 ms", label: write to a peer's firehose, note: "measured p50, timed from the write at its owner (laptop, in-memory store)", tone: blue }
   - { value: "72 h", label: of cursor backfill, note: "`--log-retention`; older cursors get OutdatedCursor", tone: amber }
   - { value: "1,000", unit: subscribers, label: kept up on one node, note: "each at 10k events/s; measured on 16 cores", tone: violet }
 ```

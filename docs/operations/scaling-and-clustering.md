@@ -38,7 +38,7 @@ mechanisms (leases, takeover, handback) are in [Architecture](../architecture.md
 ## Sizing rules
 
 ```facts
-- { value: "~100 µs", label: CPU per commit, note: "whole node: HTTP, MST, signing, log, apply" }
+- { value: "~185–240 µs", label: CPU per commit, note: "whole process at 25–50k/s, HTTP and cold loads included · measured on 16 cores" }
 - { value: "~50 µs", label: CPU per proxied request, note: AppView reads dominate CPU, tone: blue }
 - { value: "~20 ms", label: CPU per password login, note: "Argon2 · at most one per core (16 max) at once", tone: amber }
 - { value: "10–20 KB", label: memory per active repo, note: only the MST paths recent writes touched, tone: violet }

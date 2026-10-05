@@ -30,10 +30,10 @@ uploading, ack both in order), and **no per-commit MST storage churn**.
                                                ▼
                                   Sequencer / Log writer (single owner of seq)
                                     assign seq, encode firehose frame,
-                                    append to open segment; seal every 25 ms or 8 MB
+                                    append to open segment; seal when a PUT slot is free (≤ 8 MiB)
                                                │  K concurrent PUTs (If-None-Match: *)
                                                ▼
-                         s3://bucket/log/{first_seq:020}.seg   ◄── this IS the WAL and the firehose
+                  s3://bucket/log/{log_id}/{ordinal:012}.seg   ◄── this IS the WAL and the firehose
                                                │ durable watermark advances in seq order
                      ┌─────────────────────────┼───────────────────────────┐
                      ▼                         ▼                           ▼

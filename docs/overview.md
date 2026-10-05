@@ -162,7 +162,8 @@ Here's how they compare for a personal server and for all of Bluesky:
 
 A few things about where the costs come from:
 
-- Most of the CPU goes to logins and proxying. A commit costs ~100 µs of CPU end to end, and an
+- Most of the CPU goes to logins and proxying. A commit costs ~185–240 µs of whole-process CPU
+  at 25–50k commits/s, HTTP and cold repo loads included (measured on a 16-core node), and an
   Argon2 login costs ~20 ms.
 - The object-store bill depends on how many shards and nodes you run, not on how fast you write.
   Whenever anything is queued, a node PUTs about one segment per store round trip (~27/s), whether
@@ -208,8 +209,10 @@ Details: [Scaling and clustering](operations/scaling-and-clustering.md),
 ```
 
 - A write is acked only after its segment and every earlier one are in the object store, and only
-  while the node's lease is valid. If a node dies with unacked work in memory, that work was never
-  confirmed to anyone or sent on the firehose, so it's safe to throw away.
+  while the node's lease is valid. If a node dies before a write is durable, that write was never
+  confirmed to anyone or sent on the firehose, so it's safe to throw away. A write that was durable
+  but not acked yet is kept. The next owner replays it, and it may already be on the firehose (see
+  [A crash at each point](the-path-of-a-commit.md#a-crash-at-each-point)).
 - Safety doesn't depend on clocks. Fencing and compare-and-swap decide who may write, and lease
   timing only decides when a takeover happens. If a peer wrongly decides a node is dead, it costs
   some availability but never an acked write.

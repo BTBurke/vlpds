@@ -243,10 +243,12 @@ Here's why no acknowledged write is lost, whatever the clocks do:
 
 So a wrong "it's dead" guess costs a fence, a fail-stop and a few seconds of resends, but never
 data. The remaining assumptions are that clocks drift at a rate under 20 % and that no VM is
-suspended longer than `--fence-retention` (7 days). Unacked work in the dead node's memory was never
-confirmed to anyone or sent on the firehose, so dropping it is safe. In the HA matrix
-(`bench/ha/RESULTS.md`), a kill -9 under load costs only the writes that were in flight on the dead
-node (a few hundred at 6–9k writes/s), with 0 errors after the takeover.
+suspended longer than `--fence-retention` (7 days). Work in the dead node's memory that wasn't
+durable yet was never confirmed to anyone or sent on the firehose, so dropping it is safe. A write
+that was durable but not acked yet is below the fence, so it's replayed and kept, and it may already
+be on the firehose ([a crash at each point](the-path-of-a-commit.md#a-crash-at-each-point)). In
+the HA matrix (`bench/ha/RESULTS.md`), a kill -9 under load costs only the writes that were in
+flight on the dead node (a few hundred at 6–9k writes/s), with 0 errors after the takeover.
 
 The exit codes are listed in [Exit codes and fail-stops](operations/runbook.md#exit-codes-and-fail-stops).
 
