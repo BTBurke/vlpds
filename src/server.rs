@@ -565,6 +565,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
     let app = Arc::new(xrpc::App {
         spaces,
         space_blob_accounts: Default::default(),
+        http_drain: Default::default(),
         jwt: auth::Jwt::new(&cfg.jwt_secret, &cfg.service_did),
         store: state_store,
         workers,
@@ -637,7 +638,7 @@ pub async fn spawn(
         spawn_peer_listener(&app, peer)?;
     }
     let router = public_router(&app);
-    let opts = ServeOptions { h2: H2Profile::Public, max_connections: app.config.max_connections, tls: None };
+    let opts = public_serve_options(&app);
     tokio::spawn(async move {
         if let Err(e) = serve_with(public, router, opts).await {
             tracing::error!("server exited: {e:#}");
@@ -665,6 +666,7 @@ pub fn spawn_peer_listener(app: &Arc<xrpc::App>, listener: tokio::net::TcpListen
         h2: H2Profile::Peer,
         max_connections: app.config.max_connections,
         tls: Some(tls.server_config()),
+        drain: Some(app.http_drain.clone()),
     };
     let router = router(app);
     tokio::spawn(async move {
@@ -740,12 +742,93 @@ pub struct ServeOptions {
     /// At the cap new connections wait in the kernel's accept queue. 0: no cap.
     pub max_connections: usize,
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    /// None: served until the process exits.
+    pub drain: Option<Drain>,
 }
 
 impl Default for ServeOptions {
     fn default() -> Self {
-        ServeOptions { h2: H2Profile::Peer, max_connections: DEFAULT_MAX_CONNECTIONS, tls: None }
+        ServeOptions { h2: H2Profile::Peer, max_connections: DEFAULT_MAX_CONNECTIONS, tls: None, drain: None }
     }
+}
+
+/// The public listener's options.
+pub fn public_serve_options(app: &xrpc::App) -> ServeOptions {
+    ServeOptions {
+        h2: H2Profile::Public,
+        max_connections: app.config.max_connections,
+        tls: None,
+        drain: Some(app.http_drain.clone()),
+    }
+}
+
+const SERVING: u8 = 0;
+const DRAINING: u8 = 1;
+const CUT: u8 = 2;
+
+/// Ends a node's public and peer listeners at shutdown. Exiting with
+/// requests in flight would drop answers the node may already have acted
+/// on (a forwarded write applied at its owner): the client could only take
+/// that as unknown, and a load balancer that resends a request whose
+/// connection failed resends it with its spent DPoP proof, which is then
+/// refused, a definite 401 for an applied write.
+#[derive(Clone, Debug)]
+pub struct Drain(Arc<tokio::sync::watch::Sender<u8>>);
+
+impl Default for Drain {
+    fn default() -> Self {
+        Drain(Arc::new(tokio::sync::watch::channel(SERVING).0))
+    }
+}
+
+impl Drain {
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u8> {
+        self.0.subscribe()
+    }
+
+    /// Stops accepting connections, closes idle ones and lets every request
+    /// in flight be answered (HTTP/1 closes after it, HTTP/2 sends GOAWAY)
+    /// for up to `grace`; then cuts what is left. True: nothing was cut.
+    pub async fn run(&self, grace: Duration) -> bool {
+        self.0.send_replace(DRAINING);
+        if tokio::time::timeout(grace, self.0.closed()).await.is_ok() {
+            return true;
+        }
+        self.0.send_replace(CUT);
+        false
+    }
+}
+
+/// Resolves once `rx` reaches `level`; never if its [`Drain`] is gone.
+async fn reached(rx: &mut tokio::sync::watch::Receiver<u8>, level: u8) {
+    if rx.wait_for(|s| *s >= level).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Serves `$conn` (a hyper connection) to its end, or until its drain cuts it.
+macro_rules! serve_drained {
+    ($conn:expr, $stop:expr) => {{
+        let conn = $conn;
+        tokio::pin!(conn);
+        match $stop {
+            None => {
+                let _ = conn.await;
+            }
+            Some(mut stop) => {
+                tokio::select! {
+                    _ = conn.as_mut() => {}
+                    _ = reached(&mut stop, DRAINING) => {
+                        conn.as_mut().graceful_shutdown();
+                        tokio::select! {
+                            _ = conn.as_mut() => {}
+                            _ = reached(&mut stop, CUT) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }};
 }
 
 pub const DEFAULT_MAX_CONNECTIONS: usize = 50_000;
@@ -820,13 +903,25 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
     };
     let slots = (opts.max_connections > 0).then(|| Arc::new(tokio::sync::Semaphore::new(opts.max_connections)));
     let acceptor = opts.tls.clone().map(tokio_rustls::TlsAcceptor::from);
+    let mut stop = opts.drain.as_ref().map(Drain::subscribe);
     loop {
-        // a slot first: at the cap, connections wait in the accept queue
-        let slot = match &slots {
-            Some(s) => Some(s.clone().acquire_owned().await.expect("never closed")),
-            None => None,
+        let next = async {
+            // a slot first: at the cap, connections wait in the accept queue
+            let slot = match &slots {
+                Some(s) => Some(s.clone().acquire_owned().await.expect("never closed")),
+                None => None,
+            };
+            (slot, std::future::poll_fn(|cx| listener.poll_accept(cx)).await)
         };
-        let (sock, peer) = match std::future::poll_fn(|cx| listener.poll_accept(cx)).await {
+        let (slot, accepted) = match stop.as_mut() {
+            None => next.await,
+            Some(rx) => tokio::select! {
+                n = next => n,
+                // the listener closes with this: new connections are refused
+                _ = reached(rx, DRAINING) => return Ok(()),
+            },
+        };
+        let (sock, peer) = match accepted {
             Ok(c) => c,
             Err(e) => {
                 crate::metrics::HTTP_SERVER_ACCEPT_ERRORS.inc();
@@ -838,7 +933,7 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
         };
         let _ = sock.set_nodelay(true);
         crate::metrics::HTTP_SERVER_CONNECTIONS.inc();
-        let (acceptor, builder) = (acceptor.clone(), builder.clone());
+        let (acceptor, builder, stop) = (acceptor.clone(), builder.clone(), stop.clone());
         // set once the handshake has verified the client certificate
         let identity: Arc<std::sync::OnceLock<crate::peer_tls::PeerIdentity>> = Arc::default();
         let id = identity.clone();
@@ -859,7 +954,7 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
             match acceptor {
                 None => {
                     crate::metrics::HTTP_SERVER_OPEN.inc();
-                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(sock), svc).await;
+                    serve_drained!(builder.serve_connection_with_upgrades(TokioIo::new(sock), svc), stop);
                 }
                 Some(acceptor) => {
                     // on the connection's task: a slow or silent client
@@ -882,7 +977,7 @@ pub async fn serve_with<A: Accept>(mut listener: A, router: axum::Router, opts: 
                         let _ = identity.set(id);
                     }
                     crate::metrics::HTTP_SERVER_OPEN.inc();
-                    let _ = builder.serve_connection_with_upgrades(TokioIo::new(tls), svc).await;
+                    serve_drained!(builder.serve_connection_with_upgrades(TokioIo::new(tls), svc), stop);
                 }
             }
             crate::metrics::HTTP_SERVER_OPEN.dec();
@@ -973,6 +1068,23 @@ fn with_forwarding(app: &Arc<xrpc::App>, router: axum::Router) -> axum::Router {
         let ctx = ctx.clone();
         async move { crate::forward::route(&ctx.0, &ctx.1, req, next).await }
     }))
+}
+
+/// Serving on after the handoff: peers' routing follows it while we still
+/// accept (and forward).
+pub const SHUTDOWN_SETTLE: Duration = Duration::from_millis(500);
+/// Bounds the wait for requests in flight at shutdown: a resent write's
+/// budget (`forward::RETRY_BUDGET`) plus a forward's deadline, within the
+/// deploy's 60 s minimum stop grace.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// SIGTERM: [`shutdown`], [`SHUTDOWN_SETTLE`] more of serving, then the
+/// listeners drain ([`Drain::run`] for `grace`). False: requests still in
+/// flight were cut.
+pub async fn shutdown_gracefully(app: &Arc<xrpc::App>, grace: Duration) -> bool {
+    shutdown(app).await;
+    tokio::time::sleep(SHUTDOWN_SETTLE).await;
+    app.http_drain.run(grace).await
 }
 
 /// Hands every shard back and drops the node lease, so successors take over

@@ -1557,15 +1557,17 @@ async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let router = server::public_router(&app);
-    let opts = server::ServeOptions { h2: server::H2Profile::Public, max_connections: args.max_connections, tls: None };
+    let opts = server::public_serve_options(&app);
     let mut serving = tokio::spawn(server::serve_with(listener, router, opts));
     tokio::select! {
         r = &mut serving => r?,
         _ = shutdown_signal() => {
-            server::shutdown(&app).await;
-            // let in-flight requests finish and peers' routing settle
-            tokio::time::sleep(SHUTDOWN_DRAIN).await;
-            tracing::info!("shutdown complete");
+            let t = std::time::Instant::now();
+            if !server::shutdown_gracefully(&app, server::SHUTDOWN_GRACE).await {
+                let grace_ms = server::SHUTDOWN_GRACE.as_millis() as u64;
+                tracing::warn!(grace_ms, "requests still in flight at shutdown: cut");
+            }
+            tracing::info!(elapsed_ms = t.elapsed().as_millis() as u64, "shutdown complete");
             Ok(())
         }
     }
@@ -1587,8 +1589,6 @@ async fn bind(addr: &str, backlog: u32) -> anyhow::Result<tokio::net::TcpListene
         |e| anyhow::Error::from(e).context(format!("binding {addr}")),
     ))
 }
-
-const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_millis(500);
 
 async fn shutdown_signal() {
     use tokio::signal::unix::{signal, SignalKind};
