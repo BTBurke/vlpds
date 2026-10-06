@@ -134,6 +134,8 @@ pub struct App {
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
     pub ui: Arc<WebUi>,
+    /// Objects and bytes in the bucket by component (crate::store_stats).
+    pub store_stats: Arc<crate::store_stats::StoreStats>,
     /// `--spaces` (src/space): space repo heads, the notifyWrite outbox,
     /// revocations. None without the flag.
     pub spaces: Option<Arc<crate::space::Spaces>>,
