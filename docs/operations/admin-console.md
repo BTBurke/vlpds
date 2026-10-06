@@ -78,7 +78,7 @@ cluster, and account pages are routed to each account's owner.
 |---|---|---|
 | Cluster | Nodes with a lease, shards owned by this node, its lease, durable log ordinal and feature level (with a finalize or mixed-builds banner) · a shard ownership map coloured by node · a node table (reachable, lease, owned, durable ordinal, firehose lag with the slowest log marked, build and level window) · the firehose's sources | Read only. Click a node to highlight its shards, or its address or build to copy it. |
 | Live metrics | Commits and ops, commit to durable, segment PUT, HTTP and 5xx, 429s, firehose events, bytes and emit delay, cold repo loads, class A and B object-store requests and errors, CPU, memory, repos in memory and subscribers: the cluster's line and each node's, from `getNodeMetrics` | Read only. Two buttons download the [Grafana dashboards](monitoring.md#import-into-your-own-grafana). |
-| Object store | Class A and B requests per second, an estimate of this month's spend and the month projected at the last 3 minutes' rate, errors and timeouts, segment PUT p99 · requests and spend by key component (log segments, leases, SlateDB manifests and SSTs, blobs and the rest) · per node rates and PUT latency · the same traffic priced at R2, S3 and GCS | Pick the provider to price at · enter the GB stored to add storage to the totals (kept in that browser). Bucket listings aren't part of the console: a prefix's size would mean listing it. |
+| Object store | Class A and B requests per second, bytes and objects stored, errors and timeouts, segment PUT p99 · requests by key component (log segments, leases, SlateDB manifests and SSTs, blobs and the rest) and each one's share · objects and bytes stored by component from [storage stats](#storage-stats), exact or approximate, and the last backfill · per node rates and PUT latency · the bucket's provider, endpoint, prefix and region | Read only. Bucket listings aren't part of the console: stored sizes come from the nodes' own counters. |
 | Accounts | Every account on every node's shards, most recently active first (`listAccounts`), searchable by handle prefix, email prefix or DID and filtered to those needing attention, deactivated, taken down, without a second factor or with an unconfirmed email · per row its shard and owner, records, blob bytes, last commit, second factors and state · an account opens in a side panel or full page: identity, placement, sign-in and second factors with recent sign-ins, sessions, app passwords, recent ops from the firehose ring, blobs and quota, invites, spaces, cases and audit entries, the date a [scheduled deletion](email-and-moderation.md#scheduled-deletion) is due, and the dev mailbox in `--dev-mode` | Take down (with a reference) and reverse it · deactivate and reactivate · rotate the signing key · rebuild the repo (after a dry run) · check the repo · publish an `#identity` event · revoke one session, every session or an app password · clear a code lockout · change handle, email, password or blob quota · enable or disable its invites · reset its two-factor sign-in (audited and mailed to the user) · delete. Each asks for confirmation and shows the call it makes, and the destructive ones ask you to type the handle. ⌘K takes "take down @handle", "reset 2fa @handle" and the rest. |
 | Moderation | Look up a subject from a bsky.app URL, at:// URI, handle, DID or DID + blob CID, and see the account, the record's JSON and its blobs (previews load on request, blurred) · active takedowns by kind · cases · the audit log · accounts over their blob quota | Take down or restore an account, record or blob with a reason, filed under a case · open and update cases (notes, status, subjects) · change an account's blob quota. See [Email and moderation](email-and-moderation.md#operator-moderation). |
 | Handle domains | The primary (`--handle-domain`) and the domains added here, each with its active accounts (every 5 s), when it was added and by whom | Add a domain · remove one (refused while it has active accounts, with Remove anyway to force it). See [Handle domains](handle-domains.md). |
@@ -171,9 +171,9 @@ is `exact`.
 
 Each node folds its changes into `stats/storage` every 5 minutes and when it shuts down. That's a
 GET and a conditional PUT on the control-plane client, never on a request or commit path: 8,640 of
-each a month per node, about $0.04 on R2. A node that crashes loses up to 5 minutes of changes, and
-its next start marks the totals approximate until the next backfill. A node that leaves for good
-keeps what it folded.
+each a month per node. A node that crashes loses up to 5 minutes of changes, and its next start
+marks the totals approximate until the next backfill. A node that leaves for good keeps what it
+folded.
 
 The counts start at zero, so they mean nothing until one backfill lists the bucket. It lists the
 prefix once, in key order, one LIST request per 1,000 keys (Class A on R2 and S3), at
@@ -202,9 +202,8 @@ To run it on a live PDS:
 ```
 
 A bucket of N objects costs ceil(N / 1000) LIST requests, plus a GET and a PUT of `stats/backfill`
-each time it saves its place. A million objects is 1,000 LISTs and 50 saves (a PUT and a GET each), under
-$0.01 at R2's $4.50 per million Class A requests. Running it again later costs the same, and resets
-any drift.
+each time it saves its place. A million objects is 1,000 LISTs and 50 saves (a PUT and a GET each). Running it again later
+takes the same requests, and resets any drift.
 
 ### Repo bytes and filter counts
 

@@ -8,7 +8,7 @@ import { configPoll, crawlersPoll, mailPoll, setCrawlers, sumSeries, useNodeMetr
 import { flagRows, groupOf, PER_NODE, shown, sourceChip } from './Config'
 import { crawlNow, RelayResult } from './Firehose'
 import { MailChip, mailId } from './Mail'
-import { COMPONENTS, componentName, componentRows, componentUsd } from './Storage'
+import { COMPONENTS, componentName, componentRows } from './Storage'
 
 // Slide-over / full-page details for the system sections: relay, mail, setting, object-store
 // component. Spaces registers its own kind in Spaces.tsx. Registered on import (AdminApp).
@@ -217,7 +217,7 @@ registerDetail('storecomp', {
             items={[
               ['class A / s', r ? fmtNum(r.a, 2) : '0'],
               ['class B / s', r ? fmtNum(r.b, 2) : '0'],
-              ['R2, 30 days, list price', r ? `$${componentUsd('R2', r.a, r.b).toFixed(2)}` : '$0'],
+              ['of all requests', r ? `${Math.round(((r.a + r.b) / (rows.reduce((t, x) => t + x.a + x.b, 0) || 1)) * 100)}%` : '0%'],
             ]}
           />
           <Sec title="By node" digest={`over the last ${Math.round((m.nodes[0]?.raw.storeWindowMs ?? 0) / 60000) || 3} min`} open flush>
