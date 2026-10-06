@@ -37,9 +37,10 @@ else
   src="$(cd "$here/../.." && pwd)"
   rev="$(git -C "$src" rev-parse HEAD)"
   label=HEAD
-  dirty="$(git -C "$src" status --porcelain -- . | head -1)"
+  # bench/ isn't in the binary, and the harness itself lives there
+  dirty="$(git -C "$src" status --porcelain -- . ':!bench' | head -1)"
   [ -n "$dirty" ] && label="HEAD+dirty"
-  key="$src $(git -C "$src" rev-parse HEAD:./)"
+  key="$src $(git -C "$src" ls-tree --full-tree HEAD:./ | grep -v "	bench$" | git hash-object --stdin)"
 fi
 
 # A copy per checkout: another checkout's build replaces the target dir's

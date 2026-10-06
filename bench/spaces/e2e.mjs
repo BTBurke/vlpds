@@ -10,7 +10,7 @@
 import { P256Keypair } from '@atproto/crypto'
 import { LtHash, createSpaceSigHeaders, verifyCommit, verifyRepoCarFull } from '@atproto/space'
 import { APP_SCOPE, Actor, RUN } from './lib/actor.mjs'
-import { COLL, COLL_ALT, HOSTS, REF_ADMIN_PASSWORD, SPACE_TYPE, VLPDS_ADMIN_TOKEN, log } from './lib/env.mjs'
+import { COLL, COLL_ALT, HOSTS, PORTS, REF_ADMIN_PASSWORD, SPACE_TYPE, VLPDS_ADMIN_TOKEN, log } from './lib/env.mjs'
 import { NotImplemented, attempt, makeClient, rawXrpc, sleep, setTimingScope, waitFor } from './lib/http.mjs'
 import { signingKey, spaceHostEndpoint } from './lib/identity.mjs'
 import { FirehoseTap, SENTINEL, checkAuthor } from './lib/leak.mjs'
@@ -995,7 +995,7 @@ async function main() {
     configs,
   })
   const env = {}
-  env.svc = await new NotifyService(2870).start()
+  env.svc = await new NotifyService(PORTS.syncer).start()
   if (configs.some(usesVlpds)) env.vlpds = await new Vlpds({ cluster: !!process.env.CLUSTER, memory: !!process.env.MEMORY }).start()
   try {
     for (const cfg of configs) {

@@ -17,7 +17,9 @@ just spaces-boards-prod             # the production server on http://boards.loc
 UI_E2E=1 just spaces-boards-prod    # the production server in headless Chromium, then exit
 ```
 
-`BRANCH=<ref>` builds vlpds from that ref instead of this checkout, as for the other harness modes. `SCALE=small`
+`BRANCH=<ref>` builds vlpds from that ref instead of this checkout, as for the other harness modes.
+Runs can overlap: a second one moves to the next free block of ports and prints it, with its
+reports and screenshots under `out/<base>/` (`../README.md`, "Running two at once"). `SCALE=small`
 shrinks story 10 for quick runs and `SEED` fixes its workload. Reports land in
 `bench/spaces/out/boards.{md,json}` (`boards-cluster.*` with `CLUSTER=1`).
 
@@ -102,7 +104,7 @@ member repos the appview syncs (rev, record count, LtHash), the last notify and 
 expiries.
 
 The UI lives in `packages/boards/web/` (Vite, React, TypeScript). `npm run dev` there proxies to a
-running `spaces-boards-ui`, though OAuth sign-ins come back to :2888. `packages/boards/e2e/ui.mjs`
+running `spaces-boards-ui` on the first port block, though OAuth sign-ins come back to :2888. `packages/boards/e2e/ui.mjs`
 signs alice (vlpds, OAuth)
 and carol (ref-a, password) in, has them post, comment, reply and vote, checks each sees the other's
 changes, and saves screenshots to `bench/spaces/out/boards-ui/`.

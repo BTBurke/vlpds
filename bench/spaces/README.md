@@ -31,7 +31,7 @@ passwords and keys are generated per run (or are fixed test values in this direc
   `kill -9` loses nothing that was acked and the bucket's request counters are there to read.
 
 Every service URL is `http://localhost:<port>` everywhere. Each reference PDS shares the network
-namespace of a small socat container that forwards the other harness ports (2861-2889) to the other
+namespace of a small socat container that forwards the other harness ports (2861-2889, or the run's block) to the other
 PDS or to the host. So a DID document points at the same URL whether the driver, vlpds or a
 reference PDS reads it.
 
@@ -44,6 +44,18 @@ is clean and its tree hasn't changed since the last one. `VLPDS_BIN=...` skips i
 The drivers start vlpds themselves (`lib/vlpds.mjs`) with `--dev-mode --spaces` on port 2863, so the
 fault sim can kill it. `CLUSTER=1` starts 3 nodes on MinIO behind a small round-robin balancer on
 the same port, as in `tests/E2E.md`. `MEMORY=1` uses `--memory` instead of MinIO.
+
+## Running two at once
+
+Every run takes a block of 40 ports, so two checkouts (or two agents) can run the harness at the
+same time. The ports above are the first block, `PORT_BASE=2860`. When it's taken, `run.sh` moves
+to 2900, 2940 and so on, and prints the block it got. A run on another block gets its own compose
+project (`vlpds-spaces-<base>`), `out/<base>/` and `boards/.local/<base>/`, and its UI is on
+`<base>+28` (dev) or `<base>+29` (production) instead of 2888 or 2889. `lib/env.mjs` has the layout.
+A block is held by a lock under `$TMPDIR/vlpds-spaces-locks` until its run exits, on Ctrl-C too, and
+the exit takes down only that run's stack and volumes. `PORT_BASE=<base>` picks a block, which is
+how to reuse a stack left up by `KEEP=1`. One run at a time does the shared setup (the images, the
+vlpds build, `npm install`), and each UI run builds the boards web UI into its own `out/` dir.
 
 ## Real R2
 

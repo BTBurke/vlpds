@@ -13,7 +13,7 @@
 // public write), notify without linger, public commit p99 unaffected by a
 // space write load.
 import { Actor, RUN } from './lib/actor.mjs'
-import { COLL, URLS, log } from './lib/env.mjs'
+import { COLL, PORTS, URLS, log } from './lib/env.mjs'
 import { attempt, setTimingScope, sleep } from './lib/http.mjs'
 import { NotifyService } from './lib/notifysvc.mjs'
 import { Report, pct, summarize } from './lib/report.mjs'
@@ -125,7 +125,7 @@ async function pool(n, conc, fn) {
 }
 
 async function main() {
-  env.svc = await new NotifyService(2870).start()
+  env.svc = await new NotifyService(PORTS.syncer).start()
   if (host === 'vlpds') env.vlpds = await new Vlpds({ cluster: !!process.env.CLUSTER }).start()
   const S = {}
   try {

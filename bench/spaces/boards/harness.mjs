@@ -14,6 +14,12 @@ export class BoardsClient extends BaseClient {
   }
 }
 
+/** The UI's page for a board's at:// URI: <ui>/b/<owner DID>/<skey>. */
+export const boardLink = (ui, uri) => {
+  const p = uri.split('/')
+  return `${ui}/b/${p[2]}/${encodeURIComponent(p[5])}`
+}
+
 /** The appview with `account` (a read-only member) as its credential source and `svc` as its notify target. */
 export function harnessAppview({ account, svc, ...opts }) {
   return new Appview({

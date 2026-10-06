@@ -22,17 +22,72 @@ cd "$here"
 mode="${1:-e2e}"
 shift || true
 
-export PLC_PORT=2860 REF_A_PORT=2861 REF_B_PORT=2862 VLPDS_PORT=2863 MINIO_PORT=2868
-ports="$PLC_PORT $REF_A_PORT $REF_B_PORT $VLPDS_PORT 2864 2865 2866 $MINIO_PORT $(seq 2870 2882 | tr '\n' ' ')"
+# Runs may overlap (two checkouts, or two agents): each takes a block of 40
+# ports from PORT_BASE (lib/env.mjs lays it out), its own compose project, and
+# its own out/ and boards/.local/ dirs; the first block, 2860, keeps the
+# plain names. Locks are mkdir dirs holding the owner's pid.
+locks="${TMPDIR:-/tmp}/vlpds-spaces-locks"
+mkdir -p "$locks"
+claim() {
+  local d="$locks/$1" pid
+  if mkdir "$d" 2>/dev/null; then echo $$ >"$d/pid"; return 0; fi
+  pid="$(cat "$d/pid" 2>/dev/null || true)"
+  if [ -z "$pid" ] || kill -0 "$pid" 2>/dev/null; then return 1; fi
+  rm -rf "$d"
+  mkdir "$d" 2>/dev/null && echo $$ >"$d/pid"
+}
+release() { if [ "$(cat "$locks/$1/pid" 2>/dev/null)" = $$ ]; then rm -rf "${locks:?}/$1"; fi; }
+listening="$(lsof -nP -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n.*:\([0-9]*\)$/\1/p' | sort -u)"
+block_busy() { for p in $(seq "$1" $(( $1 + 39 ))); do grep -qx "$p" <<<"$listening" && return 0; done; return 1; }
+
+if [ -n "${PORT_BASE:-}" ]; then
+  claim "ports-$PORT_BASE" || { echo "PORT_BASE=$PORT_BASE belongs to a running harness (pid $(cat "$locks/ports-$PORT_BASE/pid" 2>/dev/null))" >&2; exit 1; }
+else
+  for b in $(seq 2860 40 3220); do
+    claim "ports-$b" || continue
+    if block_busy "$b"; then release "ports-$b"; continue; fi
+    PORT_BASE=$b
+    break
+  done
+  [ -n "${PORT_BASE:-}" ] || { echo "no free block of 40 ports in 2860-3259" >&2; exit 1; }
+fi
+export PORT_BASE
+export PLC_PORT=$PORT_BASE REF_A_PORT=$(( PORT_BASE + 1 )) REF_B_PORT=$(( PORT_BASE + 2 )) VLPDS_PORT=$(( PORT_BASE + 3 )) MINIO_PORT=$(( PORT_BASE + 8 ))
+export FWD_FIRST=$(( PORT_BASE + 1 )) FWD_LAST=$(( PORT_BASE + 29 ))
+if [ "$PORT_BASE" = 2860 ]; then
+  export COMPOSE_PROJECT_NAME=vlpds-spaces OUT="$here/out/" LOCAL_DIR="$here/boards/.local/"
+else
+  export COMPOSE_PROJECT_NAME="vlpds-spaces-$PORT_BASE" OUT="$here/out/$PORT_BASE/" LOCAL_DIR="$here/boards/.local/$PORT_BASE/"
+fi
+# a stack left up by KEEP=1 is reused, so its own ports may be listening
 running="$(docker compose ps -q 2>/dev/null | wc -l | tr -d ' ')"
-for p in $ports; do
+for p in $(seq "$PORT_BASE" $(( PORT_BASE + 39 ))); do
   case "$p" in $PLC_PORT|$REF_A_PORT|$REF_B_PORT|$MINIO_PORT) [ "$running" != 0 ] && continue ;; esac
-  if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "port $p is in use (an earlier run? KEEP=1 leftovers: docker compose -p vlpds-spaces down -v)" >&2
+  if grep -qx "$p" <<<"$listening"; then
+    echo "port $p is in use (an earlier run? KEEP=1 leftovers: docker compose -p $COMPOSE_PROJECT_NAME down -v)" >&2
+    release "ports-$PORT_BASE"
     exit 1
   fi
 done
+echo "harness: ports $PORT_BASE-$(( PORT_BASE + 39 )) (vlpds :$VLPDS_PORT, boards :$(( PORT_BASE + 28 ))/:$(( PORT_BASE + 29 ))), stack $COMPOSE_PROJECT_NAME, out $OUT"
 
+ui=""
+cleanup() {
+  if [ -n "$ui" ]; then kill "$ui" 2>/dev/null || true; wait "$ui" 2>/dev/null || true; fi
+  release setup
+  if [ "${KEEP:-}" = 1 ]; then
+    echo "KEEP=1: stack left up; stop with: docker compose -p $COMPOSE_PROJECT_NAME down -v (PORT_BASE=$PORT_BASE reuses it)"
+  else
+    docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+  release "ports-$PORT_BASE"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# shared by every run of this checkout: the images, the vlpds build, node_modules
+until claim setup; do sleep 1; done
 ./refpds.sh
 if [ -z "${VLPDS_BIN:-}" ]; then
   VLPDS_BIN="$(./build-vlpds.sh | tail -1)"
@@ -43,15 +98,15 @@ npm install --no-audit --no-fund --silent
 # lib/space.mjs and lib/syncer.mjs run on the boards app's Spaces code (packages/boards)
 boards="$here/../../../boards"
 (cd "$boards" && npm install --no-audit --no-fund --silent)
-
-cleanup() {
-  if [ "${KEEP:-}" = 1 ]; then
-    echo "KEEP=1: stack left up; stop with: docker compose -p vlpds-spaces down -v"
-    return
-  fi
-  docker compose down -v --remove-orphans >/dev/null 2>&1 || true
-}
-trap cleanup EXIT
+case "$mode" in
+  boards-ui | boards-prod)
+    # a build of its own: vite empties its outDir first, under a page another run may be serving
+    export BOARDS_WEB_DIR="${OUT}web"
+    built="$(cd "$boards/web" && npm install --no-audit --no-fund --silent && npm run build --silent -- --outDir "$BOARDS_WEB_DIR" --emptyOutDir 2>&1)" || { echo "$built" >&2; exit 1; }
+    if [ "${UI_E2E:-}" = 1 ]; then (cd "$boards/e2e" && npm install --no-audit --no-fund --silent && npx playwright install chromium >/dev/null); fi
+    ;;
+esac
+release setup
 
 if [ "${STORE:-minio}" = r2 ]; then
   r2env="${R2_ENV:-$HOME/.config/cloudflare/vlpds-bench-r2.env}"
@@ -59,7 +114,7 @@ if [ "${STORE:-minio}" = r2 ]; then
   set -a
   . "$r2env"
   set +a
-  export STORE R2_PREFIX="${R2_PREFIX:-bench/$(date -u +%Y%m%d-%H%M%S)-$mode}"
+  export STORE R2_PREFIX="${R2_PREFIX:-bench/$(date -u +%Y%m%d-%H%M%S)-$mode-$PORT_BASE}"
   echo "STORE=r2: prefix $R2_PREFIX (delete it afterwards: ./r2-clean.sh $R2_PREFIX)"
   docker compose up -d --wait ref-a ref-b
 else
@@ -67,7 +122,7 @@ else
   docker compose run --rm minio-init >/dev/null
 fi
 
-mkdir -p out
+mkdir -p "$OUT"
 case "$mode" in
   e2e) node e2e.mjs "$@" ;;
   sim) node sim.mjs "$@" ;;
@@ -75,19 +130,15 @@ case "$mode" in
   cost) node cost.mjs "$@" ;;
   boards) node boards/scenarios.mjs "$@" ;;
   boards-ui | boards-prod)
-    (cd "$boards/web" && npm install --no-audit --no-fund --silent && npm run build --silent) >/dev/null
-    if [ "$mode" = boards-ui ]; then runner=boards/ui.mjs seed=boards/.local/seed-accounts.json check=ui.mjs shots=out/boards-ui/
-    else runner=boards/prod.mjs seed=boards/.local/prod-seed.json check=prod.mjs shots=out/boards-prod/; fi
+    if [ "$mode" = boards-ui ]; then runner=boards/ui.mjs seed="${LOCAL_DIR}seed-accounts.json" check=ui.mjs shots="${OUT}boards-ui/"
+    else runner=boards/prod.mjs seed="${LOCAL_DIR}prod-seed.json" check=prod.mjs shots="${OUT}boards-prod/"; fi
     if [ "${UI_E2E:-}" = 1 ]; then
       rm -f "$seed"
       node "$runner" &
       ui=$!
       until [ -f "$seed" ]; do kill -0 "$ui" 2>/dev/null || exit 1; sleep 1; done
       rc=0
-      (cd "$boards/e2e" && npm install --no-audit --no-fund --silent && npx playwright install chromium >/dev/null &&
-        SEED_FILE="$here/$seed" SHOTS="$here/$shots" node "$check") || rc=$?
-      kill "$ui"
-      wait "$ui" || true
+      (cd "$boards/e2e" && SEED_FILE="$seed" SHOTS="$shots" node "$check") || rc=$?
       exit "$rc"
     fi
     START_SERVER=1 node "$runner"

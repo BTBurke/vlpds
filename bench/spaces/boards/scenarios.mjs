@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs'
 import { crc32, deflateSync } from 'node:zlib'
 import { P256Keypair } from '@atproto/crypto'
 import { Actor, RUN } from '../lib/actor.mjs'
-import { HOSTS, VLPDS_ADMIN_TOKEN, log } from '../lib/env.mjs'
+import { HOSTS, PORTS, VLPDS_ADMIN_TOKEN, log } from '../lib/env.mjs'
 import { NotImplemented, attempt, hfetch, rawXrpc, setTimingScope, sleep, waitFor } from '../lib/http.mjs'
 import { DpopKey, asPost } from '../lib/oauth.mjs'
 import { FirehoseTap, SENTINEL, checkAuthor } from '../lib/leak.mjs'
@@ -39,8 +39,8 @@ const SCALES = {
 }
 const SCALE = SCALES[process.env.SCALE] ?? SCALES.full
 const CONC = Number(process.env.BOARDS_CONC ?? 16)
-const NOTIFY_PORT = 2871
-const API_PORT = 2888
+const NOTIFY_PORT = PORTS.syncer + 1
+const API_PORT = PORTS.boardsUi
 const UNCERTAIN = Symbol('uncertain')
 
 const errName = (r) => r.error ?? `HTTP ${r.status}`

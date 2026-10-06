@@ -8,19 +8,26 @@ const int = (k, d) => Number(process.env[k] ?? d)
 
 export const HERE = fileURLToPath(new URL('..', import.meta.url))
 export const OUT = process.env.OUT ?? `${HERE}out/`
+// the seeded accounts' passwords (git ignored)
+export const LOCAL = process.env.LOCAL_DIR ?? `${HERE}boards/.local/`
 mkdirSync(OUT, { recursive: true })
 
+// One block of 40 ports per run, from PORT_BASE (run.sh picks a free block, 2860 if it can)
+const BASE = int('PORT_BASE', 2860)
+const at = (o) => BASE + o
 export const PORTS = {
-  plc: int('PLC_PORT', 2860),
-  refA: int('REF_A_PORT', 2861),
-  refB: int('REF_B_PORT', 2862),
-  vlpds: int('VLPDS_PORT', 2863), // single node, or the cluster's load balancer
-  vlpdsNodes: [2864, 2865, 2866], // cluster mode
-  vlpdsPeers: [2884, 2885, 2886],
-  minio: int('MINIO_PORT', 2868),
-  syncer: 2870, // notify receivers: 2870..2873
-  syncerProxy: 2874, // fault proxies in front of them: 2874..2877
-  hostProxy: { 'ref-a': 2880, 'ref-b': 2881, vlpds: 2882 }, // fault proxies in front of space hosts
+  plc: at(0),
+  refA: at(1),
+  refB: at(2),
+  vlpds: at(3), // single node, or the cluster's load balancer
+  vlpdsNodes: [at(4), at(5), at(6)], // cluster mode
+  vlpdsPeers: [at(24), at(25), at(26)],
+  minio: at(8),
+  syncer: at(10), // notify receivers: +10..+13
+  syncerProxy: at(14), // fault proxies in front of them: +14..+17
+  hostProxy: { 'ref-a': at(20), 'ref-b': at(21), vlpds: at(22) }, // fault proxies in front of space hosts
+  boardsUi: at(28), // the boards appview and dev UI (spaces-boards, spaces-boards-ui)
+  boardsProd: at(29), // the production boards server (spaces-boards-prod), its metrics on +30
 }
 
 // STORE=r2 puts vlpds on a real S3-compatible bucket (README.md "Real R2") under
