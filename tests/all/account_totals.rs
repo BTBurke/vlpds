@@ -23,17 +23,20 @@ fn same(kept: &Totals, scanned: &Totals) -> Result<(), String> {
         && windows(kept) == windows(scanned)
         && kept.repos() == heads
         && kept.suffixes == scanned.suffixes
+        && (kept.unconfirmed, kept.no2fa) == (scanned.unconfirmed, scanned.no2fa)
     {
         return Ok(());
     }
     Err(format!(
-        "kept {:?} {:?} {:?}, scanned {:?} {:?} {:?} ({heads} heads)",
+        "kept {:?} {:?} {:?} {:?}, scanned {:?} {:?} {:?} {:?} ({heads} heads)",
         kept.accounts,
         windows(kept),
         kept.suffixes,
+        (kept.unconfirmed, kept.no2fa),
         scanned.accounts,
         windows(scanned),
-        scanned.suffixes
+        scanned.suffixes,
+        (scanned.unconfirmed, scanned.no2fa),
     ))
 }
 
