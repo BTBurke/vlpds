@@ -1,9 +1,8 @@
-import { useSyncExternalStore } from 'react'
-import { getConfig, getNodeMetrics, listMail, type MetricsPoint, type NodeConfig, type NodeMetrics } from '../adminApi'
+import { getConfig, getStorageStats, listMail, type MetricsPoint, type NodeConfig, type StorageStats } from '../adminApi'
 import { admin, basic, getAdminToken, setAdminToken, XrpcError } from '../xrpc'
 import { clusterPoll, type ClusterStatus } from './cluster'
 import { withAdmin } from './adminAdapter'
-import { createPoller, getLive, isUnsupported } from './live'
+import { createPoller, isUnsupported } from './live'
 import { subscribersPoll, type Subscriber, type SubscriberList } from './polls'
 
 // Data for the system sections (Firehose & relays, Object store, Mail, Config, Spaces): the
@@ -14,70 +13,9 @@ export const missing = isUnsupported
 
 // ---------------------------------------------------------------- node metrics
 
-export type NodeSeries = {
-  node: string
-  self: boolean
-  reachable: boolean
-  series: MetricsPoint[]
-  latest?: MetricsPoint | null
-  raw: NodeMetrics
-}
-export type NodeMetricsState = {
-  status: 'pending' | 'ok' | 'unsupported' | 'error'
-  nodes: NodeSeries[]
-  unreachable: string[]
-  error?: unknown
-  at?: number
-  version: number
-}
-
-const KEEP_MS = 3 * 60_000
-let nm: NodeMetricsState = { status: 'pending', nodes: [], unreachable: [], version: 0 }
-const nmSubs = new Set<() => void>()
-let nmTimer: ReturnType<typeof setInterval> | undefined
-let nmBusy = false
-
-async function nmTick(force = false) {
-  if (nmBusy || (!force && getLive().paused)) return
-  nmBusy = true
-  try {
-    const have = nm.nodes.filter((n) => n.series.length)
-    // poll for what's new since the oldest node's last point, so a lagging node isn't skipped
-    const since = have.length === nm.nodes.length && have.length ? Math.min(...have.map((n) => n.series[n.series.length - 1].t)) : undefined
-    const r = await withAdmin((c) => getNodeMetrics(c, since))
-    const prev = new Map(nm.nodes.map((n) => [n.node, n]))
-    const nodes: NodeSeries[] = r.nodes.map((n) => {
-      const p = prev.get(n.node)
-      const seen = new Set(p?.series.map((x) => x.t))
-      const merged = [...(p?.series ?? []), ...(n.series ?? []).filter((x) => !seen.has(x.t))].filter((x) => x.t > r.time - KEEP_MS)
-      return { node: n.node, self: n.self, reachable: n.reachable, series: merged, latest: n.latest ?? p?.latest, raw: n.reachable ? n : (p?.raw ?? n) }
-    })
-    nm = { status: 'ok', nodes, unreachable: r.unreachableNodes ?? [], at: Date.now(), version: nm.version + 1 }
-  } catch (e) {
-    nm = { ...nm, status: missing(e) ? 'unsupported' : nm.nodes.length ? nm.status : 'error', error: e, version: nm.version + 1 }
-  } finally {
-    nmBusy = false
-    nmSubs.forEach((l) => l())
-  }
-}
-
-function nmSubscribe(l: () => void) {
-  nmSubs.add(l)
-  if (nmSubs.size === 1) {
-    nmTick(true)
-    nmTimer = setInterval(nmTick, 2000)
-  }
-  return () => {
-    nmSubs.delete(l)
-    if (!nmSubs.size && nmTimer) {
-      clearInterval(nmTimer)
-      nmTimer = undefined
-    }
-  }
-}
-
-/** Every node's getNodeMetrics series (3 minutes, one point per 2 s), polled while shown. */
-export const useNodeMetrics = () => useSyncExternalStore(nmSubscribe, () => nm)
+// one shared poll (nodeMetrics.ts): series 3 minutes deep, one point per 2 s
+export { useNodeMetrics, type NodeMetricsState, type NodeSeries } from './nodeMetrics'
+import type { NodeSeries } from './nodeMetrics'
 
 export type Num = Exclude<
   { [K in keyof MetricsPoint]: MetricsPoint[K] extends number ? K : MetricsPoint[K] extends number | null | undefined ? K : never }[keyof MetricsPoint],
@@ -307,17 +245,12 @@ export const configPoll = createPoller(configs, 30_000)
 
 // ---------------------------------------------------------------- storage stats
 
-/** Objects and bytes per key component (vlpds.admin.getStorageStats, a newer call). */
-export type StorageStats = { components: { component: string; objects: number; bytes: number }[]; totalBytes: number }
+export type { StorageStats } from '../adminApi'
 
-/** `supported: false` on a vlpds without getStorageStats. Reads the answer loosely until its API settles. */
+/** Objects and bytes per key component; `supported: false` on a vlpds without getStorageStats. */
 export const storageStatsPoll = createPoller(async (): Promise<{ supported: false } | { supported: true; data: StorageStats }> => {
   try {
-    const r = await admin<Record<string, unknown>>('vlpds.admin.getStorageStats')
-    const raw = (Array.isArray(r.components) ? r.components : Array.isArray(r.byComponent) ? r.byComponent : []) as Record<string, unknown>[]
-    const components = raw.map((c) => ({ component: String(c.component ?? c.name ?? ''), objects: Number(c.objects ?? c.count ?? 0), bytes: Number(c.bytes ?? 0) }))
-    const totalBytes = typeof r.totalBytes === 'number' ? r.totalBytes : components.reduce((t, c) => t + c.bytes, 0)
-    return { supported: true, data: { components, totalBytes } }
+    return { supported: true, data: await withAdmin((c) => getStorageStats(c)) }
   } catch (e) {
     if (isUnsupported(e)) return { supported: false }
     throw e

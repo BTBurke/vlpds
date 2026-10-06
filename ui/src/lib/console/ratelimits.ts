@@ -1,7 +1,9 @@
 import { clearLockout } from '../adminApi'
 import { admin } from '../xrpc'
-import { nodeMetrics, withAdmin } from './adminAdapter'
-import { createPoller } from './live'
+import { useMemo } from 'react'
+import { withAdmin } from './adminAdapter'
+import { createPoller, type PollState } from './live'
+import { getNodeMetricsState, refreshNodeMetrics, useNodeMetrics, type NodeMetricsState } from './nodeMetrics'
 
 // Rate limits and lockouts: getRateLimits (src/xrpc/ratelimits.rs) polled with the 429 totals
 // turned into per-bucket rates, the cluster's 429/s from getNodeMetrics, factor locks from
@@ -170,25 +172,28 @@ export function overrideTarget(kind: KeyKind, key: string): { ip?: string; did?:
 
 export type RatePoint = { t: number; v: number }
 export type Rate429 = { supported: boolean; nodes: { node: string; self: boolean; points: RatePoint[] }[]; intervalMs: number }
-const SPAN_MS = 3 * 60_000
-let perNode = new Map<string, { self: boolean; points: RatePoint[] }>()
-let lastT = 0
 
-export const rate429Poll = createPoller(async (): Promise<Rate429> => {
-  const res = await nodeMetrics(lastT || undefined)
-  if (!res.supported) return { supported: false, nodes: [], intervalMs: 0 }
-  const r = res.data
-  for (const n of r.nodes) {
-    if (!n.reachable || !n.series) continue
-    const cur = perNode.get(n.node) ?? { self: n.self, points: [] }
-    const seen = cur.points[cur.points.length - 1]?.t ?? 0
-    cur.points = [...cur.points, ...n.series.filter((p) => p.t > seen).map((p) => ({ t: p.t, v: p.rateLimitedPerSec }))].filter((p) => p.t > r.time - SPAN_MS)
-    perNode.set(n.node, cur)
-    for (const p of n.series) lastT = Math.max(lastT, p.t)
-  }
-  const interval = r.nodes.find((n) => n.intervalMs)?.intervalMs ?? 2000
-  return { supported: true, nodes: [...perNode.entries()].map(([node, x]) => ({ node, ...x })).sort((a, b) => a.node.localeCompare(b.node)), intervalMs: interval }
-}, POLL)
+function rate429Of(s: NodeMetricsState): PollState<Rate429> {
+  if (s.status === 'pending') return { loading: true }
+  if (s.status === 'unsupported') return { data: { supported: false, nodes: [], intervalMs: 0 }, at: s.at, loading: false }
+  if (s.status === 'error') return { error: s.error, loading: false }
+  const nodes = s.nodes
+    .filter((n) => n.series.length)
+    .map((n) => ({ node: n.node, self: n.self, points: n.series.map((p) => ({ t: p.t, v: p.rateLimitedPerSec })) }))
+    .sort((a, b) => a.node.localeCompare(b.node))
+  const intervalMs = s.nodes.find((n) => n.raw.intervalMs)?.raw.intervalMs ?? 2000
+  return { data: { supported: true, nodes, intervalMs }, at: s.at, loading: false }
+}
+
+/** 429s per node per second, from the console's one getNodeMetrics poll. */
+export const rate429Poll = {
+  use: (): PollState<Rate429> => {
+    const s = useNodeMetrics()
+    return useMemo(() => rate429Of(s), [s])
+  },
+  get: () => rate429Of(getNodeMetricsState()),
+  refresh: () => refreshNodeMetrics(),
+}
 
 /** The cluster total, one point per interval (nodes' points bucketed to the interval). */
 export function totalRate(r: Rate429 | undefined): number[] {
