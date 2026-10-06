@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Spaces harness (README.md): local PLC, two reference PDSes and MinIO in
-# docker, the newest vlpds Spaces branch built from a detached checkout, then
-# one of the Node drivers. Tears the stack down afterwards unless KEEP=1.
+# docker, this checkout's vlpds (build-vlpds.sh), then one of the Node
+# drivers. Tears the stack down afterwards unless KEEP=1.
 #
 #   bench/spaces/run.sh e2e [config ...]        (just spaces-e2e)
 #   bench/spaces/run.sh sim [seed] [scale]      (just spaces-sim)
@@ -11,8 +11,8 @@
 #   bench/spaces/run.sh boards-ui               (just spaces-boards-ui; UI_E2E=1 runs the headless check and exits)
 #   bench/spaces/run.sh boards-prod             (just spaces-boards-prod; the production server; UI_E2E=1 likewise)
 #
-# Env: VLPDS_BIN (skip the build), BRANCH (default: origin/spaces-1, else
-# origin/spaces-0), CLUSTER=1 (3 vlpds nodes on MinIO behind a balancer),
+# Env: VLPDS_BIN (skip the build), BRANCH (build that ref instead of this
+# checkout), CLUSTER=1 (3 vlpds nodes on MinIO behind a balancer),
 # MEMORY=1 (vlpds --memory), KEEP=1, REF_PDS_IMAGE (use a prebuilt image),
 # STORE=r2 (vlpds on a real bucket under bench/<run-id>/, keys from R2_ENV,
 # default ~/.config/cloudflare/vlpds-bench-r2.env; README.md "Real R2").

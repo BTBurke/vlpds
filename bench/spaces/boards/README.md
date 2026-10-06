@@ -17,7 +17,7 @@ just spaces-boards-prod             # the production server on http://boards.loc
 UI_E2E=1 just spaces-boards-prod    # the production server in headless Chromium, then exit
 ```
 
-`BRANCH=origin/spaces-2b` picks the vlpds branch, as for the other harness modes. `SCALE=small`
+`BRANCH=<ref>` builds vlpds from that ref instead of this checkout, as for the other harness modes. `SCALE=small`
 shrinks story 10 for quick runs and `SEED` fixes its workload. Reports land in
 `bench/spaces/out/boards.{md,json}` (`boards-cluster.*` with `CLUSTER=1`).
 

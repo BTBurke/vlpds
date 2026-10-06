@@ -35,10 +35,11 @@ namespace of a small socat container that forwards the other harness ports (2861
 PDS or to the host. So a DID document points at the same URL whether the driver, vlpds or a
 reference PDS reads it.
 
-`build-vlpds.sh` fetches `origin/spaces-1` (falling back to `origin/spaces-0`), checks it out
-detached under `.scratch/vlpds-src` and builds `--profile dev-release` into `.scratch/target`. It
-skips the build when the branch's SHA hasn't changed since the last one, and it follows force
-pushes. `VLPDS_BIN=...` skips it, and `BRANCH=origin/spaces-0` pins a branch.
+`build-vlpds.sh` builds this checkout's `packages/vlpds` as it is on disk (uncommitted changes
+included) with `--profile dev-release`, into the main checkout's `.scratch/target` so worktrees share
+compiled dependencies, and copies the binary to `.scratch/vlpds`. It skips the build when the source
+is clean and its tree hasn't changed since the last one. `VLPDS_BIN=...` skips it, and
+`BRANCH=<ref>` builds a detached checkout of that ref under `.scratch/vlpds-src` instead.
 
 The drivers start vlpds themselves (`lib/vlpds.mjs`) with `--dev-mode --spaces` on port 2863, so the
 fault sim can kill it. `CLUSTER=1` starts 3 nodes on MinIO behind a small round-robin balancer on
