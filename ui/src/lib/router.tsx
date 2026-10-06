@@ -15,6 +15,9 @@ export function navigate(to: string, opts: { replace?: boolean } = {}) {
   notify()
 }
 
+/** After the address bar was changed outside {@link navigate} (history.replaceState). */
+export const syncRoute = () => notify()
+
 function subscribe(l: () => void) {
   listeners.add(l)
   return () => {

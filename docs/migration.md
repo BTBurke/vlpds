@@ -227,8 +227,9 @@ the deactivated account on the old server.
 ### The page's OAuth client
 
 The page is its own OAuth client. vlpds serves its metadata at `/oauth/client-metadata.json` as a
-public client (`token_endpoint_auth_method: none`, DPoP-bound tokens, one redirect URI at
-`/migrate/oauth/callback`). On plain `http://127.0.0.1` the page uses a loopback client id instead,
+public client (`token_endpoint_auth_method: none`, DPoP-bound tokens, a redirect URI at
+`/migrate/oauth/callback`). The account page's Spaces tab is the same client with its own redirect
+URI, `/account/oauth/callback` ([Your spaces on the account page](spaces/reading.md#your-spaces-on-the-account-page)). On plain `http://127.0.0.1` the page uses a loopback client id instead,
 so a local test works against the reference PDS too.
 
 - The page discovers the authorization server from the PDS's

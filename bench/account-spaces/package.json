@@ -1,0 +1,8 @@
+{
+  "name": "vlpds-account-spaces-e2e",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

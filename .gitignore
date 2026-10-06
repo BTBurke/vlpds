@@ -18,3 +18,5 @@ __pycache__/
 /bench/spaces/node_modules/
 /passkey-differential/target/
 .DS_Store
+/bench/account-spaces/out/
+/bench/account-spaces/node_modules/

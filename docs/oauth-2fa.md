@@ -412,12 +412,15 @@ passkeys" covers `PasskeyRequired`.
 | Handle and email | change the handle to a name on this server or to their own domain, with a guided check · change and confirm the email | [Changing a handle](operations/email-and-moderation.md#changing-a-handle-on-the-account-page) |
 | Security | passkeys · TOTP · recovery codes · recent sign-ins · trusted browsers · sign-in alerts · OAuth only · the recovery key · app passwords, scoped or not · connected OAuth apps · the password | [Passkeys](#passkeys), [Second factors](#second-factors), [Trusted browsers](#trusted-browsers), [Sign-in alerts](#sign-in-alerts-and-recent-sign-ins), [OAuth only](#oauth-only), [Scoped app passwords](#scoped-app-passwords), [Recovery keys](keys-security.md#plc-rotation-key-and-recovery-keys) |
 | Repository, Media | browse records and delete one · preview blobs | |
+| Spaces (only with `--spaces`) | connect with OAuth · see the spaces they write in and the ones they run · browse their own space records · add or remove a member, delete a space | [Your spaces on the account page](spaces/reading.md#your-spaces-on-the-account-page) |
 | Export, Preferences | download a full backup or the repo CAR · view and edit stored app preferences | [Backups](migration.md#backups) |
 | Deactivate or delete | deactivate, reactivate (which cancels a scheduled deletion) · delete with an emailed token | [Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion) |
 
 Users manage their account at `/account` on this server. The page signs in with `createSession`, so
 the second factor applies there too, unless the browser is trusted. It also signs in with a passkey,
-through its own two calls ([Signing in with a passkey](#signing-in-with-a-passkey)).
+through its own two calls ([Signing in with a passkey](#signing-in-with-a-passkey)). The Spaces
+tab is the one exception. Space data is OAuth-only, so that tab signs in again with OAuth and keeps
+the session only while it's open.
 
 ## Auth state under concurrency
 

@@ -48,7 +48,7 @@ Other options: `HEADED=1` shows the browser, and `VLPDS_BIN=...` skips the build
 just migrate-spaces-e2e   # or bench/migrate/spaces.sh
 ```
 
-This one checks the Spaces step of `/migrate`: after the account goes live here and before the old one goes offline, the page signs in with OAuth at both servers and copies each space repo the account writes. It starts, in docker (project `vlpds-migrate-spaces`), the same PLC directory and Mailpit, plus the reference PDS at the Spaces alpha (`ghcr.io/bluesky-social/atproto:pds-spaces-alpha`, amd64 only; `REF_SPACES_IMAGE` points at a native build such as the one `bench/spaces/refpds.sh` makes) on `localhost:2786`. It runs two vlpds with `--spaces`: the target on `127.0.0.1:2787` and a source on `localhost:2788` (another host name, so the two don't share cookies).
+This one checks the Spaces step of `/migrate`: after the account goes live here and before the old one goes offline, the page signs in with OAuth at both servers and copies each space repo the account writes. It starts, in docker (project `vlpds-migrate-spaces`), the same PLC directory and Mailpit, plus the reference PDS at the Spaces alpha (`ghcr.io/bluesky-social/atproto:pds-spaces-alpha`, amd64 only; on arm64, such as Apple Silicon, the script builds and uses the native image of the same pin that `bench/spaces/refpds.sh` makes; set `REF_SPACES_IMAGE` to point at another) on `localhost:2786`. It runs two vlpds with `--spaces`: the target on `127.0.0.1:2787` and a source on `localhost:2788` (another host name, so the two don't share cookies).
 
 `spaces.mjs` then:
 

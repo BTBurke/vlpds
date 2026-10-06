@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent, type JSX } from 'react'
-import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
-import { useSession } from '../../lib/hooks'
-import { Link, match, navigate, useSearch } from '../../lib/router'
-import { call, setSession, signOut, XrpcError, errText } from '../../lib/xrpc'
+import { ErrorNotice, Field, Loading, Notice, Spinner, Topbar } from '../../components/ui'
+import { useLoad, useSession } from '../../lib/hooks'
+import { Link, match, navigate, syncRoute, useSearch } from '../../lib/router'
+import { acall, call, setSession, signOut, XrpcError, errText } from '../../lib/xrpc'
+import { serverRunsSpaces } from '../../lib/backup'
+import { ACCOUNT_CALLBACK_PATH } from '../../lib/oauth'
+import { disconnect, finishCallback, holdsSession } from '../../lib/spaces'
+import { SpacesHome, SpaceView } from './Spaces'
 import { cancelled, conditionalAvailable, didOfUserHandle, getPasskey, ipHost, passkeysHere, rpIdHere, type AssertionJson } from '../../lib/webauthn'
 import { Overview } from './Overview'
 import { Identity } from './Identity'
@@ -19,17 +23,36 @@ const NAV = [
   { to: '/account/security', label: 'Security' },
   { to: '/account/repo', label: 'Repository' },
   { to: '/account/blobs', label: 'Media' },
+  { to: '/account/spaces', label: 'Spaces', spaces: true },
   { to: '/account/export', label: 'Export' },
   { to: '/account/preferences', label: 'Preferences' },
 ]
 
+/** Back from the Spaces section's OAuth sign-in: redeem the code, then show where it started. */
+function SpacesCallback() {
+  useEffect(() => {
+    void finishCallback().then(syncRoute)
+  }, [])
+  return <Loading />
+}
+
 export function AccountApp({ path }: { path: string }) {
   const s = useSession()
   const p = path.replace(/\/+$/, '') || '/account'
+  // the Spaces section's OAuth session lives only while the section is open
+  useEffect(() => {
+    if (p !== ACCOUNT_CALLBACK_PATH && !p.startsWith('/account/spaces') && holdsSession()) void disconnect()
+  }, [p])
+  if (p === ACCOUNT_CALLBACK_PATH) return <SpacesCallback />
   if (p === '/account/reset') return <PasswordReset />
   if (p === '/account/signup' && !s) return <SignUp />
   if (!s) return <SignIn />
+  return <SignedIn p={p} />
+}
 
+function SignedIn({ p }: { p: string }) {
+  const s = useSession()!
+  const spaces = useLoad(() => serverRunsSpaces(acall), [s.did]).data
   let page: JSX.Element
   let m: Record<string, string> | null
   if (p === '/account' || p === '/account/signup') page = <Overview />
@@ -39,6 +62,10 @@ export function AccountApp({ path }: { path: string }) {
   else if ((m = match('/account/repo/:collection', p))) page = <Records collection={m.collection} />
   else if ((m = match('/account/repo/:collection/:rkey', p))) page = <RecordView collection={m.collection} rkey={m.rkey} />
   else if (p === '/account/blobs') page = <Blobs />
+  else if (p.startsWith('/account/spaces') && spaces === undefined) page = <Loading />
+  else if (p.startsWith('/account/spaces') && !spaces) page = <Notice kind="warn">This server doesn't run Spaces.</Notice>
+  else if (p === '/account/spaces') page = <SpacesHome />
+  else if ((m = match('/account/spaces/:authority/:type/:skey', p))) page = <SpaceView authority={m.authority} type={m.type} skey={m.skey} />
   else if (p === '/account/export') page = <Export />
   else if (p === '/account/preferences') page = <Preferences />
   else if (p === '/account/danger') page = <Danger />
@@ -48,7 +75,7 @@ export function AccountApp({ path }: { path: string }) {
   return (
     <>
       <Topbar where="Account">
-        <button type="button" className="btn sm" onClick={() => signOut().then(() => navigate('/account'))}>
+        <button type="button" className="btn sm" onClick={() => disconnect().then(signOut).then(() => navigate('/account'))}>
           Sign out
         </button>
       </Topbar>
@@ -59,7 +86,7 @@ export function AccountApp({ path }: { path: string }) {
             <span className="mono">{s.did}</span>
           </div>
           <nav aria-label="Account">
-            {NAV.map((n) => (
+            {NAV.filter((n) => !n.spaces || spaces).map((n) => (
               <Link key={n.to} to={n.to} aria-current={current(n.to) ? 'page' : undefined}>
                 {n.label}
               </Link>

@@ -228,15 +228,19 @@ export async function discover(pds: string): Promise<AuthServer> {
 // ---------------------------------------------------------------- the client
 
 /** Everything this client can ask for; /oauth/client-metadata.json lists the same. */
-export const CLIENT_SCOPE = 'atproto space:*?authority=*&action=read_self space:*?authority=*&collection=*&action=create&action=read_self blob:*/*'
+export const CLIENT_SCOPE =
+  'atproto space:*?authority=*&action=read_self space:*?authority=*&collection=*&action=create&action=read_self blob:*/* space:*?action=read_self&manage=update&manage=delete'
 
+/** /migrate's redirect URI. */
 export const CALLBACK_PATH = '/migrate/oauth/callback'
+/** The account page's redirect URI (its "Your spaces" section). */
+export const ACCOUNT_CALLBACK_PATH = '/account/oauth/callback'
 
 export type ClientInfo = { clientId: string; redirectUri: string }
 
 /** Null where no client can work: plain http on anything but 127.0.0.1 / [::1]. */
-export function clientInfo(): ClientInfo | null {
-  const redirectUri = `${location.origin}${CALLBACK_PATH}`
+export function clientInfo(callback: string = CALLBACK_PATH): ClientInfo | null {
+  const redirectUri = `${location.origin}${callback}`
   if (location.protocol === 'https:') return { clientId: `${location.origin}/oauth/client-metadata.json`, redirectUri }
   // RFC 8252 loopback: an atproto AS synthesizes the metadata from the id
   if (location.protocol === 'http:' && (location.hostname === '127.0.0.1' || location.hostname === '[::1]')) {
@@ -255,6 +259,7 @@ type Pending = {
   scope: string
   name: string
   client: ClientInfo
+  returnTo?: string
   at: number
 }
 
@@ -301,12 +306,16 @@ export type SignIn = {
   /** The account that must sign in; also the login hint. */
   did: string
   scope: string
+  /** The redirect URI's path: {@link CALLBACK_PATH} unless given. */
+  callback?: string
+  /** Where the callback leaves the address bar (the callback page's area by default). */
+  returnTo?: string
 }
 
 /** Starts a sign-in: PAR, then the browser goes to the authorization page
- * and comes back to {@link CALLBACK_PATH}. Doesn't return when it works. */
+ * and comes back to the callback. Doesn't return when it works. */
 export async function beginSignIn(s: SignIn): Promise<void> {
-  const client = clientInfo()
+  const client = clientInfo(s.callback)
   if (!client) throw new OAuthError('unsupported', 'Signing in with OAuth needs this page on https (or http://127.0.0.1 for development).')
   const server = await discover(s.pds)
   const { id: keyId, pair } = await newKey()
@@ -328,7 +337,7 @@ export async function beginSignIn(s: SignIn): Promise<void> {
     if (typeof par.request_uri !== 'string') throw new OAuthError('par', `${server.issuer} returned no request_uri.`)
     const old = ssGet<Pending>(PKEY)
     if (old) await delKey(old.keyId)
-    ssSet(PKEY, { ...s, state, verifier, keyId, server, client, at: Date.now() } satisfies Pending)
+    ssSet(PKEY, { name: s.name, pds: s.pds, did: s.did, scope: s.scope, returnTo: s.returnTo, state, verifier, keyId, server, client, at: Date.now() } satisfies Pending)
     location.assign(`${server.authorize}${qs({ client_id: client.clientId, request_uri: par.request_uri })}`)
   } catch (e) {
     await delKey(keyId)
@@ -337,19 +346,20 @@ export async function beginSignIn(s: SignIn): Promise<void> {
 }
 
 /** Whether this page load is the authorization server sending the user back. */
-export const isCallback = () => location.pathname === CALLBACK_PATH
+export const isCallback = (callback: string = CALLBACK_PATH) => location.pathname === callback
 
-/** On {@link CALLBACK_PATH}: checks the answer against the pending sign-in,
- * redeems the code and keeps the session. Returns its name. */
-export async function finishSignIn(): Promise<string> {
+/** On the callback: checks the answer against the pending sign-in, redeems
+ * the code and keeps the session. Returns its name. `back` is where the
+ * address bar goes when the sign-in named no `returnTo`. */
+export async function finishSignIn(back = '/migrate'): Promise<string> {
   // the code only ever comes in the fragment (response_mode=fragment), which
   // no server sees; a query is read for an error and nothing else
   const q = new URLSearchParams(location.search)
   const p = location.hash.length > 1 ? new URLSearchParams(location.hash.slice(1)) : new URLSearchParams(q.has('error') ? { state: q.get('state') ?? '', iss: q.get('iss') ?? '', error: q.get('error')!, error_description: q.get('error_description') ?? '' } : {})
-  // the code is single-use, but it shouldn't sit in the address bar or history
-  history.replaceState(null, '', '/migrate')
   const pending = ssGet<Pending>(PKEY)
   ssSet(PKEY, null)
+  // the code is single-use, but it shouldn't sit in the address bar or history
+  history.replaceState(null, '', pending?.returnTo?.startsWith('/') ? pending.returnTo : back)
   if (!pending || Date.now() - pending.at > PENDING_TTL) {
     if (pending) await delKey(pending.keyId)
     throw new OAuthError('no_pending', 'This sign-in expired or was started in another tab. Start it again.')
@@ -378,8 +388,9 @@ export async function finishSignIn(): Promise<string> {
     throw e
   })
   const stored = await checkToken(tok, pending, pending.keyId)
+  // a second grant (more scope) replaces the first: its tokens are revoked, not left live
   const prev = ssGet<Stored>(SKEY(pending.name))
-  if (prev && prev.keyId !== stored.keyId) await delKey(prev.keyId)
+  if (prev && prev.keyId !== stored.keyId) await drop(prev)
   ssSet(SKEY(pending.name), stored)
   return pending.name
 }
@@ -390,7 +401,7 @@ async function checkToken(tok: any, s: { name: string; did: string; pds: string;
     return new OAuthError('token', m)
   }
   if (typeof tok.access_token !== 'string' || String(tok.token_type).toLowerCase() !== 'dpop') throw await bad('The server issued no DPoP-bound token.')
-  if (tok.sub !== s.did) throw await bad(`Signed in as ${tok.sub ?? 'someone else'}, not ${s.did}. Sign in with the account you are moving.`)
+  if (tok.sub !== s.did) throw await bad(`Signed in as ${tok.sub ?? 'someone else'}, not ${s.did}. Sign in with that account.`)
   return {
     name: s.name,
     did: s.did,
@@ -436,10 +447,12 @@ export class OAuthSession {
   }
 
   /** Whether the granted scope includes every one of `scope`'s values
-   * (servers normalize a value's parameter order). */
+   * (servers normalize a value's parameter order, and issue a space value
+   * with no `authority`, which means `self`, naming the account). */
   grants(scope: string): boolean {
     const have = new Set(this.s.scope.split(' ').map(canonScope))
-    return scope.split(' ').every((v) => have.has(canonScope(v)))
+    const issued = (v: string) => (v.startsWith('space:') && !/[?&]authority=/.test(v) ? `${v.includes('?') ? v : `${v}?`}&authority=${this.s.did}`.replace('?&', '?') : v)
+    return scope.split(' ').every((v) => have.has(canonScope(v)) || have.has(canonScope(issued(v))))
   }
 
   private refreshing?: Promise<void>
@@ -525,11 +538,13 @@ async function drop(s: Stored) {
   await delKey(s.keyId)
 }
 
-/** Drops (and revokes) the named sessions this tab holds, and any pending sign-in. */
+/** Drops (and revokes) the named sessions this tab holds, and a pending sign-in for one of them. */
 export async function forgetAll(names: string[]) {
   const pending = ssGet<Pending>(PKEY)
-  ssSet(PKEY, null)
-  if (pending) await delKey(pending.keyId)
+  if (pending && names.includes(pending.name)) {
+    ssSet(PKEY, null)
+    await delKey(pending.keyId)
+  }
   for (const n of names) {
     const s = ssGet<Stored>(SKEY(n))
     if (s) await drop(s)

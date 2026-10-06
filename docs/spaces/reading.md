@@ -85,6 +85,40 @@ exactly that list at the code exchange and at every refresh. So if the declarati
 collection, an existing session doesn't pick it up. If the lookup fails at consent, the screen says
 the writes couldn't be looked up and the token request fails, as it does on the reference.
 
+## Your spaces on the account page
+
+With `--spaces` on, the account page (`/account`) gets a Spaces tab. The rest of the page signs in
+with a password, which can't read space data, so this tab signs in again with OAuth. It's the same
+first-party client `/migrate` uses (public, DPoP-bound), with its own redirect URI at
+`/account/oauth/callback`. The tab is hidden when `describeServer` doesn't say `vlpds.spaces`.
+
+| Grant | Asked for | What it covers |
+|---|---|---|
+| `atproto space:*?authority=*&action=read_self` | on Connect | `listSpaces`, the user's own repo in each space (`getLatestCommit`, `listRecords`), and `getSpace` and `listMembers` for the spaces they run |
+| the above plus `space:*?action=read_self&manage=update&manage=delete` | when the user opens Manage on a space they run | `putMember`, `removeMember` and `deleteSpace`, only in the user's own spaces |
+
+The owner grant leaves `authority` at its default, `self`, so the token names the user's DID and
+can't touch anyone else's space. It's a second consent on top of the first, and the new token
+replaces the old one, whose tokens the page revokes. The consent screen sums it up as "manage your
+spaces".
+
+The tab shows two lists. Spaces the user writes in have a record count (paged with `excludeValues`,
+shown as 10,000+ past ten pages) and the last write, which is the time in the head rev's TID. The
+spaces they run have their member count, how many members can write, and the read and write
+policies. Who runs a space shows as a handle only when the handle resolves back to the DID
+(`resolveIdentity`), else as the DID, as on the consent screen. A space's page browses the user's
+own records there with their values. Nobody else's records are listed, since `read_self` can't read
+them.
+
+Adding a member takes a handle, resolved with `resolveIdentity`. A handle that doesn't resolve back
+to its DID is refused, and a DID works too. Each change asks for a confirmation, and deleting a
+space has the user type its key.
+
+The tokens live in sessionStorage and the DPoP key is non-extractable in IndexedDB, as on
+`/migrate` ([The page's OAuth client](../migration.md#the-page-s-oauth-client)). Disconnect, leaving
+the tab and signing out of the account page all revoke the tokens and delete the key. A closed tab
+leaves its key behind, and the next visit deletes it once it's a day old.
+
 ## What a member host checks
 
 ```steps

@@ -1311,6 +1311,100 @@ dialog.modal h2 {
   max-width: 46ch;
 }
 
+/* Spaces (account) */
+.spaces-bar {
+  margin-bottom: 12px;
+}
+.space-name {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
+.space-name .nsid,
+.pagehead .nsid {
+  overflow-wrap: anywhere;
+}
+.space-name .nsid span,
+.pagehead .nsid span {
+  color: var(--ink3);
+  font-weight: 400;
+}
+.sm-meta {
+  display: none;
+}
+@media (max-width: 760px) {
+  .spaces-table .sm-meta {
+    display: block;
+    margin-top: 3px;
+  }
+}
+.scope-details {
+  margin: 0 0 14px;
+  color: var(--ink2);
+}
+.scope-details summary {
+  cursor: pointer;
+  margin-bottom: 6px;
+}
+.scope-details .mono {
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 6px 9px;
+  background: var(--sunk);
+  border-radius: 4px;
+}
+.scope-details p {
+  margin: 6px 0 0;
+}
+.linklike {
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.linklike.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+table.data tr.record-open td {
+  background: var(--paper);
+}
+table.data tr.record-open .json {
+  background: var(--sheet);
+  margin: 8px 0 0;
+  max-height: 420px;
+  overflow: auto;
+}
+.panel-foot {
+  padding: 10px 18px;
+  margin: 0;
+  border-top: 1px solid var(--rule2);
+}
+.add-member {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 0 10px;
+  align-items: end;
+}
+.add-member .btn {
+  margin-bottom: 14px;
+  min-height: 38px;
+}
+@media (max-width: 560px) {
+  .add-member {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .add-member .btn {
+    justify-self: end;
+  }
+}
+
 /* Blobs */
 .blobs {
   display: grid;

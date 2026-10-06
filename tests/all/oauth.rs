@@ -260,7 +260,7 @@ pub(crate) fn pkce() -> Pkce {
     Pkce { verifier, challenge }
 }
 
-fn loopback_client_id(scope: &str, redirect: &str) -> String {
+pub(crate) fn loopback_client_id(scope: &str, redirect: &str) -> String {
     format!("http://localhost?scope={}&redirect_uri={}", enc(scope), enc(redirect))
 }
 

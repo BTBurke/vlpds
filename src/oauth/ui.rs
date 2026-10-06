@@ -791,8 +791,8 @@ fn item(p: &Permission, names: Option<&SpaceNames>) -> Item {
             verbs.extend(&writes);
             let mut on_type: Vec<String> =
                 verbs.first().filter(|v| v.starts_with("read")).map(|v| v.to_string()).into_iter().collect();
+            let mut other = Vec::new();
             if let Some(m) = s.manage.as_ref().filter(|m| !m.is_empty()) {
-                verbs.push("manage");
                 let ops: Vec<&str> = m
                     .iter()
                     .map(|op| match op.as_str() {
@@ -801,7 +801,23 @@ fn item(p: &Permission, names: Option<&SpaceNames>) -> Item {
                         _ => "delete",
                     })
                     .collect();
-                on_type.push(format!("{} spaces", join_and(&ops)));
+                // management bound to one account isn't "in every space"
+                // the type covers: the summary says whose
+                let whose = match s.authority.as_str() {
+                    "*" => None,
+                    "self" => Some("your".to_string()),
+                    did => Some(format!("{did}'s")),
+                };
+                match whose {
+                    None => {
+                        verbs.push("manage");
+                        on_type.push(format!("{} spaces", join_and(&ops)));
+                    }
+                    Some(w) => {
+                        other.push(format!("manage {w} spaces"));
+                        on_type.push(format!("{} {w} spaces", join_and(&ops)));
+                    }
+                }
             }
             let mut lines = vec![(
                 s.space_type.clone(),
@@ -818,7 +834,7 @@ fn item(p: &Permission, names: Option<&SpaceNames>) -> Item {
                 place: place_of(std::slice::from_ref(&s.space_type), ("all-spaces", "Every space")),
                 lines,
                 warning: names.and_then(|_| space_warning(&s)),
-                tally: Tally { space: verbs, types: vec![s.space_type.clone()], ..Default::default() },
+                tally: Tally { space: verbs, types: vec![s.space_type.clone()], other, ..Default::default() },
                 title,
             }
         }
@@ -1438,6 +1454,22 @@ mod tests {
         assert!(s.contains("Read in every space"), "{s}");
         assert!(s.contains("asking to read every space on the network"), "{s}");
         assert_eq!(html.matches("class=\"warn\"").count(), 1, "{html}");
+    }
+
+    /// The account page's owner grant manages only the user's own spaces,
+    /// and the consent says so rather than "manage in every space".
+    #[test]
+    fn self_bound_management_says_whose() {
+        let names = SpaceNames::default();
+        let html = page_for(
+            "atproto space:*?authority=*&action=read_self space:*?action=read_self&manage=update&manage=delete",
+            &[],
+            Some(&names),
+        );
+        let s = summary_of(&html, "<span class=\"gl\">Every space</span>");
+        assert!(s.contains("Read your own in every space · manage your spaces"), "{s}");
+        assert!(!s.contains("manage in every space"), "{s}");
+        assert!(html.contains("read your own and change and delete your spaces"), "{html}");
     }
 
     #[test]
