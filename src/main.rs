@@ -65,6 +65,11 @@ struct Args {
     /// One handle domain: the same as --handle-domains with one entry.
     #[arg(long, env = "VLPDS_HANDLE_DOMAIN")]
     handle_domain: Option<String>,
+    /// How long a handle domain removed through the admin API stays
+    /// retiring (serving its handles, giving out no new ones) before the
+    /// removal can finish.
+    #[arg(long, env = "VLPDS_HANDLE_DOMAIN_RETIRE_GRACE", default_value = "2m")]
+    handle_domain_retire_grace: String,
     #[arg(long, env = "VLPDS_SERVICE_DID", default_value = "did:web:localhost")]
     service_did: String,
     /// Session JWT / OAuth key-derivation secret (>= 32 bytes; dev default
@@ -1347,6 +1352,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     let cfg = Config {
         public_url: args.public_url.clone(),
         handle_domains: handle_domains(&args)?,
+        handle_domain_retire_grace: retire_grace(&args.handle_domain_retire_grace)?,
         service_did: args.service_did.clone(),
         jwt_secret: secret(&args.jwt_secret, args.dev_mode, server::DEV_JWT_SECRET),
         admin_token: secret(&args.admin_token, args.dev_mode, server::DEV_ADMIN_TOKEN),
@@ -1610,6 +1616,15 @@ fn pick_handle_domains(many: &[String], one: Option<&str>, reference: Option<&st
     }
     let reference = list(&mut reference.unwrap_or_default().split(','));
     Ok(if reference.is_empty() { vec!["vlpds.test".into()] } else { reference })
+}
+
+/// At least two refresh intervals, so every node has stopped giving out
+/// handles under a retiring domain before it can go.
+fn retire_grace(v: &str) -> anyhow::Result<Duration> {
+    let g = vlpds::retention::parse_duration(v)?;
+    let min = 2 * vlpds::xrpc::managed_domains::REFRESH_EVERY;
+    anyhow::ensure!(g >= min, "--handle-domain-retire-grace must be at least {}s (got {v})", min.as_secs());
+    Ok(g)
 }
 
 fn flag_or_env(v: &Option<String>, k: &str) -> Option<String> {

@@ -16,6 +16,10 @@ pub struct Config {
     pub public_url: String,
     /// The service handle domains, primary first (`crate::handle_domains`).
     pub handle_domains: Vec<String>,
+    /// How long a managed handle domain stays retiring before it can be
+    /// removed (`xrpc::managed_domains`): every node must have stopped
+    /// giving out handles under it.
+    pub handle_domain_retire_grace: Duration,
     pub service_did: String,
     pub jwt_secret: String,
     pub admin_token: String,
@@ -248,6 +252,7 @@ impl Default for Config {
         Config {
             public_url: "http://localhost:2583".into(),
             handle_domains: vec!["vlpds.test".into()],
+            handle_domain_retire_grace: Duration::from_secs(120),
             service_did: "did:web:localhost".into(),
             jwt_secret: DEV_JWT_SECRET.into(),
             admin_token: DEV_ADMIN_TOKEN.into(),
@@ -346,8 +351,9 @@ impl Default for Config {
 }
 
 pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
-    let handle_domains =
-        Arc::new(crate::handle_domains::HandleDomains::new(&cfg.handle_domains).map_err(|e| anyhow::anyhow!(e))?);
+    let handle_domain_set = Arc::new(xrpc::managed_domains::Live::new(
+        crate::handle_domains::HandleDomains::new(&cfg.handle_domains).map_err(|e| anyhow::anyhow!(e))?,
+    ));
     let ui = Arc::new(xrpc::WebUi::load(cfg.ui_dir.as_deref())?);
     let plan = crate::memory::init(cfg.memory_plan()?);
     let (caps, budget) = crate::caches::resolve(
@@ -543,6 +549,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         };
         crate::reshard_gc::ReshardGc::new(state_store.clone(), gc, hooks).spawn();
     }
+    xrpc::managed_domains::load_initial(&handle_domain_set, &state_store).await?;
     tracing::info!(
         node = %cluster.cfg.node_id, log = %cluster.log_id, writer = cluster.writer, shards = cluster.layout().shards.len(),
         owned = cluster.owned().len(), elapsed_ms = started.elapsed().as_millis() as u64, "node ready"
@@ -556,7 +563,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         firehose,
         tids: crate::tid::TidClock::new(),
         public_url: cfg.public_url.clone(),
-        handle_domains,
+        handle_domain_set,
         write_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_writes)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_queued_reads.max(1))),
         exports: Arc::new(tokio::sync::Semaphore::new(cfg.max_exports.max(1))),

@@ -360,6 +360,27 @@ a name in that domain's namespace. updateHandle answers 400 `UnsupportedDomain`,
 page only offers the home domain. Admins (`updateAccountHandle`) may use any domain. With one
 domain nothing changes.
 
+#### Handle domains added at runtime
+
+Domains can also be added and removed without a restart, from the console's Handle domains page,
+`vlpds admin handle-domains`, or `vlpds.admin.addHandleDomain` / `removeHandleDomain` /
+`getHandleDomains`. They're stored in the bucket (`config/handle-domains.json`) and come after the
+configured ones. Every node re-reads them every 10 s, and the node that made a change asks the
+others to re-read at once. The configured domains can't be changed this way.
+
+```steps
+- title: Add
+  body: "The node first asks every node to scan its shards. It refuses while an account's handle would come under the new domain (an own-domain handle like `alice.new.example` when adding `new.example`), and while any node doesn't answer: unreachable, or on a build without this. Set up the domain's DNS first."
+- title: Retire
+  body: "The first remove call. The domain leaves describeServer and gives out no new handles (sign-up, createAccount, updateHandle, renames by an admin), but every handle under it keeps resolving. Adding it again puts it back in service."
+- title: Remove
+  body: "A second remove call, after `--handle-domain-retire-grace` (2 min). It scans every shard again and removes the domain only if no account holds a handle under it. Deleted accounts don't count, and neither do deactivated ones whose DID document now names another PDS (they migrated away). Otherwise it names the accounts, which you migrate, rename or delete first."
+```
+
+Both scans need every node to answer, so a change waits out a deploy. A node started on an older
+build doesn't know these domains at all, so roll back only to a build that has this, or retire the
+domains first.
+
 ### Changing a handle on the account page
 
 ```steps

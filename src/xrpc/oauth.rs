@@ -1596,11 +1596,12 @@ struct SignupValues {
 fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, status: StatusCode) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
+    let domains = app.handle_domains().claimable_names();
     let body = ui::signup(
         &flow.ctx(&csrf, &name),
         &ui::SignupForm {
             handle: &v.handle,
-            domains: app.handle_domains.all(),
+            domains: &domains,
             domain: &v.domain,
             email: &v.email,
             invite_code: &v.invite_code,
@@ -1638,11 +1639,11 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
     }
     // the form asks for the first label; a full handle under one of our
     // domains is fine too
-    let domains = &app.handle_domains;
+    let domains = app.handle_domains();
     let handle = if domains.longest_match(&v.handle).is_some() {
         v.handle.clone()
     } else {
-        let picked = Some(v.domain.as_str()).filter(|d| domains.contains(d)).unwrap_or(domains.primary());
+        let picked = Some(v.domain.as_str()).filter(|d| domains.claimable(d)).unwrap_or(domains.primary());
         format!("{}.{picked}", v.handle)
     };
     let inp = super::server::CreateAccountIn {

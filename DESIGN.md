@@ -4071,6 +4071,46 @@ checkHandle, checkHandleAvailability, OAuth sign-up, `/tls-check`,
 - Admins (`updateAccountHandle`), createAccount and imports may use any
   listed domain: who gets an account where is the operator's call (invites).
 
+### Managed domains (`src/xrpc/managed_domains.rs`)
+
+Domains added at runtime live in `config/handle-domains.json`
+(`{domains: [{domain, state: active|retiring, addedAt, retiringSince?}]}`,
+`flatten extra` at both levels), after the configured ones; the configured
+ones can't be removed or shadowed through the API. Each node holds the
+merged set in `App::handle_domain_set`, reads the object before it serves
+(`load_initial`: a handle under a managed domain must never look unknown;
+it gives up, and the node doesn't start, after five tries), re-reads it
+every 10 s, and on `/internal/v1/handle-domains/reload`, which the node that
+changed it calls on every peer. A failed re-read keeps the last set.
+
+- **Retiring** domains still match (well-known, `/tls-check`, resolveHandle,
+  `longest_match`) but aren't `claimable`: `ensure_service_handle` refuses
+  them (createAccount, updateHandle, admin renames, sign-up) and
+  describeServer leaves them out.
+- **Removal is two calls.** The first CASes the entry to retiring. The second
+  is refused until `--handle-domain-retire-grace` (2 min, at least two
+  refresh intervals) has passed since then, so every node has stopped
+  claiming handles under it and claims in flight have finished, then scans
+  every shard and CASes the entry away only if no account's longest match
+  is the domain (deleted accounts don't count; deactivated ones whose DID
+  document names another PDS don't either). The CAS is conditional on the
+  same `retiringSince`, so a re-add and re-retire in between makes it retry.
+- **Adding** scans first: refused if an account's handle would change domain
+  (an own-domain handle under it, or the domain itself), since handles
+  are only checked against the rules when they change.
+- **The scans are the capability check.** They scatter-gather
+  `/internal/v1/handle-domains/accounts` with a 120 s per-peer deadline and
+  refuse (503 `HandleDomainScanIncomplete`) unless every shard was covered
+  and no peer was unreachable or answered 404, the "unsupported" of a
+  build without this. That keeps a change from being made while an older
+  node could act on the old set. It is not a feature level: a node rolled
+  back to an older build after a domain is added doesn't know it (handles
+  under it stop resolving there, and its sign-ups refuse it). Rolling back
+  means retiring and removing managed domains first, or a level gating
+  them (not done here).
+- No new account state: removal and its checks read the account rows the
+  shards already have.
+
 ## Moderation service auth, earned invites, disposable email, DNS handles
 
 Four reference PDS features, ported with the reference's behaviour and

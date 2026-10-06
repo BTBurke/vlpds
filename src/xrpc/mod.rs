@@ -19,6 +19,7 @@ pub mod import_budget;
 mod import_stream;
 pub mod internal;
 pub mod key_rotation;
+pub mod managed_domains;
 pub mod mfa;
 pub mod moderation;
 pub mod oauth;
@@ -98,7 +99,9 @@ pub struct App {
     pub firehose: Arc<Firehose>,
     pub tids: TidClock,
     pub public_url: String,
-    pub handle_domains: Arc<crate::handle_domains::HandleDomains>,
+    /// The handle domains, configured and managed (`managed_domains`);
+    /// read them with [`App::handle_domains`].
+    pub handle_domain_set: Arc<managed_domains::Live>,
     /// Writes beyond this many in flight get a fast 503. A write's permit
     /// travels with its queued message, so it is held until its worker takes
     /// it, even if the handler is gone.
@@ -130,6 +133,11 @@ pub struct App {
 type AppState = State<Arc<App>>;
 
 impl App {
+    /// The handle domains in force on this node now.
+    pub fn handle_domains(&self) -> Arc<crate::handle_domains::HandleDomains> {
+        self.handle_domain_set.current()
+    }
+
     pub fn partition(&self, did: &str) -> Result<Arc<Partition>, XrpcError> {
         let p = self.partitions.shard_of(did);
         // moving or not reopened yet: nothing was done, so the entry node
@@ -325,7 +333,8 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(blobs::routes())
                 .merge(admin::routes())
                 .merge(admin_tools::routes())
-                .merge(crawlers::routes()),
+                .merge(crawlers::routes())
+                .merge(managed_domains::routes()),
         ))
         .merge(proxy::routes())
         .merge(oauth::routes())
@@ -344,6 +353,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(proxy::fallback);
     ratelimits::start(&app);
     crawlers::start(&app);
+    managed_domains::start(&app);
     let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
         let limiter = app.ratelimit.clone();

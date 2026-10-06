@@ -133,6 +133,22 @@ pub enum Cmd {
     /// Cluster-wide operations: status, feature levels.
     #[command(subcommand)]
     Cluster(ClusterCmd),
+    /// Handle domains: the configured ones and those added at runtime.
+    #[command(subcommand)]
+    HandleDomains(HandleDomainsCmd),
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum HandleDomainsCmd {
+    /// Every handle domain, with where it comes from and its state.
+    List,
+    /// Give out handles under a new domain (refused while an account's
+    /// handle would come under it, or a node can't answer).
+    Add { domain: String },
+    /// First call: stop giving out handles under the domain. A later call,
+    /// after the grace period: remove it, once no account holds a handle
+    /// under it.
+    Remove { domain: String },
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -485,6 +501,46 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
                 "After        : {}",
                 if r["after"]["ok"] == json!(true) { "ok".to_string() } else { s(&r["after"]["problems"]) }
             )?;
+            Ok(())
+        }
+        Cmd::HandleDomains(HandleDomainsCmd::List) => {
+            let r = c.get("vlpds.admin.getHandleDomains", &[]).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            for d in r["domains"].as_array().cloned().unwrap_or_default() {
+                let mut line = format!("{:<40} {:<8} {}", s(&d["domain"]), s(&d["source"]), s(&d["state"]));
+                if d["removableAfter"].is_string() {
+                    line.push_str(&format!(" (removable after {})", s(&d["removableAfter"])));
+                }
+                writeln!(out, "{line}")?;
+            }
+            Ok(())
+        }
+        Cmd::HandleDomains(HandleDomainsCmd::Add { domain }) => {
+            let r = c.post("vlpds.admin.addHandleDomain", &json!({"domain": domain})).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "{}: {} ({})", s(&r["domain"]), s(&r["state"]), s(&r["source"]))?;
+            Ok(())
+        }
+        Cmd::HandleDomains(HandleDomainsCmd::Remove { domain }) => {
+            let r = c.post("vlpds.admin.removeHandleDomain", &json!({"domain": domain})).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            if r["state"] == json!("retiring") {
+                writeln!(
+                    out,
+                    "{}: retiring, no new handles under it. {} account(s) still hold one. Run this again after {} to remove it.",
+                    s(&r["domain"]),
+                    s(&r["blockingAccounts"]),
+                    s(&r["removableAfter"])
+                )?;
+            } else {
+                writeln!(out, "{}: {}", s(&r["domain"]), s(&r["state"]))?;
+            }
             Ok(())
         }
         Cmd::Cluster(ClusterCmd::Status) => {

@@ -627,7 +627,7 @@ async fn update_account_handle(
     let handle = normalize_handle(&inp.handle)?;
     // reference allowAnyValid: no slur or reserved-name checks, but a
     // service-domain handle still has to be one 3-18 char label
-    if app.handle_domains.longest_match(&handle).is_some() {
+    if app.handle_domains().longest_match(&handle).is_some() {
         super::server::ensure_service_handle(&app, &handle, true)?;
     }
     ensure_account(&app, &inp.did).await?;

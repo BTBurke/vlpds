@@ -255,7 +255,7 @@ has the flags the sections above don't cover.
 
 | Group | Flags |
 |---|---|
-| Identity | `--public-url`, `--handle-domains` (comma-separated, the first is the primary; `--handle-domain` sets one, and the reference's `PDS_SERVICE_HANDLE_DOMAINS` is the fallback; see [Handle domains](email-and-moderation.md#handle-domains)), `--service-did` (`did:web:<hostname>`), `--node-id` (default `single`, keep it stable across restarts) |
+| Identity | `--public-url`, `--handle-domains` (comma-separated, the first is the primary; `--handle-domain` sets one, and the reference's `PDS_SERVICE_HANDLE_DOMAINS` is the fallback; see [Handle domains](email-and-moderation.md#handle-domains); `--handle-domain-retire-grace` (2 min, at least 20 s) for removing ones added at runtime), `--service-did` (`did:web:<hostname>`), `--node-id` (default `single`, keep it stable across restarts) |
 | Listeners | `--listen` (`0.0.0.0:2583`), `--metrics-listen` (`127.0.0.1:9583`, or `app` for the app port), `--listen-backlog` |
 | Peers (clusters only) | `--peer-listen`, `--peer-tls-dir`, `--advertise-url` (all three or none, see [Scaling and clustering](scaling-and-clustering.md#peer-tls)), `--peer-connections` |
 | Object store | `--s3-endpoint`, `--s3-bucket`, `--s3-region`, `--s3-access-key[-file]`, `--s3-secret-key[-file]`, `--prefix`, `--store-inflight` (1,024), `--log-store-inflight` (256) |

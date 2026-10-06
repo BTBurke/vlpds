@@ -29,6 +29,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/internal/v1/sync/listRepos", get(sync_list_repos))
         .route("/internal/v1/sync/listReposByCollection", get(sync_list_repos_by_collection))
         .merge(super::ratelimits::internal_routes())
+        .merge(super::managed_domains::internal_routes())
         .merge(super::firehose_subs::internal_routes())
 }
 
@@ -754,6 +755,11 @@ enum LegError {
 
 /// GETs `path?query` on every live peer concurrently.
 pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered {
+    gather_timeout(app, path, query, GATHER_TIMEOUT).await
+}
+
+/// [`gather`] with a longer per-peer deadline, for scans of whole shards.
+pub async fn gather_timeout(app: &App, path: &str, query: &[(&str, String)], timeout: std::time::Duration) -> Gathered {
     let Some(c) = &app.cluster else {
         return Gathered::default();
     };
@@ -767,7 +773,7 @@ pub async fn gather(app: &App, path: &str, query: &[(&str, String)]) -> Gathered
                 .get(format!("{}{path}", l.addr.trim_end_matches('/')))
                 .header(HDR, &app.config.internal_token)
                 .query(query)
-                .timeout(GATHER_TIMEOUT)
+                .timeout(timeout)
                 .send()
                 .await
                 .map_err(|e| LegError::Failed(e.to_string()))?;

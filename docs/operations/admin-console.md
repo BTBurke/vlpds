@@ -3,7 +3,7 @@ title: Admin console and CLI
 section: Operations
 order: 111
 status: ready
-summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, firehose subscribers, cluster status and metrics."
+summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, handle domains, firehose subscribers, cluster status and metrics."
 ---
 
 ```hero
@@ -24,7 +24,7 @@ diagram:
     - "api -> owner: per DID"
     - { from: caddy.t, to: api.b, label: never public, dash: true, arrow: none }
 facts:
-  - { value: "8", unit: pages, label: in the console, note: "cluster, live metrics, accounts, moderation, invites, rate limits, relays, firehose" }
+  - { value: "9", unit: pages, label: in the console, note: "cluster, live metrics, accounts, moderation, invites, rate limits, relays, handle domains, firehose" }
   - { value: "2 s", label: cluster view refresh, note: "getClusterStatus polled from the node you opened", tone: blue }
   - { value: "pdsadmin", label: every command covered, note: "plus the reference's maintenance scripts and cluster ops", tone: violet }
   - { value: "0", label: direct bucket access, note: "the CLI needs only a node URL and the admin token", tone: amber }
@@ -83,11 +83,12 @@ cluster, and account pages are routed to each account's owner.
 | Invite codes | Every code, newest first, one per row: uses left out of its total, when it was made, who made it and for whom, who used it, and whether it's active, disabled or used up | Create codes (count, uses, for an account) · copy a code, or a usable code's migrate or sign-up link · disable one code, or select several and disable them together. |
 | Rate limits | Each bucket's busiest key, 429s in the last minute and 15 minutes, a 429/s chart, top keys, recent 429s by route, and each node's applied config version | Change a bucket's points, window or on/off · add routes · add IP, CIDR or DID overrides (exempt or a custom limit) · a global off switch. Changes apply to every node within seconds and are kept, with your name, in the last 50 changes. See [Rate limits](rate-limits.md#changing-limits-live). |
 | Relays | The relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, and the minimum interval | Add or remove relays, reset to the flag's list, change the interval, request a crawl now · click a relay to copy it. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
+| Handle domains | Every handle domain: from `--handle-domains` or added here, in service or retiring (and when it can be removed) | Add a domain · retire one added here, put it back in service, or remove it once no account holds a handle under it. See [Handle domains](email-and-moderation.md#handle-domains-added-at-runtime). |
 | Firehose | Every subscribeRepos connection on every node, every 5 s: subscribers, live vs backfilling, this PDS's events/s and the bytes/s sent · per connection its `#conn` number and node, client address with its AS and verified reverse DNS name, the relay it matched, user agent (first 120 characters), how long it's been connected, start cursor and shard, state, lag, events/s against the PDS's rate, and events and bytes sent · the last 50 disconnects per node with their reason | Read only. Click a client address, reverse DNS name or user agent to copy it. A live connection well under the PDS's events/s is falling behind. |
 
 The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
 every node reads the same one. `{}` means the built-in defaults. The relay list lives next to it in
-`config/crawlers.json`.
+`config/crawlers.json`, and the handle domains added here in `config/handle-domains.json`.
 
 Each node serves its own firehose subscribers, so the Firehose page calls
 `vlpds.admin.listFirehoseSubscribers` on the node you opened and that node asks its peers over the
@@ -139,6 +140,7 @@ first, and refuse to run off a terminal without `--yes`.
 | Identity | `publish-identity [DID…] [--file F]`, `rotate-keys [DID…] [--generate]`, `rotate-plc-keys`, `ensure-recovery-key` |
 | Repos | `check-repo DID`, `rebuild-repo DID [--dry-run]` |
 | Secrets | `rewrap-secrets [--dry-run] [--check-versions]` |
+| Handle domains | `handle-domains list`, `handle-domains add DOMAIN`, `handle-domains remove DOMAIN` (run twice: retire, then remove) |
 | Cluster | `cluster status`, `cluster finalize [--level N]`, `cluster lower --level N`, `layout`, `shard-split`, `shard-merge`, `reshard-abort` |
 | Peer TLS | `tls ca`, `tls issue`, `tls show` (local files only, no node involved) |
 

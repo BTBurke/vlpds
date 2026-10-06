@@ -934,8 +934,14 @@ pub(super) fn ensure_no_slur(handle: &str) -> XResult<()> {
 
 /// The reference's ensureHandleServiceConstraints.
 pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: bool) -> XResult<()> {
-    let front = app.handle_domains.longest_match(handle).and_then(|d| handle.strip_suffix(d)?.strip_suffix('.'));
-    let Some(front) = front else {
+    let set = app.handle_domains();
+    let Some(domain) = set.longest_match(handle) else {
+        return Err(XrpcError::bad("UnsupportedDomain", "Not a supported handle domain"));
+    };
+    if !set.claimable(domain) {
+        return Err(XrpcError::bad("UnsupportedDomain", "Handles under this domain are no longer given out"));
+    }
+    let Some(front) = handle.strip_suffix(domain).and_then(|f| f.strip_suffix('.')) else {
         return Err(XrpcError::bad("UnsupportedDomain", "Not a supported handle domain"));
     };
     if front.contains('.') {
@@ -1269,7 +1275,7 @@ async fn describe_server(State(app): AppState) -> Json<J> {
     }
     Json(json!({
         "did": app.jwt.service_did,
-        "availableUserDomains": app.handle_domains.available(),
+        "availableUserDomains": app.handle_domains().available(),
         "inviteCodeRequired": app.config.invite_required,
         "blobUploadLimit": app.config.max_blob_size,
         "links": links,
@@ -3067,7 +3073,8 @@ async fn check_handle_availability(State(app): AppState, Query(q): Query<HandleA
             "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultAvailable"},
         })));
     }
-    let domain = app.handle_domains.longest_match(&handle).unwrap_or(app.handle_domains.primary());
+    let set = app.handle_domains();
+    let domain = set.longest_match(&handle).filter(|d| set.claimable(d)).unwrap_or(set.primary());
     let suffix = format!(".{domain}");
     let base: String =
         handle.split('.').next().unwrap_or("user").chars().filter(|c| c.is_ascii_alphanumeric()).take(14).collect();

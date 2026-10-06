@@ -9,6 +9,7 @@ import { Metrics } from './Metrics'
 import { AccountDetail, Accounts } from './Accounts'
 import { Invites } from './Invites'
 import { CaseDetail, Moderation } from './Moderation'
+import { HandleDomains } from './HandleDomains'
 import { RateLimits } from './RateLimits'
 import { Relays } from './Relays'
 
@@ -20,6 +21,7 @@ const TABS = [
   { to: '/admin/invites', label: 'Invite codes' },
   { to: '/admin/ratelimits', label: 'Rate limits' },
   { to: '/admin/relays', label: 'Relays' },
+  { to: '/admin/handle-domains', label: 'Handle domains' },
   { to: '/admin/firehose', label: 'Firehose' },
 ]
 
@@ -38,6 +40,7 @@ export function AdminApp({ path }: { path: string }) {
   else if (p === '/admin/invites') page = <Invites />
   else if (p === '/admin/ratelimits') page = <RateLimits />
   else if (p === '/admin/relays') page = <Relays />
+  else if (p === '/admin/handle-domains') page = <HandleDomains />
   else if (p === '/admin/firehose') page = <Firehose />
   else page = <Notice kind="warn">There is no console page at {p}.</Notice>
   const current = (to: string) => (to === '/admin' ? p === '/admin' : p === to || p.startsWith(`${to}/`))
