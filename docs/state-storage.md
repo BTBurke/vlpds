@@ -87,7 +87,7 @@ notes:
 | `C/{collection}\0{did}` | empty | `listReposByCollection` |
 | `D/{did}` | `deleteAfter` | deactivated accounts scheduled for deletion ([Scheduled deletion](operations/email-and-moderation.md#scheduled-deletion)) |
 | `p/{routing}\0{name}` | varies | private state: sessions, app passwords, email tokens, 2FA, OAuth, `sec/` security controls, the sign-in log and trusted browsers (`signin/`, `trust/`) |
-| `T/` | totals | the slot's account counts (`vlpds_accounts`) |
+| `T/` | totals | the slot's account counts (`vlpds_accounts`) and its active accounts by handle suffix ([handle domains](operations/handle-domains.md#counting-accounts)) |
 | **Shard** | | |
 | `meta/applied2` | log id, ordinal | the applied marker, which is where replay starts |
 | `meta/recent` | DIDs | recently written repos the next owner preloads |

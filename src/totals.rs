@@ -17,18 +17,32 @@
 //! seq, `0x01 ‖ slot ‖ T/ ‖ seq`, which is just as idempotent; the load adds
 //! a slot's delta rows to its row, and the slot's next row write deletes
 //! them.
+//!
+//! Active accounts are also counted by their handle's suffix (the handle
+//! without its first label), and `vlpds.admin.listHandleDomains` maps each
+//! suffix to the longest served domain it is or is under when it reads. Why
+//! the suffix and not the served domain: which domains are served changes
+//! at runtime and reaches each node a moment apart, so a count keyed by
+//! domain would need every slot recounted, in log order, on every add and
+//! remove. A suffix depends only on the account row, so it moves, splits
+//! and replays like the rest of the row. A row written before suffixes were
+//! counted lacks them: the load counts that slot's account rows from the
+//! same snapshot as its rows, and writes the result back.
 
 use crate::segment::Mutation;
 use crate::state::{self, Account, Head};
 use crate::tid::Tid;
 use bytes::{BufMut, Bytes};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 pub const STATUSES: [&str; 5] = ["active", "deactivated", "takendown", "suspended", "other"];
 
 /// (label, days): a window counts the repos whose latest commit's UTC day
 /// is at most `days` days before today's, so "1d" is yesterday and today.
 pub const WINDOWS: [(&str, u32); 3] = [("1d", 1), ("7d", 7), ("30d", 30)];
+
+/// Rows of slots seeded by the load written per log entry.
+const SAVE_PER_ENTRY: usize = 512;
 
 /// Days a row keeps, past the widest window: a shard's next owner whose
 /// clock is a little behind still finds every day of its windows.
@@ -76,18 +90,60 @@ impl RepoKey {
     }
 }
 
+/// The handle suffix an account counts under: active accounts only.
+pub fn suffix_of(account: &Account) -> Option<Box<str>> {
+    account.status.is_none().then(|| crate::handle_domains::handle_suffix(&account.handle)).flatten()
+}
+
+/// What an account counts toward, for changes that may touch its handle
+/// or status.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Counted {
+    pub repo: Option<RepoKey>,
+    pub suffix: Option<Box<str>>,
+}
+
+impl Counted {
+    pub fn of(account: &Account, head: &Head) -> Counted {
+        Counted { repo: RepoKey::of(account, head), suffix: suffix_of(account) }
+    }
+}
+
 /// One repo's change: before -> after (None = no account).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Delta {
     pub slot: u16,
     pub before: Option<RepoKey>,
     pub after: Option<RepoKey>,
+    /// The suffix it counts under, before -> after, when that changed.
+    pub suffix: Option<(Option<Box<str>>, Option<Box<str>>)>,
 }
 
 impl Delta {
-    /// None when nothing it counts toward changed.
+    /// A change that leaves the handle and status alone (a commit). None
+    /// when nothing it counts toward changed.
     pub fn new(did: &str, before: Option<RepoKey>, after: Option<RepoKey>) -> Option<Delta> {
-        (before != after).then(|| Delta { slot: crate::slots::slot_of(did), before, after })
+        (before != after).then(|| Delta { slot: crate::slots::slot_of(did), before, after, suffix: None })
+    }
+
+    pub fn account(did: &str, before: Counted, after: Counted) -> Option<Delta> {
+        let suffix = (before.suffix != after.suffix).then_some((before.suffix, after.suffix));
+        (before.repo != after.repo || suffix.is_some()).then(|| Delta {
+            slot: crate::slots::slot_of(did),
+            before: before.repo,
+            after: after.repo,
+            suffix,
+        })
+    }
+
+    /// Changes nothing: the entry only carries rows of slots the load
+    /// seeded.
+    pub fn save_seeded() -> Delta {
+        Delta { slot: 0, before: None, after: None, suffix: None }
+    }
+
+    fn changes(&self) -> bool {
+        self.before != self.after || self.suffix.is_some()
     }
 }
 
@@ -98,6 +154,8 @@ pub struct Totals {
     /// (UTC day, repos whose latest commit is on it), ascending; days before
     /// the cutoff linger until the row's next write but are never counted.
     pub days: Vec<(u32, i64)>,
+    /// Active accounts by handle suffix ([`suffix_of`]).
+    pub suffixes: BTreeMap<Box<str>, i64>,
 }
 
 impl Totals {
@@ -117,11 +175,46 @@ impl Totals {
         }
     }
 
+    fn add_suffix(&mut self, s: &str, n: i64) {
+        match self.suffixes.get_mut(s) {
+            Some(c) => {
+                *c += n;
+                if *c == 0 {
+                    self.suffixes.remove(s);
+                }
+            }
+            None => _ = self.suffixes.insert(s.into(), n),
+        }
+    }
+
+    fn add_delta(&mut self, d: &Delta, cut: u32) {
+        for (k, n) in [(d.before, -1), (d.after, 1)] {
+            if let Some(k) = k {
+                self.add(k, n, cut);
+            }
+        }
+        if let Some((before, after)) = &d.suffix {
+            for (s, n) in [(before, -1), (after, 1)] {
+                if let Some(s) = s {
+                    self.add_suffix(s, n);
+                }
+            }
+        }
+    }
+
     fn prune(&mut self, cutoff: u32) {
         self.days.retain(|d| d.0 >= cutoff);
     }
 
     pub fn merge(&mut self, o: &Totals) {
+        self.merge_counts(o);
+        for (s, n) in &o.suffixes {
+            self.add_suffix(s, *n);
+        }
+    }
+
+    /// [`Totals::merge`] without the suffixes.
+    pub fn merge_counts(&mut self, o: &Totals) {
         for (a, b) in self.accounts.iter_mut().zip(o.accounts) {
             *a += b;
         }
@@ -147,9 +240,12 @@ impl Totals {
 
     /// Zigzag varints: the five status counts, the number of days, then
     /// per day its distance from the previous one (the first: absolute)
-    /// and its count. ~100 bytes for a slot active on every day kept.
+    /// and its count; then the number of suffixes, and per suffix its
+    /// length, its bytes and its count. ~100 bytes for a slot active on
+    /// every day kept, plus each suffix.
     pub fn encode(&self) -> Bytes {
-        let mut b = Vec::with_capacity(16 + 6 * self.days.len());
+        let suffix_bytes: usize = self.suffixes.keys().map(|s| s.len() + 4).sum();
+        let mut b = Vec::with_capacity(17 + 6 * self.days.len() + suffix_bytes);
         for a in self.accounts {
             put_varint(&mut b, zigzag(a));
         }
@@ -160,10 +256,22 @@ impl Totals {
             put_varint(&mut b, zigzag(n));
             prev = day;
         }
+        put_varint(&mut b, self.suffixes.len() as u64);
+        for (s, n) in &self.suffixes {
+            put_varint(&mut b, s.len() as u64);
+            b.extend_from_slice(s.as_bytes());
+            put_varint(&mut b, zigzag(*n));
+        }
         b.into()
     }
 
-    pub fn decode(mut b: &[u8]) -> anyhow::Result<Totals> {
+    pub fn decode(b: &[u8]) -> anyhow::Result<Totals> {
+        Ok(Totals::decode_row(b)?.0)
+    }
+
+    /// The totals, and whether the row counts suffixes (rows written before
+    /// they were counted end after the days).
+    pub fn decode_row(mut b: &[u8]) -> anyhow::Result<(Totals, bool)> {
         let mut t = Totals::default();
         for a in &mut t.accounts {
             *a = unzigzag(get_varint(&mut b)?);
@@ -177,8 +285,21 @@ impl Totals {
                 .ok_or_else(|| anyhow::anyhow!("totals row: day overflow"))?;
             t.days.push((day, unzigzag(get_varint(&mut b)?)));
         }
+        if b.is_empty() {
+            return Ok((t, false));
+        }
+        let n = get_varint(&mut b)? as usize;
+        anyhow::ensure!(n <= 1 << 20, "totals row: {n} suffixes");
+        for _ in 0..n {
+            let len = get_varint(&mut b)? as usize;
+            anyhow::ensure!(len <= b.len(), "totals row: truncated suffix");
+            let (s, rest) = b.split_at(len);
+            let s = std::str::from_utf8(s).map_err(|_| anyhow::anyhow!("totals row: suffix not UTF-8"))?;
+            b = rest;
+            t.suffixes.insert(s.into(), unzigzag(get_varint(&mut b)?));
+        }
         anyhow::ensure!(b.is_empty(), "totals row: {} trailing bytes", b.len());
-        Ok(t)
+        Ok((t, true))
     }
 }
 
@@ -227,6 +348,17 @@ struct Slot {
     deltas: Vec<Bytes>,
 }
 
+/// One slot's rows as [`ShardTotals::read`] found them.
+#[derive(Debug, Default)]
+pub struct SlotRows {
+    pub slot: u16,
+    pub row: Option<Totals>,
+    pub deltas: Vec<(Bytes, Totals)>,
+    /// The slot's active accounts by suffix, counted from its account rows
+    /// in the read's snapshot, when a row predates suffix counts.
+    pub seed: Option<BTreeMap<Box<str>, i64>>,
+}
+
 /// A shard's totals as of the last entry the sequencer took. They load in
 /// the background after the shard opens (`spawn_load`); until then a slot's
 /// change is written as a delta row next to its row, and the load adds the
@@ -239,12 +371,20 @@ pub struct ShardTotals {
     /// Over the loaded slots; every slot once `loaded`.
     sum: Totals,
     loaded: bool,
+    /// Slots the load seeded whose rows aren't written yet.
+    unsaved: BTreeSet<u16>,
 }
 
 impl Default for ShardTotals {
     /// Loaded, with no rows: a shard with nothing in it yet.
     fn default() -> ShardTotals {
-        ShardTotals { slots: HashMap::new(), pending: HashMap::new(), sum: Totals::default(), loaded: true }
+        ShardTotals {
+            slots: HashMap::new(),
+            pending: HashMap::new(),
+            sum: Totals::default(),
+            loaded: true,
+            unsaved: BTreeSet::new(),
+        }
     }
 }
 
@@ -254,28 +394,64 @@ impl ShardTotals {
         ShardTotals { loaded: false, ..Default::default() }
     }
 
-    /// Every slot's rows: (slot, its row, its delta rows). One family scan;
-    /// delta rows sort right after their slot's row.
-    pub async fn read<R: slatedb::DbReadOps + ?Sized>(
-        db: &R,
-    ) -> anyhow::Result<Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>> {
+    /// Every slot's rows, from one snapshot: one family scan (delta rows
+    /// sort right after their slot's row), and a scan of the account rows
+    /// when some slot's rows predate suffix counts.
+    pub async fn read(db: &slatedb::Db) -> anyhow::Result<Vec<SlotRows>> {
+        #[derive(serde::Deserialize)]
+        struct Row<'a> {
+            #[serde(borrow)]
+            handle: std::borrow::Cow<'a, str>,
+            #[serde(borrow, default)]
+            status: Option<std::borrow::Cow<'a, str>>,
+        }
+        let snap = db.snapshot().await?;
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
-        let mut scan = state::FamilyScan::new(db, FAMILY, None, &opts).await?;
-        let mut out: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> = Vec::new();
+        let mut scan = state::FamilyScan::new(snap.as_ref(), FAMILY, None, &opts).await?;
+        let mut out: Vec<SlotRows> = Vec::new();
+        let mut stale = BTreeSet::new();
         while let Some(kv) = scan.next().await? {
             let Some(slot) = state::key_slot(&kv.key) else { continue };
             let body = state::key_body(&kv.key);
-            let row = Totals::decode(&kv.value).map_err(|e| e.context(format!("slot {slot}")))?;
-            if out.last().is_none_or(|o| o.0 != slot) {
-                out.push((slot, None, Vec::new()));
+            let (row, counts_suffixes) =
+                Totals::decode_row(&kv.value).map_err(|e| e.context(format!("slot {slot}")))?;
+            if !counts_suffixes {
+                stale.insert(slot);
+            }
+            if out.last().is_none_or(|o| o.slot != slot) {
+                out.push(SlotRows { slot, ..Default::default() });
             }
             let o = out.last_mut().unwrap();
             match body.len() - FAMILY.len() {
-                0 => o.1 = Some(row),
-                8 => o.2.push((kv.key, row)),
+                0 => o.row = Some(row),
+                8 => o.deltas.push((kv.key, row)),
                 n => anyhow::bail!("slot {slot}: totals key with a {n}-byte suffix"),
             }
         }
+        if stale.is_empty() {
+            return Ok(out);
+        }
+        let started = std::time::Instant::now();
+        let mut seeds: HashMap<u16, BTreeMap<Box<str>, i64>> = stale.iter().map(|s| (*s, BTreeMap::new())).collect();
+        let mut accts = state::FamilyScan::new(snap.as_ref(), state::ACCOUNT_FAMILY, None, &opts).await?;
+        while let Some(kv) = accts.next().await? {
+            let Some(seed) = state::key_slot(&kv.key).and_then(|s| seeds.get_mut(&s)) else { continue };
+            let Ok(a) = serde_json::from_slice::<Row>(&kv.value) else { continue };
+            if a.status.is_some() {
+                continue;
+            }
+            if let Some(s) = crate::handle_domains::handle_suffix(&a.handle) {
+                *seed.entry(s).or_default() += 1;
+            }
+        }
+        for o in &mut out {
+            o.seed = seeds.remove(&o.slot);
+        }
+        tracing::info!(
+            slots = stale.len(),
+            ms = started.elapsed().as_millis() as u64,
+            "account totals: counted handle suffixes of rows that lacked them"
+        );
         Ok(out)
     }
 
@@ -283,32 +459,39 @@ impl ShardTotals {
     /// A slot's row only changes once it is loaded, and until then its
     /// delta rows only accumulate, all of them in `pending` since the open:
     /// so the read plus the pending rows it missed is the slot's state.
-    pub fn install(&mut self, rows: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)>, today: u32) {
+    pub fn install(&mut self, rows: Vec<SlotRows>, today: u32) {
         if self.loaded {
             return;
         }
         let cut = cutoff(today);
-        for (slot, base, deltas) in rows {
-            let pending = self.pending.remove(&slot).unwrap_or_default();
-            self.install_slot(slot, base, deltas, pending, cut);
+        for r in rows {
+            let pending = self.pending.remove(&r.slot).unwrap_or_default();
+            self.install_slot(r, pending, cut);
         }
         for (slot, pending) in std::mem::take(&mut self.pending) {
-            self.install_slot(slot, None, Vec::new(), pending, cut);
+            self.install_slot(SlotRows { slot, ..Default::default() }, pending, cut);
         }
         self.sum.prune(cut);
         self.loaded = true;
     }
 
-    fn install_slot(
-        &mut self,
-        slot: u16,
-        base: Option<Totals>,
-        deltas: Vec<(Bytes, Totals)>,
-        pending: Vec<(Bytes, Totals)>,
-        cut: u32,
-    ) {
-        let mut s = Slot { row: base.unwrap_or_default(), deltas: Vec::new() };
-        for (k, d) in deltas.into_iter().chain(pending) {
+    fn install_slot(&mut self, r: SlotRows, pending: Vec<(Bytes, Totals)>, cut: u32) {
+        let seeded = r.seed.is_some();
+        let mut s = Slot { row: r.row.unwrap_or_default(), deltas: Vec::new() };
+        if let Some(seed) = r.seed {
+            s.row.suffixes = seed;
+        }
+        for (k, d) in r.deltas {
+            if !s.deltas.contains(&k) {
+                // a seed counted the account rows these changes are in
+                match seeded {
+                    true => s.row.merge_counts(&d),
+                    false => s.row.merge(&d),
+                }
+                s.deltas.push(k);
+            }
+        }
+        for (k, d) in pending {
             if !s.deltas.contains(&k) {
                 s.row.merge(&d);
                 s.deltas.push(k);
@@ -316,37 +499,50 @@ impl ShardTotals {
         }
         s.row.prune(cut);
         self.sum.merge(&s.row);
-        self.slots.insert(slot, s);
+        if seeded {
+            self.unsaved.insert(r.slot);
+        }
+        self.slots.insert(r.slot, s);
     }
 
     /// Appends the slot's new row (and the deletes of its delta rows) to
     /// `muts`, or a delta row while the shard's totals are loading. `seq`
-    /// is the entry's.
+    /// is the entry's. Once loaded, also the rows of up to
+    /// [`SAVE_PER_ENTRY`] slots the load seeded.
     pub fn apply(&mut self, d: &Delta, today: u32, seq: i64, muts: &mut Vec<Mutation>) {
         let cut = cutoff(today);
         if !self.loaded {
-            let mut delta = Totals::default();
-            for (k, n) in [(d.before, -1), (d.after, 1)] {
-                if let Some(k) = k {
-                    delta.add(k, n, cut);
-                }
+            if !d.changes() {
+                return;
             }
+            let mut delta = Totals::default();
+            delta.add_delta(d, cut);
             let k = delta_key(d.slot, seq);
             muts.push(Mutation { key: k.clone(), val: Some(delta.encode()) });
             self.pending.entry(d.slot).or_default().push((k, delta));
             return;
         }
-        let s = self.slots.entry(d.slot).or_default();
-        for (k, n) in [(d.before, -1), (d.after, 1)] {
-            if let Some(k) = k {
-                s.row.add(k, n, cut);
-                self.sum.add(k, n, cut);
-            }
+        if d.changes() {
+            let s = self.slots.entry(d.slot).or_default();
+            s.row.add_delta(d, cut);
+            self.sum.add_delta(d, cut);
+            s.row.prune(cut);
+            self.sum.prune(cut);
+            muts.push(Mutation { key: key(d.slot).into(), val: Some(s.row.encode()) });
+            muts.extend(s.deltas.drain(..).map(|key| Mutation { key, val: None }));
+            self.unsaved.remove(&d.slot);
         }
-        s.row.prune(cut);
-        self.sum.prune(cut);
-        muts.push(Mutation { key: key(d.slot).into(), val: Some(s.row.encode()) });
-        muts.extend(s.deltas.drain(..).map(|key| Mutation { key, val: None }));
+        for _ in 0..SAVE_PER_ENTRY {
+            let Some(slot) = self.unsaved.pop_first() else { break };
+            let Some(s) = self.slots.get_mut(&slot) else { continue };
+            muts.push(Mutation { key: key(slot).into(), val: Some(s.row.encode()) });
+            muts.extend(s.deltas.drain(..).map(|key| Mutation { key, val: None }));
+        }
+    }
+
+    /// Entries it takes to write every seeded slot's row.
+    pub fn unsaved_entries(&self) -> usize {
+        self.unsaved.len().div_ceil(SAVE_PER_ENTRY)
     }
 
     /// None while loading.
@@ -376,8 +572,13 @@ impl Drop for HeldLoads {
 }
 
 /// Loads `sink`'s totals in the background, retrying until they load or the
-/// shard closes.
-pub fn spawn_load(sink: &std::sync::Arc<crate::nodelog::ShardSink>, node_id: &str) {
+/// shard closes; then sends `log` the entries that write the rows of slots
+/// it seeded, so the next load doesn't count them again.
+pub fn spawn_load(
+    sink: &std::sync::Arc<crate::nodelog::ShardSink>,
+    node_id: &str,
+    log: tokio::sync::mpsc::Sender<crate::nodelog::LogEntry>,
+) {
     let weak = std::sync::Arc::downgrade(sink);
     let (id, db, node_id) = (sink.id, sink.db.clone(), node_id.to_string());
     tokio::spawn(async move {
@@ -390,8 +591,27 @@ pub fn spawn_load(sink: &std::sync::Arc<crate::nodelog::ShardSink>, node_id: &st
             match ShardTotals::read(db.as_ref()).await {
                 Ok(rows) => {
                     let Some(sink) = weak.upgrade() else { return };
-                    sink.totals.lock().install(rows, today());
+                    let saves = {
+                        let mut t = sink.totals.lock();
+                        t.install(rows, today());
+                        t.unsaved_entries()
+                    };
                     crate::metrics::TOTALS_LOAD_SECONDS.observe(started.elapsed().as_secs_f64());
+                    drop(sink);
+                    for _ in 0..saves {
+                        let e = crate::nodelog::LogEntry {
+                            shard: id,
+                            frames: Vec::new(),
+                            muts: Vec::new(),
+                            ack: None,
+                            pending: None,
+                            enqueued: std::time::Instant::now(),
+                            totals: Some(Delta::save_seeded()),
+                        };
+                        if log.send(e).await.is_err() {
+                            return;
+                        }
+                    }
                     return;
                 }
                 Err(e) => {
@@ -420,18 +640,36 @@ mod tests {
         assert_eq!(status_index(Some("deleted")), 4);
     }
 
+    fn suffixes(s: &[(&str, i64)]) -> BTreeMap<Box<str>, i64> {
+        s.iter().map(|(k, n)| (Box::from(*k), *n)).collect()
+    }
+
+    /// A row as a build that didn't count suffixes wrote it.
+    fn without_suffixes(t: &Totals) -> Bytes {
+        let b = Totals { suffixes: BTreeMap::new(), ..t.clone() }.encode();
+        b.slice(..b.len() - 1)
+    }
+
     #[test]
     fn rows_round_trip() {
         for t in [
             Totals::default(),
-            Totals { accounts: [1, 0, 7, -3, i64::MAX], days: vec![(20_000, 1), (20_001, -2), (20_031, 1 << 40)] },
+            Totals {
+                accounts: [1, 0, 7, -3, i64::MAX],
+                days: vec![(20_000, 1), (20_001, -2), (20_031, 1 << 40)],
+                suffixes: suffixes(&[("pds.test", 3), ("at.example.org", -1)]),
+            },
         ] {
-            assert_eq!(Totals::decode(&t.encode()).unwrap(), t);
+            assert_eq!(Totals::decode_row(&t.encode()).unwrap(), (t.clone(), true));
+            let old = Totals { suffixes: BTreeMap::new(), ..t.clone() };
+            assert_eq!(Totals::decode_row(&without_suffixes(&t)).unwrap(), (old, false));
         }
-        let mut b = Totals { accounts: [1; 5], days: vec![(9, 9)] }.encode().to_vec();
+        let t = Totals { accounts: [1; 5], days: vec![(9, 9)], suffixes: suffixes(&[("a.test", 1)]) };
+        let mut b = t.encode().to_vec();
         b.push(0);
         assert!(Totals::decode(&b).is_err());
         assert!(Totals::decode(&b[..3]).is_err());
+        assert!(Totals::decode(&b[..b.len() - 3]).is_err());
     }
 
     fn k(status: u8, day: u32) -> Option<RepoKey> {
@@ -450,7 +688,7 @@ mod tests {
     #[test]
     fn deltas_windows_and_cutoff() {
         let mut s = ShardTotals::default();
-        let d = |slot, before, after| Delta { slot, before, after };
+        let d = |slot, before, after| Delta { slot, before, after, suffix: None };
         let today = 20_000;
         apply(&mut s, d(1, None, k(0, today - 40)), today);
         apply(&mut s, d(1, None, k(0, today - 3)), today);
@@ -460,7 +698,7 @@ mod tests {
         let m = apply(&mut s, d(1, k(0, today - 3), k(0, today)), today);
         assert_eq!(
             Totals::decode(m[0].val.as_ref().unwrap()).unwrap(),
-            Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)] }
+            Totals { accounts: [2, 0, 0, 0, 0], days: vec![(today, 1)], suffixes: BTreeMap::new() }
         );
         let sum = s.sum().unwrap().clone();
         assert_eq!(sum.accounts, [2, 1, 1, 0, 0]);
@@ -480,19 +718,59 @@ mod tests {
         assert_eq!(s.sum().unwrap().accounts, [1, 0, 1, 1, 0]);
     }
 
-    /// What [`ShardTotals::read`] returns, from a key-value map.
-    fn read(db: &std::collections::BTreeMap<Bytes, Bytes>) -> Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> {
-        let mut out: Vec<(u16, Option<Totals>, Vec<(Bytes, Totals)>)> = Vec::new();
+    /// A handle change alone moves only the suffixes; a deactivation takes
+    /// the account out of them.
+    #[test]
+    fn handle_and_status_changes_move_suffixes() {
+        let mut s = ShardTotals::default();
+        let c = |status, sfx: Option<&str>| Counted { repo: k(status, 20_000), suffix: sfx.map(Box::from) };
+        let mut d = |before, after| {
+            apply(&mut s, Delta::account("did:plc:x", before, after).expect("a change"), 20_000);
+        };
+        d(Counted::default(), c(0, Some("pds.test")));
+        d(Counted::default(), c(0, Some("pds.test")));
+        d(c(0, Some("pds.test")), c(0, Some("at.example.org")));
+        d(c(0, Some("pds.test")), c(1, None));
+        assert!(Delta::account("did:plc:x", c(0, Some("a.test")), c(0, Some("a.test"))).is_none());
+        assert_eq!(s.sum().unwrap().suffixes, suffixes(&[("at.example.org", 1)]));
+        assert_eq!(s.sum().unwrap().accounts, [1, 1, 0, 0, 0]);
+    }
+
+    type Db = std::collections::BTreeMap<Bytes, Bytes>;
+    /// Account id -> the suffix it counts under: the account rows.
+    type Accounts = HashMap<u32, Option<Box<str>>>;
+
+    const SLOTS: u32 = 17;
+
+    /// What [`ShardTotals::read`] returns, from a key-value map and the
+    /// account rows.
+    fn read(db: &Db, accts: &Accounts) -> Vec<SlotRows> {
+        let mut out: Vec<SlotRows> = Vec::new();
+        let mut stale = BTreeSet::new();
         for (k, v) in db {
             let slot = state::key_slot(k).unwrap();
-            if out.last().is_none_or(|o| o.0 != slot) {
-                out.push((slot, None, Vec::new()));
+            if out.last().is_none_or(|o| o.slot != slot) {
+                out.push(SlotRows { slot, ..Default::default() });
             }
             let o = out.last_mut().unwrap();
-            let row = Totals::decode(v).unwrap();
+            let (row, counts) = Totals::decode_row(v).unwrap();
+            if !counts {
+                stale.insert(slot);
+            }
             match state::key_body(k).len() - FAMILY.len() {
-                0 => o.1 = Some(row),
-                _ => o.2.push((k.clone(), row)),
+                0 => o.row = Some(row),
+                _ => o.deltas.push((k.clone(), row)),
+            }
+        }
+        for o in &mut out {
+            if stale.contains(&o.slot) {
+                let mut seed = BTreeMap::new();
+                for (id, sfx) in accts {
+                    if let Some(sfx) = sfx.as_ref().filter(|_| (id % SLOTS) as u16 == o.slot) {
+                        *seed.entry(sfx.clone()).or_default() += 1;
+                    }
+                }
+                o.seed = Some(seed);
             }
         }
         out
@@ -501,17 +779,22 @@ mod tests {
     /// Randomized deltas against the per-repo truth, through reopens of the
     /// shard whose totals load at a random later point (from a read taken
     /// before more deltas, as the background load's scan can be), and
-    /// sometimes never before the next reopen.
+    /// sometimes never before the next reopen. Now and then every row is
+    /// rewritten as a build that didn't count suffixes left it, and the
+    /// load seeds them from the account rows.
     #[test]
     fn matches_truth_through_lazy_loads() {
         use rand::{Rng, SeedableRng};
+        const SUFFIXES: [&str; 4] = ["pds.test", "a.test", "at.a.test", "elsewhere.com"];
         let mut rng = rand::rngs::StdRng::seed_from_u64(7);
-        let mut repos: HashMap<u32, RepoKey> = HashMap::new();
-        let mut db = std::collections::BTreeMap::<Bytes, Bytes>::new();
+        let mut repos: HashMap<u32, Counted> = HashMap::new();
+        let mut accts = Accounts::new();
+        let mut db = Db::new();
         let mut s = ShardTotals::default();
         let mut snapshot: Option<Vec<_>> = None;
         let mut today = 20_000u32;
         let mut seq = 0i64;
+        let mut seeded = 0;
         for step in 0..30_000u32 {
             if rng.gen_ratio(1, 500) {
                 today += 1;
@@ -520,64 +803,117 @@ mod tests {
                 s = ShardTotals::unloaded();
                 snapshot = None;
             }
+            if rng.gen_ratio(1, 2_000) {
+                for v in db.values_mut() {
+                    *v = without_suffixes(&Totals::decode(v).unwrap());
+                }
+                s = ShardTotals::unloaded();
+                snapshot = None;
+                seeded += 1;
+            }
             if s.sum().is_none() {
                 if snapshot.is_none() && rng.gen_ratio(1, 20) {
-                    snapshot = Some(read(&db));
+                    snapshot = Some(read(&db, &accts));
                 } else if snapshot.is_some() && rng.gen_ratio(1, 20) {
                     s.install(snapshot.take().unwrap(), today);
                 }
             }
             let id = rng.gen_range(0..300u32);
-            let slot = (id % 17) as u16;
-            let before = repos.get(&id).copied();
+            let slot = (id % SLOTS) as u16;
+            let before = repos.get(&id).cloned().unwrap_or_default();
             let after = if rng.gen_ratio(1, 10) {
-                None
+                Counted::default()
             } else {
-                Some(RepoKey { status: rng.gen_range(0..5), day: today - rng.gen_range(0..2) })
+                let status = rng.gen_range(0..5);
+                let suffix = (status == 0).then(|| Box::from(SUFFIXES[rng.gen_range(0..SUFFIXES.len())]));
+                Counted { repo: Some(RepoKey { status, day: today - rng.gen_range(0..2) }), suffix }
             };
-            match after {
-                Some(a) => repos.insert(id, a),
+            match after.repo {
+                Some(_) => repos.insert(id, after.clone()),
                 None => repos.remove(&id),
             };
-            if before != after {
+            let mut muts = Vec::new();
+            if let Some(mut d) = Delta::account("did:plc:x", before, after.clone()) {
+                d.slot = slot;
                 seq += 1;
-                let mut muts = Vec::new();
-                s.apply(&Delta { slot, before, after }, today, seq, &mut muts);
-                for m in muts {
-                    match m.val {
-                        Some(v) => db.insert(m.key, v),
-                        None => db.remove(&m.key),
-                    };
-                }
+                s.apply(&d, today, seq, &mut muts);
+            } else if rng.gen_ratio(1, 4) {
+                seq += 1;
+                s.apply(&Delta::save_seeded(), today, seq, &mut muts);
+            }
+            // the entry's batch: the account row and the totals rows together
+            match after.repo {
+                Some(_) => accts.insert(id, after.suffix),
+                None => accts.remove(&id),
+            };
+            for m in muts {
+                match m.val {
+                    Some(v) => db.insert(m.key, v),
+                    None => db.remove(&m.key),
+                };
             }
             if step % 997 == 0 || step == 29_999 {
                 if s.sum().is_none() {
-                    s.install(read(&db), today);
+                    s.install(read(&db, &accts), today);
                     snapshot = None;
                 }
                 let mut want = Totals::default();
                 for r in repos.values() {
-                    want.accounts[r.status as usize] += 1;
+                    want.accounts[r.repo.unwrap().status as usize] += 1;
+                    if let Some(sfx) = &r.suffix {
+                        want.add_suffix(sfx, 1);
+                    }
                 }
                 let sum = s.sum().unwrap();
                 assert_eq!(sum.accounts, want.accounts, "step {step}");
+                assert_eq!(sum.suffixes, want.suffixes, "step {step}");
                 for (_, days) in WINDOWS {
-                    let n = repos.values().filter(|r| r.day + days >= today).count() as i64;
+                    let n = repos.values().filter(|r| r.repo.unwrap().day + days >= today).count() as i64;
                     assert_eq!(sum.written_within(days, today), n, "step {step}");
                 }
                 let mut reloaded = ShardTotals::unloaded();
-                reloaded.install(read(&db), today);
+                reloaded.install(read(&db, &accts), today);
                 assert_eq!(reloaded.sum().unwrap().accounts, want.accounts, "step {step}");
+                assert_eq!(reloaded.sum().unwrap().suffixes, want.suffixes, "step {step}");
                 for (_, days) in WINDOWS {
                     assert_eq!(reloaded.sum().unwrap().written_within(days, today), sum.written_within(days, today));
                 }
                 assert!(
                     db.len()
-                        <= 17
+                        <= SLOTS as usize
                             + s.pending.values().map(Vec::len).sum::<usize>()
                             + s.slots.values().map(|x| x.deltas.len()).sum::<usize>()
                 );
             }
         }
+        assert!(seeded > 5, "{seeded} reseeds");
+    }
+
+    /// Once the seeded rows are written, a reload counts no account rows.
+    #[test]
+    fn seeded_rows_are_saved() {
+        let mut db = Db::new();
+        let t = Totals { accounts: [2, 0, 0, 0, 0], days: vec![(20_000, 2)], suffixes: BTreeMap::new() };
+        for slot in 0..1_000u16 {
+            db.insert(key(slot).into(), without_suffixes(&t));
+        }
+        let accts: Accounts = (0..2 * SLOTS).map(|id| (id, Some(Box::from("pds.test")))).collect();
+        let mut s = ShardTotals::unloaded();
+        s.install(read(&db, &accts), 20_000);
+        assert_eq!(s.unsaved_entries(), 1_000usize.div_ceil(SAVE_PER_ENTRY));
+        for _ in 0..s.unsaved_entries() {
+            let mut muts = Vec::new();
+            s.apply(&Delta::save_seeded(), 20_000, 1, &mut muts);
+            for m in muts {
+                db.insert(m.key, m.val.unwrap());
+            }
+        }
+        assert_eq!(s.unsaved_entries(), 0);
+        let rows = read(&db, &accts);
+        assert!(rows.iter().all(|r| r.seed.is_none()));
+        let mut reloaded = ShardTotals::unloaded();
+        reloaded.install(rows, 20_000);
+        assert_eq!(reloaded.sum().unwrap().suffixes, suffixes(&[("pds.test", 2 * SLOTS as i64)]));
+        assert_eq!(reloaded.sum(), s.sum());
     }
 }

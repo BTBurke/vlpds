@@ -179,7 +179,11 @@ pub enum ClusterCmd {
 #[derive(clap::Subcommand, Debug)]
 pub enum HandleDomainCmd {
     /// Every served domain with its active accounts.
-    List,
+    List {
+        /// Count every account row instead of reading the kept totals.
+        #[arg(long)]
+        recount: bool,
+    },
     /// Serve handles under another domain (DNS for it must point here).
     Add { domain: String },
     /// Stop serving a domain. Refused while active accounts have handles
@@ -292,7 +296,10 @@ impl Client {
 
 async fn handle_domain(c: &Client, cmd: HandleDomainCmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
     let r = match cmd {
-        HandleDomainCmd::List => c.get("vlpds.admin.listHandleDomains", &[]).await?,
+        HandleDomainCmd::List { recount } => {
+            let q: &[(&str, &str)] = if recount { &[("recount", "true")] } else { &[] };
+            c.get("vlpds.admin.listHandleDomains", q).await?
+        }
         HandleDomainCmd::Add { domain } => c.post("vlpds.admin.addHandleDomain", &json!({"domain": domain})).await?,
         HandleDomainCmd::Remove { domain, force } => {
             let r = c.post("vlpds.admin.removeHandleDomain", &json!({"domain": domain, "force": force})).await?;
@@ -313,7 +320,7 @@ async fn handle_domain(c: &Client, cmd: HandleDomainCmd, opts: &Opts, out: &mut 
     }
     write!(out, "{}", table(&rows))?;
     if r["countsPartial"] == json!(true) {
-        writeln!(out, "(some nodes or shards didn't answer: counts may be low)")?;
+        writeln!(out, "(some nodes or shards didn't answer or are still loading their totals: counts may be low)")?;
     }
     Ok(())
 }

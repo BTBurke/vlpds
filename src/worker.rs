@@ -1339,7 +1339,11 @@ impl Worker {
             })),
             pending: Some(pending.clone()),
             enqueued: Instant::now(),
-            totals: crate::totals::Delta::new(&did, None, crate::totals::RepoKey::of(&account, &head)),
+            totals: crate::totals::Delta::account(
+                &did,
+                Default::default(),
+                crate::totals::Counted::of(&account, &head),
+            ),
         };
         let nodes = crate::mst::SharedNodeIndex::default();
         let mst = LazyTree::loaded(tree, 1);
@@ -3298,7 +3302,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
     let time = events::now_rfc3339();
     let mut frames = Vec::new();
     let mut muts = Vec::new();
-    let before = crate::totals::RepoKey::of(&st.account, &st.head);
+    let before = crate::totals::Counted::of(&st.account, &st.head);
     let whole_tree = matches!(req.op, AccountOp::ReplaceRepo { .. } | AccountOp::Delete { .. });
     let new_repo = whole_tree || matches!(req.op, AccountOp::Import(ImportStep::Commit { .. }));
     let gen = st.gen();
@@ -3488,7 +3492,7 @@ fn apply_account(st: &mut RepoState, req: AccountReq, clock_id: u64, src: &dyn S
         })),
         pending: Some(st.pending.clone()),
         enqueued: Instant::now(),
-        totals: crate::totals::Delta::new(&st.did, before, crate::totals::RepoKey::of(&st.account, &st.head)),
+        totals: crate::totals::Delta::account(&st.did, before, crate::totals::Counted::of(&st.account, &st.head)),
     };
     send_entry(st, entry)
 }

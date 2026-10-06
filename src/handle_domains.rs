@@ -74,6 +74,15 @@ pub fn longest<'a, 'd>(name: &'a str, domains: impl Iterator<Item = &'d str>) ->
     domains.filter_map(|d| front(name, d).map(|f| (f, d))).max_by_key(|(_, d)| d.len())
 }
 
+/// What an account with `handle` counts under in the kept totals
+/// (`crate::totals`): the handle without its first label, lowercased. It
+/// counts toward the longest served domain that suffix is or is under,
+/// which is the longest one the handle is strictly under.
+pub fn handle_suffix(handle: &str) -> Option<Box<str>> {
+    let (_, rest) = handle.trim_end_matches('.').split_once('.')?;
+    (!rest.is_empty()).then(|| rest.to_ascii_lowercase().into())
+}
+
 impl HandleDomains {
     pub fn new(primary: &str) -> HandleDomains {
         HandleDomains {
@@ -381,6 +390,21 @@ mod tests {
         assert_eq!(d.served("é.pds.test").as_deref(), Some("pds.test"));
         assert_eq!(d.served(""), None);
         assert_eq!(d.names(), vec!["pds.test", "example.org", "at.example.org"]);
+    }
+
+    #[test]
+    fn suffixes_count_under_the_longest_domain_above_the_handle() {
+        assert_eq!(handle_suffix("Alice.PDS.test.").as_deref(), Some("pds.test"));
+        assert_eq!(handle_suffix("bob.at.example.org").as_deref(), Some("at.example.org"));
+        assert_eq!(handle_suffix("example"), None);
+        assert_eq!(handle_suffix("x."), None);
+        let d = with(&["example.org", "at.example.org"]);
+        let under = |h: &str| handle_suffix(h).and_then(|s| d.served(&s));
+        assert_eq!(under("bob.at.example.org").as_deref(), Some("at.example.org"));
+        assert_eq!(under("x.y.example.org").as_deref(), Some("example.org"));
+        // a handle that is a served domain counts under the one above it
+        assert_eq!(under("at.example.org").as_deref(), Some("example.org"));
+        assert_eq!(under("alice.elsewhere.com"), None);
     }
 
     #[test]

@@ -19,9 +19,10 @@ function Added({ x }: { x: Domain }) {
   )
 }
 
+const POLL = 5000
+
 export function HandleDomains() {
-  // not polled: each load reads every account row in the cluster to count them
-  const l = useLoad<Listing>(() => admin('vlpds.admin.listHandleDomains'), [])
+  const l = useLoad<Listing>(() => admin('vlpds.admin.listHandleDomains'), [], POLL)
   const [added, setAdded] = useState('')
   const [notice, setNotice] = useState<string>()
   const [inUse, setInUse] = useState<{ domain: string; message: string }>()
@@ -92,7 +93,10 @@ export function HandleDomains() {
       <ErrorNotice error={l.error || remove.error} />
       {notice && <Notice kind="ok">{notice}</Notice>}
       {d.countsPartial && (
-        <Notice kind="warn">Some nodes or shards didn’t answer, so the account counts may be low. Removing a domain needs “Remove anyway” until they do.</Notice>
+        <Notice kind="warn">
+          Some nodes or shards didn’t answer or are still loading their totals, so the account counts may be low. Removing a domain needs “Remove anyway” until
+          they do.
+        </Notice>
       )}
       <PartialNotice partial={partialOf(d)} />
       <Panel title="Domains" flush>
