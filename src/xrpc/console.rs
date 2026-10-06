@@ -711,6 +711,8 @@ async fn list_sessions(State(app): AppState, Auth(creds): Auth, Query(q): Query<
             "device": device.as_ref().map(|d| super::signin::describe_user_agent(d.user_agent.as_deref())),
             "deviceLastSeenAt": device.as_ref().map(|d| ms(d.last_seen_at)),
             "passkey": s.auth_cred.is_some(),
+            "ip": s.ip,
+            "signedInIp": s.created_ip,
         }));
     }
     oauth.sort_by_key(|j| std::cmp::Reverse(j["refreshedAt"].as_u64()));
