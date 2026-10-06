@@ -334,10 +334,10 @@ async fn totals_follow_shards_between_nodes() {
     }
     let want = check(&[&a], "one node").await;
     assert_eq!((want.accounts[0], want.accounts[1], want.accounts[2], want.repos()), (12, 6, 6, 24));
-    assert_eq!(
-        domain_counts(&a, false).await.unwrap(),
-        vec![(HANDLE_DOMAIN.to_string(), 9), ("group-a.test".to_string(), 3)]
-    );
+    let l = complete_domain_counts(&a).await;
+    let rows: Vec<_> =
+        l["domains"].as_array().unwrap().iter().map(|d| (d["domain"].clone(), d["accounts"].clone())).collect();
+    assert_eq!(rows, vec![(json!(HANDLE_DOMAIN), json!(9)), (json!("group-a.test"), json!(3))]);
 
     let b = node("tot-b", &store).await;
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -383,6 +383,6 @@ async fn totals_follow_shards_between_nodes() {
     let after = check(&[&a, &b], "all deactivated").await;
     assert_eq!((after.accounts[0], after.accounts[1], after.accounts[2], after.repos()), (0, 18, 6, 24), "{after:?}");
     assert!(after.suffixes.is_empty(), "{:?}", after.suffixes);
-    let r = b.xrpc.post("vlpds.admin.removeHandleDomain", &json!({"domain": "group-a.test"}), &Auth::Admin).await;
+    let r = remove_handle_domain_unforced(&b, "group-a.test").await;
     assert_eq!(r.ok()["accounts"], json!(0));
 }
