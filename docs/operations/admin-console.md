@@ -137,7 +137,9 @@ another one over peer mTLS.
 | `listMail` (GET) | `limit?` (default 100) | Every node's recent mail, newest first: purpose, the recipient's domain only, status (`queued`, `retrying`, `sent`, `failed`, `dropped`, `suppressed`, `logged`), attempts, the provider's error with any address removed, and the budget that suppressed it · each node's queue depth |
 | `listLockouts` (GET) | | Accounts whose TOTP and recovery codes (`second_factor`) or email codes (`email_code`) are locked after wrong codes, with the count and when the lock ends, from the lockout index of every node's shards |
 | `clearLockout` | `{did, reason}` | Clears both locks and their counts. Audited as `lockout.clear`. The sign-in rate-limit buckets are separate: a DID override on the Rate limits page lifts those |
-| `getConfig` (GET) | | This node's flags, each with its source (`flag`, `env`, `default`, `unset`, or `file` for a secret set by its `-file` flag) and value · settings stored in the bucket (handle domains, rate-limit version, shard layout, feature level) · version and build rev |
+| `getConfig` (GET) | | This node's flags, each with its source (`flag`, `env`, `default`, `unset`, or `file` for a secret set by its `-file` flag) and value · settings stored in the bucket (handle domains, rate-limit version, shard layout, feature level) · version and build rev · `peerTls`: the peer certificate in use (`nodeId`, `subject`, `hosts`, `notBefore`, `notAfter`, the earliest CA's `caNotAfter`), null without peer TLS · `secretFiles`: each `-file` secret's `flag`, `path` and the file's `modifiedAt`, so a rotation shows as a recent change |
+| `getStorageStats` (GET) | | Objects and bytes in the bucket by key component (`components`, each `exact` or not, with its count of guessed changes), `totalObjects`, `totalBytes`, `exact`, `inexactBecause`, `seeded` and `lastBackfillAt` · `backfill`: the latest run's phase, requests, keys and place · per node: what it hasn't folded yet and when it last did. See [Storage stats](#storage-stats) |
+| `backfillStorageStats` | `{dryRun?, maxRequests?, pagesPerSecond?, restart?}` | Lists the bucket once in the background to seed the counts. `dryRun` answers the estimate (`estimatedObjects`, `estimatedRequests`, `estimatedSeconds`) and starts nothing. Otherwise `maxRequests` is required. Audited as `storage.backfill` |
 | `kickSubscriber` | `{conn}` | Closes that firehose connection on this node with reason `kicked`. The client can reconnect with its cursor |
 
 What these never return:
@@ -152,9 +154,57 @@ Each node keeps the last 1,024 segments it sealed, the last 200 mails and 3 minu
 memory, so none of this reads the bucket. A restart starts them empty. Lockouts are indexed in the
 shards (`L/{did}\0{factor}`, written in the same batch as the lock), so the list survives restarts
 and shard moves; an entry whose lock has run out is dropped the next time the list finds it.
-`listRepoOps` reads only the ring,
-so a quiet account's older events aren't there. The prefix sizes the Object store page could show
-would mean listing the bucket, so they aren't part of this API.
+`listRepoOps` reads only the ring, so a quiet account's older events aren't there.
+`getStorageStats` reads one control-plane object and asks each node for what it holds, and never
+lists the bucket.
+
+### Storage stats
+
+Every PUT, copy and DELETE a node makes passes the request counter (`src/objstats.rs`), which also
+keeps objects and bytes by key component (`src/store_stats.rs`). A PUT knows its size. A DELETE
+doesn't, so each node remembers the size of every key it has written, read or seen in a LIST its
+background jobs already run (retention lists the segments it deletes, SlateDB's GC its SSTs, the
+blob sweep the blobs), up to 262,144 keys. A change it has to guess is counted as uncertain: a
+DELETE of a key it never saw takes the component's mean size, and an overwrite of a control-plane
+key it never saw is taken as a replace. A component with no guessed change since the last backfill
+is `exact`.
+
+Each node folds its changes into `stats/storage` every 5 minutes and when it shuts down. That's a
+GET and a conditional PUT on the control-plane client, never on a request or commit path: 8,640 of
+each a month per node, about $0.04 on R2. A node that crashes loses up to 5 minutes of changes, and
+its next start marks the totals approximate until the next backfill. A node that leaves for good
+keeps what it folded.
+
+The counts start at zero, so they mean nothing until one backfill lists the bucket. It lists the
+prefix once, in key order, one LIST request per 1,000 keys (Class A on R2 and S3), at
+`pagesPerSecond` (default 2, at most 50), and stops after `maxRequests` requests. It saves its place
+every 20 pages or 15 s in `stats/backfill`, so a capped, failed or interrupted run resumes after the
+last key it listed. One run at a time: a second call while one is running answers `AlreadyRunning`,
+and another node takes a run over once its runner hasn't saved for 2 minutes. While it lists, every
+node keeps its changes aside with their key and time. At the end each one is checked against the
+page that listed its key. A change made before that page was read is already in the listing and is
+dropped, one made after is kept, and one made while the page was in flight (within 250 ms on another
+node's clock) is kept as uncertain.
+
+To run it on a live PDS:
+
+```steps
+- title: Read the estimate
+  body: "`curl -su admin:$TOKEN -H 'content-type: application/json' -d '{\"dryRun\":true}' https://<pds>/xrpc/vlpds.admin.backfillStorageStats`. Before the first backfill `estimatedObjects` comes from the LISTs the background jobs ran last (`estimateBasis: \"observed LISTs\"`), which misses prefixes nothing lists, so expect the real count to be somewhat higher. `estimatedRequests` is ceil(objects / 1000)."
+- title: Run it with a budget
+  body: "`-d '{\"maxRequests\":<estimate × 1.5>,\"pagesPerSecond\":2}'`. The cap is the most it can spend: a bucket bigger than the estimate stops at the cap with `phase: \"capped\"` instead of listing on."
+- title: Watch it
+  body: "`getStorageStats` shows `backfill.phase`, `requests`, `keys` and `cursor`, and so does the Object store page. At 2 pages a second, a million objects take about 8 minutes."
+- title: Resume if it stopped
+  body: "Call it again with a new `maxRequests`. It goes on from `cursor`. `restart: true` starts over instead."
+- title: Check the result
+  body: "`seeded: true`, `lastBackfillAt` set, and `exact: true` once every node has folded. `inexactBecause` says what's in the way otherwise."
+```
+
+A bucket of N objects costs ceil(N / 1000) LIST requests, plus a GET and a PUT of `stats/backfill`
+each time it saves its place. A million objects is 1,000 LISTs and 50 saves (a PUT and a GET each), under
+$0.01 at R2's $4.50 per million Class A requests. Running it again later costs the same, and resets
+any drift.
 
 ### Repo bytes and filter counts
 

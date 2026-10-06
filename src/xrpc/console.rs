@@ -1226,6 +1226,8 @@ async fn get_config(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>>
         "settings": crate::config_report::settings(),
         "recorded": !crate::config_report::settings().is_empty(),
         "stored": stored,
+        "peerTls": app.config.peer_tls.as_ref().map(|t| t.report()),
+        "secretFiles": crate::config_report::secret_files(crate::config_report::settings()),
     })))
 }
 

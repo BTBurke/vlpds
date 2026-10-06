@@ -3,13 +3,31 @@ import { DataTable } from '../../components/console/DataTable'
 import { Banners, Chip, ErrorState, Glyph, KV, Loading, Meter, Mini, Minis, NeedsVersion, PageHead, Panel, PanelBody, Seg, Spark, Src, Swatch, Tiles, type BannerSpec } from '../../components/console/kit'
 import { registerPalette } from '../../components/console/Palette'
 import { useClusterView } from '../../lib/console/cluster'
-import { fmtBytes, fmtMs, fmtNum, fmtSi } from '../../lib/console/fmt'
-import { configPoll, storageStatsPoll, maxLatest, nodeSeries, sumLatest, sumMean, sumSeries, useNodeMetrics, worstSeries, type NodeSeries } from '../../lib/console/sys'
+import { ago, fmtBytes, fmtMs, fmtNum, fmtSi } from '../../lib/console/fmt'
+import { configPoll, storageStatsPoll, maxLatest, nodeSeries, sumLatest, sumMean, sumSeries, useNodeMetrics, worstSeries, type NodeSeries, type StorageStats } from '../../lib/console/sys'
 import { navigate } from '../../lib/router'
 
 // Object store: billable request rates (class A: writes, lists, CAS; class B: reads) and what
 // they cost, by key component and by node, segment PUT latency, and the same traffic priced at
-// R2, S3 and GCS. Bucket prefix sizes would mean listing the bucket, so they aren't here.
+// R2, S3 and GCS. What's stored per component comes from getStorageStats: counters every node
+// keeps from its own PUTs and DELETEs, seeded by one operator-run backfill; the console itself
+// never lists the bucket.
+
+/** Last backfill, a run in progress, and why the counts aren't exact. */
+function storageFoot(s: StorageStats) {
+  const b = s.backfill
+  const run =
+    b && b.phase !== 'done'
+      ? `Backfill ${b.phase === 'capped' ? 'stopped at its budget' : b.phase}: ${fmtNum(b.keys)} keys in ${fmtNum(b.requests)} LISTs${b.phase === 'capped' ? '; another call resumes it' : ''}${b.error ? ` (${b.error})` : ''}.`
+      : undefined
+  return (
+    <span>
+      {s.lastBackfillAt ? `Backfilled ${ago(s.lastBackfillAt)}.` : 'Never backfilled: the counts are changes since the nodes started counting.'}
+      {run ? ` ${run}` : ''}
+      {s.inexactBecause.length ? ` Approximate: ${s.inexactBecause.join('; ')}.` : !s.exact ? ` Approximate: ${fmtNum(s.uncertainChanges)} changes since were guessed (≈ rows).` : ''}
+    </span>
+  )
+}
 
 export type Provider = 'R2' | 'S3' | 'GCS'
 /** USD list prices: per million requests, per GB-month; free tiers per month. */
@@ -48,6 +66,7 @@ export const COMPONENTS: Record<string, { name: string; what: string }> = {
   ctl_lease: { name: 'Node leases', what: 'each node renews its lease by CAS every TTL/5' },
   ctl_assign: { name: 'Shard assignments', what: 'owners and the slot layout, by CAS' },
   ctl_writer: { name: 'Writer claims', what: 'the writer byte each log signs seqs with' },
+  ctl_stats: { name: 'Storage stats', what: 'these counts, folded by each node every 5 minutes, and the backfill\'s place' },
   ctl_version: { name: 'Feature level', what: 'the cluster version object' },
   account_index: { name: 'Handle and email index', what: 'uniqueness claims for handles and emails' },
   blob: { name: 'Blobs', what: 'uploads (multipart when large), reads, GC' },
@@ -109,7 +128,9 @@ export function Storage() {
   const cfg = configPoll.use()
   const [gbTyped, setGb] = useState<number | undefined>(readGb)
   const stats = storageStatsPoll.use()
-  const measured = stats.data?.supported ? stats.data.data : undefined
+  const counts = stats.data?.supported ? stats.data.data : undefined
+  // before a backfill the counts are only changes since nodes started counting: no size to price
+  const measured = counts?.seeded ? counts : undefined
   // a typed figure wins: the operator may know the bill's number better
   const gb = gbTyped ?? (measured ? measured.totalBytes / 1e9 : undefined)
   const self = cfg.data?.find((x) => x.config && x.self)?.config ?? cfg.data?.find((x) => x.config)?.config
@@ -289,7 +310,9 @@ export function Storage() {
                     }}
                   />
                 </label>{' '}
-                <span className="muted">{measured ? '(measured; type to override)' : '(this server can’t measure it yet)'}</span>
+                <span className="muted">
+                  {measured ? `(measured${measured.exact ? '' : ', approximate'}; type to override)` : counts ? '(not backfilled yet: type it in)' : '(this server can’t measure it yet)'}
+                </span>
               </>
             }
           >
@@ -354,24 +377,46 @@ export function Storage() {
               ]}
             />
           </Panel>
-          <Panel title="Stored by component" src={<Src isNew={!measured}>getStorageStats</Src>} right={measured ? <span className="muted sm">{fmtBytes(measured.totalBytes)} in all</span> : undefined}>
+          <Panel
+            title="Stored by component"
+            src={<Src isNew={!counts}>getStorageStats · 60 s</Src>}
+            right={
+              counts ? (
+                <span className="cx-cellid end">
+                  <span className="muted sm">{fmtBytes(counts.totalBytes)} in all</span>
+                  <Chip k={counts.exact ? 'ok' : 'warn'}>{counts.exact ? 'exact' : 'approximate'}</Chip>
+                </span>
+              ) : undefined
+            }
+            foot={counts ? storageFoot(counts) : undefined}
+          >
             {stats.data && !stats.data.supported ? (
               <NeedsVersion what="Objects and bytes by component" nsid="vlpds.admin.getStorageStats" />
             ) : stats.error ? (
               <ErrorState error={stats.error} retry={storageStatsPoll.refresh} />
-            ) : !measured ? (
+            ) : !counts ? (
               <Loading />
             ) : (
               <DataTable
                 compact
-                rows={[...measured.components].sort((x, y) => y.bytes - x.bytes)}
+                rows={[...counts.components].sort((x, y) => y.bytes - x.bytes)}
                 rowKey={(r) => r.component}
                 open={(r) => ({ type: 'storecomp', id: r.component })}
                 empty={<div className="cx-empty">Nothing counted yet.</div>}
                 cols={[
                   { id: 'c', label: 'Component', render: (r) => <b>{componentName(r.component)}</b> },
                   { id: 'o', label: 'Objects', r: true, render: (r) => <span className="mono">{fmtNum(r.objects)}</span> },
-                  { id: 'b', label: 'Size', r: true, render: (r) => <span className="mono">{fmtBytes(r.bytes)}</span> },
+                  {
+                    id: 'b',
+                    label: 'Size',
+                    r: true,
+                    render: (r) => (
+                      <span className="mono" title={r.exact ? undefined : `${fmtNum(r.uncertain)} guessed changes since the backfill`}>
+                        {r.exact ? '' : '≈ '}
+                        {fmtBytes(r.bytes)}
+                      </span>
+                    ),
+                  },
                   { id: 'm', label: `${priceAt}/month`, r: true, render: (r) => <span className="mono">{usd((r.bytes / 1e9) * PRICE[priceAt].gb)}</span> },
                 ]}
               />
