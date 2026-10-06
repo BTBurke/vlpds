@@ -700,7 +700,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn flags_from_the_row() {
+        let mut a = Account { email_confirmed: false, ..Default::default() };
+        assert_eq!(flags_of(&a), UNCONFIRMED | NO_2FA);
+        a.email_confirmed = true;
+        assert_eq!(flags_of(&a), NO_2FA);
+        for (k, v) in [
+            ("totpEnabled", serde_json::json!(true)),
+            ("emailAuthFactorAt", serde_json::json!("2026-10-01T00:00:00Z")),
+            ("passkeys", serde_json::json!(2)),
+        ] {
+            let mut b = a.clone();
+            b.extra.insert(k.into(), v);
+            assert_eq!(flags_of(&b), 0, "{k}");
+        }
+        for (k, v) in [("totpEnabled", serde_json::json!(false)), ("passkeys", serde_json::json!(0))] {
+            let mut b = a.clone();
+            b.extra.insert(k.into(), v);
+            assert_eq!(flags_of(&b), NO_2FA, "{k}");
+        }
+        // only active accounts lack a factor
+        a.status = Some("deactivated".into());
+        assert_eq!(flags_of(&a), 0);
+    }
+
+    #[test]
     fn statuses() {
+
         assert_eq!(status_index(None), 0);
         assert_eq!(status_index(Some("deactivated")), 1);
         assert_eq!(status_index(Some("takendown")), 2);

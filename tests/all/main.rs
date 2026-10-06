@@ -38,6 +38,7 @@ mod commit_cpu;
 mod common;
 mod compaction_polling;
 mod console_api;
+mod console_api_accounts;
 mod cost_defaults;
 mod crawlers;
 mod create_post;

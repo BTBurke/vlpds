@@ -102,3 +102,39 @@ pub async fn walk<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen:
     })
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_with_and_without_bytes() {
+        let full = RepoStats { records: 3, nodes: 2, blobs: 1, bytes: Some(RepoBytes { records: 900, nodes: 200 }) };
+        assert_eq!(full.encode().len(), RepoStats::LEN);
+        assert_eq!(RepoStats::decode(&full.encode()).unwrap(), full);
+        // a row from before bytes were counted: its next load counts them
+        let old = RepoStats { bytes: None, ..full };
+        assert_eq!(old.encode().len(), 24);
+        assert_eq!(RepoStats::decode(&old.encode()).unwrap(), old);
+        assert!(RepoStats::decode(&[0; 32]).is_err());
+    }
+
+    #[test]
+    fn commits_keep_bytes_close() {
+        let before = RepoStats { records: 10, nodes: 4, blobs: 0, bytes: Some(RepoBytes { records: 1000, nodes: 400 }) };
+        let mut b = before.bytes.unwrap();
+        // two creates of 150 bytes and one delete (the mean, 100); a new
+        // node of 120 bytes and one replaced (the mean, 100)
+        b.commit(&before, 300, 1, 120, 1);
+        assert_eq!(b, RepoBytes { records: 1200, nodes: 420 });
+        // never below zero
+        let mut z = RepoBytes { records: 10, nodes: 0 };
+        z.commit(&RepoStats { records: 1, ..Default::default() }, 0, 5, 0, 3);
+        assert_eq!(z, RepoBytes::default());
+    }
+
+    #[test]
+    fn the_empty_tree_has_no_bytes() {
+        assert_eq!(tree_bytes(&Tree::new()).unwrap(), 0, "the empty tree's root isn't counted");
+    }
+}
