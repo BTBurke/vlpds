@@ -173,6 +173,7 @@ function Sessions({ a, mode }: { a: Who; mode: DetailMode }) {
                 <tr>
                   <th>App</th>
                   <th>Device</th>
+                  <th>IP</th>
                   <th className="r">Signed in</th>
                   <th className="r">Last refresh</th>
                   <th />
@@ -187,6 +188,9 @@ function Sessions({ a, mode }: { a: Who; mode: DetailMode }) {
                       {s.passkey && <> <Chip k="acc">passkey</Chip></>}
                     </td>
                     <td className="t2 sm">{s.kind === 'oauth' ? (s.device ?? '—') : '—'}</td>
+                    <td className="mono sm" title={s.signedInIp ? `signed in from ${s.signedInIp}` : undefined}>
+                      {s.ip ?? '—'}
+                    </td>
                     <td className="r">{when(s.signedInAt)}</td>
                     <td className="r">{when(s.refreshedAt)}</td>
                     <td className="r">
@@ -276,6 +280,56 @@ function CheckRepo({ did }: { did: string }) {
   )
 }
 
+/** The DID document's keys and the directory's rotation keys: one directory request, so only on a click. */
+function AccountKeys({ did }: { did: string }) {
+  const [busy, setBusy] = useState(false)
+  const [k, setK] = useState<api.AccountKeys>()
+  const load = async (refresh: boolean) => {
+    setBusy(true)
+    try {
+      setK(await withAdmin((c) => api.getAccountKeys(c, did, refresh)))
+    } catch (e) {
+      toast(errText(e), { err: true })
+    } finally {
+      setBusy(false)
+    }
+  }
+  if (!k)
+    return (
+      <button type="button" className="cx-btn sm" disabled={busy} onClick={() => load(false)}>
+        {busy && <Spinner />}
+        Show keys
+      </button>
+    )
+  return (
+    <div className="cx-acc-keys">
+      {(k.verificationMethods ?? []).map((m) => (
+        <div key={m.id} title={m.type}>
+          <span className="muted sm">{m.id.replace(did, '')}</span> <Copy text={m.publicKeyMultibase ?? ''} />{' '}
+          {m.matchesAccount ? <Chip k="ok">matches</Chip> : <Chip k="err">not the account’s key</Chip>}
+        </div>
+      ))}
+      {k.didDocError && <div className="t2 sm">DID document: {k.didDocError}</div>}
+      {k.pendingSigningKey && (
+        <div>
+          <span className="muted sm">pending</span> <Copy text={k.pendingSigningKey} />
+        </div>
+      )}
+      {(k.rotationKeys ?? []).map((r, i) => (
+        <div key={r.didKey}>
+          <span className="muted sm">rotation {i + 1}</span> <Copy text={r.didKey} />{' '}
+          <Chip k={r.role === 'other' ? 'plain' : 'acc'}>{r.role === 'server' ? 'this PDS' : r.role === 'operator_recovery' ? 'operator recovery' : 'other'}</Chip>
+        </div>
+      ))}
+      {k.rotationKeysError && <div className="t2 sm">Rotation keys: {k.rotationKeysError}</div>}
+      <button type="button" className="cx-btn sm quiet" disabled={busy} onClick={() => load(true)}>
+        {busy && <Spinner />}
+        Refetch the DID document
+      </button>
+    </div>
+  )
+}
+
 function Placement({ row, mode }: { row?: AccountRow; mode: DetailMode }) {
   const { view } = useClusterView()
   if (!row) return null
@@ -291,6 +345,13 @@ function Placement({ row, mode }: { row?: AccountRow; mode: DetailMode }) {
           ['Last commit', when(row.lastCommitAt)],
           ['Records', row.records === undefined ? '—' : fmtNum(row.records)],
           ['MST nodes', row.mstNodes === undefined ? '—' : fmtNum(row.mstNodes)],
+          [
+            'Repo size',
+            <span title="Record blocks + MST node blocks, kept close by each commit; a recount makes it exact">
+              {row.repoBytes === undefined ? '—' : `${fmtBytes(row.repoBytes)} (${fmtBytes(row.recordBytes ?? 0)} records · ${fmtBytes(row.mstBytes ?? 0)} MST)`}{' '}
+              {btn('Recount…', () => act.recountRepo({ did: row.did, handle: row.handle, node: row.node }))}
+            </span>,
+          ],
           ['Checks', <CheckRepo did={row.did} />],
         ]}
       />
@@ -456,7 +517,7 @@ type Audit = { id: string; at: string; actor: string; action: string; reason?: s
 
 function Moderation({ did, status, mode }: { did: string; status?: SubjectStatus; mode: DetailMode }) {
   const v = useAccountsVersion()
-  const cases = useLoad(async () => (await admin<{ cases: Case[] }>('vlpds.admin.listCases')).cases.filter((c) => c.subjects.some((s) => s.did === did)), [did, v])
+  const cases = useLoad(async () => (await admin<{ cases: Case[] }>('vlpds.admin.listCases', { params: { did } })).cases, [did, v])
   const audit = useLoad(async () => (await admin<{ entries: Audit[] }>('vlpds.admin.getAuditLog', { params: { did, limit: 10 } })).entries, [did, v])
   const cs = cases.data ?? []
   const open = cs.filter((c) => c.status === 'open').length
@@ -613,6 +674,7 @@ registerDetail('account', {
       <Strip
         items={[
           ['records', r?.records === undefined ? '—' : fmtNum(r.records)],
+          ['repo', r?.repoBytes === undefined ? '—' : fmtBytes(r.repoBytes)],
           [`blobs · ${r ? fmtBytes(r.blobBytes) : '—'}`, r?.blobs === undefined ? '—' : fmtNum(r.blobs)],
           ['MST nodes', r?.mstNodes === undefined ? '—' : fmtNum(r.mstNodes)],
           ['app passwords', s ? fmtNum(s.appPasswords.length) : '—'],
@@ -630,6 +692,7 @@ registerDetail('account', {
             ['Created', i ? <>{date(i.indexedAt)} <span className="muted">({iso(i.indexedAt)})</span></> : '—'],
             ['2FA', r ? <TwoFactor f={r.secondFactors} /> : '—'],
             ['PLC', did.startsWith('did:plc:') ? <a href={`https://plc.directory/${did}/log/audit`} target="_blank" rel="noreferrer">audit log ↗</a> : <span className="mono sm">{did.split(':').slice(0, 2).join(':')}</span>],
+            ['Keys', <AccountKeys did={did} />],
             ['Identity', btn('Publish #identity…', () => act.publishIdentity(a))],
           ]}
         />

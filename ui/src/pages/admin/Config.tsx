@@ -93,16 +93,14 @@ registerPalette({
 
 type Filter = 'set' | 'all' | 'differs'
 
-// Fields newer getConfig answers add (peer certificate expiry, when a secret was set). Read
-// loosely: they light up when present and the panels say what's missing when not.
-const asMs = (v: unknown): number | undefined => (typeof v === 'number' ? v : typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : undefined)
+// getConfig's peerTls (the node's certificate) and secretFiles (when each `-file` secret last
+// changed); an older vlpds answers without them and the Builds panel says so.
 export function certExpiry(c?: NodeConfigResult['config']): number | undefined {
-  const x = c as Record<string, any> | undefined
-  return asMs(x?.peerTls?.notAfter ?? x?.peerTls?.expiresAt ?? x?.peerCertExpiresAt ?? x?.peerCert?.notAfter)
+  return c?.peerTls?.notAfter ?? undefined
 }
-export function secretSetAt(s?: Setting): number | undefined {
-  const x = s as Record<string, any> | undefined
-  return asMs(x?.setAt ?? x?.changedAt ?? x?.modifiedAt) ?? (typeof x?.ageMs === 'number' ? Date.now() - x.ageMs : undefined)
+/** When the file behind a secret flag (`--x` read from `--x-file`) last changed. */
+export function secretSetAt(c: NodeConfigResult['config'] | undefined, flag: string): number | undefined {
+  return c?.secretFiles?.find((f) => f.flag === `${flag}-file`)?.modifiedAt ?? undefined
 }
 
 export function Config() {
@@ -131,7 +129,8 @@ export function Config() {
   const revs = new Set(okNodes.map((r) => r.config!.rev))
   const multi = okNodes.length > 1
   const hasCert = okNodes.some((r) => certExpiry(r.config) !== undefined)
-  const hasAge = rows.some((r) => r.secret && [...r.per.values()].some((x) => secretSetAt(x) !== undefined))
+  const hasAge = rows.some((r) => r.secret && okNodes.some((n) => secretSetAt(n.config, r.flag) !== undefined))
+  const olderBuild = okNodes.some((r) => r.config!.peerTls === undefined || r.config!.secretFiles === undefined)
   const soon = okNodes.filter((r) => {
     const e = certExpiry(r.config)
     return e !== undefined && e - Date.now() < 14 * 86400_000
@@ -294,10 +293,10 @@ export function Config() {
                   ? [
                       {
                         id: 'age',
-                        label: 'Set',
+                        label: 'File changed',
                         r: true,
                         render: (r: FlagRow) => {
-                          const at = secretSetAt(r.per.get(cur?.node ?? ''))
+                          const at = secretSetAt(cur?.config, r.flag)
                           return at ? <span className="t2 sm">{ago(at)}</span> : null
                         },
                       },
@@ -323,7 +322,7 @@ export function Config() {
           )}
           <Panel
             title="Builds"
-            foot={!hasCert || !hasAge ? <span>Peer certificate expiry and secret age need a newer vlpds (getConfig adds them).</span> : undefined}
+            foot={olderBuild ? <span>Peer certificate expiry and secret file ages need a newer vlpds (getConfig adds them).</span> : undefined}
           >
             <DataTable
               compact

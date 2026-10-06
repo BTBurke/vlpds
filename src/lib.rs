@@ -61,6 +61,7 @@ pub mod space;
 pub mod state;
 pub mod stats;
 pub mod store;
+pub mod store_stats;
 pub mod throttle;
 pub mod tid;
 pub mod totals;

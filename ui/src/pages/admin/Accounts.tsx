@@ -10,7 +10,7 @@ import { useClusterView, type ClusterView } from '../../lib/console/cluster'
 import { ago, fmtBytes, fmtNum, plural, shortDid } from '../../lib/console/fmt'
 import { isUnsupported } from '../../lib/console/live'
 import { Link } from '../../lib/router'
-import { useAccountsVersion } from './accountActions'
+import { createAccount, useAccountsVersion } from './accountActions'
 import './accountDetail'
 import './accounts.css'
 
@@ -28,6 +28,23 @@ const FILTERS: { v: AccountFilter; label: string }[] = [
 ]
 
 const PAGE = 50
+
+/** Which of listAccounts' counts each filter shows; attention has none (quotas and lockouts aren't counted). */
+const COUNT_OF: Partial<Record<AccountFilter, keyof api.AccountCounts>> = {
+  all: 'total',
+  deactivated: 'deactivated',
+  takendown: 'takendown',
+  no2fa: 'no2fa',
+  unconfirmed: 'unconfirmed',
+}
+
+function filterOptions(counts?: api.AccountCounts) {
+  return FILTERS.map((f) => {
+    const k = COUNT_OF[f.v]
+    const n = counts && k ? (counts[k] as number) : undefined
+    return { ...f, n: n === undefined ? undefined : `${counts?.approximate ? '≈' : ''}${fmtNum(n)}` }
+  })
+}
 
 /** The account's state as a chip: tone and word. */
 export function accountState(a: Pick<AccountRow, 'status' | 'deleteAfter'>): [ChipKind, string] {
@@ -108,6 +125,14 @@ function cols(view: ClusterView | undefined): Col<AccountRow>[] {
     },
     { id: 'records', label: 'Records', r: true, sort: (a, b) => (a.records ?? 0) - (b.records ?? 0), render: (a) => <span className="mono">{a.records === undefined ? '—' : fmtNum(a.records)}</span> },
     {
+      id: 'repo',
+      label: 'Repo',
+      r: true,
+      title: 'Record and MST blocks: what a getRepo CAR carries',
+      sort: (a, b) => (a.repoBytes ?? 0) - (b.repoBytes ?? 0),
+      render: (a) => <span className="mono">{a.repoBytes === undefined ? '—' : fmtBytes(a.repoBytes)}</span>,
+    },
+    {
       id: 'blobs',
       label: 'Blobs',
       r: true,
@@ -145,6 +170,7 @@ export function Accounts() {
   const [qq, setQq] = useState('')
   const [filter, setFilter] = useState<AccountFilter>('all')
   const [page, setPage] = useState<Page>()
+  const [counts, setCounts] = useState<api.AccountCounts>()
   const [error, setError] = useState<unknown>()
   const [busy, setBusy] = useState(false)
   const [unsupported, setUnsupported] = useState(false)
@@ -163,6 +189,7 @@ export function Accounts() {
       const r = await withAdmin((c) => api.listAccounts(c, { q: qq || undefined, filter, cursor, limit: PAGE }))
       if (my !== seq.current) return
       setPage((p) => ({ rows: cursor && p ? [...p.rows, ...r.accounts] : r.accounts, cursor: r.cursor, last: r }))
+      if (r.counts) setCounts(r.counts)
       setError(undefined)
     } catch (e) {
       if (my !== seq.current) return
@@ -209,9 +236,14 @@ export function Accounts() {
           </>
         }
         actions={
-          <Link className="cx-btn" to={SECTION.domains.path}>
-            Invite codes ›
-          </Link>
+          <>
+            <button type="button" className="cx-btn" onClick={() => createAccount()}>
+              Create account…
+            </button>
+            <Link className="cx-btn" to={SECTION.domains.path}>
+              Invite codes ›
+            </Link>
+          </>
         }
       />
       <Banners items={banners} />
@@ -254,7 +286,7 @@ export function Accounts() {
             autoCapitalize="none"
             onChange={(e) => setQ(e.target.value)}
           />
-          <Seg value={filter} options={FILTERS} onChange={setFilter} label="Filter accounts" />
+          <Seg value={filter} options={filterOptions(counts)} onChange={setFilter} label="Filter accounts" />
         </form>
         {error ? (
           <ErrorState error={error} retry={() => load()} />

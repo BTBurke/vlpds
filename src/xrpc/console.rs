@@ -215,6 +215,12 @@ async fn account_row(app: &App, p: &Partition, a: &Account) -> XResult<J> {
         row["records"] = json!(s.records);
         row["mstNodes"] = json!(s.nodes);
         row["blobs"] = json!(s.blobs);
+        // absent until the repo's next load counts it (state::RepoBytes)
+        if let Some(b) = s.bytes {
+            row["repoBytes"] = json!(b.total());
+            row["recordBytes"] = json!(b.records);
+            row["mstBytes"] = json!(b.nodes);
+        }
     }
     if let Some(h) = &head {
         row["rev"] = json!(h.rev.to_string());
@@ -259,8 +265,14 @@ fn matches_q(q: &str, a: &Account) -> bool {
     a.handle.starts_with(q) || a.did.starts_with(q) || a.email.as_deref().is_some_and(|e| e.starts_with(q))
 }
 
-fn locked_dids() -> std::collections::HashSet<String> {
-    super::mfa::noted_lockouts().into_iter().map(|(d, _, _)| d).collect()
+/// The DIDs the lockout index of this node's shards lists as locked now:
+/// only for the attention filter, the one that needs them.
+async fn locked_dids(app: &App, f: Filter) -> XResult<std::collections::HashSet<String>> {
+    if f != Filter::Attention {
+        return Ok(Default::default());
+    }
+    let now = crate::totp::now_secs();
+    Ok(indexed_lockouts(app).await?.0.into_iter().filter(|l| l.2 > now).map(|(d, _, _)| d).collect())
 }
 
 /// This node's half of listAccounts: `{owned, accounts, resumeAt}`.
@@ -282,7 +294,7 @@ async fn local_accounts(app: &App, q: &AccountsQ) -> XResult<J> {
         }
         return Ok(json!({"owned": ids, "accounts": out, "resumeAt": null}));
     }
-    let locked = locked_dids();
+    let locked = locked_dids(app, pq.filter).await?;
     if pq.recent {
         let cursor = q.cursor.as_deref().filter(|c| !c.is_empty()).map(split_cursor).transpose()?;
         let rows = recent_accounts(app, &owned, &pq, cursor, &locked).await?;
@@ -393,7 +405,46 @@ async fn recent_accounts(
 
 async fn internal_accounts(State(app): AppState, headers: HeaderMap, Query(q): Query<AccountsQ>) -> XResult<Json<J>> {
     internal::check(&app, &headers)?;
-    Ok(Json(local_accounts(&app, &q).await?))
+    let mut out = local_accounts(&app, &q).await?;
+    out["counts"] = local_counts(&app);
+    Ok(Json(out))
+}
+
+const COUNT_KEYS: [&str; 7] = ["total", "active", "deactivated", "takendown", "suspended", "unconfirmed", "no2fa"];
+
+/// The filter counts of this node's open shards, from their totals
+/// (crate::totals): in memory, no reads. A shard whose totals are still
+/// loading counts nothing yet (`loadingShards`).
+fn local_counts(app: &App) -> J {
+    let (t, loading) = super::totals_loading(app);
+    let n = [t.repos(), t.accounts[0], t.accounts[1], t.accounts[2], t.accounts[3], t.unconfirmed, t.no2fa];
+    let mut out: serde_json::Map<String, J> =
+        COUNT_KEYS.iter().zip(n).map(|(k, v)| (k.to_string(), json!(v))).collect();
+    out.insert("loadingShards".into(), json!(loading));
+    J::Object(out)
+}
+
+/// Sums each node's counts. Approximate while a shard's totals are loading,
+/// a node didn't answer, or some shard has no owner.
+fn sum_counts(app: &App, bodies: &[J], covered: &std::collections::HashSet<crate::slots::ShardId>) -> J {
+    let mut sum = [0i64; COUNT_KEYS.len()];
+    let mut approximate = false;
+    for b in bodies {
+        let c = &b["counts"];
+        if !c.is_object() {
+            approximate = true;
+            continue;
+        }
+        approximate |= c["loadingShards"].as_u64().unwrap_or(0) > 0;
+        for (s, k) in sum.iter_mut().zip(COUNT_KEYS) {
+            *s += c[k].as_i64().unwrap_or(0);
+        }
+    }
+    approximate |= app.partitions.layout().shards.iter().any(|r| !covered.contains(&r.id));
+    let mut out: serde_json::Map<String, J> =
+        COUNT_KEYS.iter().zip(sum).map(|(k, v)| (k.to_string(), json!(v.max(0)))).collect();
+    out.insert("approximate".into(), json!(approximate));
+    J::Object(out)
 }
 
 fn query_pairs(q: &AccountsQ) -> Vec<(&'static str, String)> {
@@ -425,7 +476,8 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         };
         return Ok(Json(json!({"accounts": rows, "exact": true})));
     }
-    let mine = local_accounts(&app, &q).await?;
+    let mut mine = local_accounts(&app, &q).await?;
+    mine["counts"] = local_counts(&app);
     let g = internal::gather(&app, "/internal/v1/console/accounts", &query_pairs(&q)).await;
     let mut covered: std::collections::HashSet<crate::slots::ShardId> =
         serde_json::from_value(mine["owned"].clone()).unwrap_or_default();
@@ -435,6 +487,7 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         covered.extend(r.owned);
         bodies.push(r.body);
     }
+    let counts = sum_counts(&app, &bodies, &covered);
     let mut res = if pq.recent {
         let mut rows: Vec<J> =
             bodies.iter().flat_map(|b| b["accounts"].as_array().cloned().unwrap_or_default()).collect();
@@ -468,6 +521,7 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         super::admin::partial_fields(&app, &mut res, Vec::new(), Vec::new(), &covered, from);
         res
     };
+    res["counts"] = counts;
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
     }
@@ -506,6 +560,11 @@ async fn exact_row(app: &App, a: &Account) -> XResult<J> {
 #[derive(Deserialize)]
 struct DidQ {
     did: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct DidIn {
+    pub did: String,
 }
 
 fn secs_ms(s: u64) -> u64 {
@@ -657,6 +716,8 @@ async fn list_sessions(State(app): AppState, Auth(creds): Auth, Query(q): Query<
             "device": device.as_ref().map(|d| super::signin::describe_user_agent(d.user_agent.as_deref())),
             "deviceLastSeenAt": device.as_ref().map(|d| ms(d.last_seen_at)),
             "passkey": s.auth_cred.is_some(),
+            "ip": s.ip,
+            "signedInIp": s.created_ip,
         }));
     }
     oauth.sort_by_key(|j| std::cmp::Reverse(j["refreshedAt"].as_u64()));
@@ -1005,24 +1066,61 @@ async fn list_mail(State(app): AppState, Auth(creds): Auth, Query(q): Query<Limi
 
 // ----------------------------------------------------------------- lockouts
 
-/// The factor locks noted on this node that its rows still show.
-async fn local_lockouts(app: &App) -> Vec<J> {
+/// (did, factor, locked until) of every lockout index entry of this node's
+/// shards (`mfa::lockout_index`), and the keys that don't parse.
+async fn indexed_lockouts(app: &App) -> XResult<(Vec<(String, &'static str, u64)>, Vec<(Arc<Partition>, Bytes)>)> {
+    let (mut entries, mut junk) = (Vec::new(), Vec::new());
+    for p in app.partitions.owned() {
+        let mut it = state::FamilyScan::new(p.db.as_ref(), state::LOCKOUT_FAMILY, None, &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
+        while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
+            let body = &state::key_body(&kv.key)[state::LOCKOUT_FAMILY.len()..];
+            let parsed = body.iter().rposition(|b| *b == 0).and_then(|i| {
+                let did = std::str::from_utf8(&body[..i]).ok()?;
+                let factor = super::mfa::lockout_factor(&body[i + 1..])?;
+                let until = u64::from_be_bytes(kv.value.as_ref().try_into().ok()?);
+                Some((did.to_string(), factor, until))
+            });
+            match parsed {
+                Some(l) => entries.push(l),
+                None => junk.push((p.clone(), kv.key)),
+            }
+        }
+    }
+    Ok((entries, junk))
+}
+
+/// The lockouts in this node's shards' index, as their rows show them now.
+/// An entry whose row no longer locks (it expired, or the account is gone)
+/// is dropped by writing the row back unchanged under the conditional
+/// write's lock, which deletes the entry with it: a lockout set meanwhile
+/// fails the condition and keeps its entry.
+async fn local_lockouts(app: &App) -> XResult<Vec<J>> {
+    use super::cas::{Cond, Op};
     let now = crate::totp::now_secs();
     let mut out = Vec::new();
-    for (did, factor, _) in super::mfa::noted_lockouts() {
-        let (failures, until) = match factor {
-            super::mfa::FACTOR_LOCK => match super::mfa::load_raw(app, &did).await {
-                Ok((m, _)) => (m.failures, m.locked_until),
-                Err(_) => continue,
-            },
-            _ => match super::server::get_json::<super::email2fa::Lockout>(app, &did, super::email2fa::LOCKOUT_NAME)
-                .await
-            {
-                Ok(Some(l)) => (l.failures, l.locked_until),
-                _ => continue,
-            },
+    let (entries, junk) = indexed_lockouts(app).await?;
+    for (did, factor, _) in entries {
+        let name = match factor {
+            super::mfa::FACTOR_LOCK => super::mfa::ROW,
+            _ => super::email2fa::LOCKOUT_NAME,
+        };
+        let raw = app.get_private(&did, name).await?;
+        let (failures, until) = match (factor, raw.as_deref()) {
+            (_, None) => (0, 0),
+            (super::mfa::FACTOR_LOCK, Some(v)) => {
+                serde_json::from_slice::<super::mfa::Mfa>(v).map_or((0, 0), |m| (m.failures, m.locked_until))
+            }
+            (_, Some(v)) => {
+                serde_json::from_slice::<super::email2fa::Lockout>(v).map_or((0, 0), |l| (l.failures, l.locked_until))
+            }
         };
         if until <= now {
+            let (conds, ops) = (vec![Cond::eq(name, raw.clone())], vec![Op::put(name, raw)]);
+            if let Err(e) = app.private_cas(&did, conds, ops).await {
+                tracing::debug!(%did, "dropping a lockout index entry: {}", e.message);
+            }
             continue;
         }
         let handle = internal::account_anywhere(app, &did).await.ok().map(|a| a.handle);
@@ -1034,17 +1132,20 @@ async fn local_lockouts(app: &App) -> Vec<J> {
             "lockedUntil": secs_ms(until),
         }));
     }
-    out
+    for (p, key) in junk {
+        let _ = super::write_private_local(&p, vec![crate::segment::Mutation { key, val: None }]).await;
+    }
+    Ok(out)
 }
 
 async fn internal_lockouts(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
     internal::check(&app, &headers)?;
-    Ok(Json(json!({"lockouts": local_lockouts(&app).await})))
+    Ok(Json(json!({"lockouts": local_lockouts(&app).await?})))
 }
 
 async fn list_lockouts(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let mine = json!({"lockouts": local_lockouts(&app).await});
+    let mine = json!({"lockouts": local_lockouts(&app).await?});
     let g = internal::gather(&app, "/internal/v1/console/lockouts", &[]).await;
     let (nodes, unreachable) = gathered_nodes(&app, mine, g);
     let mut seen: HashMap<(String, String), J> = HashMap::new();
@@ -1099,7 +1200,6 @@ async fn clear_lockout(
     if !done {
         return Err(crate::totp::conflict());
     }
-    super::mfa::forget_lockouts(did);
     let e =
         audit(&app, &who(inp.actor, ip), "lockout.clear", Some(&SubjectRef::account(did)), Some(&reason), None, None)
             .await?;
@@ -1126,6 +1226,8 @@ async fn get_config(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>>
         "settings": crate::config_report::settings(),
         "recorded": !crate::config_report::settings().is_empty(),
         "stored": stored,
+        "peerTls": app.config.peer_tls.as_ref().map(|t| t.report()),
+        "secretFiles": crate::config_report::secret_files(crate::config_report::settings()),
     })))
 }
 

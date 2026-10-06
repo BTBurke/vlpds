@@ -9,6 +9,8 @@ mod blob_quota;
 pub mod blobs;
 pub mod cas;
 mod console;
+mod console_accounts;
+mod console_storage;
 pub mod crawlers;
 mod ctl_load;
 mod email2fa;
@@ -134,6 +136,8 @@ pub struct App {
     /// None = DIDs minted locally and never registered (dev only).
     pub plc: Option<Arc<crate::plc::Plc>>,
     pub ui: Arc<WebUi>,
+    /// Objects and bytes in the bucket by component (crate::store_stats).
+    pub store_stats: Arc<crate::store_stats::StoreStats>,
     /// `--spaces` (src/space): space repo heads, the notifyWrite outbox,
     /// revocations. None without the flag.
     pub spaces: Option<Arc<crate::space::Spaces>>,
@@ -359,6 +363,8 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(ratelimits::routes())
         .merge(firehose_subs::routes())
         .merge(console::routes())
+        .merge(console_accounts::routes())
+        .merge(console_storage::routes())
         .merge(moderation::routes())
         .merge(feature_level::routes())
         .merge(webui::routes())

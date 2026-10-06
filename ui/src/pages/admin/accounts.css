@@ -46,3 +46,12 @@
 .cx-fullpage .cx-banners {
   margin-bottom: 10px;
 }
+
+.cx-acc-keys {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

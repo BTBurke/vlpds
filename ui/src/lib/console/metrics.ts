@@ -1,11 +1,13 @@
 import { useSyncExternalStore } from 'react'
 import { parseProm, quantile, rate, sum, type Sample, type Scrape } from '../prom'
-import { nodeMetrics, type MetricsPoint } from './adminAdapter'
+import { type MetricsPoint } from './adminAdapter'
 import { getLive } from './live'
+import { getNodeMetricsState, subscribeNodeMetrics, type NodeMetricsState } from './nodeMetrics'
 
-// Rates and latencies per node, every 2 s while a console page reads them. getNodeMetrics
-// gathers every node's series (each keeps 3 minutes in memory), so it works where /metrics is
-// off the app port. A server without it falls back to scraping this node's own /metrics into
+// Rates and latencies per node, every 2 s while a console page reads them, from the console's
+// one getNodeMetrics poll (nodeMetrics.ts), which gathers every node's series (each keeps 3
+// minutes in memory), so it works where /metrics is off the app port. A server without it
+// falls back to scraping this node's own /metrics into
 // rates client-side (lib/prom.ts); with neither the source is "none" and the tiles say so.
 // The fan-out has no hedge, lease-ratio or mail-budget figures: those stay empty.
 
@@ -110,12 +112,8 @@ const prev = new Map<string, Scrape>()
 const subs = new Set<() => void>()
 let timer: ReturnType<typeof setInterval> | undefined
 let busy = false
-let fanout: boolean | undefined
 
 const push = (arr: Point[] | undefined, p: Point) => [...(arr ?? []), p].slice(-KEEP)
-
-/** Newest point per node from getNodeMetrics, for the next call's `since`. */
-const lastT: Record<string, number> = {}
 
 async function scrapeLocal(): Promise<{ node: string; s: Scrape }[] | null> {
   const res = await fetch('/metrics')
@@ -176,37 +174,43 @@ function mergeNodes(byNode: Record<string, Point[]>, interval: number): Point[] 
     .slice(-KEEP)
 }
 
-/** False when the server has no getNodeMetrics. */
-async function tickFanout(): Promise<boolean> {
-  const seen = Object.values(lastT)
-  const r = await nodeMetrics(seen.length ? Math.min(...seen) : undefined)
-  if (!r.supported) return false
-  const byNode = { ...st.byNode }
+/** The shared getNodeMetrics poll's latest answer, as points (all of them: it keeps 3 minutes). */
+function fromShared(s: NodeMetricsState) {
+  const byNode: Record<string, Point[]> = {}
   const gauges: Record<string, Gauges> = {}
   let interval = INTERVAL
-  for (const n of r.data.nodes) {
+  for (const n of s.nodes) {
+    // an unreachable node keeps the points it had
+    if (n.series.length) byNode[n.node] = n.series.map((p) => pointOf(p, n.raw.cpuLimitCores)).slice(-KEEP)
     if (!n.reachable) continue
-    interval = n.intervalMs ?? interval
-    const fresh = (n.series ?? []).filter((p) => p.t > (lastT[n.node] ?? 0))
-    if (fresh.length) {
-      byNode[n.node] = [...(byNode[n.node] ?? []), ...fresh.map((p) => pointOf(p, n.cpuLimitCores))].slice(-KEEP)
-      lastT[n.node] = fresh[fresh.length - 1].t
-    }
-    const g = n.latest ?? n.series?.[n.series.length - 1]
-    gauges[n.node] = { cachedRepos: g?.cachedRepos, mailQueue: g?.mailQueue, resident: g?.rssBytes, memLimit: n.memoryLimitBytes, subscribers: g?.subscribers }
+    interval = n.raw.intervalMs ?? interval
+    const g = n.latest ?? n.series[n.series.length - 1]
+    gauges[n.node] = { cachedRepos: g?.cachedRepos, mailQueue: g?.mailQueue, resident: g?.rssBytes, memLimit: n.raw.memoryLimitBytes, subscribers: g?.subscribers }
   }
   st = { source: 'fanout', cluster: mergeNodes(byNode, interval), byNode, gauges, version: st.version + 1 }
-  return true
 }
 
+function onShared() {
+  const s = getNodeMetricsState()
+  if (s.status === 'unsupported') {
+    // an older vlpds: scrape this node's /metrics instead
+    if (!timer) {
+      tick()
+      timer = setInterval(tick, INTERVAL)
+    }
+    return
+  }
+  if (s.status === 'ok') fromShared(s)
+  else if (s.status === 'error') st = { ...st, error: s.error instanceof Error ? s.error.message : String(s.error), version: st.version + 1 }
+  else return
+  subs.forEach((l) => l())
+}
+
+/** The /metrics scrape, for a server without getNodeMetrics. */
 async function tick() {
   if (busy || getLive().paused) return
   busy = true
   try {
-    if (fanout !== false) {
-      fanout = await tickFanout()
-      if (fanout) return
-    }
     const got = await scrapeLocal()
     if (!got) {
       st = { ...st, source: 'none', version: st.version + 1 }
@@ -241,15 +245,20 @@ async function tick() {
 }
 
 
+let unshare: (() => void) | undefined
+
 function subscribe(l: () => void) {
   subs.add(l)
   if (subs.size === 1) {
-    tick()
-    timer = setInterval(tick, INTERVAL)
+    unshare = subscribeNodeMetrics(onShared)
+    onShared()
   }
   return () => {
     subs.delete(l)
-    if (!subs.size && timer) {
+    if (subs.size) return
+    unshare?.()
+    unshare = undefined
+    if (timer) {
       clearInterval(timer)
       timer = undefined
     }

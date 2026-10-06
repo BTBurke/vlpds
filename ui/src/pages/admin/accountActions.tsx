@@ -1,8 +1,10 @@
-import { useSyncExternalStore } from 'react'
-import { confirmAction } from '../../components/console/dialogs'
+import { useSyncExternalStore, type ReactNode } from 'react'
+import { confirmAction, FormDialog, openDialog } from '../../components/console/dialogs'
+import { Copy, KV } from '../../components/console/kit'
+import { openPanel } from '../../components/console/nav'
 import * as api from '../../lib/adminApi'
 import { withAdmin } from '../../lib/console/adminAdapter'
-import { fmtNum, plural } from '../../lib/console/fmt'
+import { fmtBytes, fmtNum, plural } from '../../lib/console/fmt'
 import { admin } from '../../lib/xrpc'
 
 // Every action the Accounts section can take on one account, each behind a typed confirm that
@@ -344,3 +346,75 @@ export const setQuota = (a: Who, q: Quota) =>
       done: 'Quota saved',
     }),
   )
+
+export const recountRepo = (a: Who) =>
+  after(
+    confirmAction({
+      tone: 'warn',
+      title: `Recount @${a.handle}'s repo?`,
+      items: ['Reads the whole repo, as Check repo does, and replaces its kept counts and size with exact ones.', 'A commit landing meanwhile refuses it: run it again.'],
+      action: 'Recount',
+      primary: true,
+      call: `vlpds.admin.recountRepo${to(a)}`,
+      run: () => withAdmin((c) => api.recountRepo(c, a.did)),
+      done: (r) => {
+        const b = (r as { repoBytes?: number | null }).repoBytes
+        return `Recounted @${a.handle}${b != null ? `: ${fmtBytes(b)}` : ''}`
+      },
+    }),
+  )
+
+/** The password made for a new account, shown once. */
+function Created({ made, close }: { made: { did: string; handle: string; password?: string }; close: () => void }) {
+  return (
+    <FormDialog title={`Created @${made.handle}`} icon="✓" action="Done" onSubmit={close} onCancel={close}>
+      <KV
+        rows={[
+          ['DID', <Copy text={made.did} />],
+          ...(made.password ? ([['Password', <Copy text={made.password} />]] as [string, ReactNode][]) : []),
+        ]}
+      />
+      {made.password && <p className="t2 sm">Shown once. Hand it over; they can change it after signing in, or reset it by email.</p>}
+    </FormDialog>
+  )
+}
+
+/** As a sign-up, with no invite code; leaving the password blank generates one. */
+export const createAccount = () => {
+  let made: { did: string; handle: string; password?: string } | undefined
+  return after(
+    confirmAction({
+      tone: 'warn',
+      title: 'Create an account',
+      items: ['Checks and claims the handle and email as a sign-up does, and registers the DID.', 'No invite code is needed. Audited as account.create.'],
+      fields: [
+        { id: 'handle', label: 'Handle', required: true, placeholder: 'alice.example.com' },
+        { id: 'email', label: 'Email', required: true },
+        { id: 'password', label: 'Password (blank: generate one)' },
+        { id: 'reason', label: 'Reason (audited)' },
+      ],
+      action: 'Create',
+      primary: true,
+      call: 'vlpds.admin.createAccount',
+      run: async (v) => {
+        made = await withAdmin((c) =>
+          api.createAccount(c, {
+            handle: text(v.handle).replace(/^@/, ''),
+            email: text(v.email),
+            password: text(v.password) || undefined,
+            reason: text(v.reason) || undefined,
+          }),
+        )
+        return made
+      },
+      done: () => `Created @${made?.handle ?? ''}`,
+    }),
+  ).then((ok) => {
+    if (ok && made) {
+      const m = made
+      openPanel('account', m.did)
+      if (m.password) openDialog((close) => <Created made={m} close={close} />)
+    }
+    return ok
+  })
+}

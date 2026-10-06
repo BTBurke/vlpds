@@ -16,6 +16,7 @@ import {
   getCase,
   getSubject,
   listCases,
+  listCasesAbout,
   moderate,
   resolveSubject,
   SEMANTICS,
@@ -412,6 +413,7 @@ registerDetail('subject', {
     const det = useLoad(() => (r ? getSubject(r) : Promise.resolve(undefined)), [r?.did, r?.uri, r?.cid, v])
     const audit = useLoad(() => (r ? getAuditLog({ did: r.did, limit: 25 }) : Promise.resolve([])), [r?.did, v])
     const cases = useLoad(() => listCases(), [v])
+    const about = useLoad(() => (r ? listCasesAbout(r.did, r.uri ?? r.cid) : Promise.resolve([])), [r?.did, r?.uri, r?.cid, v])
     if (res.error) return { title: <span className="mono">{id}</span>, body: null, missing: errText(res.error) }
     const d = det.data
     if (!r || !d) return { title: <span className="mono">{id}</span>, body: null, loading: !det.error, missing: det.error ? errText(det.error) : undefined }
@@ -533,6 +535,20 @@ registerDetail('subject', {
         </div>
       </Sec>
     )
+    const aboutCases = (
+      <Sec title={s.kind === 'account' ? 'Cases about this account' : `Cases about this ${s.kind}`} digest={about.data ? plural(about.data.length, 'case') : '…'} open={!!about.data?.length} right={<Src>listCases · did, subject</Src>}>
+        {about.data?.length ? (
+          about.data.map((c) => (
+            <RRow key={c.id} to={`/admin/moderation/cases/${encodeURIComponent(c.id)}`} x={<Chip k={CASE_TONE[c.status]}>{c.status}</Chip>}>
+              <span className="mono sm">{c.id}</span>
+              <span className="nm t2">{c.source}</span>
+            </RRow>
+          ))
+        ) : (
+          <div className="cx-empty">{about.error ? errText(about.error) : 'No case names it.'}</div>
+        )}
+      </Sec>
+    )
     const history = (
       <Sec title="Audit log for this account" digest={audit.data ? `${plural(audit.data.length, 'entry', 'entries')}${audit.data.length >= 25 ? ' or more' : ''}` : ''} open={page} flush>
         {audit.data?.length ? (
@@ -579,6 +595,7 @@ registerDetail('subject', {
               </div>
               <div>
                 {quota}
+                {aboutCases}
                 {history}
               </div>
             </div>
@@ -587,6 +604,7 @@ registerDetail('subject', {
               {subjectCards}
               {account}
               {quota}
+              {aboutCases}
               {history}
             </>
           )}
