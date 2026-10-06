@@ -3,11 +3,11 @@
 // vlpds (--spaces --dev-mode, with the boards lexicons published locally so
 // the bare `space:dev.example.boards.board` grant resolves) stands in for real
 // PDSes, the local PLC for plc.directory, and the server runs as a
-// confidential OAuth client at http://boards.localhost:2889 with its notify
-// target did:web:127.0.0.1%3A2889. It seeds a board (alice owns it, bob
-// writes, carol and dave aren't in it yet), writes the server's env and the
-// accounts to boards/.local/prod-seed.json (git ignored, test-only values),
-// and waits. With START_SERVER=1 it runs the server too (until Ctrl-C);
+// confidential OAuth client at http://boards.localhost:2889 (PORT_BASE + 29)
+// with its notify target did:web:127.0.0.1%3A2889. It seeds a board (alice
+// owns it, bob writes, carol and dave aren't in it yet), writes the server's
+// env and the accounts to boards/.local/prod-seed.json (LOCAL_DIR; git
+// ignored, test-only values), and waits. With START_SERVER=1 it runs the server too (until Ctrl-C);
 // otherwise packages/boards/e2e/prod.mjs (UI_E2E=1 in run.sh) starts the
 // server from that file and drives it.
 import { spawn } from 'node:child_process'
@@ -17,13 +17,12 @@ import { fileURLToPath } from 'node:url'
 import { SCOPES } from '../../../../boards/src/client.mjs'
 import { generateClientKey } from '../../../../boards/src/oauth.mjs'
 import { Actor } from '../lib/actor.mjs'
-import { OUT, URLS, log } from '../lib/env.mjs'
+import { LOCAL, OUT, PORTS, URLS, log } from '../lib/env.mjs'
 import { Vlpds } from '../lib/vlpds.mjs'
-import { BoardsClient } from './harness.mjs'
+import { BoardsClient, boardLink } from './harness.mjs'
 import { png, setupLexicons } from './scenarios.mjs'
 
-const here = fileURLToPath(new URL('.', import.meta.url))
-const PORT = 2889
+const PORT = PORTS.boardsProd
 
 let vlpds
 async function main() {
@@ -63,11 +62,11 @@ async function main() {
     BOARDS_HANDLE_RESOLVER: URLS.vlpds,
     BOARDS_POLL_MS: '5000',
   }
-  mkdirSync(`${here}.local`, { recursive: true })
-  const file = `${here}.local/prod-seed.json`
+  mkdirSync(LOCAL, { recursive: true })
+  const file = `${LOCAL}prod-seed.json`
   const accounts = Object.entries(acct).map(([name, a]) => ({ name, handle: a.handle, did: a.did, password: a.password }))
   writeFileSync(file, JSON.stringify({ ui, board, metrics: `http://127.0.0.1:${PORT + 1}/metrics`, logDir: dir, env, accounts }, null, 2))
-  log(`seeded board ${board}; lexicons by ${lex.handle}`)
+  log(`seeded board ${boardLink(ui, board)}; lexicons by ${lex.handle}`)
   for (const a of accounts) log(`  @${a.handle}`)
   log(`server env and passwords: ${file}`)
   let server

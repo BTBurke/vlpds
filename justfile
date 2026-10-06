@@ -112,7 +112,7 @@ account-spaces-e2e:
     bench/account-spaces/run.sh
 
 # Spaces e2e matrix (bench/spaces/README.md): local PLC, two reference PDSes at the Spaces alpha and MinIO in
-# docker, vlpds from the newest spaces branch; each role on vlpds or a reference PDS, pass / fail / not impl. per step
+# docker, vlpds from this checkout; each role on vlpds or a reference PDS, pass / fail / not impl. per step
 # (configs: ref-ref vlpds-authority ref-authority vlpds-only; default all; KEEP=1 leaves it up, CLUSTER=1 for 3 nodes)
 spaces-e2e *configs:
     bench/spaces/run.sh e2e {{configs}}
