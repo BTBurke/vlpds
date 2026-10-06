@@ -1440,6 +1440,21 @@ table.cx-t.compact td {
   min-width: 0;
   overflow-wrap: anywhere;
 }
+/* rows with a status chip or an action: label · value · chip · action, every row the height
+   of a small button so the panel keeps one rhythm */
+.cx-kv.x {
+  grid-template-columns: 132px minmax(0, 1fr) auto auto;
+  grid-auto-rows: minmax(27px, auto);
+  align-items: center;
+  gap: 5px 12px;
+}
+.cx-kv.x dd.kc,
+.cx-kv.x dd.ka {
+  justify-self: end;
+  display: flex;
+  gap: 6px;
+  white-space: nowrap;
+}
 .cx-copy {
   cursor: copy;
   border: 0;
@@ -1561,6 +1576,79 @@ pre.cx-json .b {
   color: var(--ink2);
   margin-top: 8px;
   min-height: 18px;
+}
+
+/* Nodes & shards: node cards fill the row whatever the count; a cluster of one gets one panel */
+.cx-nodecards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 14px;
+  align-items: start;
+}
+.cx-pn-h h3.cx-solo-name,
+.cx-nodecards .cx-pn-h h3 {
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  font-size: 13.5px;
+}
+.cx-solo > .cx-tiles {
+  border-radius: 0;
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+}
+.cx-solo-strata {
+  border-top: 1px solid var(--rule2);
+  padding: 10px 14px 0;
+}
+.cx-solo-strata .cx-strata {
+  padding: 4px 0 8px;
+}
+@media (max-width: 1500px) {
+  .cx-solo > .cx-tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media (max-width: 760px) {
+  .cx-solo > .cx-tiles {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+.cx-solo .cx-tile .cx-meter {
+  margin-top: 6px;
+}
+.cx-solo-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr) minmax(0, 1.1fr);
+  border-top: 1px solid var(--rule2);
+}
+.cx-solo-cols > div {
+  padding: 12px 14px 14px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.cx-solo-cols > div + div {
+  border-left: 1px solid var(--rule2);
+}
+@media (max-width: 1280px) {
+  .cx-solo-cols {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .cx-solo-cols > div:nth-child(3) {
+    grid-column: 1 / -1;
+    border-left: 0;
+    border-top: 1px solid var(--rule2);
+  }
+}
+@media (max-width: 760px) {
+  .cx-solo-cols {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .cx-solo-cols > div + div {
+    border-left: 0;
+    border-top: 1px solid var(--rule2);
+  }
 }
 
 /* ---------------------------------------------------------------- live tail */
@@ -2258,6 +2346,28 @@ a.cx-rrow:hover {
   }
   .cx-kv {
     grid-template-columns: 104px minmax(0, 1fr);
+  }
+  /* label · value · action on one row; a chip goes under the value, beside the action */
+  .cx-kv.x {
+    grid-template-columns: 96px minmax(0, 1fr) auto;
+  }
+  .cx-kv.x dt {
+    grid-column: 1;
+  }
+  .cx-kv.x dd.kc {
+    grid-column: 2;
+    justify-self: start;
+  }
+  .cx-kv.x dd.ka {
+    grid-column: 3;
+  }
+  /* a row without an action gives its value the action's width */
+  .cx-kv.x dd:not(.kc):not(.ka):has(+ dd.kc + dd.ka:empty) {
+    grid-column: 2 / -1;
+  }
+  .cx-kv.x dd.kc:empty,
+  .cx-kv.x dd.ka:empty {
+    display: none;
   }
   .cx-tl-row {
     grid-template-columns: 56px 64px minmax(0, 1fr);

@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { registerDetail, type DetailMode } from '../../components/console/Drawer'
-import { Banners, Chip, Copy, ErrorState, Json, KV, Loading, Meter, NeedsVersion, RRow, Sec, Spinner, Src, Strip, type BannerSpec } from '../../components/console/kit'
+import { Banners, Chip, Copy, ErrorState, Json, KV, Loading, Meter, NeedsVersion, RRow, Sec, Spinner, Src, Strip, type BannerSpec, type KVRow } from '../../components/console/kit'
 import { openPanel } from '../../components/console/nav'
 import { registerPalette, type PalItem } from '../../components/console/Palette'
 import { toast } from '../../components/console/toast'
@@ -72,7 +72,7 @@ const btn = (label: string, run: () => unknown, danger?: boolean) => (
 
 // ---------------------------------------------------------------- sections
 
-function Security({ a, sec, mode }: { a: Who; sec: ReturnType<typeof useLoad<AccountSecurity>>; mode: DetailMode }) {
+function Security({ a, sec }: { a: Who; sec: ReturnType<typeof useLoad<AccountSecurity>> }) {
   const s = sec.data
   const factors = s ? [s.passkeys.length ? plural(s.passkeys.length, 'passkey') : '', s.totp.enabled ? 'authenticator app' : '', s.emailCode.enabled ? 'email code' : ''].filter(Boolean) : []
   return (
@@ -82,65 +82,133 @@ function Security({ a, sec, mode }: { a: Who; sec: ReturnType<typeof useLoad<Acc
       ) : !s ? (
         <Loading />
       ) : (
-        <>
-          <KV
-            rows={[
-              ['Password', s.oauthOnly ? <Chip k="info">OAuth only</Chip> : s.passwordSet ? 'set' : <span className="muted">not set</span>],
-              ['Second factor', s.secondFactorRequired ? <Chip k="ok">required at sign-in</Chip> : <span className="muted">not required</span>],
-              [
-                'Passkeys',
-                s.passkeys.length ? (
-                  <span className="cx-acc-chips">
-                    {s.passkeys.map((p) => (
-                      <Chip key={p.name + p.createdAt} k={p.suspect ? 'warn' : 'plain'} title={`added ${date(p.createdAt)}${p.lastUsedAt ? `, used ${ago(p.lastUsedAt)}` : ''}${p.backedUp ? ', synced' : ''}`}>
-                        {p.name}
-                        {p.suspect ? ' · copied?' : ''}
-                      </Chip>
-                    ))}
-                  </span>
-                ) : (
-                  <span className="muted">none</span>
-                ),
-              ],
-              ['Authenticator', s.totp.enabled ? <Chip k="ok">on{s.totp.enabledAt ? ` since ${date(s.totp.enabledAt)}` : ''}</Chip> : <span className="muted">off</span>],
-              ['Email code', s.emailCode.enabled ? <Chip k="ok">on</Chip> : <span className="muted">off</span>],
-              ['Recovery codes', s.recoveryCodes.issuedAt ? `${s.recoveryCodes.remaining} of ${s.recoveryCodes.total} left` : <span className="muted">none issued</span>],
-              ['Trusted browsers', fmtNum(s.trustedBrowsers.length)],
-              ['App passwords', s.blockAppPasswords ? <Chip k="info">blocked by the owner</Chip> : fmtNum(s.appPasswords.length)],
-              ...s.lockouts
-                .filter((l) => l.failures > 0 || l.lockedUntil)
-                .map((l): [ReactNode, ReactNode] => [
-                  factorName(l.factor),
-                  l.lockedUntil && l.lockedUntil > Date.now() ? <Chip k="err">locked, {plural(l.failures, 'wrong code')}</Chip> : `${plural(l.failures, 'wrong code')}`,
-                ]),
-            ]}
-          />
-          <div className="cx-form-row" style={{ marginTop: 10, flexWrap: 'wrap' }}>
-            {btn('Reset two-factor…', () => act.resetSecondFactors(a), true)}
-            {!s.oauthOnly && btn('Set password…', () => act.setPassword(a))}
-          </div>
-          {s.recentSignIns.length > 0 && (
-            <Sec title="Recent sign-ins" digest={`${s.recentSignIns.length} in 30 days · last ${ago(s.recentSignIns[0].at)}`} open={mode === 'page'} flush>
-              <div className="cx-tw">
-                <table className="cx-t compact">
-                  <tbody>
-                    {s.recentSignIns.slice(0, mode === 'page' ? 50 : 10).map((x, i) => (
-                      <tr key={i}>
-                        <td>{ago(x.at)}</td>
-                        <td>
-                          <span className="mono sm">{x.method === 'app_password' ? `app password ${x.appPassword ?? ''}` : x.method === 'oauth' ? (x.clientId ?? 'oauth') : x.method}</span>
-                          {x.newDevice && <> <Chip k="info">new device</Chip></>}
-                        </td>
-                        <td className="t2 sm">{x.device}</td>
-                        <td className="mono sm">{x.ip ?? ''}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </Sec>
-          )}
-        </>
+        <KV
+          rows={[
+            [
+              'Password',
+              s.oauthOnly ? <span className="t2">no password sign-in</span> : s.passwordSet ? 'set' : <span className="muted">not set</span>,
+              { chip: s.oauthOnly ? <Chip k="info">OAuth only</Chip> : undefined, act: !s.oauthOnly && btn('Set password…', () => act.setPassword(a)) },
+            ],
+            [
+              'Second factor',
+              s.secondFactorRequired ? 'asked at every password sign-in' : <span className="muted">not asked</span>,
+              { chip: onOff(s.secondFactorRequired, 'required'), act: btn('Reset two-factor…', () => act.resetSecondFactors(a), true) },
+            ],
+            [
+              'Passkeys',
+              s.passkeys.length ? (
+                <span className="cx-acc-chips">
+                  {s.passkeys.map((p) => (
+                    <Chip key={p.name + p.createdAt} k={p.suspect ? 'warn' : 'plain'} title={`added ${date(p.createdAt)}${p.lastUsedAt ? `, used ${ago(p.lastUsedAt)}` : ''}${p.backedUp ? ', synced' : ''}`}>
+                      {p.name}
+                      {p.suspect ? ' · copied?' : ''}
+                    </Chip>
+                  ))}
+                </span>
+              ) : (
+                <span className="muted">none</span>
+              ),
+              { chip: onOff(s.passkeys.length > 0) },
+            ],
+            ['Authenticator app', s.totp.enabled ? (s.totp.enabledAt ? `since ${date(s.totp.enabledAt)}` : 'set up') : <span className="muted">not set up</span>, { chip: onOff(s.totp.enabled) }],
+            ['Email code', s.emailCode.enabled ? (s.emailCode.since ? `since ${date(s.emailCode.since)}` : 'set up') : <span className="muted">not set up</span>, { chip: onOff(s.emailCode.enabled) }],
+            [
+              'Recovery codes',
+              s.recoveryCodes.issuedAt ? `${s.recoveryCodes.remaining} of ${s.recoveryCodes.total} left` : <span className="muted">none issued</span>,
+              { chip: s.recoveryCodes.issuedAt && s.recoveryCodes.remaining <= 2 ? <Chip k="warn">low</Chip> : undefined },
+            ],
+            ['Trusted browsers', fmtNum(s.trustedBrowsers.length)],
+            ['App passwords', s.blockAppPasswords ? <span className="t2">refused at sign-in</span> : fmtNum(s.appPasswords.length), { chip: s.blockAppPasswords ? <Chip k="info">blocked by the owner</Chip> : undefined }],
+            ...s.lockouts
+              .filter((l) => l.failures > 0 || l.lockedUntil)
+              .map((l): KVRow => {
+                const locked = !!l.lockedUntil && l.lockedUntil > Date.now()
+                return [factorName(l.factor), plural(l.failures, 'wrong code'), { chip: locked ? <Chip k="err">locked</Chip> : undefined, act: locked ? btn('Unlock…', () => act.clearLockout(a)) : undefined }]
+              }),
+          ]}
+        />
+      )}
+    </Sec>
+  )
+}
+
+const onOff = (on: boolean, label = 'on') => (on ? <Chip k="ok">{label}</Chip> : <Chip k="idle">off</Chip>)
+
+const METHOD: Record<string, string> = { password: 'password', app_password: 'app password', oauth: 'OAuth', passkey: 'passkey' }
+const FACTOR: Record<string, string> = { totp: 'authenticator', email: 'email code', passkey: 'passkey', recovery: 'recovery code', trusted: 'trusted browser' }
+
+/** An OAuth client by its host ("boards.example.com"); the id itself when it isn't a URL. */
+export function clientHost(id: string): string {
+  try {
+    return new URL(id).hostname || id
+  } catch {
+    return id
+  }
+}
+
+/** A client id as its host, the full id on hover. */
+const Client = ({ id }: { id: string }) => (
+  <span className="trunc cx-acc-cell" title={id}>
+    {clientHost(id)}
+  </span>
+)
+
+/** The parsed device ("Chrome on macOS"), the user agent it came from on hover. */
+const Device = ({ name, ua }: { name?: string | null; ua?: string | null }) => (
+  <span className="trunc cx-acc-cell" title={ua ?? undefined}>
+    {name ?? '—'}
+  </span>
+)
+
+function SignIns({ sec, mode }: { sec: ReturnType<typeof useLoad<AccountSecurity>>; mode: DetailMode }) {
+  const [more, setMore] = useState(false)
+  const s = sec.data
+  if (!s?.recentSignIns.length) return null
+  const all = s.recentSignIns
+  const n = more ? all.length : mode === 'page' ? 15 : 10
+  const fresh = all.filter((x) => x.newDevice).length
+  return (
+    <Sec title="Recent sign-ins" digest={`${all.length} in 30 days · last ${ago(all[0].at)}${fresh ? ` · ${fresh} from a new device` : ''}`} open flush right={<Src>getAccountSecurity</Src>}>
+      <div className="cx-tw">
+        <table className="cx-t compact cx-acc-signins">
+          <thead>
+            <tr>
+              <th>When</th>
+              <th>Method</th>
+              <th>Client</th>
+              <th>Device</th>
+              <th>IP</th>
+              <th>
+                <span className="sr">New device</span>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {all.slice(0, n).map((x, i) => (
+              <tr key={i}>
+                <td title={new Date(x.at).toLocaleString()}>{ago(x.at)}</td>
+                <td>
+                  {METHOD[x.method] ?? x.method}
+                  {x.factor && x.factor !== x.method && <span className="muted"> + {FACTOR[x.factor] ?? x.factor}</span>}
+                </td>
+                <td>{x.clientId ? <Client id={x.clientId} /> : x.method === 'app_password' ? <span className="trunc cx-acc-cell">“{x.appPassword ?? ''}”</span> : <span className="muted">—</span>}</td>
+                <td>
+                  <Device name={x.device} ua={x.userAgent} />
+                </td>
+                <td className="mono sm">{x.ip ?? '—'}</td>
+                <td style={{ width: '100%' }}>{x.newDevice && <Chip k="info">new device</Chip>}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {all.length > (mode === 'page' ? 15 : 10) && (
+        <div className="cx-pn-f">
+          <span>{more ? `All ${all.length}, newest first (the server keeps 30 days, at most 50).` : `The ${n} newest of ${all.length}.`}</span>
+          <button type="button" className="cx-linklike" style={{ marginLeft: 'auto' }} onClick={() => setMore((v) => !v)}>
+            {more ? 'Show fewer' : `Show all ${all.length}`}
+          </button>
+        </div>
       )}
     </Sec>
   )
@@ -155,8 +223,10 @@ function sessionLabel(s: Session): string {
 function Sessions({ a, mode }: { a: Who; mode: DetailMode }) {
   const v = useAccountsVersion()
   const l = useLoad(() => withAdmin((c) => api.listSessions(c, a.did)), [a.did, v])
+  const [more, setMore] = useState(false)
   const ss = l.data?.sessions ?? []
   const oauth = ss.filter((s) => s.kind === 'oauth').length
+  const first = mode === 'page' ? 15 : 10
   return (
     <Sec title="Sessions" digest={l.data ? `${ss.length} signed in · ${oauth} OAuth` : '…'} open flush right={<Src>listSessions</Src>}>
       {l.error ? (
@@ -180,15 +250,17 @@ function Sessions({ a, mode }: { a: Who; mode: DetailMode }) {
                 </tr>
               </thead>
               <tbody>
-                {ss.slice(0, mode === 'page' ? 200 : 20).map((s) => (
+                {ss.slice(0, more ? 200 : first).map((s) => (
                   <tr key={s.id} title={s.kind === 'oauth' ? s.scope : undefined}>
                     <td>
-                      {s.kind === 'oauth' ? <span className="mono sm">{s.clientId}</span> : <Chip k="plain">{s.kind === 'appPassword' ? `app pw · ${s.appPassword ?? ''}` : 'password'}</Chip>}
-                      {s.kind !== 'oauth' && s.privileged && <> <Chip k="warn">privileged</Chip></>}
-                      {s.passkey && <> <Chip k="acc">passkey</Chip></>}
+                      <span className="cx-cellid">
+                        {s.kind === 'oauth' ? <Client id={s.clientId} /> : s.kind === 'appPassword' ? <span className="trunc cx-acc-cell">app password “{s.appPassword ?? ''}”</span> : 'password'}
+                        {s.kind !== 'oauth' && s.privileged && <Chip k="warn">privileged</Chip>}
+                        {s.passkey && <Chip k="acc">passkey</Chip>}
+                      </span>
                     </td>
-                    <td className="t2 sm">{s.kind === 'oauth' ? (s.device ?? '—') : '—'}</td>
-                    <td className="mono sm" title={s.signedInIp ? `signed in from ${s.signedInIp}` : undefined}>
+                    <td>{s.kind === 'oauth' ? <Device name={s.device} ua={s.userAgent} /> : <span className="muted">—</span>}</td>
+                    <td className="mono sm" style={{ width: '100%' }} title={s.signedInIp ? `signed in from ${s.signedInIp}` : undefined}>
                       {s.ip ?? '—'}
                     </td>
                     <td className="r">{when(s.signedInAt)}</td>
@@ -203,7 +275,14 @@ function Sessions({ a, mode }: { a: Who; mode: DetailMode }) {
               </tbody>
             </table>
           </div>
-          <div className="cx-pn-f">{btn('Sign out everywhere…', () => act.signOutEverywhere(a, ss.length), true)}</div>
+          <div className="cx-pn-f">
+            {btn('Sign out everywhere…', () => act.signOutEverywhere(a, ss.length), true)}
+            {ss.length > first && (
+              <button type="button" className="cx-linklike" style={{ marginLeft: 'auto' }} onClick={() => setMore((x) => !x)}>
+                {more ? 'Show fewer' : `Show all ${ss.length}`}
+              </button>
+            )}
+          </div>
         </>
       )}
     </Sec>
@@ -222,10 +301,13 @@ function AppPasswords({ a, sec, mode }: { a: Who; sec?: AccountSecurity; mode: D
             <tbody>
               {pw.map((p) => (
                 <tr key={p.name}>
-                  <td>
-                    <b>{p.name}</b> {p.privileged && <Chip k="warn">privileged</Chip>}
+                  <td style={{ width: '100%' }}>
+                    <b>{p.name}</b>
                   </td>
-                  <td className="t2">created {iso(p.createdAt)}</td>
+                  <td>{p.privileged && <Chip k="warn">privileged</Chip>}</td>
+                  <td className="r t2" title={p.createdAt}>
+                    created {iso(p.createdAt)}
+                  </td>
                   <td className="r">
                     <button type="button" className="cx-btn sm quiet" onClick={() => act.revokeAppPassword(a, p.name)}>
                       Revoke
@@ -241,67 +323,62 @@ function AppPasswords({ a, sec, mode }: { a: Who; sec?: AccountSecurity; mode: D
   )
 }
 
-function CheckRepo({ did }: { did: string }) {
+/** A click-to-run load for a KV row: the button goes in the row's action slot, the answer in its value. */
+function useOnDemand<T>(run: (refresh: boolean) => Promise<T>) {
   const [busy, setBusy] = useState(false)
-  const [r, setR] = useState<{ ok: boolean; problems?: string[]; records?: { count: number } }>()
-  return (
-    <>
-      <button
-        type="button"
-        className="cx-btn sm"
-        disabled={busy}
-        onClick={async () => {
-          setBusy(true)
-          try {
-            setR(await admin('vlpds.admin.checkRepo', { params: { did } }))
-          } catch (e) {
-            toast(errText(e), { err: true })
-          } finally {
-            setBusy(false)
-          }
-        }}
-      >
-        {busy && <Spinner />}
-        Check repo
-      </button>
-      {r && (
-        <div className="cx-acc-check">
-          {r.ok ? <Chip k="ok">ok</Chip> : <Chip k="err">{plural(r.problems?.length ?? 0, 'problem')}</Chip>} head signature, records, MST and indexes
-          {!!r.problems?.length && (
-            <ul>
-              {r.problems.map((p, i) => (
-                <li key={i}>{p}</li>
-              ))}
-            </ul>
-          )}
-        </div>
-      )}
-    </>
-  )
-}
-
-/** The DID document's keys and the directory's rotation keys: one directory request, so only on a click. */
-function AccountKeys({ did }: { did: string }) {
-  const [busy, setBusy] = useState(false)
-  const [k, setK] = useState<api.AccountKeys>()
-  const load = async (refresh: boolean) => {
+  const [r, setR] = useState<T>()
+  const go = async (refresh: boolean) => {
     setBusy(true)
     try {
-      setK(await withAdmin((c) => api.getAccountKeys(c, did, refresh)))
+      setR(await run(refresh))
     } catch (e) {
       toast(errText(e), { err: true })
     } finally {
       setBusy(false)
     }
   }
-  if (!k)
-    return (
-      <button type="button" className="cx-btn sm" disabled={busy} onClick={() => load(false)}>
-        {busy && <Spinner />}
-        Show keys
-      </button>
-    )
-  return (
+  const button = (label: string, refresh = false) => (
+    <button type="button" className="cx-btn sm" disabled={busy} onClick={() => go(refresh)}>
+      {busy && <Spinner />}
+      {label}
+    </button>
+  )
+  return { r, button }
+}
+
+type RepoCheck = { ok: boolean; problems?: string[]; records?: { count: number } }
+
+/** Check repo: a row of its own, the verdict as its chip. */
+function useCheckRepo(did: string): KVRow {
+  const c = useOnDemand<RepoCheck>(() => admin('vlpds.admin.checkRepo', { params: { did } }))
+  const r = c.r
+  return [
+    'Integrity',
+    r ? (
+      <div className="cx-acc-check">
+        head signature, records, MST and indexes
+        {!!r.problems?.length && (
+          <ul>
+            {r.problems.map((p, i) => (
+              <li key={i}>{p}</li>
+            ))}
+          </ul>
+        )}
+      </div>
+    ) : (
+      <span className="muted">head signature, records, MST and indexes, on request</span>
+    ),
+    { chip: r ? r.ok ? <Chip k="ok">ok</Chip> : <Chip k="err">{plural(r.problems?.length ?? 0, 'problem')}</Chip> : undefined, act: c.button(r ? 'Check again' : 'Check repo') },
+  ]
+}
+
+/** The DID document's keys and the directory's rotation keys: one directory request, so only on a click. */
+function useAccountKeys(did: string): KVRow {
+  const c = useOnDemand((refresh) => withAdmin((x) => api.getAccountKeys(x, did, refresh)))
+  const k = c.r
+  if (!k) return ['Keys', <span className="muted">the DID document’s keys and rotation keys, on request</span>, { act: c.button('Show keys') }]
+  return [
+    'Keys',
     <div className="cx-acc-keys">
       {(k.verificationMethods ?? []).map((m) => (
         <div key={m.id} title={m.type}>
@@ -322,16 +399,14 @@ function AccountKeys({ did }: { did: string }) {
         </div>
       ))}
       {k.rotationKeysError && <div className="t2 sm">Rotation keys: {k.rotationKeysError}</div>}
-      <button type="button" className="cx-btn sm quiet" disabled={busy} onClick={() => load(true)}>
-        {busy && <Spinner />}
-        Refetch the DID document
-      </button>
-    </div>
-  )
+    </div>,
+    { act: c.button('Refetch', true) },
+  ]
 }
 
-function Placement({ row, mode }: { row?: AccountRow; mode: DetailMode }) {
+function Placement({ did, row, mode }: { did: string; row?: AccountRow; mode: DetailMode }) {
   const { view } = useClusterView()
+  const check = useCheckRepo(did)
   if (!row) return null
   const owner = view?.nodes.find((n) => n.node === row.node)
   const pos = view?.raw.layout ? view.raw.layout.shards.findIndex((s) => s.id === row.shard) : row.shard
@@ -339,8 +414,28 @@ function Placement({ row, mode }: { row?: AccountRow; mode: DetailMode }) {
     <Sec title="Placement" digest={`shard ${row.shard} on ${row.node}`} open={mode === 'page'}>
       <KV
         rows={[
-          ['Shard', <span className="mono">{String(row.shard).padStart(10, '0')} {pos !== undefined && pos >= 0 && <span className="muted">· <Open type="shard" id={String(pos)}>open shard</Open></span>}</span>],
-          ['Owner', owner ? <Open type="node" id={owner.node}><NodeTag n={owner} /></Open> : <span className="mono">{row.node}</span>],
+          [
+            'Shard',
+            <span className="mono">{String(row.shard).padStart(10, '0')}</span>,
+            {
+              act:
+                pos !== undefined && pos >= 0 ? (
+                  <button type="button" className="cx-btn sm quiet" onClick={() => openPanel('shard', String(pos))}>
+                    Open shard ›
+                  </button>
+                ) : undefined,
+            },
+          ],
+          [
+            'Owner',
+            owner ? (
+              <Open type="node" id={owner.node}>
+                <NodeTag n={owner} />
+              </Open>
+            ) : (
+              <span className="mono">{row.node}</span>
+            ),
+          ],
           ['Repo rev', <span className="mono">{row.rev ?? '—'}</span>],
           ['Last commit', when(row.lastCommitAt)],
           ['Records', row.records === undefined ? '—' : fmtNum(row.records)],
@@ -348,11 +443,20 @@ function Placement({ row, mode }: { row?: AccountRow; mode: DetailMode }) {
           [
             'Repo size',
             <span title="Record blocks + MST node blocks, kept close by each commit; a recount makes it exact">
-              {row.repoBytes === undefined ? '—' : `${fmtBytes(row.repoBytes)} (${fmtBytes(row.recordBytes ?? 0)} records · ${fmtBytes(row.mstBytes ?? 0)} MST)`}{' '}
-              {btn('Recount…', () => act.recountRepo({ did: row.did, handle: row.handle, node: row.node }))}
+              {row.repoBytes === undefined ? (
+                '—'
+              ) : (
+                <>
+                  {fmtBytes(row.repoBytes)}{' '}
+                  <span className="muted">
+                    ({fmtBytes(row.recordBytes ?? 0)} records · {fmtBytes(row.mstBytes ?? 0)} MST)
+                  </span>
+                </>
+              )}
             </span>,
+            { act: btn('Recount…', () => act.recountRepo({ did: row.did, handle: row.handle, node: row.node })) },
           ],
-          ['Checks', <CheckRepo did={row.did} />],
+          check,
         ]}
       />
     </Sec>
@@ -422,26 +526,33 @@ function Blobs({ a, row, mode }: { a: Who; row?: AccountRow; mode: DetailMode })
         <Loading />
       ) : (
         <>
-          {q.limitBytes > 0 && (
-            <div className="cx-mini" style={{ marginBottom: 8 }}>
-              <div className="ml">
-                <span>quota</span>
-                <b>{pct!.toFixed(0)}%</b>
-              </div>
-              <Meter v={q.bytes} max={q.limitBytes} k={q.over ? 'err' : undefined} wide />
-            </div>
-          )}
           <KV
             rows={[
               ['Blobs', row?.blobs !== undefined ? fmtNum(row.blobs) : '—'],
-              ['Stored', `${fmtBytes(q.bytes)}${q.limitBytes ? ` of ${fmtBytes(q.limitBytes)}` : ', no limit'}`],
+              [
+                'Stored',
+                q.limitBytes > 0 ? (
+                  <span className="cx-acc-quota">
+                    <span>
+                      {fmtBytes(q.bytes)} <span className="muted">of {fmtBytes(q.limitBytes)}</span>
+                    </span>
+                    <Meter v={q.bytes} max={q.limitBytes} k={q.over ? 'err' : pct! >= 80 ? 'warn' : undefined} wide />
+                  </span>
+                ) : (
+                  <>
+                    {fmtBytes(q.bytes)} <span className="muted">· no limit</span>
+                  </>
+                ),
+                { chip: q.limitBytes > 0 ? q.over ? <Chip k="err">over</Chip> : <span className="mono sm t2">{pct!.toFixed(0)}%</span> : undefined },
+              ],
               ['Uploads today', `${fmtNum(q.uploadsToday)}${q.limitUploadsPerDay ? ` of ${fmtNum(q.limitUploadsPerDay)}` : ''}`],
-              ['Limits', q.override.bytes !== undefined || q.override.uploadsPerDay !== undefined ? <Chip k="info">custom</Chip> : 'server defaults'],
+              [
+                'Limits',
+                q.override.bytes !== undefined || q.override.uploadsPerDay !== undefined ? 'set for this account' : 'server defaults',
+                { chip: q.override.bytes !== undefined || q.override.uploadsPerDay !== undefined ? <Chip k="info">custom</Chip> : undefined, act: btn('Change quota…', () => act.setQuota(a, q)) },
+              ],
             ]}
           />
-          <div className="cx-form-row" style={{ marginTop: 10 }}>
-            {btn('Change quota…', () => act.setQuota(a, q))}
-          </div>
         </>
       )}
     </Sec>
@@ -452,16 +563,25 @@ function Invites({ a, info }: { a: Who; info?: AccountInfo }) {
   const codes = info?.invites ?? []
   return (
     <Sec title="Invites" digest={!info ? '…' : info.invitesDisabled ? 'blocked from creating codes' : plural(codes.length, 'code')} right={<Src>getAccountInfo</Src>}>
-      <div className="cx-form-row" style={{ justifyContent: 'space-between', marginBottom: codes.length ? 8 : 0 }}>
-        <span className="t2">{info?.invitesDisabled ? 'This account cannot create invite codes.' : 'This account may create invite codes.'}</span>
-        {info && btn(info.invitesDisabled ? 'Allow invites…' : 'Block invites…', () => act.setInvites(a, !!info.invitesDisabled))}
-      </div>
-      {codes.map((c) => (
-        <RRow key={c.code} x={`${c.uses.length}/${c.available} used${c.disabled ? ' · disabled' : ''}`}>
-          <span className="mono sm">{c.code}</span>
-        </RRow>
-      ))}
-      <KV style={{ marginTop: 8 }} rows={[['Invited with', <span className="mono sm">{info?.invitedBy?.code ?? '—'}</span>]]} />
+      <KV
+        rows={[
+          [
+            'Creating codes',
+            info?.invitesDisabled ? <span className="t2">blocked</span> : 'allowed',
+            { chip: info ? onOff(!info.invitesDisabled, 'allowed') : undefined, act: info && btn(info.invitesDisabled ? 'Allow invites…' : 'Block invites…', () => act.setInvites(a, !!info.invitesDisabled)) },
+          ],
+          ['Invited with', <span className="mono sm">{info?.invitedBy?.code ?? '—'}</span>],
+        ]}
+      />
+      {codes.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          {codes.map((c) => (
+            <RRow key={c.code} x={`${c.uses.length}/${c.available} used${c.disabled ? ' · disabled' : ''}`}>
+              <span className="mono sm">{c.code}</span>
+            </RRow>
+          ))}
+        </div>
+      )}
     </Sec>
   )
 }
@@ -530,8 +650,19 @@ function Moderation({ did, status, mode }: { did: string; status?: SubjectStatus
     >
       <KV
         rows={[
-          ['Takedown', status?.takedown?.applied ? <Chip k="err">in effect{status.takedown.ref ? ` · ${status.takedown.ref}` : ''}</Chip> : 'none'],
-          ['Deactivated', status?.deactivated?.applied ? <Chip k="warn">yes</Chip> : 'no'],
+          [
+            'Takedown',
+            status?.takedown?.applied ? <span className="mono sm">{status.takedown.ref ?? 'no reference'}</span> : <span className="muted">none</span>,
+            {
+              chip: status?.takedown?.applied ? <Chip k="err">in effect</Chip> : undefined,
+              act: (
+                <Link className="cx-btn sm quiet" to={`/admin/moderation?q=${encodeURIComponent(did)}`}>
+                  Moderation ›
+                </Link>
+              ),
+            },
+          ],
+          ['Deactivated', status?.deactivated?.applied ? 'yes' : <span className="muted">no</span>, { chip: status?.deactivated?.applied ? <Chip k="warn">deactivated</Chip> : undefined }],
         ]}
       />
       {!!cases.error && <ErrorState error={cases.error} retry={cases.reload} />}
@@ -554,11 +685,6 @@ function Moderation({ did, status, mode }: { did: string; status?: SubjectStatus
           ))}
         </>
       )}
-      <div className="cx-form-row" style={{ marginTop: 8 }}>
-        <Link className="cx-btn sm" to={`/admin/moderation?q=${encodeURIComponent(did)}`}>
-          Look up in Moderation ›
-        </Link>
-      </div>
     </Sec>
   )
 }
@@ -611,6 +737,49 @@ function Danger({ a, row, status, mode }: { a: Who; row?: AccountRow; status?: S
           {btn('Delete…', () => act.deleteAccount(a, { records: row?.records, blobs: row?.blobs }), true)}
         </Act>
       </div>
+    </Sec>
+  )
+}
+
+function Identity({ a, i, r }: { a: Who; i?: AccountInfo; r?: AccountRow }) {
+  const did = a.did
+  const keys = useAccountKeys(did)
+  return (
+    <Sec title="Identity" digest={did} open right={<Src>getAccountInfo</Src>}>
+      <KV
+        rows={[
+          ['DID', <Copy text={did} />],
+          ['Handle', `@${a.handle}`, { act: btn('Change…', () => act.setHandle(a)) }],
+          [
+            'Email',
+            i?.email ? <Copy text={i.email} mono={false} /> : <span className="muted">none</span>,
+            i?.email ? { chip: i.emailConfirmedAt ? <Chip k="ok">confirmed</Chip> : <Chip k="warn">unconfirmed</Chip>, act: btn('Change…', () => act.setEmail(a, i.email)) } : {},
+          ],
+          [
+            'Created',
+            i ? (
+              <>
+                {date(i.indexedAt)} <span className="muted">({iso(i.indexedAt)})</span>
+              </>
+            ) : (
+              '—'
+            ),
+          ],
+          ['Second factors', r ? <TwoFactor f={r.secondFactors} /> : '—'],
+          [
+            'PLC',
+            did.startsWith('did:plc:') ? (
+              <a href={`https://plc.directory/${did}/log/audit`} target="_blank" rel="noreferrer">
+                audit log ↗
+              </a>
+            ) : (
+              <span className="mono sm">{did.split(':').slice(0, 2).join(':')}</span>
+            ),
+          ],
+          keys,
+          ['#identity', <span className="muted">tells relays and AppViews to re-resolve the DID and handle</span>, { act: btn('Publish…', () => act.publishIdentity(a)) }],
+        ]}
+      />
     </Sec>
   )
 }
@@ -682,24 +851,10 @@ registerDetail('account', {
         ]}
       />
     )
-    const identity = (
-      <Sec title="Identity" digest={did} open right={<Src>getAccountInfo</Src>}>
-        <KV
-          rows={[
-            ['DID', <Copy text={did} />],
-            ['Handle', <>@{handle} {btn('Change…', () => act.setHandle(a))}</>],
-            ['Email', i?.email ? <><Copy text={i.email} mono={false} /> {i.emailConfirmedAt ? <Chip k="ok">confirmed</Chip> : <Chip k="warn">unconfirmed</Chip>} {btn('Change…', () => act.setEmail(a, i.email))}</> : <span className="muted">none</span>],
-            ['Created', i ? <>{date(i.indexedAt)} <span className="muted">({iso(i.indexedAt)})</span></> : '—'],
-            ['2FA', r ? <TwoFactor f={r.secondFactors} /> : '—'],
-            ['PLC', did.startsWith('did:plc:') ? <a href={`https://plc.directory/${did}/log/audit`} target="_blank" rel="noreferrer">audit log ↗</a> : <span className="mono sm">{did.split(':').slice(0, 2).join(':')}</span>],
-            ['Keys', <AccountKeys did={did} />],
-            ['Identity', btn('Publish #identity…', () => act.publishIdentity(a))],
-          ]}
-        />
-      </Sec>
-    )
-    const placement = <Placement row={r} mode={mode} />
-    const security = <Security a={a} sec={sec} mode={mode} />
+    const identity = <Identity a={a} i={i} r={r} />
+    const placement = <Placement did={did} row={r} mode={mode} />
+    const security = <Security a={a} sec={sec} />
+    const signIns = <SignIns sec={sec} mode={mode} />
     const sessions = <Sessions a={a} mode={mode} />
     const apppw = <AppPasswords a={a} sec={s} mode={mode} />
     const ops = <Ops did={did} mode={mode} />
@@ -716,6 +871,7 @@ registerDetail('account', {
       </>
     )
     return {
+      wide: true,
       title: `@${handle}`,
       chip: <Chip k={k}>{t}</Chip>,
       foot: (
@@ -728,19 +884,22 @@ registerDetail('account', {
           <>
             {top}
             <div className="cols">
+              <div>{identity}</div>
+              <div>{security}</div>
+            </div>
+            {signIns}
+            {sessions}
+            <div className="cols">
               <div>
-                {identity}
                 {placement}
-                {ops}
                 {blobs}
+                {ops}
                 {spaces}
-                {moder}
               </div>
               <div>
-                {security}
-                {sessions}
                 {apppw}
                 {invites}
+                {moder}
                 {dev}
                 {danger}
               </div>
@@ -751,6 +910,7 @@ registerDetail('account', {
             {top}
             {identity}
             {security}
+            {signIns}
             {sessions}
             {placement}
             {apppw}

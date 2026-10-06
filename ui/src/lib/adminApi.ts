@@ -204,7 +204,9 @@ export type AccountSecurity = {
     method: 'password' | 'app_password' | 'oauth' | 'passkey' | string
     appPassword?: string | null
     clientId?: string | null
+    /** Parsed from `userAgent`: "Chrome on macOS". */
     device: string
+    userAgent?: string | null
     ip?: string | null
     factor?: string | null
     newDevice: boolean
@@ -228,6 +230,7 @@ export type Session =
       refreshedAt: number
       expiresAt?: number | null
       device?: string | null
+      userAgent?: string | null
       deviceLastSeenAt?: number | null
       passkey: boolean
       /** Client address at the latest refresh, and at sign-in. */
