@@ -147,9 +147,9 @@ name = "level_gating"
 path = "tests/level_gating.rs"
 required-features = ["test-level"]
 
-# slatedb 0.17.0 (upstream c1e36fc) plus six patches: 1-4 on the fork branch
-# vlpds-0.17-filtercache, 5 on fix/l0-view-merge-dup-sst on top of it, 6 on
-# vlpds-0.17-cache-first-loader on top of that (all pending an upstream report):
+# The fork's main = upstream slatedb 0.17.0 (c1e36fc) plus the patches listed
+# in its PATCHES.md, pinned here by rev (each patch also has its own branch for
+# an upstream report, all pending):
 # 1. a union clone (a shard merge) of two sources that inherited the same L0
 #    SST from a common ancestor (a split's halves merged back) repeated its L0
 #    view id, and the merged shard's first compaction of it dropped one half's
@@ -176,9 +176,9 @@ required-features = ["test-level"]
 #    per cached get in the fork's alloc bench). MetaCache and BlockCache use
 #    the default peek, their get_*.
 [patch.crates-io]
-slatedb = { git = "https://github.com/jazware/slatedb", rev = "17d684450e8daba2e2b3f8c6c68f47dc1d69e08a" }
+slatedb = { git = "https://github.com/jazware/slatedb", rev = "8510667e0b3b99f9bfdd61f687a8bdb79ed03b92" }
 # the same rev, so the metrics recorder (src/metrics.rs) and slatedb share one slatedb-common
-slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "17d684450e8daba2e2b3f8c6c68f47dc1d69e08a" }
+slatedb-common = { git = "https://github.com/jazware/slatedb", rev = "8510667e0b3b99f9bfdd61f687a8bdb79ed03b92" }
 
 # Fat LTO + 1 codegen unit: ~4 min of a release build is this crate's
 # single-threaded optimization and LTO, but cheaper settings cost runtime
