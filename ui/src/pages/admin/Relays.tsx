@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { CopyValue, Empty, ErrorNotice, Field, Loading, Notice, Panel, Spinner, Status } from '../../components/ui'
+import { AddRow, ConsolePage, CopyValue, Empty, ErrorNotice, Loading, Notice, Panel, Spinner, Status } from '../../components/ui'
 import { fmtTime, relTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { admin } from '../../lib/xrpc'
@@ -42,9 +42,12 @@ export function Relays() {
     if (d && minutes === '') setMinutes(String(d.intervalSecs / 60))
   }, [d, minutes])
 
-  const save = useAction(async (body: { relays?: string[] | null; intervalSecs?: number | null }) => {
+  const [adding, setAdding] = useState(false)
+  const save = useAction(async (body: { relays?: string[] | null; intervalSecs?: number | null }, isAdd: boolean = false) => {
+    setAdding(isAdd)
     await admin('vlpds.admin.setCrawlers', { body })
     c.reload()
+    return true
   })
   const crawl = useAction(async (relays: string[]) => {
     const r = await admin('vlpds.admin.requestCrawl', { body: { relays } })
@@ -54,26 +57,34 @@ export function Relays() {
 
   if (!d)
     return (
-      <>
+      <ConsolePage title="Relays">
         <ErrorNotice error={c.error} />
         {!c.error && <Loading />}
-      </>
+      </ConsolePage>
     )
   const list = d.relays.map((r) => r.relay)
   const intervalSecs = Math.round(Number(minutes) * 60)
   const intervalValid = Number.isFinite(intervalSecs) && intervalSecs >= 1 && intervalSecs <= 7 * 24 * 3600
   const busy = save.busy || crawl.busy
   return (
-    <>
-      <div className="console-head">
-        <h1>Relays</h1>
-      </div>
-      <p className="muted">
-        Relays are asked to crawl <span className="mono">{d.hostname}</span> (<span className="mono">com.atproto.sync.requestCrawl</span>) at startup and again
-        after new activity, at most once every {every(d.intervalSecs)} per relay. One node sends for the cluster, the owner of slot 0:{' '}
-        {d.sender ? 'this node' : 'not this node'} (<span className="mono">{d.node}</span>).
-      </p>
-      <ErrorNotice error={c.error || save.error || crawl.error} />
+    <ConsolePage
+      title="Relays"
+      intro={
+        <>
+          Relays are asked to crawl <span className="mono">{d.hostname}</span> at startup and after new activity, at most once every {every(d.intervalSecs)}{' '}
+          per relay.
+        </>
+      }
+      setupLabel="How requests are sent"
+      setup={
+        <p>
+          Each request is a <span className="mono">com.atproto.sync.requestCrawl</span>. One node sends for the whole cluster, the owner of slot 0; that is{' '}
+          {d.sender ? 'this node' : 'not this node'} (<span className="mono">{d.node}</span>). The relay list and interval are stored in the bucket once
+          changed here, and override the nodes’ <span className="mono">--crawlers</span> and <span className="mono">--crawl-interval-secs</span>.
+        </p>
+      }
+    >
+      <ErrorNotice error={c.error || crawl.error || (!adding && save.error)} />
       {results && (
         <Notice kind={results.every((r) => r.ok) ? 'ok' : 'warn'}>
           {results.map((r) => (
@@ -85,11 +96,7 @@ export function Relays() {
       )}
       <Panel
         title="Relays"
-        desc={
-          d.relaysSource === 'stored'
-            ? 'Set in this console (stored in the bucket); overrides the nodes’ --crawlers.'
-            : 'From the nodes’ --crawlers flag. Adding or removing a relay here stores the list for the cluster.'
-        }
+        desc={d.relaysSource === 'stored' ? 'Set in this console; overrides --crawlers.' : 'From --crawlers. Changing the list here stores it for the cluster.'}
         flush
         actions={
           <>
@@ -109,15 +116,14 @@ export function Relays() {
           <Empty title="No relays">Nothing is told about this PDS: relays won’t crawl it until asked.</Empty>
         ) : (
           <div className="table-wrap">
-            <table className="data">
+            <table className="data fit">
               <thead>
                 <tr>
                   <th>Relay</th>
                   <th>Last result</th>
-                  <th>Last asked</th>
-                  <th>Last accepted</th>
-                  <th>Error</th>
-                  <th>
+                  <th>Asked</th>
+                  <th>Accepted</th>
+                  <th className="slack">
                     <span className="sr-only">Actions</span>
                   </th>
                 </tr>
@@ -128,20 +134,22 @@ export function Relays() {
                     <td>
                       <CopyValue text={r.relay} label={`Copy relay ${r.relay}`} title={r.url === r.relay ? undefined : `${r.url} (click to copy ${r.relay})`} />
                     </td>
-                    <td className="nowrap">
+                    <td>
                       <Result s={r.status} />
+                      {r.status?.error && (
+                        <span className="sub" title={r.status.error}>
+                          {r.status.error}
+                        </span>
+                      )}
                     </td>
-                    <td className="nowrap small" title={r.status ? `${fmtTime(r.status.lastAttemptMs)} by ${r.status.node}` : undefined}>
-                      {r.status ? relTime(r.status.lastAttemptMs) : <span className="muted">—</span>}
+                    <td className="small" title={r.status ? `${fmtTime(r.status.lastAttemptMs)} by ${r.status.node}` : undefined}>
+                      {r.status ? relTime(r.status.lastAttemptMs) : <span className="faint">—</span>}
                     </td>
-                    <td className="nowrap small" title={r.status?.lastSuccessMs ? fmtTime(r.status.lastSuccessMs) : undefined}>
-                      {r.status?.lastSuccessMs ? relTime(r.status.lastSuccessMs) : <span className="muted">—</span>}
+                    <td className="small" title={r.status?.lastSuccessMs ? fmtTime(r.status.lastSuccessMs) : undefined}>
+                      {r.status?.lastSuccessMs ? relTime(r.status.lastSuccessMs) : <span className="faint">—</span>}
                     </td>
-                    <td className="small" title={r.status?.error} style={{ maxWidth: '24rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {r.status?.error || <span className="muted">—</span>}
-                    </td>
-                    <td className="nowrap">
-                      <div className="row end">
+                    <td className="slack">
+                      <div className="row">
                         <button className="btn sm" disabled={busy} onClick={() => crawl.run([r.relay])}>
                           Crawl now
                         </button>
@@ -156,62 +164,61 @@ export function Relays() {
             </table>
           </div>
         )}
-      </Panel>
-      <Panel title="Settings">
-        <form
-          className="inline-form"
-          onSubmit={async (e) => {
-            e.preventDefault()
-            const v = added.trim()
-            if (!v) return
-            await save.run({ relays: [...list, v] })
-            setAdded('')
-          }}
-        >
-          <Field label="Add a relay" hint="A hostname (asked over https) or an http(s):// origin.">
-            <input type="text" value={added} onChange={(e) => setAdded(e.target.value)} placeholder="bsky.network" spellCheck={false} required />
-          </Field>
-          <button className="btn primary" disabled={busy || !added.trim()}>
-            Add relay
-          </button>
-        </form>
-        <form
-          className="inline-form"
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (intervalValid) save.run({ intervalSecs })
-          }}
-        >
-          <Field
-            label="Minimum interval (minutes)"
-            hint={
-              d.intervalSource === 'stored'
-                ? `Set in this console; --crawl-interval-secs is ${d.flagIntervalSecs}.`
-                : 'From --crawl-interval-secs. The reference PDS uses 20 minutes.'
+        <div className="panel-foot roomy">
+          <AddRow
+            label="Add a relay"
+            hint="A hostname (asked over https) or an http(s):// origin."
+            error={adding && save.error}
+            onSubmit={async () => {
+              const v = added.trim()
+              if (!v) return
+              if (await save.run({ relays: [...list, v] }, true)) setAdded('')
+            }}
+            submit={
+              <button className="btn primary" disabled={busy || !added.trim()}>
+                Add relay
+              </button>
             }
           >
-            <input type="number" min={1 / 60} step="any" value={minutes} onChange={(e) => setMinutes(e.target.value)} required />
-          </Field>
-          <button className="btn primary" disabled={busy || !intervalValid || intervalSecs === d.intervalSecs}>
-            {save.busy && <Spinner />}
-            Save interval
-          </button>
-          {d.intervalSource === 'stored' && (
-            <button
-              type="button"
-              className="btn"
-              disabled={busy}
-              onClick={async () => {
-                await save.run({ intervalSecs: null })
-                setMinutes('')
-              }}
-            >
-              Use flag
-            </button>
-          )}
-        </form>
-        {d.updatedAt && <p className="small muted">Last changed {fmtTime(d.updatedAt)}.</p>}
+            <input type="text" value={added} onChange={(e) => setAdded(e.target.value)} placeholder="bsky.network" autoCapitalize="none" spellCheck={false} required />
+          </AddRow>
+        </div>
       </Panel>
-    </>
+      <Panel title="Crawl interval">
+        <AddRow
+          label="Minimum interval (minutes)"
+          hint={
+            d.intervalSource === 'stored'
+              ? `Set in this console; --crawl-interval-secs is ${d.flagIntervalSecs}.`
+              : 'From --crawl-interval-secs. The reference PDS uses 20 minutes.'
+          }
+          onSubmit={() => intervalValid && save.run({ intervalSecs })}
+          submit={
+            <button className="btn primary" disabled={busy || !intervalValid || intervalSecs === d.intervalSecs}>
+              {save.busy && <Spinner />}
+              Save interval
+            </button>
+          }
+          extra={
+            d.intervalSource === 'stored' && (
+              <button
+                type="button"
+                className="btn"
+                disabled={busy}
+                onClick={async () => {
+                  await save.run({ intervalSecs: null })
+                  setMinutes('')
+                }}
+              >
+                Use flag
+              </button>
+            )
+          }
+        >
+          <input type="number" min={1 / 60} step="any" value={minutes} onChange={(e) => setMinutes(e.target.value)} required />
+        </AddRow>
+      </Panel>
+      {d.updatedAt && <p className="small faint">Last changed {fmtTime(d.updatedAt)}.</p>}
+    </ConsolePage>
   )
 }
