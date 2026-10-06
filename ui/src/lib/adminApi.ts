@@ -92,6 +92,10 @@ export type AccountRow = {
   mstNodes?: number
   /** Distinct blobs the records reference. */
   blobs?: number
+  /** Record blocks + MST node blocks (what a getRepo CAR carries). Close, not exact, between recounts (recountRepo); absent until the repo's next load counts it. */
+  repoBytes?: number
+  recordBytes?: number
+  mstBytes?: number
   /** TID of the head commit. */
   rev?: string
   lastCommitAt?: number
@@ -111,8 +115,24 @@ export type ListAccountsParams = {
   limit?: number
 }
 
+/** Every account, from the shards' kept totals (no scan). */
+export type AccountCounts = {
+  total: number
+  active: number
+  deactivated: number
+  takendown: number
+  suspended: number
+  unconfirmed: number
+  /** Active, with no second factor on the account row. */
+  no2fa: number
+  /** A shard's totals are loading, a node didn't answer or a shard has no owner. */
+  approximate: boolean
+}
+
 export type ListAccountsResult = Gathered & {
   accounts: AccountRow[]
+  /** Absent on a whole-DID lookup. */
+  counts?: AccountCounts
   /** Pass back for the next page; absent at the end. */
   cursor?: string
   sort?: 'recent' | 'slot'
@@ -125,6 +145,39 @@ export type ListAccountsResult = Gathered & {
 
 export const listAccounts = (c: AdminClient, p: ListAccountsParams = {}, signal?: AbortSignal) =>
   call<ListAccountsResult>(c, 'vlpds.admin.listAccounts', { params: p, signal })
+
+export type AccountKeys = {
+  did: string
+  /** Multibase multikey of the account's signing key. */
+  signingKey: string
+  pendingSigningKey?: string | null
+  /** From the DID document (the resolver's cache). */
+  verificationMethods?: { id: string; type: string; controller?: string; publicKeyMultibase?: string | null; matchesAccount: boolean }[]
+  alsoKnownAs?: string[]
+  pds?: string | null
+  didDocError?: string
+  /** did:plc only, from the directory (one request). */
+  rotationKeys?: { didKey: string; role: 'server' | 'operator_recovery' | 'other' }[]
+  rotationKeysError?: string
+}
+
+/** `refresh`: drop the cached DID document first. */
+export const getAccountKeys = (c: AdminClient, did: string, refresh = false, signal?: AbortSignal) =>
+  call<AccountKeys>(c, 'vlpds.admin.getAccountKeys', { params: { did, refresh: refresh || undefined }, signal })
+
+/** As createAccount, no invite needed. Without `password`, one is generated and returned once. */
+export const createAccount = (
+  c: AdminClient,
+  input: { handle: string; email: string; password?: string; reason?: string; actor?: string },
+) => call<Audited & { did: string; handle: string; password?: string }>(c, 'vlpds.admin.createAccount', { body: input })
+
+type RepoCounts = { records: number; nodes: number; blobs: number; recordBytes?: number | null; nodeBytes?: number | null }
+
+/** Counts the repo from a snapshot and installs it (InvalidSwap if a commit landed meanwhile: run it again). */
+export const recountRepo = (c: AdminClient, did: string) =>
+  call<{ did: string; before?: RepoCounts | null; after: RepoCounts; repoBytes?: number | null }>(c, 'vlpds.admin.recountRepo', {
+    body: { did },
+  })
 
 // --------------------------------------------------------- account security
 
@@ -177,6 +230,9 @@ export type Session =
       device?: string | null
       deviceLastSeenAt?: number | null
       passkey: boolean
+      /** Client address at the latest refresh, and at sign-in. */
+      ip?: string | null
+      signedInIp?: string | null
     }
   | {
       /** `legacy:{family}` */
@@ -188,7 +244,10 @@ export type Session =
       refreshedAt: number
       expiresAt: number
       passkey: boolean
+      ip?: string | null
+      signedInIp?: string | null
     }
+
 
 export const listSessions = (c: AdminClient, did: string, signal?: AbortSignal) =>
   call<{ did: string; sessions: Session[] }>(c, 'vlpds.admin.listSessions', { params: { did }, signal })

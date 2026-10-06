@@ -139,6 +139,11 @@ export async function getAuditLog(p: { limit?: number; did?: string; space?: str
 }
 
 export const listCases = (status?: string) => admin<{ cases: Case[] }>('vlpds.admin.listCases', { params: { status } }).then((r) => r.cases)
+
+/** Cases with a subject of this account, or (with `subject`, a record URI or blob CID) of that one record or blob. */
+export const listCasesAbout = (did: string, subject?: string) =>
+  admin<{ cases: Case[] }>('vlpds.admin.listCases', { params: { did, subject } }).then((r) => r.cases)
+
 export const getCase = (id: string) => admin<Case>('vlpds.admin.getCase', { params: { id } })
 export const listTakedowns = (kind?: string) => admin<{ takedowns: TakedownEntry[] }>('vlpds.admin.listTakedowns', { params: { kind } }).then((r) => r.takedowns)
 export const listOverQuota = () => admin<{ accounts: { did: string; bytes: number; limit: number; at: string }[] }>('vlpds.admin.listOverQuota').then((r) => r.accounts)
