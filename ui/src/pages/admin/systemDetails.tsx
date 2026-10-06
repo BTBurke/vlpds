@@ -8,7 +8,7 @@ import { configPoll, crawlersPoll, mailPoll, setCrawlers, sumSeries, useNodeMetr
 import { flagRows, groupOf, PER_NODE, shown, sourceChip } from './Config'
 import { crawlNow, RelayResult } from './Firehose'
 import { MailChip, mailId } from './Mail'
-import { COMPONENTS, componentName, componentRows, monthCost, PRICE } from './Storage'
+import { COMPONENTS, componentName, componentRows, componentUsd } from './Storage'
 
 // Slide-over / full-page details for the system sections: relay, mail, setting, object-store
 // component. Spaces registers its own kind in Spaces.tsx. Registered on import (AdminApp).
@@ -203,7 +203,6 @@ registerDetail('storecomp', {
     const c = COMPONENTS[id]
     if (m.status === 'pending') return { title: componentName(id), body: null, loading: true }
     const color = (n: string) => view?.nodes.find((x) => x.node === n)?.color
-    const cost = r ? monthCost('R2', r.a, r.b) : undefined
     return {
       title: (
         <>
@@ -213,12 +212,12 @@ registerDetail('storecomp', {
       foot: <Src>getNodeMetrics · storeComponents</Src>,
       body: (
         <>
-          {c && <p style={{ margin: 0 }}>{c.what}.</p>}
+          {c && <p style={{ margin: 0 }}>{c.what[0].toUpperCase() + c.what.slice(1)}.</p>}
           <Strip
             items={[
               ['class A / s', r ? fmtNum(r.a, 2) : '0'],
               ['class B / s', r ? fmtNum(r.b, 2) : '0'],
-              ['R2, 30 days', cost ? `$${(cost.mA * PRICE.R2.a + cost.mB * PRICE.R2.b).toFixed(2)}` : '$0'],
+              ['R2, 30 days, list price', r ? `$${componentUsd('R2', r.a, r.b).toFixed(2)}` : '$0'],
             ]}
           />
           <Sec title="By node" digest={`over the last ${Math.round((m.nodes[0]?.raw.storeWindowMs ?? 0) / 60000) || 3} min`} open flush>

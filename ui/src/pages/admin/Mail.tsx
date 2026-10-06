@@ -1,7 +1,6 @@
 import { useState } from 'react'
 import { DataTable } from '../../components/console/DataTable'
 import { Banners, Chip, ErrorState, Glyph, Loading, Meter, NeedsVersion, PageHead, Panel, Seg, Spark, Src, Swatch, Tiles, type BannerSpec } from '../../components/console/kit'
-import { openPanel } from '../../components/console/nav'
 import { registerPalette } from '../../components/console/Palette'
 import { useClusterView } from '../../lib/console/cluster'
 import { ago, dur, fmtNum, plural } from '../../lib/console/fmt'
@@ -94,6 +93,7 @@ export function Mail() {
   const oldest = d.mail.length ? Math.min(...d.mail.map((x) => x.at)) : undefined
   const budgets = bud.data?.budgets ?? []
   const day = budgets.find((b) => b.limiter === 'mail-cluster-day')
+  const dayUsed = day?.top[0]?.used ?? 0
   const nodeHour = budgets.find((b) => b.limiter === 'mail-node-hour')
 
   const purposes = new Map<string, { purpose: string; total: number; sent: number; bad: number; suppressed: number; last: number }>()
@@ -115,8 +115,8 @@ export function Mail() {
   if (d.unreachableNodes?.length) banners.push({ id: 'unreach', tone: 'warn', title: `${d.unreachableNodes.join(', ')} didn't answer`, desc: 'Their queues and mail are missing below.' })
   const failed = count(['failed', 'dropped'])
   if (failed) banners.push({ id: 'failed', tone: 'err', title: `${plural(failed, 'mail')} failed or dropped`, desc: 'in the log below. Dropped means the node’s queue was full.' })
-  if (day?.used !== undefined && day.points && day.used >= day.points * 0.9)
-    banners.push({ id: 'budget', tone: day.used >= day.points ? 'err' : 'warn', title: `Cluster mail budget ${day.used >= day.points ? 'spent' : 'nearly spent'}`, desc: `${fmtNum(day.used)} of ${fmtNum(day.points)} today. Account mail past it is suppressed until the UTC day ends.` })
+  if (day?.enabled && dayUsed >= day.points * 0.9)
+    banners.push({ id: 'budget', tone: dayUsed >= day.points ? 'err' : 'warn', title: `Cluster mail budget ${dayUsed >= day.points ? 'spent' : 'nearly spent'}`, desc: `${fmtNum(dayUsed)} of ${fmtNum(day.points)} today. Account mail past it is suppressed until the UTC day ends.` })
   if (bud.data && !bud.data.enabled) banners.push({ id: 'rloff', tone: 'info', title: 'Rate limits are off', desc: 'so no mail budget applies.' })
 
   return (
@@ -147,11 +147,11 @@ export function Mail() {
           {
             label: 'Cluster budget today',
             right: 'UTC day',
-            value: day?.used !== undefined ? fmtNum(day.used) : day ? '0' : '—',
+            value: day ? fmtNum(dayUsed) : '—',
             unit: day ? `/ ${fmtNum(day.points)}` : undefined,
             spark: day ? (
               <div style={{ marginTop: 9 }}>
-                <Meter v={day.used ?? 0} max={day.points} wide k={(day.used ?? 0) >= day.points * 0.9 ? 'warn' : undefined} />
+                <Meter v={dayUsed} max={day.points} wide k={dayUsed >= day.points * 0.9 ? 'warn' : undefined} />
               </div>
             ) : undefined,
           },
@@ -194,15 +194,16 @@ export function Mail() {
                   id: 'h',
                   label: 'Sent this hour',
                   r: true,
-                  title: 'mail-node-hour: mail this node handed to the transport in the current window',
+                  title: 'mail-node-hour: account mail this node sent in the current window',
                   render: (n) => {
-                    const u = nodeHour?.perNode?.find((x) => x.key.includes(n.node))
-                    return nodeHour ? (
-                      <span className="mono">
-                        {fmtNum(u?.used ?? 0)} <span className="muted">/ {fmtNum(nodeHour.points)}</span>
+                    const t = nodeHour?.top[0]
+                    if (!nodeHour) return <span className="muted">—</span>
+                    // the bucket reports its total and its busiest node; one node alone is exact
+                    const used = !t || !t.nodes.includes(n.node) ? 0 : t.nodes.length === 1 ? t.used : undefined
+                    return (
+                      <span className="mono" title={used === undefined ? `the busiest node sent ${t!.maxNodeUsed}` : undefined}>
+                        {used === undefined ? `≤ ${fmtNum(t!.maxNodeUsed)}` : fmtNum(used)} <span className="muted">/ {fmtNum(nodeHour.points)}</span>
                       </span>
-                    ) : (
-                      <span className="muted">—</span>
                     )
                   },
                 },
@@ -235,17 +236,16 @@ export function Mail() {
                     id: 'u',
                     label: 'Used',
                     r: true,
-                    render: (b) =>
-                      b.limiter === 'mail-cluster-day' ? (
-                        <span className="cx-cellid end">
-                          <Meter v={b.used ?? 0} max={b.points} />
-                          <span className="mono">{fmtNum(b.used ?? 0)}</span>
+                    render: (b) => {
+                      const busiest = b.limiter === 'mail-node-hour' ? (b.top[0]?.maxNodeUsed ?? 0) : Math.max(0, ...b.top.map((x) => x.used))
+                      return (
+                        <span className="cx-cellid end" title={b.limiter === 'mail-cluster-day' ? undefined : 'the busiest node or recipient'}>
+                          <Meter v={busiest} max={b.points} k={busiest >= b.points * 0.9 ? 'warn' : undefined} />
+                          <span className="mono">{fmtNum(busiest)}</span>
+                          {b.limiter !== 'mail-cluster-day' && <span className="muted sm">busiest</span>}
                         </span>
-                      ) : b.perNode ? (
-                        <span className="mono">{fmtNum(Math.max(0, ...b.perNode.map((x) => x.used)))} <span className="muted">busiest</span></span>
-                      ) : (
-                        <span className="muted">per recipient</span>
-                      ),
+                      )
+                    },
                   },
                 ]}
               />
@@ -314,4 +314,3 @@ export function Mail() {
   )
 }
 
-export const openMail = (m: MailEntry) => openPanel('mail', mailId(m))

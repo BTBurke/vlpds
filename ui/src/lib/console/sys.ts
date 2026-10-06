@@ -231,7 +231,14 @@ export const requestCrawl = (relays: string[]) => admin<{ results: CrawlResult[]
 export const mailPoll = createPoller(() => api((c) => listMail(c, 200)), 5000)
 
 /** The rate-limit buckets the mailer spends (getRateLimits): the cluster's daily budget and each node's hourly one. */
-export type MailBudget = { limiter: string; points: number; windowSecs: number; enabled: boolean; used?: number; resetMs?: number; perNode?: { key: string; used: number; resetMs: number }[] }
+export type MailBudget = {
+  limiter: string
+  points: number
+  windowSecs: number
+  enabled: boolean
+  /** The busiest keys: the cluster, the node bucket (`used` summed, `maxNodeUsed` the busiest node's), or recipients. */
+  top: { key: string; used: number; maxNodeUsed: number; nodes: string[]; resetMs: number }[]
+}
 type RL = {
   enabled: boolean
   limiters: { name: string; windowSecs: number; points: number; enabled: boolean; scope: string }[]
@@ -241,18 +248,7 @@ export const mailBudgetPoll = createPoller(async (): Promise<{ enabled: boolean;
   const r = await admin<RL>('vlpds.admin.getRateLimits')
   const budgets = r.limiters
     .filter((l) => l.name.startsWith('mail-'))
-    .map((l) => {
-      const top = r.top[l.name] ?? []
-      return {
-        limiter: l.name,
-        points: l.points,
-        windowSecs: l.windowSecs,
-        enabled: l.enabled,
-        used: l.name === 'mail-cluster-day' ? top[0]?.used : undefined,
-        resetMs: l.name === 'mail-cluster-day' ? top[0]?.resetMs : undefined,
-        perNode: l.name === 'mail-node-hour' ? top.map((t) => ({ key: t.key, used: t.used, resetMs: t.resetMs })) : undefined,
-      }
-    })
+    .map((l) => ({ limiter: l.name, points: l.points, windowSecs: l.windowSecs, enabled: l.enabled, top: r.top[l.name] ?? [] }))
   return { enabled: r.enabled, budgets }
 }, 15_000)
 

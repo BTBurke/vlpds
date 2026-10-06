@@ -21,7 +21,7 @@ export const REASONS: Record<string, string> = {
   too_slow: 'Too slow (fell behind)',
   write_stalled: 'Stopped reading',
   shutdown: 'Server shut down',
-  kicked: 'Disconnected from the console',
+  kicked: 'Kicked from the console',
 }
 export const reasonText = (r?: string) => (r ? (REASONS[r] ?? r) : 'gone')
 
@@ -114,7 +114,7 @@ function Interval({ close }: { close: () => void }) {
         Minutes between requests to one relay
       </label>
       <div className="cx-form-row">
-        <input id="crawl-int" className="cx-inp mono" type="number" min={1 / 60} step="any" autoFocus value={v} onChange={(e) => setV(e.target.value)} />
+        <input id="crawl-int" className="cx-inp mono" inputMode="decimal" autoFocus value={v} onChange={(e) => setV(e.target.value)} />
         {d?.intervalSource === 'stored' && (
           <button type="button" className="cx-btn" disabled={busy} onClick={() => save(null)}>
             Use the flag ({d.flagIntervalSecs / 60} min)
@@ -159,8 +159,8 @@ registerPalette({
 })
 
 function lagText(s: Subscriber) {
-  if (s.state === 'backfilling') return <span className="s-info">{s.lagMs != null ? `${dur(s.lagMs)} behind` : s.lagEvents != null ? `${fmtNum(s.lagEvents)} events` : 'backfilling'}</span>
-  if (s.lagMs != null && s.lagMs >= 1000) return <span className={isSlow(s) ? 's-warn' : undefined}>{dur(s.lagMs)} behind</span>
+  if (s.state === 'backfilling') return <span className="s-info">◆ {s.lagMs != null ? `${dur(s.lagMs)} behind` : s.lagEvents != null ? `${fmtNum(s.lagEvents)} events` : 'backfilling'}</span>
+  if (s.lagMs != null && s.lagMs >= 1000) return isSlow(s) ? <span className="s-warn">▲ {dur(s.lagMs)} behind</span> : <span>{dur(s.lagMs)} behind</span>
   if (s.lagEvents) return <span>{fmtNum(s.lagEvents)} events</span>
   return <span className="muted">caught up</span>
 }
@@ -247,7 +247,7 @@ export function Firehose() {
         const v = h[h.length - 1]
         return (
           <span className="cx-cellid">
-            <Spark size="inline" data={h} l2={rates.pds.slice(-h.length)} color={isSlow(s) ? 'warn' : s.state === 'backfilling' ? 'info' : 'accent'} />
+            {h.length < 2 ? <span className="muted sm" style={{ width: 72, display: 'inline-block' }}>measuring…</span> : <Spark size="inline" data={h} l2={rates.pds.slice(-h.length)} color={isSlow(s) ? 'warn' : s.state === 'backfilling' ? 'info' : 'accent'} />}
             <span className="mono sm">{v === undefined ? '—' : fmtSi(v)}</span>
           </span>
         )
@@ -313,9 +313,9 @@ export function Firehose() {
         tiles={[
           {
             label: 'Last emitted seq',
-            right: 'unix µs × 256 + writer',
+            right: sms ? `writer ${w}${writer ? ` · ${shortNode(writer)}` : ''}` : undefined,
             value: <span className="mono" style={{ fontSize: 15 }}>{seq && seq !== '0' ? seq : '—'}</span>,
-            sec: sms ? `writer ${w}${writer ? ` · ${shortNode(writer)}` : ''}` : undefined,
+            title: 'unix µs × 256 + the writer byte of the log that assigned it',
           },
           {
             label: "This PDS's events / s",
@@ -383,7 +383,7 @@ export function Firehose() {
             }
             foot={
               cr.data && (
-                <>
+                <span>
                   Sent by the owner of slot 0 ({cr.data.sender ? 'this node, ' : ''}
                   <span className="mono">{cr.data.node}</span>).{' '}
                   {cr.data.relaysSource === 'stored' ? (
@@ -411,7 +411,7 @@ export function Firehose() {
                       From <span className="mono">--crawlers</span>. Changing the list here stores it for the cluster.
                     </>
                   )}
-                </>
+                </span>
               )
             }
           >

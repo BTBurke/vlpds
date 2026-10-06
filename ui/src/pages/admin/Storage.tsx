@@ -30,6 +30,9 @@ export function monthCost(p: Provider, aPerSec: number, bPerSec: number, gb?: nu
   return { mA, mB, ca, cb, cs, total: ca + cb + (cs ?? 0) }
 }
 
+/** One component's requests over a month at list price, before the free tier (which is per account, not per component). */
+export const componentUsd = (p: Provider, aPerSec: number, bPerSec: number, days = 30) => ((aPerSec * PRICE[p].a + bPerSec * PRICE[p].b) * 86400 * days) / 1e6
+
 /** The provider an endpoint belongs to; MinIO and the rest are "S3-compatible". */
 export function providerOf(endpoint?: string): { p?: Provider; label: string } {
   const e = endpoint ?? ''
@@ -191,7 +194,7 @@ export function Storage() {
             title: `Estimated: the last ${windowMin || 3} minutes' rate over the whole month so far, after ${priceAt}'s free tier`,
           },
           { label: 'Projected, this month', right: `${fmtNum(cur.mA, 1)} M A · ${fmtNum(cur.mB, 1)} M B`, value: usd(cur.total), sec: gb === undefined ? 'requests only' : `incl. ${fmtNum(gb, 1)} GB` },
-          { label: 'Errors · timeouts / s', right: 'after retries', value: fmtSi(errNow), spark: <Spark data={sumSeries(nodes, 'storeErrorsPerSec')} color="warn" /> },
+          { label: 'Errors · timeouts / s', right: 'after retries', value: errNow ? fmtSi(errNow) : '0', spark: <Spark data={sumSeries(nodes, 'storeErrorsPerSec')} color="warn" /> },
           { label: 'Segment PUT p99', right: 'worst node · p50 dashed', value: fmtMs(putP99), spark: <Spark data={worstSeries(nodes, 'putP99Ms')} l2={worstSeries(nodes, 'putP50Ms')} color="amber" /> },
         ]}
       />
@@ -201,7 +204,7 @@ export function Storage() {
             title="Requests by component"
             src={<Src>getNodeMetrics · storeComponents</Src>}
             right={<span className="muted sm">last {windowMin || 3} min · all nodes</span>}
-            foot="Spend follows nodes and shards more than traffic: every shard polls its SlateDB manifest and every node renews its lease, idle or not."
+            foot="Monthly figures here are before the free tier. Spend follows nodes and shards more than traffic: every shard polls its SlateDB manifest and every node renews its lease, idle or not."
           >
             <DataTable
               compact
@@ -231,7 +234,7 @@ export function Storage() {
                     </span>
                   ),
                 },
-                { id: 'usd', label: '$/month', r: true, sort: (x, y) => spendOf(x) - spendOf(y), render: (r) => <span className="mono">{usd(monthCost(priceAt, r.a, r.b, undefined, month.length).ca + monthCost(priceAt, r.a, r.b, undefined, month.length).cb)}</span> },
+                { id: 'usd', label: '$/month', r: true, sort: (x, y) => spendOf(x) - spendOf(y), render: (r) => <span className="mono">{usd(componentUsd(priceAt, r.a, r.b, month.length))}</span> },
               ]}
             />
           </Panel>
@@ -266,9 +269,7 @@ export function Storage() {
                   <input
                     className="cx-inp mono"
                     style={{ width: 80, height: 24, display: 'inline-block' }}
-                    type="number"
-                    min={0}
-                    step="any"
+                    inputMode="decimal"
                     placeholder="—"
                     aria-label="GB stored"
                     value={gb ?? ''}
