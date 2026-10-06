@@ -1,71 +1,121 @@
-import { useState, type JSX } from 'react'
-import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
+import { useState, type JSX, type ReactNode } from 'react'
+import '../../console.css'
+import { DetailPage, detailKind } from '../../components/console/Drawer'
+import { Empty } from '../../components/console/kit'
+import { Shell } from '../../components/console/Shell'
+import { SECTION, sectionOf, type Section } from '../../components/console/sections'
+import { ErrorNotice, Field, Spinner, Topbar } from '../../components/ui'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { basic, call, setAdminToken } from '../../lib/xrpc'
+import { AccountDetail, Accounts } from './Accounts'
 import { Cluster } from './Cluster'
+import './clusterDetails'
 import { Firehose } from './Firehose'
 import { HandleDomains } from './HandleDomains'
-import { Metrics } from './Metrics'
-import { AccountDetail, Accounts } from './Accounts'
 import { Invites } from './Invites'
+import { Metrics } from './Metrics'
 import { CaseDetail, Moderation } from './Moderation'
+import { Nodes } from './Nodes'
+import { Overview } from './Overview'
+import { Legacy, Placeholder } from './Placeholder'
 import { RateLimits } from './RateLimits'
 import { Relays } from './Relays'
 import { SpaceDetail, Spaces } from './Spaces'
 
-const TABS = [
-  { to: '/admin', label: 'Cluster' },
-  { to: '/admin/metrics', label: 'Live metrics' },
-  { to: '/admin/accounts', label: 'Accounts' },
-  { to: '/admin/moderation', label: 'Moderation' },
-  { to: '/admin/spaces', label: 'Spaces' },
-  { to: '/admin/invites', label: 'Invite codes' },
-  { to: '/admin/handle-domains', label: 'Handle domains' },
-  { to: '/admin/ratelimits', label: 'Rate limits' },
-  { to: '/admin/relays', label: 'Relays' },
-  { to: '/admin/firehose', label: 'Firehose' },
-]
+// The operator console: the token gate, then the shell around one page per route. Sections
+// still on their pre-console pages render them inside <Legacy> until they're rebuilt
+// (CONSOLE.md lists which).
+
+type Route = { section: Section; page: JSX.Element; crumbs?: ReactNode }
+
+const crumb = (section: Section, last: ReactNode) => (
+  <>
+    <Link to={section.path}>{section.label}</Link>
+    <span className="sep">/</span>
+    <b>{last}</b>
+  </>
+)
+
+function route(p: string): Route {
+  let m: Record<string, string> | null
+  const S = SECTION
+  switch (p) {
+    case '/admin':
+      return { section: S.overview, page: <Overview /> }
+    case '/admin/nodes':
+      return { section: S.nodes, page: <Nodes /> }
+    case '/admin/metrics':
+      return { section: S.nodes, page: <Legacy><Metrics /></Legacy>, crumbs: crumb(S.nodes, 'Live metrics') }
+    case '/admin/cluster':
+      return { section: S.nodes, page: <Legacy><Cluster /></Legacy>, crumbs: crumb(S.nodes, 'Classic view') }
+    case '/admin/storage':
+      return {
+        section: S.storage,
+        page: (
+          <Placeholder section={S.storage} what="Request rates and spend by component, latency, prefixes in the bucket">
+            Until then, segment PUT latency and object-store request rates are on the <Link to="/admin">Overview</Link> and in <Link to="/admin/metrics">Live metrics</Link>.
+          </Placeholder>
+        ),
+      }
+    case '/admin/firehose':
+    case '/admin/relays':
+      return {
+        section: S.firehose,
+        page: (
+          <Legacy>
+            <Firehose />
+            <Relays />
+          </Legacy>
+        ),
+      }
+    case '/admin/accounts':
+      return { section: S.accounts, page: <Legacy><Accounts /></Legacy> }
+    case '/admin/moderation':
+      return { section: S.moderation, page: <Legacy><Moderation /></Legacy> }
+    case '/admin/limits':
+    case '/admin/ratelimits':
+      return { section: S.limits, page: <Legacy><RateLimits /></Legacy> }
+    case '/admin/domains':
+    case '/admin/invites':
+    case '/admin/handle-domains':
+      return {
+        section: S.domains,
+        page: (
+          <Legacy>
+            <HandleDomains />
+            <div style={{ height: 24 }} />
+            <Invites />
+          </Legacy>
+        ),
+      }
+    case '/admin/spaces':
+      return { section: S.spaces, page: <Legacy><Spaces /></Legacy> }
+    case '/admin/spaces/space':
+      return { section: S.spaces, page: <Legacy><SpaceDetail /></Legacy>, crumbs: crumb(S.spaces, 'Space') }
+    case '/admin/mail':
+      return { section: S.mail, page: <Placeholder section={S.mail} what="Queue, sends by purpose, the daily budget and a log of recent messages" nsid="vlpds.admin.getMailLog" /> }
+    case '/admin/config':
+      return { section: S.config, page: <Placeholder section={S.config} what="Every flag, default and stored setting each node runs with; secrets as set or unset" nsid="vlpds.admin.getConfig" /> }
+  }
+  if ((m = match('/admin/accounts/:did', p))) return { section: S.accounts, page: <Legacy><AccountDetail did={m.did} /></Legacy>, crumbs: crumb(S.accounts, m.did) }
+  if ((m = match('/admin/moderation/cases/:id', p))) return { section: S.moderation, page: <Legacy><CaseDetail id={m.id} /></Legacy>, crumbs: crumb(S.moderation, m.id) }
+  // a detail kind's full page: /admin/<section>/<type>/<id>
+  if ((m = match('/admin/:section/:type/:id', p)) && detailKind(m.type)) {
+    const section = sectionOf(p)
+    return { section, page: <DetailPage key={m.type} type={m.type} id={m.id} />, crumbs: crumb(section, m.id) }
+  }
+  return { section: sectionOf(p), page: <Empty title="No such page">There is no console page at {p}.</Empty> }
+}
 
 export function AdminApp({ path }: { path: string }) {
   const token = useAdminToken()
-  const p = path.replace(/\/+$/, '') || '/admin'
   if (!token) return <AdminLogin />
-  let page: JSX.Element
-  let m: Record<string, string> | null
-  if (p === '/admin') page = <Cluster />
-  else if (p === '/admin/metrics') page = <Metrics />
-  else if (p === '/admin/accounts') page = <Accounts />
-  else if ((m = match('/admin/accounts/:did', p))) page = <AccountDetail did={m.did} />
-  else if (p === '/admin/moderation') page = <Moderation />
-  else if ((m = match('/admin/moderation/cases/:id', p))) page = <CaseDetail id={m.id} />
-  else if (p === '/admin/spaces') page = <Spaces />
-  else if (p === '/admin/spaces/space') page = <SpaceDetail />
-  else if (p === '/admin/invites') page = <Invites />
-  else if (p === '/admin/handle-domains') page = <HandleDomains />
-  else if (p === '/admin/ratelimits') page = <RateLimits />
-  else if (p === '/admin/relays') page = <Relays />
-  else if (p === '/admin/firehose') page = <Firehose />
-  else page = <Notice kind="warn">There is no console page at {p}.</Notice>
-  const current = (to: string) => (to === '/admin' ? p === '/admin' : p === to || p.startsWith(`${to}/`))
+  const r = route(path.replace(/\/+$/, '') || '/admin')
   return (
-    <>
-      <Topbar where="Operator console">
-        <button type="button" className="btn sm" onClick={() => setAdminToken(null)}>
-          Lock console
-        </button>
-      </Topbar>
-      <main className="console">
-        <nav className="tabs" aria-label="Console">
-          {TABS.map((t) => (
-            <Link key={t.to} to={t.to} aria-current={current(t.to) ? 'page' : undefined}>
-              {t.label}
-            </Link>
-          ))}
-        </nav>
-        {page}
-      </main>
-    </>
+    <Shell section={r.section} crumbs={r.crumbs}>
+      {r.page}
+    </Shell>
   )
 }
 
