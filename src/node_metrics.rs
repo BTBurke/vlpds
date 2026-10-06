@@ -130,7 +130,8 @@ fn sample() -> Sample {
                 continue;
             }
             if let Some(i) = store_class(label(&labels, "op")) {
-                store.entry(label(&labels, "component").to_string()).or_default()[i] += m.get_counter().get_value() as u64;
+                store.entry(label(&labels, "component").to_string()).or_default()[i] +=
+                    m.get_counter().get_value() as u64;
             }
         }
     }
@@ -346,6 +347,22 @@ mod tests {
         assert_eq!(quantile(0.5, &bounds, &b, &b), None, "no observations in between");
         // everything past the last bound
         assert_eq!(quantile(0.99, &bounds, &a, &[0, 0, 0, 5]), Some(4.0));
+    }
+
+    #[test]
+    fn component_rates_busiest_first() {
+        let at = |t_ms: u64, store: &[(&str, [u64; 2])]| Sample {
+            t_ms,
+            store: store.iter().map(|(c, v)| (c.to_string(), *v)).collect(),
+            ..Default::default()
+        };
+        let a = at(0, &[("ctl_lease", [10, 10]), ("blob", [5, 0])]);
+        let b = at(2000, &[("ctl_lease", [14, 12]), ("blob", [5, 0]), ("log_segment", [20, 2])]);
+        let r = components(&a, &b);
+        let names: Vec<&str> = r.iter().map(|c| c.component.as_str()).collect();
+        assert_eq!(names, ["log_segment", "ctl_lease"], "idle components are left out");
+        assert_eq!((r[0].class_a_per_sec, r[0].class_b_per_sec), (10.0, 1.0), "new since `a`: counted from 0");
+        assert_eq!((r[1].class_a_per_sec, r[1].class_b_per_sec), (2.0, 1.0));
     }
 
     #[test]

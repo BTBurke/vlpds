@@ -1,28 +1,16 @@
 import { useSyncExternalStore } from 'react'
-import { AdminApiError, getConfig, getNodeMetrics, listMail, type AdminClient, type MetricsPoint, type NodeConfig, type NodeMetrics } from '../adminApi'
+import { getConfig, getNodeMetrics, listMail, type MetricsPoint, type NodeConfig, type NodeMetrics } from '../adminApi'
 import { admin, basic, getAdminToken, setAdminToken, XrpcError } from '../xrpc'
 import { clusterPoll, type ClusterStatus } from './cluster'
-import { createPoller, getLive } from './live'
+import { withAdmin } from './adminAdapter'
+import { createPoller, getLive, isUnsupported } from './live'
 import { subscribersPoll, type Subscriber, type SubscriberList } from './polls'
 
 // Data for the system sections (Firehose & relays, Object store, Mail, Config, Spaces): the
 // typed console API (lib/adminApi.ts) plus the older admin calls these pages share.
 
-export const client = (): AdminClient => ({ token: getAdminToken() ?? '' })
-
-/** Runs an adminApi call; a 401 sends the console back to the token form, like admin() does. */
-export async function api<T>(run: (c: AdminClient) => Promise<T>): Promise<T> {
-  try {
-    return await run(client())
-  } catch (e) {
-    if (e instanceof AdminApiError && e.status === 401) setAdminToken(null)
-    throw e
-  }
-}
-
-/** An older vlpds without the method (the proxy fallback answers 501 or 404). */
-export const missing = (e: unknown) =>
-  (e instanceof AdminApiError || e instanceof XrpcError) && (e.status === 501 || e.status === 404 || e.error === 'MethodNotImplemented' || e.error === 'MethodNotSupported')
+/** An older vlpds without the method. */
+export const missing = isUnsupported
 
 // ---------------------------------------------------------------- node metrics
 
@@ -56,7 +44,7 @@ async function nmTick(force = false) {
     const have = nm.nodes.filter((n) => n.series.length)
     // poll for what's new since the oldest node's last point, so a lagging node isn't skipped
     const since = have.length === nm.nodes.length && have.length ? Math.min(...have.map((n) => n.series[n.series.length - 1].t)) : undefined
-    const r = await api((c) => getNodeMetrics(c, since))
+    const r = await withAdmin((c) => getNodeMetrics(c, since))
     const prev = new Map(nm.nodes.map((n) => [n.node, n]))
     const nodes: NodeSeries[] = r.nodes.map((n) => {
       const p = prev.get(n.node)
@@ -228,7 +216,7 @@ export const requestCrawl = (relays: string[]) => admin<{ results: CrawlResult[]
 
 // ---------------------------------------------------------------- mail
 
-export const mailPoll = createPoller(() => api((c) => listMail(c, 200)), 5000)
+export const mailPoll = createPoller(() => withAdmin((c) => listMail(c, 200)), 5000)
 
 /** The rate-limit buckets the mailer spends (getRateLimits): the cluster's daily budget and each node's hourly one. */
 export type MailBudget = {
@@ -308,7 +296,7 @@ export async function configs(): Promise<NodeConfigResult[]> {
   return Promise.all(
     nodes.map(async ({ node, self }) => {
       try {
-        return { node, self, config: await api((cl) => getConfig(cl, self ? undefined : node)) }
+        return { node, self, config: await withAdmin((cl) => getConfig(cl, self ? undefined : node)) }
       } catch (error) {
         return { node, self, error }
       }
