@@ -69,7 +69,11 @@ registerPalette({
   items: (q) => {
     if (q.length < 2) return []
     const d = configPoll.get().data
-    if (!d) return []
+    if (!d) {
+      // loaded on first use, so the next keystroke can list flags
+      if (!configPoll.get().error) configPoll.refresh()
+      return []
+    }
     return flagRows(d)
       .filter((r) => r.flag.includes(q.toLowerCase().replace(/^-*/, '--')) || r.flag.includes(q.toLowerCase()))
       .slice(0, 12)

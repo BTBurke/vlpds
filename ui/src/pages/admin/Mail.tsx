@@ -235,6 +235,7 @@ export function Mail() {
                   {
                     id: 'u',
                     label: 'Used',
+                    title: 'The cluster’s total; for the other buckets, the busiest node or recipient',
                     r: true,
                     render: (b) => {
                       const busiest = b.limiter === 'mail-node-hour' ? (b.top[0]?.maxNodeUsed ?? 0) : Math.max(0, ...b.top.map((x) => x.used))
@@ -242,7 +243,6 @@ export function Mail() {
                         <span className="cx-cellid end" title={b.limiter === 'mail-cluster-day' ? undefined : 'the busiest node or recipient'}>
                           <Meter v={busiest} max={b.points} k={busiest >= b.points * 0.9 ? 'warn' : undefined} />
                           <span className="mono">{fmtNum(busiest)}</span>
-                          {b.limiter !== 'mail-cluster-day' && <span className="muted sm">busiest</span>}
                         </span>
                       )
                     },
