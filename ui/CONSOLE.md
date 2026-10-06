@@ -1,0 +1,117 @@
+# Operator console
+
+The console at `/admin` is a status-first shell: a top bar with the strata rule, a rail of sections, a dense main column and one slide-over for any row. This file is the kit and the rules for building a section in it.
+
+## Where things live
+
+| Path | What |
+| --- | --- |
+| `src/console.css` | Tokens and every console class. All classes start with `cx-` (or sit under one) because `styles.css` is global and already owns `.btn`, `.tile`, `.seg`, `.empty`. |
+| `src/components/console/` | The kit: `kit.tsx` (small parts), `DataTable.tsx`, `Drawer.tsx` (detail kinds), `dialogs.tsx` (confirm and form dialogs), `toast.tsx`, `LiveTail.tsx`, `Strata.tsx`, `Palette.tsx`, `Shell.tsx`, `sections.tsx` (the IA), `nav.ts` (slide-over URLs). |
+| `src/lib/console/` | Data: `live.ts` (pause, stale, shared pollers), `cluster.ts` (getClusterStatus + derived view), `metrics.ts` (Prometheus scrapes to rates), `firehose.ts` (subscribeRepos tail, handle lookups), `polls.ts` (subscribers, cases, audit, lockouts), `adminAdapter.ts` (endpoints older servers lack), `fmt.ts`. |
+| `src/pages/admin/` | Pages. `AdminApp.tsx` routes. `Overview.tsx` and `Nodes.tsx` are built on the kit, `clusterUi.tsx` holds what they share, `clusterDetails.tsx` registers the node, shard, event and sub details. The rest are the pre-console pages, shown inside `<Legacy>`. |
+
+## Building a section
+
+1. Replace the section's `case` in `route()` (`AdminApp.tsx`) with your page. Keep the old paths in `aliases` (`sections.tsx`) so links keep landing.
+2. Start the page with `<PageHead title sub actions />`, then `<Banners>` if anything needs attention, then `<Tiles boxed>` for the figures, then panels in `cx-grid2` / `cx-grid3` / `cx-stack`.
+3. Every row that has more to show opens in the slide-over. Register a detail kind (below) and give the table `open={(row) => ({ type, id })}`.
+4. Anything that changes the cluster goes through `confirmAction`. No mock actions: call the real endpoint, or the adapter, and let the dialog show the error.
+5. Add your entities and verbs to ⌘K with `registerPalette`.
+6. Check it at 390 px and in both themes, and that the console log stays clean.
+
+## Kit
+
+All from `components/console/kit.tsx` unless noted.
+
+- `Glyph k`, `Chip k`: status is a colour and a glyph, always both. `ok ●`, `warn ▲`, `err ■`, `info ◆`, `idle ○`. Chips also come in `acc`, `plain`, `violet`, `stale`.
+- `Kbd k`, `Swatch color` (a node's square; striped red when nobody owns it), `Spinner`.
+- `Spark data l2 color th min size` draws a sparkline in a 100-wide box. `color` is a token name (`accent`, `amber`, `c1`–`c6`, `warn`, `violet`). `l2` is dashed on the same scale and `th` is a dotted threshold. Under two points it draws a hatched placeholder.
+- `Meter v max k wide`, `MiniBar parts`.
+- `Tiles tiles boxed`: `{ label, right, value, unit, sec, spark, to }`. Values are wrapped in `LiveVal`, so they hatch when the console is stale.
+- `HealthLine cells`: one cell per subsystem, each a link with `tone`, `value`, `unit`, `sub`.
+- `Banners items`: `{ id, tone, title, desc, right, body, open }`. With `body` it's a collapsible `<details>`.
+- `Panel title to src right foot`: `to` links the title to a section with a ›. Put tables and tiles straight inside. Wrap free content in `PanelBody`.
+- `Sec title digest right open flush danger`: a collapsible section for drawers and detail pages. `flush` drops the padding for tables.
+- `PageHead`, `KV rows`, `Strip items` (figures across a drawer), `Minis n` + `Mini label value` (labelled sparklines), `RRow onClick|to x` (a rail row), `Copy text` (click to copy), `Json value`, `Toggle`, `Seg`, `SearchInput` (has `data-search`, so `/` focuses it).
+- States: `Loading`, `Empty title`, `ErrorState error retry`, `NeedsVersion what nsid` (in place of a panel whose endpoint this server doesn't have), and `Loaded load` which does loading, error and keep-last-data in one.
+- `Src` tags where a panel's data comes from. They only show with "Show data sources" (sidebar foot or ⌘K), so leave them in.
+- `DataTable rows cols rowKey open onRow sort dim empty` (`DataTable.tsx`). Columns are `{ id, label, r, sort, render, title, style }`. Rows that open carry `data-open="type:id"`, which is all the shell's `j` / `k` / `Enter` handling needs. A row whose detail is open gets `.sel`.
+- `LiveTail height max nodeFilter` (`LiveTail.tsx`) is the merged firehose. It's pausable (global space), filterable by text, kind and node, and keeps your place when you've scrolled down.
+- `Strata view fetchedAt` (`Strata.tsx`) is the logs → watermark → firehose canvas.
+- `toast(msg, { err })` (`toast.tsx`).
+
+## Details: slide-over and full page
+
+```tsx
+registerDetail('account', {
+  kind: 'Account',            // eyebrow over the title
+  section: 'accounts',        // full page lives at /admin/accounts/account/<id>
+  use: (id, mode) => {        // a hook: load what you need here
+    const info = useLoad(...)
+    return { title, chip, body, foot, loading, missing }
+  },
+})
+```
+
+`openPanel(type, id)` opens `?open=type:id` on the current page, so a reload keeps it and back closes it. `o` or "Full page ↗" goes to `/admin/<section>/<type>/<id>`, and `mode === 'page'` tells `use` to open more sections or lay out two columns (`<div className="cols">` inside the body). Register kinds in a module that `AdminApp.tsx` imports.
+
+## Actions
+
+```ts
+confirmAction({
+  tone: 'err',                       // or 'warn'
+  title: `Take down @${handle}?`,
+  items: ['Its repo stops being served…', 'Every session is revoked.'],
+  fields: [{ id: 'reason', label: 'Reason (audited)', required: true }],
+  word: handle,                      // must be typed to enable the button
+  action: 'Take down',
+  primary: false,                    // true: verdigris button for routine or reversible actions
+  call: 'com.atproto.admin.updateSubjectStatus → owner node',
+  run: (v) => admin('…', { body: { … } }),
+  done: 'Taken down',
+})
+```
+
+The footer shows `call`, the request it makes. `run` errors stay in the dialog. `openDialog(close => <FormDialog …/>)` is for forms that aren't confirmations.
+
+## Data
+
+- `createPoller(fetch, ms, { heartbeat })` (`live.ts`) is one shared poll per thing. It runs only while something renders `poll.use()` and skips ticks while paused. `getClusterStatus` is the heartbeat: when it fails the shell shows "Not updating", hatches live values and greys the sparklines.
+- `useClusterView()` gives the status plus node colours, shard counts, watermark lag per log, lease time left and `health` per node.
+- `useMetrics()` gives per-node and merged `Point[]` (3 minutes at 2 s) and gauges. The source is the peer fan-out when the server has it, else this node's `/metrics`. Production keeps `/metrics` off the app port, so expect `source: 'none'` there until `getNodeMetrics` lands, and show `NeedsVersion`.
+- `useFirehose()` is the live tail. `useHandle(did)` batches handle lookups through `getAccountInfos`.
+- `adminAdapter.ts` is the only place that calls endpoints older servers don't have. Each call returns `{ supported: true, data }` or `{ supported: false, nsid }`. When `lib/adminApi.ts` lands, these bodies call it and the pages don't change. The NSIDs there are placeholders until then.
+- `useLoad` and `admin()` from `lib/hooks.ts` and `lib/xrpc.ts` still work for one-off loads inside a section.
+
+## Keyboard
+
+`⌘K` palette. `g` then a letter jumps to a section (the letters are in `sections.tsx`). `j` / `k` move through rows, `Enter` opens, `o` goes full page, `Esc` closes the panel, dialog or full page. `/` focuses the page's `data-search` input, else the palette. `space` pauses live updates, `t` toggles the theme, `?` lists all of it.
+
+## Look
+
+- Tokens are on `.cx`: `--paper --sheet --raised --sunk --hover`, ink `--ink --ink2 --ink3`, rules `--rule --rule2`, `--accent` (verdigris, for action), `--amber` (the live signal: watermark, latency), status `--ok --warn --err --info --idle --violet`, node and series colours `--c1`–`--c6`. Dark mode follows the system unless `t` picked one.
+- Schibsted Grotesk for text, JetBrains Mono for ids, numbers and code (`.mono`). 13 px base, tables 12.5 px.
+- Numbers right-aligned in `td.r`, ids in mono, durations through `fmt.ts` (`dur`, `fmtMs`, `fmtSec`, `ago`).
+- No new colours for status. No colour without its glyph.
+- Use example.com-style names in fixtures and placeholders. main syncs to the public repo.
+
+## Sections
+
+| Section | Path | State |
+| --- | --- | --- |
+| Overview | `/admin` | Built |
+| Nodes & shards | `/admin/nodes` | Built. Old page at `/admin/cluster`, charts at `/admin/metrics` |
+| Object store | `/admin/storage` | Placeholder |
+| Firehose & relays | `/admin/firehose` | Legacy (`Firehose` + `Relays`). Detail kinds `event` and `sub` exist |
+| Accounts | `/admin/accounts` | Legacy, plus `/admin/accounts/:did` |
+| Moderation | `/admin/moderation` | Legacy, plus `/admin/moderation/cases/:id` |
+| Limits & lockouts | `/admin/limits` | Legacy (`RateLimits`), alias `/admin/ratelimits` |
+| Domains & invites | `/admin/domains` | Legacy (`HandleDomains` + `Invites`) |
+| Spaces | `/admin/spaces` | Legacy, plus `/admin/spaces/space` |
+| Mail | `/admin/mail` | Placeholder (needs `getMailLog`) |
+| Config | `/admin/config` | Placeholder (needs `getConfig`) |
+
+## Trying it
+
+`just dev` (or any local vlpds) and `just dev-ui url=http://127.0.0.1:2620`, then `/admin` with the dev admin token. `loadgen setup` and `loadgen run --rate 5` give the tail and the strata something to show. A real three-node cluster needs an S3 bucket (a throwaway MinIO works) and three `--dev-mode` nodes sharing `--peer-tls-dir` and `--prefix`, as `bench/ha/hactl.py` starts them.
