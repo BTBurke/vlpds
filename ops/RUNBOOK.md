@@ -105,7 +105,7 @@ Production refuses the MinIO default S3 credentials, and
 | What | How |
 |---|---|
 | Liveness | `GET /xrpc/_health` -> `{"version":"vlpds"}` |
-| Caddy on-demand TLS | `on_demand_tls { ask http://127.0.0.1:2583/tls-check }`. `GET /tls-check?domain=D` is 200 for the `--public-url` host and handles of active accounts here, 400 outside `--handle-domain` and 404 for unknown/deactivated handles (any node answers) |
+| Caddy on-demand TLS | `on_demand_tls { ask http://127.0.0.1:2583/tls-check }`. `GET /tls-check?domain=D` is 200 for the `--public-url` host and handles of active accounts here, 400 outside the handle domains (`--handle-domains`) and 404 for unknown/deactivated handles (any node answers) |
 | Service DID document | `GET /.well-known/did.json` returns the `did:web` `--service-did`'s document (`#atproto_pds` at `--public-url`). 404 for any other DID method |
 | Metrics | `GET http://127.0.0.1:9583/metrics` (Prometheus text, `--metrics-listen`) |
 | Cluster view (admin) | `GET /xrpc/vlpds.admin.getClusterStatus` with `Authorization: Basic base64(admin:$VLPDS_ADMIN_TOKEN)`. Returns `node`, `log`, `logDurableOrdinal`, `owned` (shard ids), `shards`, `table` (owner per shard in slot order, `null` = unowned), `layout` (`version`, `shards`, `op` = split/merge in progress), `leaseValid`, `leaseExpiresMs`, `fencedLogs`, `firehose.{lastEmitted,minWatermark,sources[{log,watermark,local}]}`, `version` (feature levels, see [Rolling upgrade](#rolling-upgrade-finalize-rollback): `active`, `target` while a raise runs, `history`, this build's `binary.{min,max,rev}`, `mixedBuilds`, `revs`, `finalizable`, `finalizedAt`), and `nodes[]` with each peer's `reachable`, `leaseValid`, `logDurableOrdinal`, `owned` count, `writer`, `expiresMs`, `rev`, `minLevel`, `maxLevel`, `seenLevel` (peers fetched with a 1.5 s timeout). |
@@ -2299,7 +2299,7 @@ reference PDS's variable:
   `com.atproto.admin.disableAccountInvites` (its codes are disabled, and codes it
   earns afterwards are created disabled). Changing `--invite-epoch-ms` to now
   restarts everyone's earning from zero.
-- External handles. updateHandle to a domain outside `--handle-domain` needs a
+- External handles. updateHandle to a domain outside the handle domains needs a
   DNS TXT record `_atproto.<handle>` = `did=<the account's DID>` or
   `https://<handle>/.well-known/atproto-did` serving the DID. Both are tried at
   once with a 3 s deadline each, through the host's resolver
