@@ -514,8 +514,23 @@ struct Args {
     /// server. Applies to the moderation mailer too.
     #[arg(long, env = "VLPDS_EMAIL_SMTP_CA_FILE")]
     email_smtp_ca_file: Option<std::path::PathBuf>,
+    /// Send email over an HTTPS mail API instead of SMTP, for hosts whose
+    /// provider blocks outbound SMTP: Cloudflare Email Sending's REST API,
+    /// https://api.cloudflare.com/client/v4/accounts/{account_id}/email/sending/send.
+    /// Set this or --email-smtp-url, not both.
+    #[arg(long, env = "VLPDS_EMAIL_API_URL")]
+    email_api_url: Option<String>,
+    /// Bearer token for --email-api-url (Cloudflare: an API token with
+    /// Email Sending: Edit). Also used by --moderation-email-api-url unless
+    /// it has its own.
+    #[arg(long, env = "VLPDS_EMAIL_API_TOKEN", hide_env_values = true)]
+    email_api_token: Option<String>,
+    /// File holding --email-api-token.
+    #[arg(long, env = "VLPDS_EMAIL_API_TOKEN_FILE", conflicts_with = "email_api_token")]
+    email_api_token_file: Option<std::path::PathBuf>,
     /// From address for email ("addr@host" or "Name <addr@host>"); falls
-    /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url.
+    /// back to PDS_EMAIL_FROM_ADDRESS. Required with --email-smtp-url or
+    /// --email-api-url.
     #[arg(long, env = "VLPDS_EMAIL_FROM_ADDRESS")]
     email_from_address: Option<String>,
     /// Service name in email (falls back to PDS_SERVICE_NAME; default
@@ -545,8 +560,19 @@ struct Args {
     /// File holding --moderation-email-smtp-url.
     #[arg(long, env = "VLPDS_MODERATION_EMAIL_SMTP_URL_FILE", conflicts_with = "moderation_email_smtp_url")]
     moderation_email_smtp_url_file: Option<std::path::PathBuf>,
+    /// Mail API URL for admin sendEmail (same form as --email-api-url). Set
+    /// this or --moderation-email-smtp-url, not both.
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_API_URL")]
+    moderation_email_api_url: Option<String>,
+    /// Bearer token for --moderation-email-api-url (default --email-api-token).
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_API_TOKEN", hide_env_values = true)]
+    moderation_email_api_token: Option<String>,
+    /// File holding --moderation-email-api-token.
+    #[arg(long, env = "VLPDS_MODERATION_EMAIL_API_TOKEN_FILE", conflicts_with = "moderation_email_api_token")]
+    moderation_email_api_token_file: Option<std::path::PathBuf>,
     /// From address for moderation mail (falls back to
-    /// PDS_MODERATION_EMAIL_ADDRESS). Required with --moderation-email-smtp-url.
+    /// PDS_MODERATION_EMAIL_ADDRESS). Required with --moderation-email-smtp-url
+    /// or --moderation-email-api-url.
     #[arg(long, env = "VLPDS_MODERATION_EMAIL_ADDRESS")]
     moderation_email_address: Option<String>,
     /// Max uploadBlob size (MB).
@@ -1033,6 +1059,12 @@ fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
         &args.moderation_email_smtp_url_file,
         &mut args.moderation_email_smtp_url,
     )?;
+    resolve("email-api-token-file", &args.email_api_token_file, &mut args.email_api_token)?;
+    resolve(
+        "moderation-email-api-token-file",
+        &args.moderation_email_api_token_file,
+        &mut args.moderation_email_api_token,
+    )?;
     resolve("rate-limit-bypass-key-file", &args.rate_limit_bypass_key_file, &mut args.rate_limit_bypass_key)?;
     resolve("vault-approle-role-id-file", &args.vault_approle_role_id_file, &mut args.vault_approle_role_id)?;
     if let Some(p) = &args.s3_access_key_file {
@@ -1413,16 +1445,20 @@ async fn run(args: Args) -> anyhow::Result<()> {
         dev_mode: args.dev_mode,
         allow_bulk_create: args.allow_bulk_create,
         kek: kek_config(&args)?,
-        mailer: vlpds::mail::from_flags(
-            args.email_smtp_url.clone(),
-            args.email_from_address.clone(),
-            args.email_smtp_ca_file.as_deref(),
-        )?,
-        moderation_mailer: vlpds::mail::moderation_from_flags(
-            args.moderation_email_smtp_url.clone(),
-            args.moderation_email_address.clone(),
-            args.email_smtp_ca_file.as_deref(),
-        )?,
+        mailer: vlpds::mail::from_flags(vlpds::mail::Flags {
+            smtp_url: args.email_smtp_url.clone(),
+            api_url: args.email_api_url.clone(),
+            api_token: args.email_api_token.clone(),
+            from: args.email_from_address.clone(),
+            ca_file: args.email_smtp_ca_file.as_deref(),
+        })?,
+        moderation_mailer: vlpds::mail::moderation_from_flags(vlpds::mail::Flags {
+            smtp_url: args.moderation_email_smtp_url.clone(),
+            api_url: args.moderation_email_api_url.clone(),
+            api_token: args.moderation_email_api_token.clone().or_else(|| args.email_api_token.clone()),
+            from: args.moderation_email_address.clone(),
+            ca_file: args.email_smtp_ca_file.as_deref(),
+        })?,
         email_branding: vlpds::mail::Branding::from_flags(
             args.email_brand_name.clone(),
             args.email_home_url.clone(),

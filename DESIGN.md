@@ -3553,13 +3553,18 @@ least the backup retention.
 
 Email confirmation, email update, password reset, account deletion, PLC
 operation, sign-in code (email 2FA) and admin `sendEmail` mail go out over
-SMTP (`src/mail.rs`, lettre over rustls) when configured:
+SMTP (`src/mail.rs`, lettre over rustls) or, for hosts whose provider blocks
+outbound SMTP, Cloudflare Email Sending's REST API, when configured:
 
 | Flag | Env | Reference PDS env (also read) |
 |---|---|---|
 | `--email-smtp-url` | `VLPDS_EMAIL_SMTP_URL` | `PDS_EMAIL_SMTP_URL` |
+| `--email-api-url` | `VLPDS_EMAIL_API_URL` | |
+| `--email-api-token[-file]` | `VLPDS_EMAIL_API_TOKEN[_FILE]` | |
 | `--email-from-address` | `VLPDS_EMAIL_FROM_ADDRESS` | `PDS_EMAIL_FROM_ADDRESS` |
 | `--moderation-email-smtp-url` | `VLPDS_MODERATION_EMAIL_SMTP_URL` | `PDS_MODERATION_EMAIL_SMTP_URL` |
+| `--moderation-email-api-url` | `VLPDS_MODERATION_EMAIL_API_URL` | |
+| `--moderation-email-api-token[-file]` | `VLPDS_MODERATION_EMAIL_API_TOKEN[_FILE]` | |
 | `--moderation-email-address` | `VLPDS_MODERATION_EMAIL_ADDRESS` | `PDS_MODERATION_EMAIL_ADDRESS` |
 | `--email-brand-name` | `VLPDS_EMAIL_BRAND_NAME` | `PDS_SERVICE_NAME` |
 | `--email-home-url` | `VLPDS_EMAIL_HOME_URL` | `PDS_HOME_URL` |
@@ -3618,8 +3623,24 @@ attempt; transient failures (4xx, network, timeout) retry after ~2 s, 10 s and
 `vlpds_mail_retries_total`, `vlpds_mail_queue_depth`, `vlpds_mail_send_seconds`.
 Each node mails for the requests it handles; tokens live in the account's
 private state, so any node verifies them. Queued mail is lost if the node
-stops (the user asks again). A moderation mailer is a second `SmtpMailer`
+stops (the user asks again). A moderation mailer is a second `QueueMailer`
 with its own queue and pool; the metrics are shared (`purpose="admin"`).
+
+**HTTPS transport.** `--email-api-url` (the account's
+`https://api.cloudflare.com/client/v4/accounts/{account_id}/email/sending/send`)
+replaces SMTP with one JSON POST per mail (`from` as an address or
+`{address, name}`, `to`, `subject`, `text`, `html`), the token
+(`--email-api-token[-file]`, Email Sending: Edit, the same token the SMTP relay
+takes) as `Authorization: Bearer`. Exactly one of the SMTP and API URLs per
+mailer, else startup fails. It shares the queue, concurrency, backoff and
+metrics. 429, 408, 5xx, connection errors and timeouts retry; any other 4xx
+is permanent, as is a 200 whose `result.permanent_bounces` or
+`suppressed_recipients` is non-empty. A 200 without a parsable body counts as
+sent (retrying could deliver twice). Cloudflare sets `Message-ID` and refuses
+it in `headers`. The URL must be `https://` (plain `http://` only to loopback,
+for tests), and the token is a sensitive header value that no log or `Debug`
+shows. The moderation mailer takes `--moderation-email-api-url`, with its own
+token or the main one.
 
 ## Choosing a bucket (`vlpds-bucket-probe`)
 
