@@ -50,7 +50,7 @@ rebuild, so moving to more nodes later just means starting another one on the sa
 |---|---|---|
 | Host | Linux with Docker, 2+ vCPU, 4+ GB RAM, ~15 GB free disk | The tiny profile's disk cache is 4 GiB on the root disk, and the deploy keeps 10 GiB free beyond it. |
 | Bucket | S3, R2 or GCS (MinIO for tests) that passes `vlpds-bucket-probe` | Needs strongly consistent conditional writes. See [Object store](object-store.md). |
-| DNS | `A` for the hostname, `A` for `*.<handle domain>` | Both point at the host. Handles resolve over HTTPS at `https://<handle>/.well-known/atproto-did`. |
+| DNS | `A` for the hostname, `A` for `*.<handle domain>` | Both point at the host. Handles resolve over HTTPS at `https://<handle>/.well-known/atproto-did`. More handle domains each need their own wildcard record (see [Handle domains](handle-domains.md)). |
 | Secrets | JWT secret, admin token, internal token, S3 key pair, KEK (or Cloud KMS), PLC rotation key | The three tokens are 32+ bytes and must all differ. The KEK and the PLC key aren't in the bucket, so back them up offline. |
 | Mail | an SMTP URL and a sender domain with SPF/DKIM | Optional. Without it, verification and 2FA mails only go to the log. See [Email and moderation](email-and-moderation.md). |
 

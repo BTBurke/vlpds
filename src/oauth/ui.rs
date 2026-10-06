@@ -36,7 +36,7 @@ label{display:block;font-size:13.5px;font-weight:600;margin:16px 0 5px}
 input[type=text],input[type=password],input[type=email]{width:100%;padding:10px 12px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);font:inherit;font-size:15px}
 .affix{display:flex;align-items:stretch}
 .affix input{border-radius:5px 0 0 5px;min-width:0}
-.affix span{display:flex;align-items:center;padding:0 11px;border:1px solid var(--rule);border-left:0;border-radius:0 5px 5px 0;background:var(--sheet);color:var(--ink2);font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:13px;white-space:nowrap}
+.affix span,.affix select{display:flex;align-items:center;padding:0 11px;border:1px solid var(--rule);border-left:0;border-radius:0 5px 5px 0;background:var(--sheet);color:var(--ink2);font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:13px;white-space:nowrap}
 .hint{color:var(--ink2);font-size:12.5px;margin:5px 0 0}
 .alt{margin:18px 0 0;padding-top:14px;border-top:1px solid var(--rule);font-size:14px;color:var(--ink2)}
 input:focus-visible,button:focus-visible,a:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
@@ -422,11 +422,26 @@ fn screen_url(c: &Ctx, screen: &str) -> String {
 pub struct SignupForm<'a> {
     /// The first label.
     pub handle: &'a str,
+    /// The one picked of `domains` (primary first).
     pub domain: &'a str,
+    pub domains: &'a [String],
     pub email: &'a str,
     pub invite_code: &'a str,
     pub invite_required: bool,
     pub error: Option<&'a str>,
+}
+
+fn domain_affix(f: &SignupForm) -> String {
+    if f.domains.len() < 2 {
+        return format!("<span>.{}</span>", e(f.domain));
+    }
+    let mut s = String::from("<select name=\"domain\" aria-label=\"Domain\">");
+    for d in f.domains {
+        let sel = if d == f.domain { " selected" } else { "" };
+        s.push_str(&format!("<option value=\"{}\"{sel}>.{}</option>", e(d), e(d)));
+    }
+    s.push_str("</select>");
+    s
 }
 
 pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
@@ -442,14 +457,14 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
     b.push_str(&hidden(ctx));
     b.push_str(&format!(
         "<label for=\"handle\">Handle</label>\
-<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus><span>.{}</span></div>\
+<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus>{}</div>\
 <p class=\"hint\">3 to 18 letters, digits or hyphens. You can switch to your own domain later.</p>\
 <label for=\"email\">Email</label>\
 <input type=\"email\" id=\"email\" name=\"email\" value=\"{}\" autocomplete=\"email\" required>\
 <label for=\"password\">Password</label>\
 <input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"new-password\" minlength=\"8\" maxlength=\"256\" required>",
         e(f.handle),
-        e(f.domain),
+        domain_affix(f),
         e(f.email)
     ));
     if f.invite_required {
@@ -1546,5 +1561,27 @@ mod tests {
         assert!(raw.contains(&format!("<li><code>{}</code></li>", e(BOARDS))), "{raw}");
         assert!(!raw.contains("name=\"scope\""), "{raw}");
         assert!(raw.find("</details>").unwrap() < raw.find("Allow</button>").unwrap(), "{raw}");
+    }
+
+    #[test]
+    fn signup_offers_a_domain_select_only_with_several() {
+        let ctx = Ctx { request_uri: "r", csrf: "c", client_id: "x", loopback: true, server_name: "s" };
+        let one = ["pds.test".to_string()];
+        let f = |domain, domains| SignupForm {
+            handle: "al",
+            domain,
+            domains,
+            email: "",
+            invite_code: "",
+            invite_required: false,
+            error: None,
+        };
+        let html = signup(&ctx, &f("pds.test", &one));
+        assert!(html.contains("<span>.pds.test</span>") && !html.contains("<select"), "{html}");
+        let two = ["pds.test".to_string(), "group-a.test".to_string()];
+        let html = signup(&ctx, &f("group-a.test", &two));
+        assert!(html.contains("<select name=\"domain\""), "{html}");
+        assert!(html.contains("<option value=\"group-a.test\" selected>.group-a.test</option>"), "{html}");
+        assert!(html.contains("<option value=\"pds.test\">.pds.test</option>"), "{html}");
     }
 }

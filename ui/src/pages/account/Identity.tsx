@@ -18,7 +18,7 @@ export function Identity() {
       ) : (
         <>
           {desc.data ? (
-            <HandleChange current={d.handle} did={d.did} domain={desc.data.availableUserDomains[0] ?? ''} onDone={info.reload} />
+            <HandleChange current={d.handle} did={d.did} domains={desc.data.availableUserDomains ?? []} onDone={info.reload} />
           ) : desc.error ? (
             <ErrorNotice error={desc.error} />
           ) : (

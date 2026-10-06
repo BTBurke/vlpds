@@ -36,6 +36,14 @@ pub fn valid_record_path(path: &str) -> bool {
     path.split_once('/').is_some_and(|(c, r)| valid_nsid(c) && valid_rkey(r))
 }
 
+/// Handles under these can't be resolved publicly (reference
+/// DISALLOWED_TLDS).
+pub fn disallowed_handle_tld(h: &str) -> bool {
+    const DISALLOWED_TLDS: &[&str] =
+        &[".local", ".arpa", ".invalid", ".localhost", ".internal", ".example", ".alt", ".onion"];
+    DISALLOWED_TLDS.iter().any(|t| h.ends_with(t))
+}
+
 /// The TLD starts with a letter.
 pub fn valid_handle(h: &str) -> bool {
     labels(h, 2, 253).is_some_and(|l| l[l.len() - 1].as_bytes()[0].is_ascii_alphabetic())

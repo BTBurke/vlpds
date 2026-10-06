@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { CopyText, Field, Notice, Panel, Spinner, Status } from '../../components/ui'
+import { CopyText, DomainAffix, Field, Notice, Panel, Spinner, Status } from '../../components/ui'
 import * as I from '../../components/icons'
+import { domainOf } from '../../lib/domains'
 import { useAction } from '../../lib/hooks'
 import { acall, errText, XrpcError } from '../../lib/xrpc'
 import './handle.css'
@@ -44,9 +45,9 @@ export function normalizeDomain(input: string): string {
     .replace(/\.$/, '')
 }
 
-export function domainProblem(d: string, serviceDomain: string): string | undefined {
+export function domainProblem(d: string, serviceDomains: string[]): string | undefined {
   if (!d) return undefined
-  if (serviceDomain && d.endsWith(serviceDomain)) return 'That\'s a name on this server. Choose "A name on this server" for that.'
+  if (domainOf(d, serviceDomains)) return 'That\'s a name on this server. Choose "A name on this server" for that.'
   if (!d.includes('.')) return 'Enter the whole domain, like alice.com.'
   const labels = d.split('.')
   if (d.length > 253 || labels.some((l) => !/^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/.test(l)) || !/^[a-z]/.test(labels[labels.length - 1]))
@@ -89,12 +90,13 @@ function checkErrText(e: unknown): string {
 
 type Done = { from: string; to: string }
 
-/** The Handle panel: pick a name on this server or set up your own domain, then switch. */
-export function HandleChange({ current, did, domain, onDone }: { current: string; did: string; domain: string; onDone: () => void }) {
+/** The Handle panel: pick a name on this server or set up your own domain, then switch.
+ * `domains` are the served handle domains, primary first. */
+export function HandleChange({ current, did, domains, onDone }: { current: string; did: string; domains: string[]; onDone: () => void }) {
   const [mode, setMode] = useState<'server' | 'domain'>()
   const [done, setDone] = useState<Done>()
   const [prefill, setPrefill] = useState('')
-  const host = domain.replace(/^\./, '')
+  const domain = domains[0] ?? ''
 
   const pick = (m: 'server' | 'domain') => {
     setDone(undefined)
@@ -112,10 +114,10 @@ export function HandleChange({ current, did, domain, onDone }: { current: string
       {done && (
         <AfterSwitch
           done={done}
-          domain={domain}
+          domains={domains}
           onSwitchBack={() => {
-            const label = done.from.endsWith(domain) ? done.from.slice(0, -domain.length) : ''
-            setPrefill(label)
+            const under = domainOf(done.from, domains)
+            setPrefill(under ? done.from : '')
             setDone(undefined)
             setMode('server')
           }}
@@ -143,29 +145,35 @@ export function HandleChange({ current, did, domain, onDone }: { current: string
           </span>
         </label>
       </fieldset>
-      {mode === 'server' && <ServerName key={prefill} domain={domain} host={host} current={current} initial={prefill} onSwitched={switched} />}
-      {mode === 'domain' && <OwnDomain domain={domain} did={did} current={current} onSwitched={switched} />}
+      {mode === 'server' && <ServerName key={prefill} domains={domains} current={current} initial={prefill} onSwitched={switched} />}
+      {mode === 'domain' && <OwnDomain domains={domains} did={did} current={current} onSwitched={switched} />}
     </Panel>
   )
 }
 
 // ---------------------------------------------------------------- a name here
 
+/** `initial` is a whole handle under a served domain, or empty. */
 function ServerName({
-  domain,
-  host,
+  domains,
   current,
   initial,
   onSwitched,
 }: {
-  domain: string
-  host: string
+  domains: string[]
   current: string
   initial: string
   onSwitched: (to: string) => void
 }) {
-  const [name, setName] = useState(initial)
-  const label = name.trim().replace(/^@/, '').toLowerCase().replace(new RegExp(`${domain.replace(/\./g, '\\.')}$`), '')
+  const typed = (s: string) => s.trim().replace(/^@/, '').toLowerCase()
+  const [picked, setPicked] = useState(() => domainOf(initial, domains) ?? domainOf(current, domains) ?? domains[0] ?? '')
+  const [name, setName] = useState(() => {
+    const under = domainOf(initial, domains)
+    return under ? initial.slice(0, -under.length) : initial
+  })
+  const under = domainOf(typed(name), domains)
+  const label = under ? typed(name).slice(0, -under.length) : typed(name)
+  const domain = under ?? picked
   const full = label ? `${label}${domain}` : ''
   const local = serverNameProblem(label)
   const [state, setState] = useState<{ handle: string; check?: Check; error?: unknown }>()
@@ -219,7 +227,11 @@ function ServerName({
           <input
             type="text"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value)
+              const u = domainOf(typed(e.target.value), domains)
+              if (u) setPicked(u)
+            }}
             autoCapitalize="none"
             autoComplete="off"
             spellCheck={false}
@@ -228,7 +240,15 @@ function ServerName({
             aria-invalid={!!local || (!!check && !available)}
             autoFocus
           />
-          <span className="mono">{domain || host}</span>
+          <DomainAffix
+            domains={domains}
+            value={domain}
+            placeholder=""
+            onChange={(d) => {
+              setPicked(d)
+              if (under) setName(label)
+            }}
+          />
         </span>
       </Field>
       {act.error ? <Notice kind="err">{handleErrText(act.error)}</Notice> : null}
@@ -247,7 +267,7 @@ function ServerName({
 
 const STEPS = ['Your domain', 'Add the record', 'Check', 'Switch'] as const
 
-function OwnDomain({ domain, did, current, onSwitched }: { domain: string; did: string; current: string; onSwitched: (to: string) => void }) {
+function OwnDomain({ domains, did, current, onSwitched }: { domains: string[]; did: string; current: string; onSwitched: (to: string) => void }) {
   const [step, setStep] = useState(0)
   const [input, setInput] = useState('')
   const [method, setMethod] = useState<'dns' | 'http'>('dns')
@@ -281,7 +301,7 @@ function OwnDomain({ domain, did, current, onSwitched }: { domain: string; did: 
       <h3 ref={headRef} tabIndex={-1} className="hc-step-title">
         Step {step + 1} of {STEPS.length}: {STEPS[step]}
       </h3>
-      {step === 0 && <DomainStep input={input} setInput={setInput} d={d} domain={domain} current={current} onNext={(c) => (c.status === 'verified' ? (setVerified(c), go(3)) : go(1))} />}
+      {step === 0 && <DomainStep input={input} setInput={setInput} d={d} domains={domains} current={current} onNext={(c) => (c.status === 'verified' ? (setVerified(c), go(3)) : go(1))} />}
       {step === 1 && <RecordStep d={d} did={did} method={method} setMethod={setMethod} onBack={() => go(0)} onNext={() => go(2)} />}
       {step === 2 && (
         <CheckStep
@@ -303,19 +323,19 @@ function DomainStep({
   input,
   setInput,
   d,
-  domain,
+  domains,
   current,
   onNext,
 }: {
   input: string
   setInput: (s: string) => void
   d: string
-  domain: string
+  domains: string[]
   current: string
   onNext: (c: Check) => void
 }) {
   const [touched, setTouched] = useState(false)
-  const local = domainProblem(d, domain)
+  const local = domainProblem(d, domains)
   const [problem, setProblem] = useState<string>()
   const act = useAction(async () => {
     const c = await checkHandle(d)
@@ -653,10 +673,10 @@ function ConfirmStep({
 
 // ---------------------------------------------------------------- after
 
-function AfterSwitch({ done, domain, onSwitchBack, onDismiss }: { done: Done; domain: string; onSwitchBack: () => void; onDismiss: () => void }) {
+function AfterSwitch({ done, domains, onSwitchBack, onDismiss }: { done: Done; domains: string[]; onSwitchBack: () => void; onDismiss: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => ref.current?.focus(), [])
-  const own = !done.to.endsWith(domain)
+  const own = !domainOf(done.to, domains)
   return (
     <div className="hc-after" ref={ref} tabIndex={-1}>
       <Notice kind="ok">

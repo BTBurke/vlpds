@@ -1673,6 +1673,30 @@ async fn prompt_create_signs_up() {
     assert!(html.contains("Create an account"), "{html}");
 }
 
+/// With several handle domains the sign-up page offers them all, and the
+/// one picked is the new handle's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_up_under_an_added_domain() {
+    let s = spawn().await;
+    vlpds::handle_domains::add(&s.app.handle_domains, &s.app.store, "group-a.test", "test").await.unwrap();
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto transition:generic", &key).with("prompt", "create");
+    let mut b = Browser::default();
+    let ru = f.request_uri(&s, &pkce(), "c1").await;
+    let (_, _, html) = b.authorize(&s, &f, &ru).await;
+    assert!(html.contains("<option value=\"group-a.test\">.group-a.test</option>"), "{html}");
+    let name = format!("grp{}", rand::random::<u32>() % 100000);
+    let email = format!("{name}@example.com");
+    let mut form = sign_up_form(&ru, "", &name, &email, None);
+    let csrf = csrf_of(&html);
+    form[1].1 = &csrf;
+    form.push(("domain", "group-a.test"));
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &form).await;
+    assert_eq!(st, 200, "{html}");
+    let did = hidden_field(&html, "did").expect("did on the consent form");
+    assert_eq!(s.app.account(&did).await.ok().unwrap().handle, format!("{name}.group-a.test"));
+}
+
 /// With invites required, the sign-up page asks for a code and enforces it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sign_up_page_with_required_invites() {

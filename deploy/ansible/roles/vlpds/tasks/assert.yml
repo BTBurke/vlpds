@@ -166,9 +166,13 @@
       - vlpds_caddy_wildcard_dns in ['', 'cloudflare']
       - vlpds_caddy_wildcard_dns == '' or vlpds_cloudflare_dns_token | length > 0
       - not (vlpds_caddy_hostname_dns01 | bool) or vlpds_caddy_wildcard_dns == 'cloudflare'
+      - vlpds_extra_handle_domains | length == 0 or vlpds_caddy_wildcard_dns == 'cloudflare'
+      - vlpds_extra_handle_domains | select('match', '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$') | list | length == vlpds_extra_handle_domains | length
+      - vlpds_handle_domain not in vlpds_extra_handle_domains
     fail_msg: >-
-      vlpds_caddy_wildcard_dns is '' or cloudflare (vlpds_caddy_hostname_dns01 needs
-      cloudflare). cloudflare needs
+      vlpds_caddy_wildcard_dns is '' or cloudflare (vlpds_caddy_hostname_dns01 and
+      vlpds_extra_handle_domains need cloudflare, and the extra domains are lowercase
+      names without a leading dot, other than vlpds_handle_domain). cloudflare needs
       vlpds_cloudflare_dns_token: a Cloudflare API token with Zone:Zone:Read + Zone:DNS:Edit
       on the handle domain's zone (a secret: the inventory's sops file)
     quiet: true

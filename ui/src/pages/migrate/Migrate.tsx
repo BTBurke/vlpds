@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from 'react'
-import { CopyText, ErrorNotice, Field, Notice, Spinner, Status, Topbar } from '../../components/ui'
+import { CopyText, DomainAffix, ErrorNotice, Field, Notice, Spinner, Status, Topbar } from '../../components/ui'
 import { RecoveryKeyExplainer, RecoveryKeyPicker, type RecoveryKeyChoice } from '../../components/RecoveryKey'
 import { BackupBox } from '../../components/Backup'
 import { canStreamToDisk, type BackupSource } from '../../lib/backup'
@@ -797,7 +797,8 @@ function maskEmail(e: string) {
 
 function HandleStep({ saved, describe, update }: { saved: Saved; describe: Describe; update: (p: Partial<Saved>) => void }) {
   const adv = useAdv()
-  const domain = describe.availableUserDomains[0] ?? ''
+  const domains = describe.availableUserDomains
+  const [domain, setDomain] = useState(domains[0] ?? '')
   const provided = saved.oldDomains.some((d) => saved.oldHandle.endsWith(d))
   const custom = !provided && !saved.oldHandle.startsWith('did:') && saved.oldHandle !== 'handle.invalid'
   const [mode, setMode] = useState<'keep' | 'new'>(custom ? 'keep' : 'new')
@@ -896,7 +897,15 @@ function HandleStep({ saved, describe, update }: { saved: Saved; describe: Descr
                 minLength={3}
                 maxLength={18}
               />
-              <span className="mono">{domain}</span>
+              <DomainAffix
+                domains={domains}
+                value={domain}
+                placeholder=""
+                onChange={(d) => {
+                  setDomain(d)
+                  setMode('new')
+                }}
+              />
             </span>
           </Field>
           {mode === 'new' && avail && 'error' in avail && <Problem error={avail.error} />}

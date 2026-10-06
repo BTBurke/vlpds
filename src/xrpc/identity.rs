@@ -32,10 +32,6 @@ async fn active_handle_did(app: &Arc<App>, handle: &str) -> Result<Option<String
     }
 }
 
-fn under_handle_domain(app: &App, host: &str) -> bool {
-    host.ends_with(&format!(".{}", app.handle_domain))
-}
-
 fn public_host(app: &App) -> Option<String> {
     reqwest::Url::parse(&app.public_url).ok()?.host_str().map(|h| h.to_ascii_lowercase())
 }
@@ -58,7 +54,7 @@ async fn tls_check(State(app): AppState, Query(q): Query<TlsCheckQ>) -> Response
     if public_host(&app).as_deref() == Some(domain.as_str()) {
         return Json(json!({"success": true})).into_response();
     }
-    if !under_handle_domain(&app, &domain) {
+    if app.handle_domains.under(&domain).is_none() {
         return err(StatusCode::BAD_REQUEST, "InvalidRequest", "handles are not provided on this domain");
     }
     match active_handle_did(&app, &domain).await {
@@ -98,7 +94,7 @@ async fn well_known_atproto_did(State(app): AppState, headers: HeaderMap) -> Res
     }
     .to_ascii_lowercase();
     let not_found = || (StatusCode::NOT_FOUND, "User not found").into_response();
-    if !under_handle_domain(&app, &handle) {
+    if app.handle_domains.under(&handle).is_none() {
         return not_found();
     }
     match active_handle_did(&app, &handle).await {
@@ -183,7 +179,7 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
 
 /// Reference `serviceHandleDomains` check.
 fn is_service_handle(app: &App, handle: &str) -> bool {
-    under_handle_domain(app, handle) || handle == app.handle_domain
+    app.handle_domains.served(handle).is_some()
 }
 
 /// Inactive accounts don't resolve (reference getAccount(handle)).
@@ -404,8 +400,7 @@ pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XRes
     // syntax + disallowed TLDs, then the slur filter (reference order)
     super::server::normalize_handle(handle)?;
     super::server::ensure_no_slur(handle)?;
-    let suffix = format!(".{}", app.handle_domain);
-    if handle.ends_with(&suffix) {
+    if app.handle_domains.under(handle).is_some() {
         // same rules as createAccount, reserved names included
         return super::server::ensure_service_handle(app, handle, false);
     }
@@ -483,8 +478,8 @@ fn handle_problem(app: &App, handle: &str) -> Option<(&'static str, String)> {
     if handle.is_empty() {
         return invalid("Enter a handle.");
     }
-    let suffix = format!(".{}", app.handle_domain);
-    if let Some(front) = handle.strip_suffix(&suffix) {
+    let service = app.handle_domains.under(handle).is_some();
+    if let Some((front, _)) = app.handle_domains.under(handle) {
         if front.contains('.') {
             return invalid(
                 "A name on this server can't contain dots. To use a domain you own, choose \"Your own domain\".",
@@ -514,7 +509,7 @@ fn handle_problem(app: &App, handle: &str) -> Option<(&'static str, String)> {
     if super::server::ensure_no_slur(handle).is_err() {
         return invalid("That name isn't allowed. Try another.");
     }
-    if handle.ends_with(&suffix) {
+    if service {
         if let Err(e) = super::server::ensure_service_handle(app, handle, false) {
             return Some(match e.error.as_str() {
                 "HandleNotAvailable" => ("reserved", "That name is reserved on this server. Try another.".into()),
@@ -551,7 +546,7 @@ async fn check_handle(State(app): AppState, Auth(creds): Auth, Query(q): Query<C
     }
     let acct = app.account(&did).await?;
     let handle = q.name.trim().trim_start_matches('@').trim_end_matches('.').to_ascii_lowercase();
-    let service = handle.ends_with(&format!(".{}", app.handle_domain));
+    let service = app.handle_domains.under(&handle).is_some();
     let kind = if service { "service" } else { "external" };
     let base = |status: &str, message: Option<String>| {
         crate::metrics::HANDLE_CHECKS.with_label_values(&[kind, status]).inc();

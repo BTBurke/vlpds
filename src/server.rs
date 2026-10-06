@@ -585,7 +585,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
         firehose,
         tids: crate::tid::TidClock::new(),
         public_url: cfg.public_url.clone(),
-        handle_domain: cfg.handle_domain.clone(),
+        handle_domains: Arc::new(crate::handle_domains::HandleDomains::new(&cfg.handle_domain)),
         write_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_inflight_writes)),
         read_permits: Arc::new(tokio::sync::Semaphore::new(cfg.max_queued_reads.max(1))),
         exports: Arc::new(tokio::sync::Semaphore::new(cfg.max_exports.max(1))),

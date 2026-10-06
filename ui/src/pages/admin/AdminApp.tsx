@@ -5,6 +5,7 @@ import { Link, match } from '../../lib/router'
 import { basic, call, setAdminToken } from '../../lib/xrpc'
 import { Cluster } from './Cluster'
 import { Firehose } from './Firehose'
+import { HandleDomains } from './HandleDomains'
 import { Metrics } from './Metrics'
 import { AccountDetail, Accounts } from './Accounts'
 import { Invites } from './Invites'
@@ -20,6 +21,7 @@ const TABS = [
   { to: '/admin/moderation', label: 'Moderation' },
   { to: '/admin/spaces', label: 'Spaces' },
   { to: '/admin/invites', label: 'Invite codes' },
+  { to: '/admin/handle-domains', label: 'Handle domains' },
   { to: '/admin/ratelimits', label: 'Rate limits' },
   { to: '/admin/relays', label: 'Relays' },
   { to: '/admin/firehose', label: 'Firehose' },
@@ -40,6 +42,7 @@ export function AdminApp({ path }: { path: string }) {
   else if (p === '/admin/spaces') page = <Spaces />
   else if (p === '/admin/spaces/space') page = <SpaceDetail />
   else if (p === '/admin/invites') page = <Invites />
+  else if (p === '/admin/handle-domains') page = <HandleDomains />
   else if (p === '/admin/ratelimits') page = <RateLimits />
   else if (p === '/admin/relays') page = <Relays />
   else if (p === '/admin/firehose') page = <Firehose />
