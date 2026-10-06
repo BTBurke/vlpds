@@ -65,6 +65,89 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   )
 }
 
+/** A settings-style console page (a few short tables and forms), held to a readable width instead of the full console. */
+export function ConsolePage({
+  title,
+  intro,
+  setup,
+  setupLabel = 'Setup',
+  actions,
+  children,
+}: {
+  title: ReactNode
+  intro?: ReactNode
+  setup?: ReactNode
+  setupLabel?: string
+  actions?: ReactNode
+  children: ReactNode
+}) {
+  return (
+    <div className="console-page">
+      <div className="console-head">
+        <h1>{title}</h1>
+        {actions && <div className="row">{actions}</div>}
+      </div>
+      {(intro || setup) && (
+        <div className="page-intro">
+          {intro && <p>{intro}</p>}
+          {setup && (
+            <details className="page-setup">
+              <summary>{setupLabel}</summary>
+              <div>{setup}</div>
+            </details>
+          )}
+        </div>
+      )}
+      {children}
+    </div>
+  )
+}
+
+/** One labelled input with its submit button on the same line, the hint and any error underneath. */
+export function AddRow({
+  label,
+  hint,
+  error,
+  submit,
+  extra,
+  onSubmit,
+  children,
+}: {
+  label: string
+  hint?: ReactNode
+  error?: unknown
+  submit: ReactNode
+  extra?: ReactNode
+  onSubmit: () => void
+  children: ReactNode
+}) {
+  return (
+    <form
+      className="add-row"
+      onSubmit={(e) => {
+        e.preventDefault()
+        onSubmit()
+      }}
+    >
+      <label>
+        <span className="label">{label}</span>
+        {children}
+      </label>
+      <div className="add-row-actions">
+        {submit}
+        {extra}
+      </div>
+      {hint && <p className="hint">{hint}</p>}
+      {!!error && (
+        <p className="add-row-error" role="alert">
+          <I.Alert />
+          {errText(error)}
+        </p>
+      )}
+    </form>
+  )
+}
+
 function useCopy(text: string) {
   const [done, setDone] = useState(false)
   const timer = useRef<number>(undefined)

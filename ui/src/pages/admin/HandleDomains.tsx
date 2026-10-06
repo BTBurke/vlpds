@@ -1,11 +1,23 @@
-import { useState } from 'react'
-import { CopyValue, ErrorNotice, Field, Loading, Notice, Panel, PartialNotice, partialOf, Spinner, type PartialResult } from '../../components/ui'
-import { fmtNum, fmtTime } from '../../lib/format'
+import { Fragment, useState } from 'react'
+import { AddRow, ConsolePage, CopyValue, ErrorNotice, Loading, Notice, Panel, PartialNotice, partialOf, Spinner, type PartialResult } from '../../components/ui'
+import { fmtNum, fmtTime, relTime } from '../../lib/format'
 import { useAction, useLoad } from '../../lib/hooks'
 import { admin, errText, XrpcError } from '../../lib/xrpc'
 
 type Domain = { domain: string; primary: boolean; accounts: number | null; addedAt?: string; addedBy?: string }
 type Listing = PartialResult & { primary: string; domains: Domain[]; updatedAt?: string; refreshSecs: number; countsPartial?: boolean }
+
+function Added({ x }: { x: Domain }) {
+  if (x.primary) return <span className="faint">from --handle-domain</span>
+  const ms = x.addedAt ? Date.parse(x.addedAt) : NaN
+  if (isNaN(ms)) return <span className="faint">—</span>
+  return (
+    <span title={fmtTime(x.addedAt)}>
+      {relTime(ms)}
+      {x.addedBy && <span className="faint"> by {x.addedBy}</span>}
+    </span>
+  )
+}
 
 export function HandleDomains() {
   // not polled: each load reads every account row in the cluster to count them
@@ -32,7 +44,7 @@ export function HandleDomains() {
           : `Removed ${domain}.`,
       )
     } catch (e) {
-      if (e instanceof XrpcError && e.error === 'DomainInUse') return setInUse({ domain, message: errText(e) })
+      if (e instanceof XrpcError && e.error === 'DomainInUse') return setInUse({ domain, message: errText(e).replace(/; pass force to remove it anyway$/, '.') })
       throw e
     } finally {
       l.reload()
@@ -49,109 +61,141 @@ export function HandleDomains() {
 
   if (!d)
     return (
-      <>
+      <ConsolePage title="Handle domains">
         <ErrorNotice error={l.error} />
         {!l.error && <Loading />}
-      </>
+      </ConsolePage>
     )
   const busy = add.busy || remove.busy
   const typed = added.trim().toLowerCase().replace(/^\.+/, '')
   return (
-    <>
-      <div className="console-head">
-        <h1>Handle domains</h1>
-      </div>
-      <p className="muted">
-        Accounts can take a handle under any of these domains. The primary, <span className="mono">{d.primary}</span>, comes from{' '}
-        <span className="mono">--handle-domain</span> and is always served. Domains added here are stored in the bucket for the whole cluster. Each one needs DNS: a
-        wildcard record pointing at the PDS, and a certificate (on-demand TLS covers it; a wildcard certificate needs the DNS-01 token to control the zone).
-      </p>
-      <ErrorNotice error={l.error || add.error || remove.error} />
+    <ConsolePage
+      title="Handle domains"
+      intro={
+        <>
+          Accounts can take a handle under any of these domains. Every node picks up a change within seconds (at most {d.refreshSecs} s).
+        </>
+      }
+      setup={
+        <>
+          <p>
+            Each domain needs a wildcard DNS record (<span className="mono">*.example.org</span>) pointing at the PDS, and a certificate. On-demand TLS covers
+            it; a wildcard certificate needs the DNS-01 token to control the zone.
+          </p>
+          <p>
+            The primary, <span className="mono">{d.primary}</span>, comes from <span className="mono">--handle-domain</span> and is always served. Domains added
+            here are stored in the bucket.
+          </p>
+        </>
+      }
+    >
+      <ErrorNotice error={l.error || remove.error} />
       {notice && <Notice kind="ok">{notice}</Notice>}
-      {inUse && (
-        <Notice kind="warn">
-          <p>{inUse.message}</p>
-          <div className="row">
-            <button type="button" className="btn sm danger" disabled={busy} onClick={() => forceRemove(inUse.domain)}>
-              Remove anyway
-            </button>
-            <button type="button" className="btn sm quiet" onClick={() => setInUse(undefined)}>
-              Keep it
-            </button>
-          </div>
-        </Notice>
-      )}
       {d.countsPartial && (
         <Notice kind="warn">Some nodes or shards didn’t answer, so the account counts may be low. Removing a domain needs “Remove anyway” until they do.</Notice>
       )}
       <PartialNotice partial={partialOf(d)} />
-      <Panel title="Domains" desc={`Primary first. Nodes pick up changes within seconds (at most ${d.refreshSecs} s).`} flush>
+      <Panel title="Domains" flush>
         <div className="table-wrap">
-          <table className="data">
+          <table className="data fit">
             <thead>
               <tr>
                 <th>Domain</th>
-                <th className="num">Active accounts</th>
+                <th className="num" title="Active accounts with a handle under the domain">
+                  Accounts
+                </th>
                 <th>Added</th>
-                <th>
+                <th className="slack">
                   <span className="sr-only">Actions</span>
                 </th>
               </tr>
             </thead>
             <tbody>
-              {d.domains.map((x) => (
-                <tr key={x.domain}>
-                  <td>
-                    <CopyValue text={x.domain} label={`Copy domain ${x.domain}`} /> {x.primary && <span className="pill accent">Primary</span>}
-                  </td>
-                  <td className="num">{x.accounts === null ? <span className="muted" title="Couldn't be counted">—</span> : fmtNum(x.accounts)}</td>
-                  <td className="nowrap small">
-                    {x.primary ? (
-                      <span className="muted">--handle-domain</span>
-                    ) : (
-                      <>
-                        {fmtTime(x.addedAt)}
-                        {x.addedBy && <span className="muted"> by {x.addedBy}</span>}
-                      </>
+              {d.domains.map((x) => {
+                const alert = inUse?.domain === x.domain
+                return (
+                  <Fragment key={x.domain}>
+                    <tr className={alert ? 'has-alert' : undefined}>
+                      <td>
+                        <span className="cell-main">
+                          <CopyValue text={x.domain} label={`Copy domain ${x.domain}`} />
+                          {x.primary && <span className="pill accent">Primary</span>}
+                        </span>
+                      </td>
+                      <td className="num">{x.accounts === null ? <span className="faint" title="Couldn't be counted">—</span> : fmtNum(x.accounts)}</td>
+                      <td className="small">
+                        <Added x={x} />
+                      </td>
+                      <td className="slack">
+                        {x.primary ? (
+                          <span className="small faint" title="The primary comes from --handle-domain and can't be removed here">
+                            Always served
+                          </span>
+                        ) : (
+                          <button type="button" className="btn sm danger" disabled={busy} onClick={() => remove.run(x.domain, false)}>
+                            Remove
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                    {alert && (
+                      <tr className="row-alert">
+                        <td colSpan={4}>
+                          <Notice kind="warn">
+                            <p>
+                              <b>Still in use.</b> {inUse.message}
+                            </p>
+                            <div className="row">
+                              <button type="button" className="btn sm danger" disabled={busy} onClick={() => forceRemove(inUse.domain)}>
+                                Remove anyway
+                              </button>
+                              <button type="button" className="btn sm quiet" onClick={() => setInUse(undefined)}>
+                                Keep it
+                              </button>
+                            </div>
+                          </Notice>
+                        </td>
+                      </tr>
                     )}
-                  </td>
-                  <td className="nowrap">
-                    <div className="row end">
-                      <button
-                        type="button"
-                        className="btn sm danger"
-                        disabled={busy || x.primary}
-                        title={x.primary ? 'The primary comes from --handle-domain' : undefined}
-                        onClick={() => remove.run(x.domain, false)}
-                      >
-                        Remove
-                      </button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                  </Fragment>
+                )
+              })}
             </tbody>
           </table>
         </div>
+        <div className="panel-foot roomy">
+          <AddRow
+            label="Add a domain"
+            hint={
+              <>
+                Handles look like <span className="mono">alice.{typed || 'example.org'}</span>. Set up its DNS first.
+              </>
+            }
+            error={add.error}
+            onSubmit={() => typed && add.run(typed)}
+            submit={
+              <button className="btn primary" disabled={busy || !typed}>
+                {add.busy && <Spinner />}
+                Add domain
+              </button>
+            }
+          >
+            <input
+              type="text"
+              value={added}
+              onChange={(e) => {
+                setAdded(e.target.value)
+                if (add.error) add.setError(undefined)
+              }}
+              placeholder="at.example.org"
+              autoCapitalize="none"
+              spellCheck={false}
+              required
+            />
+          </AddRow>
+        </div>
       </Panel>
-      <Panel title="Add a domain">
-        <form
-          className="inline-form"
-          onSubmit={(e) => {
-            e.preventDefault()
-            if (typed) add.run(typed)
-          }}
-        >
-          <Field label="Domain" hint="Handles look like alice.<domain>. Set up its DNS first.">
-            <input type="text" value={added} onChange={(e) => setAdded(e.target.value)} placeholder="at.example.org" autoCapitalize="none" spellCheck={false} required />
-          </Field>
-          <button className="btn primary" disabled={busy || !typed}>
-            {add.busy && <Spinner />}
-            Add domain
-          </button>
-        </form>
-        {d.updatedAt && <p className="small muted">Last changed {fmtTime(d.updatedAt)}.</p>}
-      </Panel>
-    </>
+      {d.updatedAt && <p className="small faint">Last changed {fmtTime(d.updatedAt)}.</p>}
+    </ConsolePage>
   )
 }

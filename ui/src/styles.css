@@ -461,6 +461,10 @@ input.code {
 .inline-form .field {
   margin: 0;
   flex: 1 1 220px;
+  max-width: 22rem;
+}
+.inline-form .field:has(input[type='number']) {
+  flex: 0 1 9rem;
 }
 
 /* ------------------------------------------------------------ notices & status */
@@ -1528,6 +1532,151 @@ table.data tr.record-open .json {
 }
 .console-head h1 {
   font-size: 22px;
+}
+.console-page {
+  max-width: 960px;
+}
+.page-intro {
+  margin: -6px 0 16px;
+  color: var(--ink2);
+}
+.page-intro > p {
+  margin: 0 0 6px;
+}
+.page-setup {
+  font-size: 13.5px;
+}
+.page-setup > summary {
+  cursor: pointer;
+  width: fit-content;
+  color: var(--ink2);
+  font-weight: 600;
+}
+.page-setup > summary:hover {
+  color: var(--ink);
+}
+.page-setup > div {
+  width: fit-content;
+  margin: 8px 0 4px;
+  padding: 10px 14px;
+  border-left: 3px solid var(--rule);
+  background: var(--sheet);
+  border-radius: 0 5px 5px 0;
+}
+.page-setup > div > p {
+  margin: 0 0 6px;
+}
+.page-setup > div > :last-child {
+  margin-bottom: 0;
+}
+.faint {
+  color: var(--ink3);
+}
+
+/* Columns hug their content; the actions column (.slack) takes the leftover width so the
+   row's buttons sit right after the data instead of at the far edge. */
+table.data.fit td {
+  padding-block: 7px;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+table.data.fit .slack {
+  width: 100%;
+}
+table.data.fit td.wrap {
+  white-space: normal;
+}
+table.data.fit .cell-main {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+table.data.fit .sub {
+  display: block;
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12.5px;
+  color: var(--ink2);
+}
+table.data tr.row-alert td {
+  border-top: 0;
+  padding-top: 0;
+  white-space: normal;
+}
+table.data tr.row-alert .notice {
+  max-width: 44rem;
+}
+table.data tr.has-alert td {
+  border-bottom: 0;
+}
+
+.add-row {
+  display: grid;
+  grid-template-columns: minmax(0, auto) auto;
+  justify-content: start;
+  align-items: end;
+  gap: 4px 8px;
+}
+.add-row > label .label {
+  display: block;
+  /* a long label overflows rather than widening the input's column and pushing the button away */
+  contain: inline-size;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 13.5px;
+  margin-bottom: 5px;
+}
+.add-row > label input {
+  width: 22rem;
+  max-width: 100%;
+}
+.add-row > label input[type='number'] {
+  width: 9rem;
+}
+.add-row-actions {
+  display: flex;
+  gap: 8px;
+}
+.add-row-actions .btn {
+  min-height: 38px;
+}
+.add-row > .hint,
+.add-row > .add-row-error {
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 12.5px;
+}
+.add-row > .hint {
+  color: var(--ink2);
+}
+.add-row-error {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  color: var(--danger);
+  font-weight: 600;
+}
+.add-row-error svg {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin-top: 1px;
+}
+.panel-foot.roomy {
+  padding: 14px 18px;
+  margin-top: 6px;
+}
+.panel-foot .add-row + .add-row {
+  margin-top: 14px;
+}
+@media (max-width: 560px) {
+  .add-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .add-row > label input[type] {
+    width: 100%;
+  }
 }
 .grid2 {
   display: grid;
@@ -3189,4 +3338,7 @@ table.data td.spc-json {
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
+}
+table.data.fit .row {
+  flex-wrap: nowrap;
 }
