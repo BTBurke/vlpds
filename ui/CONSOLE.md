@@ -33,7 +33,8 @@ All from `components/console/kit.tsx` unless noted.
 - `Banners items`: `{ id, tone, title, desc, right, body, open }`. With `body` it's a collapsible `<details>`.
 - `Panel title to src right foot`: `to` links the title to a section with a ›. Put tables and tiles straight inside. Wrap free content in `PanelBody`.
 - `Sec title digest right open flush danger`: a collapsible section for drawers and detail pages. `flush` drops the padding for tables.
-- `PageHead`, `KV rows`, `Strip items` (figures across a drawer), `Minis n` + `Mini label value` (labelled sparklines), `RRow onClick|to x` (a rail row), `Copy text` (click to copy), `Json value`, `Toggle`, `Seg`, `SearchInput` (has `data-search`, so `/` focuses it).
+- `PageHead`, `KV rows`, `Strip items` (figures across a drawer), `Minis n` + `Mini label value` (labelled sparklines), `RRow onClick|to x` (a rail row), `Copy text full` (click to copy; `full` puts the whole value in the tooltip, for a value truncated to a fixed width), `Json value`, `Toggle`, `Seg`, `SearchInput` (has `data-search`, so `/` focuses it).
+- A `KV` row can take a third element, `{ chip, act }`: the status chip and the row's button each get a right-aligned column, so values, chips and buttons line up down the list and every row is a small button high. Put a row's action there, not after its value.
 - States: `Loading`, `Empty title`, `ErrorState error retry`, `NeedsVersion what nsid` (in place of a panel whose endpoint this server doesn't have), and `Loaded load` which does loading, error and keep-last-data in one.
 - `Src` tags where a panel's data comes from. They only show with "Show data sources" (sidebar foot or ⌘K), so leave them in.
 - `DataTable rows cols rowKey open onRow sort dim empty` (`DataTable.tsx`). Columns are `{ id, label, r, sort, render, title, style }`. Rows that open carry `data-open="type:id"`, which is all the shell's `j` / `k` / `Enter` handling needs. A row whose detail is open gets `.sel`.
@@ -54,7 +55,7 @@ registerDetail('account', {
 })
 ```
 
-`openPanel(type, id)` opens `?open=type:id` on the current page, so a reload keeps it and back closes it. `o` or "Full page ↗" goes to `/admin/<section>/<type>/<id>`, and `mode === 'page'` tells `use` to open more sections or lay out two columns (`<div className="cols">` inside the body). Register kinds in a module that `AdminApp.tsx` imports.
+`openPanel(type, id)` opens `?open=type:id` on the current page, so a reload keeps it and back closes it. `o` or "Full page ↗" goes to `/admin/<section>/<type>/<id>`, and `mode === 'page'` tells `use` to open more sections or lay out two columns (`<div className="cols">` inside the body). `wide: true` lets the full page grow past the usual 1,100 px for wide tables (the account page). Register kinds in a module that `AdminApp.tsx` imports.
 
 ## Actions
 
@@ -93,7 +94,7 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 
 - Tokens are on `.cx`: `--paper --sheet --raised --sunk --hover`, ink `--ink --ink2 --ink3`, rules `--rule --rule2`, `--accent` (verdigris, for action), `--amber` (the live signal: watermark, latency), status `--ok --warn --err --info --idle --violet`, node and series colours `--c1`–`--c6`. Dark mode follows the system unless `t` picked one.
 - Schibsted Grotesk for text, JetBrains Mono for ids, numbers and code (`.mono`). 13 px base, tables 12.5 px.
-- Numbers right-aligned in `td.r`, ids in mono, durations through `fmt.ts` (`dur`, `fmtMs`, `fmtSec`, `ago`).
+- Numbers right-aligned in `td.r`, ids in mono, durations through `fmt.ts` (`dur`, `fmtMs`, `fmtSec`, `ago`). In a table, keep a column's contents one width (a key truncated to a fixed width, a count before a fixed-width meter) and give the slack to one text column (`style: { width: '100%' }`) rather than letting it spread between numbers. A sparkline with nothing to show is a muted `—`, not a flat line.
 - No new colours for status. No colour without its glyph.
 - Use example.com-style names in fixtures and placeholders. main syncs to the public repo.
 
@@ -102,7 +103,7 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 | Section | Path | State |
 | --- | --- | --- |
 | Overview | `/admin` | Built |
-| Nodes & shards | `/admin/nodes` | Built. Old page at `/admin/cluster`. Live metrics at `/admin/metrics` (`Metrics.tsx`, every getNodeMetrics series per node) |
+| Nodes & shards | `/admin/nodes` | Built. A cluster of one (or `--memory`) gets one panel for its node (`nodeSolo.tsx`); more get node cards, and the nodes table past three. Old page at `/admin/cluster`. Live metrics at `/admin/metrics` (`Metrics.tsx`, every getNodeMetrics series per node) |
 | Object store | `/admin/storage` | Built (`Storage.tsx`). Detail kind `storecomp` (a key component). No bucket listing |
 | Firehose & relays | `/admin/firehose` | Built, alias `/admin/relays`. Detail kinds `event`, `sub` (live or disconnected, id `node/conn`), `relay` |
 | Accounts | `/admin/accounts` | Built. Detail kind `account` (`accountDetail.tsx`, actions in `accountActions.tsx`), full page at `/admin/accounts/account/<did>`; the old `/admin/accounts/<did>` still lands there |

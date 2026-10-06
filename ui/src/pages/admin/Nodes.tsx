@@ -1,16 +1,17 @@
-import { useState } from 'react'
+import { useState, type Dispatch, type SetStateAction } from 'react'
 import { Banners, Chip, Copy, ErrorState, KV, Loading, Mini, Minis, PageHead, Panel, PanelBody, Spark, Src } from '../../components/console/kit'
 import { registerPalette } from '../../components/console/Palette'
 import { openPanel } from '../../components/console/nav'
-import { clusterPoll, clusterView, useClusterView } from '../../lib/console/cluster'
-import { ago, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural } from '../../lib/console/fmt'
-import { col, last, nodePoints, useMetrics } from '../../lib/console/metrics'
+import { clusterPoll, clusterView, useClusterView, type ClusterView } from '../../lib/console/cluster'
+import { ago, fmtBytes, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural } from '../../lib/console/fmt'
+import { col, last, nodeGauges, nodePoints, useMetrics, type MetricsState } from '../../lib/console/metrics'
 import { lockoutsPoll, subscribersPoll } from '../../lib/console/polls'
 import { Link } from '../../lib/router'
 import { clusterBanners, finalizeLevel, LeaseCell, NodesTable, ShardMap } from './clusterUi'
+import { OneNode } from './nodeSolo'
 
 // Nodes & shards: one card per node, shard ownership, the firehose merge, the feature level,
-// and every node in a table.
+// and every node in a table; a cluster of one gets one panel for its node (nodeSolo.tsx).
 
 // "Finalize level N" in ⌘K while a level is ready
 registerPalette({
@@ -23,22 +24,24 @@ registerPalette({
 })
 
 export function Nodes() {
-  const { view, error } = useClusterView()
+  const { view, error, at } = useClusterView()
   const m = useMetrics()
   const subs = subscribersPoll.use()
   const locks = lockoutsPoll.use()
   const [focus, setFocus] = useState<string>()
   if (!view) return error ? <ErrorState error={error} retry={clusterPoll.refresh} /> : <Loading label="Asking the cluster…" />
   const v = view.raw.version
-  const fenced = Object.entries(view.raw.fencedLogs)
-  const live = new Set(view.nodes.map((n) => n.log))
-  const draining = view.raw.firehose.sources.filter((s) => !live.has(s.log))
+  const one = view.nodes.length === 1
   return (
     <>
       <PageHead
         title={
           view.single ? (
             <>Single node</>
+          ) : one ? (
+            <>
+              Single node <span className="mono">{view.self}</span>
+            </>
           ) : (
             <>
               Cluster <span className="muted" style={{ fontWeight: 500 }}>as seen by</span> <span className="mono">{view.self}</span>
@@ -48,7 +51,7 @@ export function Nodes() {
         sub={
           <>
             <span>{fmtNum(view.table.length)} shards</span>
-            {!view.single && <span>{plural(view.nodes.length, 'node')} holding a lease</span>}
+            {!view.single && <span>{one ? 'a cluster of one, holding the lease' : `${plural(view.nodes.length, 'node')} holding a lease`}</span>}
             {v && (
               <span>
                 feature level {v.active ?? '—'}
@@ -72,9 +75,29 @@ export function Nodes() {
         }
       />
       <Banners items={clusterBanners(view, subs.data, locks.data)} />
-      <div className="cx-grid3 cx-mb">
+      {view.nodes.length === 1 ? (
+        <OneNode view={view} n={view.nodes[0]} m={m} subs={subs.data} at={at} />
+      ) : (
+        <Many view={view} m={m} focus={focus} setFocus={setFocus} />
+      )}
+    </>
+  )
+}
+
+/** Up to this many nodes the cards say everything the table would; past it the table is the overview. */
+const CARDS_ONLY = 3
+
+function Many({ view, m, focus, setFocus }: { view: ClusterView; m: MetricsState; focus?: string; setFocus: Dispatch<SetStateAction<string | undefined>> }) {
+  const v = view.raw.version
+  const fenced = Object.entries(view.raw.fencedLogs)
+  const live = new Set(view.nodes.map((n) => n.log))
+  const draining = view.raw.firehose.sources.filter((s) => !live.has(s.log))
+  return (
+    <>
+      <div className="cx-nodecards cx-mb">
         {view.nodes.map((n) => {
           const p = nodePoints(m, n.node, n.self)
+          const g = nodeGauges(m, n.node, n.self)
           return (
             <section key={n.node} className="cx-pn" data-open={`node:${n.node}`} style={{ cursor: 'pointer' }} onClick={(e) => !(e.target as HTMLElement).closest('button,a') && openPanel('node', n.node)}>
               <div className="cx-pn-h">
@@ -111,6 +134,7 @@ export function Nodes() {
                     ['log', <span className="mono">{n.log}{n.logDurableOrdinal != null && <span className="muted"> @ {fmtNum(n.logDurableOrdinal)}</span>}</span>],
                     ['watermark lag', <span className="mono">{fmtMs(n.wmLagMs)}{n.slowest && <> <Chip k="warn">slowest log</Chip></>}</span>],
                     ['shards', <>{n.shards}{!view.single && <> · writer byte {n.writer}</>}</>],
+                    ['memory', g?.resident !== undefined ? <span className="mono">{fmtBytes(g.resident)}{g.memLimit ? <span className="muted"> of {fmtBytes(g.memLimit)}</span> : null}</span> : '—'],
                     ['build', n.rev ? <span className="mono">{n.rev.slice(0, 12)} <span className="muted">L{n.minLevel}–{n.maxLevel}</span></span> : '—'],
                     ...(n.addr ? [['address', <Copy text={n.addr.replace(/^https?:\/\//, '')} />] as [string, React.ReactNode]] : []),
                   ]}
@@ -170,9 +194,11 @@ export function Nodes() {
           )}
         </div>
       </div>
-      <Panel title="All nodes" className="cx-mt" src={<Src>getClusterStatus</Src>}>
-        <NodesTable view={view} metrics={m} />
-      </Panel>
+      {view.nodes.length > CARDS_ONLY && (
+        <Panel title="All nodes" className="cx-mt" src={<Src>getClusterStatus</Src>}>
+          <NodesTable view={view} metrics={m} />
+        </Panel>
+      )}
     </>
   )
 }

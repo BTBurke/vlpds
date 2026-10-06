@@ -1,7 +1,7 @@
 import { useMemo, useState, type ReactNode } from 'react'
 import { DataTable, type Col } from '../../components/console/DataTable'
 import { detailKind } from '../../components/console/Drawer'
-import { Banners, Chip, Empty, ErrorState, Loading, Mini, Minis, NeedsVersion, PageHead, Panel, PanelBody, Sec, SearchInput, Spark, Src, Tiles, Toggle, type BannerSpec } from '../../components/console/kit'
+import { Banners, Chip, Empty, ErrorState, Glyph, Loading, Mini, Minis, NeedsVersion, PageHead, Panel, PanelBody, Sec, SearchInput, Spark, Src, Tiles, Toggle, type BannerSpec } from '../../components/console/kit'
 import { useClusterView } from '../../lib/console/cluster'
 import { ago, fmtNum, fmtSi, plural } from '../../lib/console/fmt'
 import {
@@ -9,7 +9,7 @@ import {
   KEY_LABEL,
   KEY_SHORT,
   busiest,
-  fmtLimit,
+  fmtWindow,
   held,
   rate429Poll,
   rejectionHistory,
@@ -22,7 +22,7 @@ import {
 } from '../../lib/console/ratelimits'
 import type { Lockout } from '../../lib/adminApi'
 import { lockoutsPoll } from '../../lib/console/polls'
-import { addOverrideDialog, addRouteDialog, bucketRows, clearLock, KeyUse, overrideFor, toggleEnforcement, type BucketRow } from './limitsUi'
+import { addOverrideDialog, addRouteDialog, bucketRows, clearLock, KeyId, KeyUse, overrideFor, toggleEnforcement, type BucketRow } from './limitsUi'
 import { AccountLink, openAccount } from './peopleUi'
 
 // Limits & lockouts: who is locked out now, the cluster's 429s, every bucket with its busiest
@@ -163,10 +163,10 @@ function LockedOut({ d, factorLocks, supported, heldKeys }: { d: Loaded; factorL
       label: 'Who',
       className: 'trunc',
       style: { maxWidth: 150 },
-      render: (r) => (r.factor ? <AccountLink did={r.factor.did} handle={r.factor.handle} /> : <span className="mono sm">{r.key!.c.key}</span>),
+      render: (r) => (r.factor ? <AccountLink did={r.factor.did} handle={r.factor.handle} /> : <KeyId k={r.key!.c.key} w={150} />),
     },
     { id: 'by', label: 'Held by', className: 'trunc', style: { maxWidth: 130 }, render: (r) => (r.factor ? <span className="t2">{FACTOR_LABEL[r.factor.factor] ?? r.factor.factor}</span> : <span className="mono sm">{shortName(r.key!.b.name)}</span>) },
-    { id: 'used', label: 'Used', render: (r) => (r.factor ? <span className="mono sm">{plural(r.factor.failures, 'wrong code')}</span> : <KeyUse c={r.key!.c} />) },
+    { id: 'used', label: 'Used', r: true, render: (r) => (r.factor ? <span className="mono sm">{plural(r.factor.failures, 'wrong code')}</span> : <KeyUse c={r.key!.c} />) },
     { id: 'clears', label: 'Clears', r: true, render: (r) => ago(r.factor ? r.factor.lockedUntil : r.key!.c.resetMs) },
     {
       id: 'act',
@@ -242,30 +242,48 @@ function Buckets({ rows }: { rows: BucketRow[] }) {
         </span>
       ),
     },
-    { id: 'key', label: 'Key', render: (b) => <span className="t2 sm" title={KEY_LABEL[b.key]}>{KEY_SHORT[b.key]}</span> },
-    { id: 'limit', label: 'Limit', r: true, render: (b) => <span className="mono">{fmtLimit(b.points, b.windowSecs)}</span> },
+    { id: 'key', label: 'Keyed by', style: { width: '100%' }, render: (b) => <span className="t2" title={KEY_LABEL[b.key]}>{KEY_SHORT[b.key]}</span> },
+    { id: 'limit', label: 'Limit', r: true, sort: (a, b) => a.points - b.points, render: (b) => <span className="mono">{fmtNum(b.points)}</span> },
+    { id: 'win', label: 'Window', className: 'cxp-win', sort: (a, b) => a.windowSecs - b.windowSecs, render: (b) => <span className="t2">{fmtWindow(b.windowSecs)}</span> },
     {
       id: 'busy',
       label: 'Busiest key',
       render: (b) => {
         const c = busiest(b.top)
-        return c ? (
-          <span className="cx-cellid">
-            <span className="mono sm trunc" style={{ maxWidth: 170 }} title={c.key}>
-              {c.key}
-            </span>
-            <KeyUse c={c} />
-            {b.top.length > 1 && <span className="muted sm">+{b.top.length - 1}</span>}
-          </span>
-        ) : (
-          <span className="muted">—</span>
-        )
+        return c ? <KeyId k={c.key} w={190} /> : <span className="muted">—</span>
       },
     },
-    { id: 'm1', label: '1m', r: true, sort: (a, b) => a.m1 - b.m1, render: (b) => <span className={`mono ${b.m1 ? 's-warn' : 'muted'}`}>{fmtNum(b.m1)}</span> },
+    {
+      id: 'used',
+      label: 'Used',
+      r: true,
+      title: 'What the busiest node counted for that key in its current window',
+      sort: (a, b) => frac(a) - frac(b),
+      render: (b) => {
+        const c = busiest(b.top)
+        return c ? <KeyUse c={c} of={b.points} /> : <span className="muted">—</span>
+      },
+    },
+    {
+      id: 'keys',
+      label: 'Keys',
+      r: true,
+      title: 'Keys counted in their current window (the ten busiest are listed)',
+      render: (b) => <span className={`mono${b.top.length ? '' : ' muted'}`}>{b.top.length >= TOP ? `${TOP}+` : b.top.length || '—'}</span>,
+    },
+    { id: 'm1', label: '429s 1m', r: true, sort: (a, b) => a.m1 - b.m1, render: (b) => <span className={`mono ${b.m1 ? 's-warn' : 'muted'}`}>{fmtNum(b.m1)}</span> },
     { id: 'm15', label: '15m', r: true, sort: (a, b) => a.m15 - b.m15, render: (b) => <span className={`mono ${b.m15 ? '' : 'muted'}`}>{fmtNum(b.m15)}</span> },
-    { id: 'spark', label: '429/s', style: { width: 84 }, render: (b) => <Spark data={hist.byBucket.get(b.name) ?? hist.total.map(() => 0)} color={b.m1 ? 'warn' : 'ink3'} size="inline" min={0.05} /> },
-    { id: 'on', label: 'On', render: (b) => (b.enabled ? <Chip k="ok">on</Chip> : <Chip k="idle">off</Chip>) },
+    {
+      id: 'spark',
+      label: '429/s',
+      r: true,
+      title: 'Since this console opened',
+      render: (b) => {
+        const h = hist.byBucket.get(b.name) ?? []
+        return h.some((v) => v > 0) ? <Spark data={h} color={b.m1 ? 'warn' : 'ink3'} size="inline" min={0.05} /> : <span className="muted" title="No 429s since this console opened">—</span>
+      },
+    },
+    { id: 'on', label: 'On', render: (b) => (b.enabled ? <Glyph k="ok" title="on" /> : <Glyph k="idle" title="off" />) },
   ]
   return (
     <Panel
@@ -297,6 +315,9 @@ function Buckets({ rows }: { rows: BucketRow[] }) {
   )
 }
 
+/** getRateLimits' `top`: keys listed per bucket. */
+const TOP = 10
+
 const frac = (b: BucketRow) => {
   const c = busiest(b.top)
   return c?.limit ? c.maxNodeUsed / c.limit : 0
@@ -324,21 +345,22 @@ function Overrides({ overrides }: { overrides: OverrideCfg[] }) {
         label="Overrides"
         empty={<Empty>No overrides: every client gets the bucket limits.</Empty>}
         cols={[
+          { id: 'kind', label: 'Match', render: ({ o }) => <span className="t2">{o.ip ? 'IP' : 'DID'}</span> },
+          { id: 'match', label: <span className="sr">Value</span>, render: ({ o }) => <KeyId k={(o.ip ?? o.did)!} w={200} /> },
           {
-            id: 'match',
-            label: 'Match',
-            className: 'trunc',
-            style: { maxWidth: 220 },
-            render: ({ o }) => (
-              <span className="mono">
-                <span className="muted">{o.ip ? 'IP ' : 'DID '}</span>
-                {o.ip ?? o.did}
-              </span>
-            ),
+            id: 'b',
+            label: 'Buckets',
+            render: ({ o }) => {
+              const t = o.limiters?.length ? o.limiters.map(shortName).join(', ') : 'all'
+              return (
+                <span className="sm t2 mono trunc cxp-fixed" style={{ width: 170 }} title={t}>
+                  {t}
+                </span>
+              )
+            },
           },
-          { id: 'b', label: 'Buckets', className: 'trunc', style: { maxWidth: 200 }, render: ({ o }) => <span className="sm t2 mono">{o.limiters?.length ? o.limiters.map(shortName).join(', ') : 'all'}</span> },
-          { id: 'a', label: 'Action', render: ({ o }) => (o.exempt ? <Chip k="info">exempt</Chip> : <span className="mono">{fmtNum(o.points)} pts</span>) },
-          { id: 'n', label: 'Note', className: 'trunc', style: { maxWidth: 200 }, render: ({ o }) => <span className="t2 sm">{o.note ?? ''}</span> },
+          { id: 'a', label: 'Limit', r: true, render: ({ o }) => (o.exempt ? <Chip k="info">exempt</Chip> : <span className="mono">{fmtNum(o.points)}</span>) },
+          { id: 'n', label: 'Note', style: { width: '100%' }, render: ({ o }) => <span className="t2 sm">{o.note ?? ''}</span> },
         ]}
       />
     </Panel>

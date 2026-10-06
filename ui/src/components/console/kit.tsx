@@ -340,13 +340,20 @@ export function PageHead({ title, sub, actions }: { title: ReactNode; sub?: Reac
   )
 }
 
-export function KV({ rows, style }: { rows: [ReactNode, ReactNode][]; style?: CSSProperties }) {
+/** A row's status chip and action, each in its own column so they line up down the list. */
+export type KVExtra = { chip?: ReactNode; act?: ReactNode }
+export type KVRow = [ReactNode, ReactNode] | [ReactNode, ReactNode, KVExtra]
+
+export function KV({ rows, style }: { rows: KVRow[]; style?: CSSProperties }) {
+  const x = rows.some((r) => r[2])
   return (
-    <dl className="cx-kv" style={style}>
-      {rows.map(([k, v], i) => (
+    <dl className={`cx-kv${x ? ' x' : ''}`} style={style}>
+      {rows.map(([k, v, e], i) => (
         <div key={i} style={{ display: 'contents' }}>
           <dt>{k}</dt>
           <dd>{v}</dd>
+          {x && <dd className="kc">{e?.chip}</dd>}
+          {x && <dd className="ka">{e?.act}</dd>}
         </div>
       ))}
     </dl>
@@ -417,12 +424,12 @@ export function RRow({ onClick, to, children, x, title }: { onClick?: () => void
 }
 
 /** Click to copy (ids, DIDs, CIDs): the value itself is the button. */
-export function Copy({ text, children, mono = true }: { text: string; children?: ReactNode; mono?: boolean }) {
+export function Copy({ text, children, mono = true, full, className }: { text: string; children?: ReactNode; mono?: boolean; full?: boolean; className?: string }) {
   return (
     <button
       type="button"
-      className={`cx-copy${mono ? ' mono' : ''}`}
-      title="Click to copy"
+      className={`cx-copy${mono ? ' mono' : ''}${className ? ` ${className}` : ''}`}
+      title={full ? `${text}\nClick to copy` : 'Click to copy'}
       onClick={(e) => {
         e.stopPropagation()
         navigator.clipboard.writeText(text).then(

@@ -18,6 +18,8 @@ export type DetailView = {
   loading?: boolean
   /** Set when the thing is gone (a node left, an event scrolled out). */
   missing?: ReactNode
+  /** The full page may grow past the usual reading width (wide tables). */
+  wide?: boolean
 }
 export type DetailKind = {
   /** Eyebrow over the title: "Node", "Firehose event". */
@@ -88,7 +90,7 @@ export function DetailPage({ type, id }: { type: string; id: string }) {
   const v = k.use(id, 'page')
   const sec = SECTION[k.section]
   return (
-    <div className="cx-fullpage">
+    <div className={`cx-fullpage${v.wide ? ' wide' : ''}`}>
       <PageHead
         title={
           <>

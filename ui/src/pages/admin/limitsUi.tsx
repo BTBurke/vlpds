@@ -364,24 +364,39 @@ export function overrideFor(b: { name: string; key: KeyKind }, key: string): Ove
   return t && { ...t, limiters: [b.name], exempt: true }
 }
 
-/** A key's meter: what the busiest node counted against the limit. */
-export function KeyUse({ c }: { c: Consumer }) {
+/**
+ * A key's use: what the busiest node counted, then a fixed-width meter, for a right-aligned
+ * cell so counts and meters line up down a column. `of`: the bucket's limit, already shown
+ * in its own column, so only a key whose override changes it repeats it.
+ */
+export function KeyUse({ c, of }: { c: Consumer; of?: number }) {
   if (c.limit == null)
     return (
-      <Chip k="info" glyph={false}>
-        exempt · {fmtNum(c.used)}
-      </Chip>
+      <span className="cxp-use" title={`exempt by an override; ${fmtNum(c.used)} counted`}>
+        <span className="n">{fmtNum(c.used)}</span>
+        <Chip k="info" glyph={false}>
+          exempt
+        </Chip>
+      </span>
     )
   const f = c.maxNodeUsed / c.limit
   return (
-    <span className="cx-form-row nowrap" style={{ gap: 6, flexWrap: 'nowrap' }} title={`${fmtNum(c.used)} used cluster-wide; ${fmtNum(c.maxNodeUsed)} of ${fmtNum(c.limit)} on the busiest node`}>
-      <Meter v={Math.min(c.maxNodeUsed, c.limit)} max={c.limit} k={f >= 1 ? 'err' : f >= 0.8 ? 'warn' : undefined} />
-      <span className="mono sm">
-        {fmtNum(c.maxNodeUsed)}/{fmtNum(c.limit)}
+    <span className="cxp-use" title={`${fmtNum(c.used)} used cluster-wide; ${fmtNum(c.maxNodeUsed)} of ${fmtNum(c.limit)} on the busiest node`}>
+      <span className="n">
+        {fmtNum(c.maxNodeUsed)}
+        {c.limit !== of && <span className="muted">/{fmtNum(c.limit)}</span>}
       </span>
+      <Meter v={Math.min(c.maxNodeUsed, c.limit)} max={c.limit} k={f >= 1 ? 'err' : f >= 0.8 ? 'warn' : undefined} />
     </span>
   )
 }
+
+/** A key truncated to a fixed width; the whole key on hover, copied on click. */
+export const KeyId = ({ k, w }: { k: string; w?: number }) => (
+  <Copy text={k} full className="cxp-key">
+    <span style={w ? { width: w } : undefined}>{k}</span>
+  </Copy>
+)
 
 // ---------------------------------------------------------------- slide-overs
 
@@ -421,17 +436,29 @@ registerDetail('bucket', {
             {top.length ? (
               <div className="cx-tw">
                 <table className="cx-t compact">
+                  <thead>
+                    <tr>
+                      <th>Key</th>
+                      <th className="r" title="What the busiest node counted against the limit">
+                        Used of {fmtNum(b.points)}
+                      </th>
+                      <th className="r">Resets</th>
+                      <th>
+                        <span className="sr">Actions</span>
+                      </th>
+                    </tr>
+                  </thead>
                   <tbody>
                     {top.map((c) => {
                       const ov = overrideFor(b, c.key)
                       return (
                         <tr key={c.key}>
-                          <td className="trunc" style={{ maxWidth: 180 }}>
-                            <Copy text={c.key}>{c.key}</Copy>
+                          <td style={{ width: '100%' }}>
+                            <KeyId k={c.key} w={200} />
                             {c.nodes.length > 1 && <span className="muted sm"> ×{c.nodes.length}</span>}
                           </td>
-                          <td>
-                            <KeyUse c={c} />
+                          <td className="r">
+                            <KeyUse c={c} of={b.points} />
                           </td>
                           <td className="r muted">{ago(c.resetMs)}</td>
                           <td className="r">

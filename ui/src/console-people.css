@@ -175,6 +175,45 @@
 .cxp-domgrid {
   grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
 }
+
+/* rate-limit tables: a key at a fixed width, use as a right-aligned count then a fixed meter */
+.cxp-key {
+  display: inline-flex;
+  max-width: 100%;
+  vertical-align: middle;
+  font-size: 11.5px;
+}
+.cxp-key > span,
+.cxp-fixed {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.cxp-use {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  white-space: nowrap;
+}
+.cxp-use .n {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+}
+.cxp-use .cx-meter,
+.cxp-use .cx-chip {
+  width: 64px;
+  flex: none;
+  justify-content: center;
+}
+/* the window reads with the limit to its left: "300  1 h" */
+table.cx-t td.cxp-win {
+  padding-left: 2px;
+}
 @media (max-width: 1100px) {
   .cxp-domgrid {
     grid-template-columns: minmax(0, 1fr);
