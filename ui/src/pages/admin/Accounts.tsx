@@ -287,7 +287,6 @@ export function Accounts() {
             onChange={(e) => setQ(e.target.value)}
           />
           <Seg value={filter} options={filterOptions(counts)} onChange={setFilter} label="Filter accounts" />
-
         </form>
         {error ? (
           <ErrorState error={error} retry={() => load()} />

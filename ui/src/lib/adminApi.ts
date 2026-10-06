@@ -248,7 +248,6 @@ export type Session =
       signedInIp?: string | null
     }
 
-
 export const listSessions = (c: AdminClient, did: string, signal?: AbortSignal) =>
   call<{ did: string; sessions: Session[] }>(c, 'vlpds.admin.listSessions', { params: { did }, signal })
 

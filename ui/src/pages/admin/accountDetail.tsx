@@ -693,7 +693,6 @@ registerDetail('account', {
             ['2FA', r ? <TwoFactor f={r.secondFactors} /> : '—'],
             ['PLC', did.startsWith('did:plc:') ? <a href={`https://plc.directory/${did}/log/audit`} target="_blank" rel="noreferrer">audit log ↗</a> : <span className="mono sm">{did.split(':').slice(0, 2).join(':')}</span>],
             ['Keys', <AccountKeys did={did} />],
-
             ['Identity', btn('Publish #identity…', () => act.publishIdentity(a))],
           ]}
         />

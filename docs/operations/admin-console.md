@@ -182,7 +182,6 @@ thousand, a subject index written with each case would replace the scan.
 
 ## Admin CLI
 
-
 ```diagram
 caption: "`vlpds admin` is the same binary in client mode. Per-account calls go to any node and are routed to the owner. Per-node maintenance runs on every node `getClusterStatus` lists, and shards that moved mid-run are rerun on their new owner."
 nodes:

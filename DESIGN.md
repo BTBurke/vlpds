@@ -4830,11 +4830,10 @@ the next count. Now the totals are kept exact as part of the state:
   latest commit on that day (the last 32 days, zigzag varints, ~100 bytes
   when a slot has activity on every day), plus the console's filter counts
   (email unconfirmed; active with no second factor on the account row),
-  which are flags of the account row moved by the same deltas.
- Since the rows are slot-major,
-  they split, merge and move with their slots like every other key. A
-  per-shard row would need splitting and merging logic, and no per-shard
-  summary can be divided at a split point.
+  which are flags of the account row moved by the same deltas. Since the
+  rows are slot-major, they split, merge and move with their slots like
+  every other key. A per-shard row would need splitting and merging logic,
+  and no per-shard summary can be divided at a split point.
 - **Exact deltas from the worker.** Each repo's worker holds its account
   and head, so for every create, commit, status change (deactivate,
   activate, takedown, suspend), import, key re-sign or delete, it knows

@@ -18,7 +18,6 @@ import {
   listCases,
   listCasesAbout,
   moderate,
-
   resolveSubject,
   SEMANTICS,
   setBlobQuota,
