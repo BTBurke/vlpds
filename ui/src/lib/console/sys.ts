@@ -61,18 +61,6 @@ export function maxLatest(nodes: NodeSeries[], k: Num): number | undefined {
   const xs = nodes.map((n) => n.latest?.[k]).filter((v): v is number => typeof v === 'number')
   return xs.length ? Math.max(...xs) : undefined
 }
-/** Average over the whole kept window, summed over nodes: steadier for cost projections. */
-export function sumMean(nodes: NodeSeries[], k: Num): number | undefined {
-  let any = false
-  let tot = 0
-  for (const n of nodes) {
-    const xs = n.series.map((p) => p[k]).filter((v): v is number => typeof v === 'number')
-    if (!xs.length) continue
-    any = true
-    tot += xs.reduce((a, b) => a + b, 0) / xs.length
-  }
-  return any ? tot : undefined
-}
 
 // ---------------------------------------------------------------- firehose: per-connection rates
 
