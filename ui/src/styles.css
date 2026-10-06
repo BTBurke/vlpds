@@ -1183,6 +1183,17 @@ dialog.modal h2 {
   border-top-right-radius: 0;
   border-bottom-right-radius: 0;
 }
+.affix > select {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 0 8px;
+  border: 1px solid var(--rule);
+  border-left: 0;
+  border-radius: 0 5px 5px 0;
+  background: var(--sunk);
+  color: var(--ink2);
+  font-size: 13px;
+}
 .affix > span {
   display: flex;
   align-items: center;

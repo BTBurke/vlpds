@@ -90,7 +90,7 @@ async fn ref_admin_update_handle_auth_message() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ref_handle_length_with_long_service_domain() {
     let domain = "loooooooooooooooooong-pds-over18chars.mybsky.mydomain.com";
-    let s = TestServer::spawn_with(|c| c.handle_domain = domain.to_string()).await;
+    let s = TestServer::spawn_with(|c| c.handle_domains = vec![domain.to_string()]).await;
     let try_create = |handle: String| {
         let s = &s;
         async move {

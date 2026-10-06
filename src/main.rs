@@ -56,8 +56,15 @@ struct Args {
     max_connections: usize,
     #[arg(long, env = "VLPDS_PUBLIC_URL", default_value = "http://localhost:2583")]
     public_url: String,
-    #[arg(long, env = "VLPDS_HANDLE_DOMAIN", default_value = "vlpds.test")]
-    handle_domain: String,
+    /// The service handle domains, comma-separated (a leading dot is
+    /// optional): handles are given out as `name.<domain>`, and the first is
+    /// the primary. Unset: --handle-domain, then the reference's
+    /// PDS_SERVICE_HANDLE_DOMAINS, then vlpds.test.
+    #[arg(long, env = "VLPDS_HANDLE_DOMAINS", value_delimiter = ',')]
+    handle_domains: Vec<String>,
+    /// One handle domain: the same as --handle-domains with one entry.
+    #[arg(long, env = "VLPDS_HANDLE_DOMAIN")]
+    handle_domain: Option<String>,
     #[arg(long, env = "VLPDS_SERVICE_DID", default_value = "did:web:localhost")]
     service_did: String,
     /// Session JWT / OAuth key-derivation secret (>= 32 bytes; dev default
@@ -1339,7 +1346,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
     });
     let cfg = Config {
         public_url: args.public_url.clone(),
-        handle_domain: args.handle_domain.clone(),
+        handle_domains: handle_domains(&args)?,
         service_did: args.service_did.clone(),
         jwt_secret: secret(&args.jwt_secret, args.dev_mode, server::DEV_JWT_SECRET),
         admin_token: secret(&args.admin_token, args.dev_mode, server::DEV_ADMIN_TOKEN),
@@ -1577,6 +1584,54 @@ async fn shutdown_signal() {
 }
 
 /// Else the reference PDS's environment variable.
+/// `--handle-domains`, else `--handle-domain`, else the reference's
+/// `PDS_SERVICE_HANDLE_DOMAINS`, else `vlpds.test` (checked when the server
+/// is built).
+fn handle_domains(args: &Args) -> anyhow::Result<Vec<String>> {
+    pick_handle_domains(
+        &args.handle_domains,
+        args.handle_domain.as_deref(),
+        std::env::var("PDS_SERVICE_HANDLE_DOMAINS").ok().as_deref(),
+    )
+}
+
+fn pick_handle_domains(many: &[String], one: Option<&str>, reference: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let list = |v: &mut dyn Iterator<Item = &str>| {
+        v.map(str::trim).filter(|d| !d.is_empty()).map(str::to_string).collect::<Vec<_>>()
+    };
+    let many = list(&mut many.iter().map(String::as_str));
+    let one = one.map(str::trim).filter(|d| !d.is_empty());
+    anyhow::ensure!(many.is_empty() || one.is_none(), "set --handle-domains or --handle-domain, not both");
+    if !many.is_empty() {
+        return Ok(many);
+    }
+    if let Some(d) = one {
+        return Ok(vec![d.to_string()]);
+    }
+    let reference = list(&mut reference.unwrap_or_default().split(','));
+    Ok(if reference.is_empty() { vec!["vlpds.test".into()] } else { reference })
+}
+
 fn flag_or_env(v: &Option<String>, k: &str) -> Option<String> {
     v.clone().filter(|v| !v.is_empty()).or_else(|| std::env::var(k).ok().filter(|v| !v.is_empty()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_handle_domains;
+
+    #[test]
+    fn handle_domain_flags_in_order_of_precedence() {
+        let v = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(pick_handle_domains(&[], None, None).unwrap(), v(&["vlpds.test"]));
+        assert_eq!(pick_handle_domains(&[], None, Some(".a.com, .b.com,")).unwrap(), v(&[".a.com", ".b.com"]));
+        assert_eq!(pick_handle_domains(&[], Some("one.com"), Some(".a.com")).unwrap(), v(&["one.com"]));
+        assert_eq!(
+            pick_handle_domains(&v(&["x.com", " y.com"]), None, Some(".a.com")).unwrap(),
+            v(&["x.com", "y.com"])
+        );
+        // empty values count as unset
+        assert_eq!(pick_handle_domains(&v(&[""]), Some(" "), Some("")).unwrap(), v(&["vlpds.test"]));
+        assert!(pick_handle_domains(&v(&["x.com"]), Some("one.com"), None).is_err());
+    }
 }

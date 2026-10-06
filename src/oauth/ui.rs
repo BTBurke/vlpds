@@ -36,6 +36,7 @@ label{display:block;font-size:13.5px;font-weight:600;margin:16px 0 5px}
 input[type=text],input[type=password],input[type=email]{width:100%;padding:10px 12px;border:1px solid var(--rule);border-radius:5px;background:var(--paper);color:var(--ink);font:inherit;font-size:15px}
 .affix{display:flex;align-items:stretch}
 .affix input{border-radius:5px 0 0 5px;min-width:0}
+.affix select{width:auto;padding:0 8px;border:1px solid var(--rule);border-left:0;border-radius:0 5px 5px 0;background:var(--sheet);color:var(--ink2);font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:13px}
 .affix span{display:flex;align-items:center;padding:0 11px;border:1px solid var(--rule);border-left:0;border-radius:0 5px 5px 0;background:var(--sheet);color:var(--ink2);font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:13px;white-space:nowrap}
 .hint{color:var(--ink2);font-size:12.5px;margin:5px 0 0}
 .alt{margin:18px 0 0;padding-top:14px;border-top:1px solid var(--rule);font-size:14px;color:var(--ink2)}
@@ -395,6 +396,9 @@ fn screen_url(c: &Ctx, screen: &str) -> String {
 pub struct SignupForm<'a> {
     /// The first label.
     pub handle: &'a str,
+    /// The handle domains, primary first; a picker shows with several.
+    pub domains: &'a [String],
+    /// The picked one (empty: the primary).
     pub domain: &'a str,
     pub email: &'a str,
     pub invite_code: &'a str,
@@ -415,14 +419,14 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
     b.push_str(&hidden(ctx));
     b.push_str(&format!(
         "<label for=\"handle\">Handle</label>\
-<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus><span>.{}</span></div>\
+<div class=\"affix\"><input type=\"text\" id=\"handle\" name=\"handle\" value=\"{}\" autocomplete=\"username\" autocapitalize=\"none\" spellcheck=\"false\" minlength=\"3\" maxlength=\"18\" required autofocus>{}</div>\
 <p class=\"hint\">3 to 18 letters, digits or hyphens. You can switch to your own domain later.</p>\
 <label for=\"email\">Email</label>\
 <input type=\"email\" id=\"email\" name=\"email\" value=\"{}\" autocomplete=\"email\" required>\
 <label for=\"password\">Password</label>\
 <input type=\"password\" id=\"password\" name=\"password\" autocomplete=\"new-password\" minlength=\"8\" maxlength=\"256\" required>",
         e(f.handle),
-        e(f.domain),
+        domain_affix(f.domains, f.domain),
         e(f.email)
     ));
     if f.invite_required {
@@ -441,6 +445,22 @@ pub fn signup(ctx: &Ctx, f: &SignupForm) -> String {
         e(&screen_url(ctx, "sign-in"))
     ));
     page("Create an account", &b)
+}
+
+/// The handle field's suffix: the domain, or a picker with several.
+fn domain_affix(domains: &[String], picked: &str) -> String {
+    let primary = domains.first().map(String::as_str).unwrap_or_default();
+    if domains.len() < 2 {
+        return format!("<span>.{}</span>", e(primary));
+    }
+    let picked = if domains.iter().any(|d| d == picked) { picked } else { primary };
+    let mut s = String::from("<select name=\"domain\" aria-label=\"Domain\">");
+    for d in domains {
+        let sel = if d == picked { " selected" } else { "" };
+        s.push_str(&format!("<option value=\"{0}\"{sel}>.{0}</option>", e(d)));
+    }
+    s.push_str("</select>");
+    s
 }
 
 pub fn chooser(ctx: &Ctx, accounts: &[(String, String)]) -> String {

@@ -1587,6 +1587,8 @@ async fn authorize_sign_in(
 #[derive(Default)]
 struct SignupValues {
     handle: String,
+    /// The picked handle domain (with several).
+    domain: String,
     email: String,
     invite_code: String,
 }
@@ -1598,7 +1600,8 @@ fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, st
         &flow.ctx(&csrf, &name),
         &ui::SignupForm {
             handle: &v.handle,
-            domain: &app.handle_domain,
+            domains: app.handle_domains.all(),
+            domain: &v.domain,
             email: &v.email,
             invite_code: &v.invite_code,
             invite_required: app.config.invite_required,
@@ -1625,6 +1628,7 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
     let field = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
     let v = SignupValues {
         handle: field("handle").trim_start_matches('@').to_ascii_lowercase(),
+        domain: field("domain").trim_start_matches('.').to_ascii_lowercase(),
         email: field("email"),
         invite_code: field("invite_code"),
     };
@@ -1632,9 +1636,15 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         let msg = "Too many sign-up attempts. Please try again later.";
         return signup_page(&app, &flow, &v, Some(msg), StatusCode::TOO_MANY_REQUESTS);
     }
-    // the form asks for the first label; a full handle under our domain is fine too
-    let suffix = format!(".{}", app.handle_domain);
-    let handle = if v.handle.ends_with(&suffix) { v.handle.clone() } else { format!("{}{suffix}", v.handle) };
+    // the form asks for the first label; a full handle under one of our
+    // domains is fine too
+    let domains = &app.handle_domains;
+    let handle = if domains.longest_match(&v.handle).is_some() {
+        v.handle.clone()
+    } else {
+        let picked = Some(v.domain.as_str()).filter(|d| domains.contains(d)).unwrap_or(domains.primary());
+        format!("{}.{picked}", v.handle)
+    };
     let inp = super::server::CreateAccountIn {
         handle,
         email: Some(v.email.clone()),

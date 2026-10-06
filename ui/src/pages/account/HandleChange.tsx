@@ -124,15 +124,17 @@ export function HandleChange({ current, did, domain, onDone }: { current: string
       )}
       <fieldset className="hc-choice">
         <legend>Change it to</legend>
-        <label className="hc-option">
-          <input type="radio" name="hc-mode" checked={mode === 'server'} onChange={() => pick('server')} />
-          <span>
-            <strong>A name on this server</strong>
-            <span className="small muted">
-              Like <span className="mono">@alice{domain}</span>. Ready right away.
+        {domain && (
+          <label className="hc-option">
+            <input type="radio" name="hc-mode" checked={mode === 'server'} onChange={() => pick('server')} />
+            <span>
+              <strong>A name on this server</strong>
+              <span className="small muted">
+                Like <span className="mono">@alice{domain}</span>. Ready right away.
+              </span>
             </span>
-          </span>
-        </label>
+          </label>
+        )}
         <label className="hc-option">
           <input type="radio" name="hc-mode" checked={mode === 'domain'} onChange={() => pick('domain')} />
           <span>

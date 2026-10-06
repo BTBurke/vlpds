@@ -4036,6 +4036,41 @@ differential run against the JS implementation over 200k generated strings
 matched (`handle_policy::tests::slurs_corpus_differential`, ignored; needs a
 corpus file).
 
+## Handle domains (`src/handle_domains.rs`)
+
+The reference's `serviceHandleDomains`: one or more suffixes handles are
+given out under, from `--handle-domains` (comma-separated), else
+`--handle-domain` (one), else `PDS_SERVICE_HANDLE_DOMAINS`, else
+`vlpds.test`. Stored bare and lowercase (the reference's leading dot is
+optional on input); the first is the primary. `describeServer` lists all of
+them with leading dots, in order. Everything that asked "under our domain?"
+asks the set: `longest_match` (service handles: createAccount, updateHandle,
+checkHandle, checkHandleAvailability, OAuth sign-up, `/tls-check`,
+`.well-known/atproto-did`) or `serves` (also a domain itself: resolveHandle's
+"don't look this up elsewhere").
+
+- **Longest match, not first.** The reference's `ensureHandleServiceConstraints`
+  takes the first listed domain the handle ends with, so with `.example.com`
+  listed before `.at.example.com`, `bob.at.example.com` is a dotted name
+  under `example.com` and refused. The longest match makes nesting work in
+  any order; without nesting the two agree.
+- **Home domain.** With several domains, one account moving its own handle
+  into another domain's namespace would take a name its operator may have
+  promised elsewhere (a tenant's users, say). So an account's own
+  updateHandle onto a service domain must stay in its home domain: the one
+  its handle is under; else the one it left for a domain of its own,
+  recorded in the account's `extra` as `homeHandleDomain` when it leaves;
+  else the primary. Refused: 400 `UnsupportedDomain`. Moving to a domain of
+  one's own is unchanged. `homeHandleDomain` is written only while there
+  is more than one domain, so a single-domain server writes nothing new,
+  and an old node keeps it through `Account`'s `extra`. A recorded domain
+  that's no longer configured leaves the account no service domain of its
+  own (an admin can still give it one). `vlpds.identity.getHandleDomain`
+  gives the account page its home domain; `checkHandle` reports another
+  domain as `invalid`.
+- Admins (`updateAccountHandle`), createAccount and imports may use any
+  listed domain: who gets an account where is the operator's call (invites).
+
 ## Moderation service auth, earned invites, disposable email, DNS handles
 
 Four reference PDS features, ported with the reference's behaviour and

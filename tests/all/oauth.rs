@@ -1588,6 +1588,41 @@ async fn response_modes_form_post_and_fragment() {
     assert_eq!(r.status, 400, "{}", r.body);
 }
 
+/// With several handle domains the sign-up page offers a picker, and the
+/// account lands under the domain picked (one domain: no picker, as before).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sign_up_picks_a_handle_domain() {
+    let s = spawn_with(|c| c.handle_domains = vec!["vlpds.test".into(), "second.test".into()]).await;
+    let key = DpopKey::new();
+    let f = Flow::loopback("atproto", &key).with("prompt", "create");
+    let mut b = Browser::default();
+    let ru = f.request_uri(&s, &pkce(), "pick").await;
+    let (st, _, html) = b.authorize(&s, &f, &ru).await;
+    assert_eq!(st, 200);
+    assert!(html.contains("<select name=\"domain\"") && html.contains(">.second.test</option>"), "{html}");
+    let name = format!("pick{}", rand::random::<u32>() % 100000);
+    let email = format!("{name}@example.com");
+    let mut form = sign_up_form(&ru, "", &name, &email, None);
+    let csrf = csrf_of(&html);
+    form.retain(|(k, _)| *k != "csrf");
+    form.extend([("csrf", csrf.as_str()), ("domain", "second.test")]);
+    let (st, _, html) = b.post(&s, "/oauth/authorize/sign-up", &form).await;
+    assert_eq!(st, 200, "{html}");
+    let r = s
+        .http
+        .post(format!("{}/xrpc/com.atproto.server.createSession", s.base))
+        .json(&json!({"identifier": format!("{name}.second.test"), "password": PASSWORD}))
+        .send()
+        .await
+        .unwrap();
+    assert!(r.status().is_success());
+
+    let one = spawn().await;
+    let ru = f.request_uri(&one, &pkce(), "one").await;
+    let (_, _, html) = Browser::default().authorize(&one, &f, &ru).await;
+    assert!(!html.contains("<select") && html.contains("<span>.vlpds.test</span>"), "{html}");
+}
+
 /// prompt=create: the sign-up page. Creating an account there signs it in
 /// on the device and continues to consent; the two pages link to each
 /// other; form errors keep the values entered.

@@ -18,6 +18,7 @@ pub mod email_policy;
 pub mod events;
 pub mod firehose;
 pub mod forward;
+pub mod handle_domains;
 pub mod handle_policy;
 pub mod handle_resolver;
 pub mod http;

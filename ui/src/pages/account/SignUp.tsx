@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from 'react'
-import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
+import { DomainAffix, ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
 import { useLoad } from '../../lib/hooks'
 import { Link, navigate, useSearch } from '../../lib/router'
 import { call, setSession } from '../../lib/xrpc'
@@ -18,7 +18,9 @@ export function SignUp() {
   const [invite, setInvite] = useState(q.get('invite') ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
-  const domain = d.data?.availableUserDomains[0] ?? ''
+  const domains = d.data?.availableUserDomains ?? []
+  const [picked, setPicked] = useState('')
+  const domain = domains.includes(picked) ? picked : (domains[0] ?? '')
   const inviteRequired = !!d.data?.inviteCodeRequired
   const label = handle.trim().replace(/^@/, '').toLowerCase()
 
@@ -27,7 +29,7 @@ export function SignUp() {
     setBusy(true)
     setError(undefined)
     try {
-      const full = domain && label.endsWith(domain) ? label : `${label}${domain}`
+      const full = domains.some((x) => label.endsWith(x)) ? label : `${label}${domain}`
       const out = await call('com.atproto.server.createAccount', {
         body: { handle: full, email: email.trim(), password, inviteCode: invite.trim() || undefined },
       })
@@ -64,7 +66,7 @@ export function SignUp() {
                     required
                     autoFocus
                   />
-                  <span className="mono">{domain || '…'}</span>
+                  <DomainAffix domains={domains} value={domain} onChange={setPicked} />
                 </span>
               </Field>
               <Field label="Email" hint="For password resets and account deletion codes.">

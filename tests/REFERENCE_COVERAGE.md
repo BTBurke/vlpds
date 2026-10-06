@@ -119,6 +119,10 @@ New test modules (`cargo test --test all ref_`): `ref_account`, `ref_auth`, `ref
   `InvalidRequest` "Unable to resolve handle". A dev-mode vlpds resolves external handles only through the AppView.
 - **disable/enableAccountInvites** act on the account's existing codes as well as the flag. The reference only flips the flag,
   which marks interval-generated codes disabled when they are created (vlpds does that too).
+- **Several handle domains** (`--handle-domains`, the reference's `PDS_SERVICE_HANDLE_DOMAINS`): a handle belongs to the longest
+  listed domain it ends with; the reference takes the first listed one, which differs only when one domain is under another. An
+  account's own updateHandle onto a service domain other than its home one is 400 `UnsupportedDomain`; the reference allows any
+  listed domain (`handle_domains::own_handle_changes_stay_in_the_home_domain`). With one domain both behave alike.
 - **OAuth UI** has no forgot-password step and no deactivate button. Those are the XRPC flows, and the pages are English only.
 - **Legacy blob refs** are refused everywhere. The reference upgrades them on profile updates as a temporary hack.
 - **uploadBlob with user service auth on a taken-down account** is 401 AccountTakedown, as with a session. The reference's

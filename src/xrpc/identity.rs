@@ -14,6 +14,7 @@ pub fn routes() -> Router<Arc<App>> {
         .route("/xrpc/vlpds.identity.getPlcData", get(get_plc_data))
         .route("/xrpc/vlpds.identity.getPlcAuditLog", get(get_plc_audit_log))
         .route("/xrpc/vlpds.identity.checkHandle", get(check_handle))
+        .route("/xrpc/vlpds.identity.getHandleDomain", get(get_handle_domain))
         .route("/.well-known/atproto-did", get(well_known_atproto_did))
         .route("/.well-known/did.json", get(well_known_did_json))
         .route("/tls-check", get(tls_check))
@@ -33,7 +34,7 @@ async fn active_handle_did(app: &Arc<App>, handle: &str) -> Result<Option<String
 }
 
 fn under_handle_domain(app: &App, host: &str) -> bool {
-    host.ends_with(&format!(".{}", app.handle_domain))
+    app.handle_domains.longest_match(host).is_some()
 }
 
 fn public_host(app: &App) -> Option<String> {
@@ -183,7 +184,7 @@ async fn resolve_handle(State(app): AppState, Query(q): Query<HandleQ>) -> XResu
 
 /// Reference `serviceHandleDomains` check.
 fn is_service_handle(app: &App, handle: &str) -> bool {
-    under_handle_domain(app, handle) || handle == app.handle_domain
+    app.handle_domains.serves(handle)
 }
 
 /// Inactive accounts don't resolve (reference getAccount(handle)).
@@ -398,8 +399,7 @@ pub(super) async fn check_new_handle(app: &App, handle: &str, did: &str) -> XRes
     // syntax + disallowed TLDs, then the slur filter (reference order)
     super::server::normalize_handle(handle)?;
     super::server::ensure_no_slur(handle)?;
-    let suffix = format!(".{}", app.handle_domain);
-    if handle.ends_with(&suffix) {
+    if under_handle_domain(app, handle) {
         // same rules as createAccount, reserved names included
         return super::server::ensure_service_handle(app, handle, false);
     }
@@ -455,12 +455,40 @@ async fn update_handle(
     }
     let handle = inp.handle.trim().to_ascii_lowercase();
     if handle != acct.handle {
+        ensure_home_domain(&app, &acct, &handle)?;
         // the slow part (external .well-known proof) runs before the op
         check_new_handle(&app, &handle, &did).await?;
     }
     // same handle: the reference still re-announces it
     set_handle(&app, &did, &handle, true).await?;
     Ok(StatusCode::OK)
+}
+
+/// The service domain an account may take handles under itself: the one
+/// its handle is under, else the one it left for a handle of its own, else
+/// the primary (DESIGN.md "Handle domains"). None: only an admin may give
+/// it a service handle.
+fn home_domain<'a>(app: &'a App, acct: &Account) -> Option<&'a str> {
+    let stored = acct.extra.get(crate::handle_domains::HOME_KEY).and_then(|v| v.as_str());
+    app.handle_domains.home(&acct.handle, stored)
+}
+
+/// An account's own move onto a service domain other than its home one
+/// would take a name in another domain's namespace.
+fn ensure_home_domain(app: &App, acct: &Account, handle: &str) -> XResult<()> {
+    match app.handle_domains.longest_match(handle) {
+        Some(d) if home_domain(app, acct) != Some(d) => {
+            Err(XrpcError::bad("UnsupportedDomain", "Not a supported handle domain for this account"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The account page's domain for "A name on this server" (null: none).
+async fn get_handle_domain(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+    creds.need_identity("handle")?;
+    let acct = app.account(creds.user_did()?).await?;
+    Ok(Json(json!({"domain": home_domain(&app, &acct).map(|d| format!(".{d}"))})))
 }
 
 #[derive(Deserialize)]
@@ -477,8 +505,8 @@ fn handle_problem(app: &App, handle: &str) -> Option<(&'static str, String)> {
     if handle.is_empty() {
         return invalid("Enter a handle.");
     }
-    let suffix = format!(".{}", app.handle_domain);
-    if let Some(front) = handle.strip_suffix(&suffix) {
+    let domain = app.handle_domains.longest_match(handle);
+    if let Some(front) = domain.and_then(|d| handle.strip_suffix(d)?.strip_suffix('.')) {
         if front.contains('.') {
             return invalid(
                 "A name on this server can't contain dots. To use a domain you own, choose \"Your own domain\".",
@@ -508,7 +536,7 @@ fn handle_problem(app: &App, handle: &str) -> Option<(&'static str, String)> {
     if super::server::ensure_no_slur(handle).is_err() {
         return invalid("That name isn't allowed. Try another.");
     }
-    if handle.ends_with(&suffix) {
+    if domain.is_some() {
         if let Err(e) = super::server::ensure_service_handle(app, handle, false) {
             return Some(match e.error.as_str() {
                 "HandleNotAvailable" => ("reserved", "That name is reserved on this server. Try another.".into()),
@@ -545,7 +573,7 @@ async fn check_handle(State(app): AppState, Auth(creds): Auth, Query(q): Query<C
     }
     let acct = app.account(&did).await?;
     let handle = q.name.trim().trim_start_matches('@').trim_end_matches('.').to_ascii_lowercase();
-    let service = handle.ends_with(&format!(".{}", app.handle_domain));
+    let service = under_handle_domain(&app, &handle);
     let kind = if service { "service" } else { "external" };
     let base = |status: &str, message: Option<String>| {
         crate::metrics::HANDLE_CHECKS.with_label_values(&[kind, status]).inc();
@@ -556,6 +584,10 @@ async fn check_handle(State(app): AppState, Auth(creds): Auth, Query(q): Query<C
     }
     if handle == acct.handle {
         return Ok(Json(base("current", Some("That's already your handle.".into()))));
+    }
+    if ensure_home_domain(&app, &acct, &handle).is_err() {
+        let d = app.handle_domains.longest_match(&handle).unwrap_or_default();
+        return Ok(Json(base("invalid", Some(format!("Names under .{d} aren't available to this account.")))));
     }
     if app.resolve_handle(&handle).await?.is_some_and(|holder| holder != did) {
         return Ok(Json(base("taken", Some("Another account on this server already has that handle.".into()))));
@@ -616,6 +648,7 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
         return Err(e);
     }
     let h = handle.to_string();
+    let domains = app.handle_domains.clone();
     let res = app
         .mutate_account(did, true, false, false, move |a| {
             if user && super::server::is_takendown_account(a) {
@@ -624,6 +657,16 @@ pub(super) async fn set_handle(app: &App, did: &str, handle: &str, user: bool) -
             if a.handle != h && !claimed {
                 // renamed since the read above: we hold no claim on `h`
                 return Err(XrpcError::bad("InvalidRequest", "Handle changed concurrently, retry"));
+            }
+            use crate::handle_domains::HOME_KEY;
+            let stored = a.extra.get(HOME_KEY).and_then(|v| v.as_str());
+            match domains.stored_home_after(&a.handle, &h, stored) {
+                Some(d) => {
+                    a.extra.insert(HOME_KEY.into(), json!(d));
+                }
+                None => {
+                    a.extra.remove(HOME_KEY);
+                }
             }
             a.handle = h;
             Ok(true)

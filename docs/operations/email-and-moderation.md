@@ -318,7 +318,7 @@ deletion".
 ## Handle policy
 
 ```facts
-- { value: "~1,000", unit: labels, label: reserved, note: "first label of a handle under --handle-domain: 400 HandleNotAvailable" }
+- { value: "~1,000", unit: labels, label: reserved, note: "first label of a handle under a handle domain: 400 HandleNotAvailable" }
 - { value: "7", unit: patterns, label: refused as slurs, note: "any user-chosen handle (also with . - _ removed) and record keys", tone: rust }
 - { value: "3 s", label: to prove an external handle, note: "DNS TXT and HTTPS well-known, tried at once", tone: blue }
 ```
@@ -326,11 +326,11 @@ deletion".
 The reference's reserved-handle list and slur filter are compiled in verbatim
 (`src/handle_policy/`), so updating them takes a release. They apply at createAccount, OAuth sign-up
 and updateHandle, with the reference's error names. An admin (`updateAccountHandle`) skips both,
-but a handle under `--handle-domain` must still be one 3–18 character label. The slur filter also
+but a handle under a handle domain must still be one 3–18 character label. The slur filter also
 checks the record key of every create and update (createRecord, putRecord, applyWrites), the same
 as the reference. Deletes aren't checked.
 
-External handles (a domain outside `--handle-domain`) need proof, the same as in the reference.
+External handles (a domain outside the handle domains) need proof, the same as in the reference.
 That's either a DNS TXT record `_atproto.<handle>` = `did=<the account's DID>`, or
 `https://<handle>/.well-known/atproto-did` serving the DID. vlpds tries both at once with a 3 s
 deadline each, through the host's own resolver. Say a user swears their handle is set up and still
@@ -338,8 +338,27 @@ gets "External handle did not resolve to DID". Usually the node can't reach the 
 (`dig TXT _atproto.<handle>` from the node) or there's more than one `did=` record. `--dev-mode`
 skips the proof.
 
-Handles under `--handle-domain` resolve over HTTPS through Caddy's certificates for each handle.
+Handles under the handle domains resolve over HTTPS through Caddy's certificates for each handle.
 See [Deploy](deploy.md#first-deploy).
+
+### Handle domains
+
+`--handle-domains a.example,b.example` gives out handles under several domains from one PDS
+(`--handle-domain` sets one, as before). `describeServer` lists them all, in that order, as the
+reference does. Sign-up and the `/migrate` page then offer a picker. Each domain needs what a single
+one does in [Deploy](deploy.md): an `A` record for `*.<domain>` and a certificate for it (a wildcard,
+or on demand through `/tls-check`, which answers for every domain).
+
+A handle belongs to the longest domain it ends with, so `at.example.com` and `example.com` can both
+be listed. The reference takes the first listed domain it ends with, which only differs for a
+domain under another.
+
+An account's own handle changes stay in its **home domain**: the one its handle is under, or the
+one it left for a domain of its own, or the first listed. So someone under `a.example` can switch
+to `alice.com` and back to `alice.a.example`, but not to a name under `b.example`, which would take
+a name in that domain's namespace. updateHandle answers 400 `UnsupportedDomain`, and the account
+page only offers the home domain. Admins (`updateAccountHandle`) may use any domain. With one
+domain nothing changes.
 
 ### Changing a handle on the account page
 
@@ -354,7 +373,7 @@ See [Deploy](deploy.md#first-deploy).
 
 Both paths ask `vlpds.identity.checkHandle?name=<handle>`, a read-only call for the signed-in account
 (the parameter isn't called `handle` because forwarding would route by it). For a name under
-`--handle-domain` it answers `available`, `taken` (by another account on this server), `reserved`,
+a handle domain it answers `available`, `taken` (by another account on this server), `reserved`,
 `invalid` or `current`, with a message for the user. For a domain it looks up the TXT record and fetches the file, with the same 3 s deadlines and
 the same SSRF-guarded client as updateHandle (guarded in `--dev-mode` too). It reports each one
 separately: found with this DID, found with another DID, several `did=` records, or nothing. The

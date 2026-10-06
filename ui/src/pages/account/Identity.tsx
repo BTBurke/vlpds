@@ -1,14 +1,15 @@
 import { useState } from 'react'
 import { ErrorNotice, Field, Loading, Notice, PageHead, Panel, Spinner, Status } from '../../components/ui'
 import { useAction, useLoad } from '../../lib/hooks'
-import { acall, call } from '../../lib/xrpc'
+import { acall } from '../../lib/xrpc'
 import { HandleChange } from './HandleChange'
 import { loadSession } from './Overview'
 
 export function Identity() {
   const info = useLoad(loadSession, [])
-  const desc = useLoad(() => call('com.atproto.server.describeServer'), [])
   const d = info.data
+  // the domain this account may take a name under (several are possible)
+  const home = useLoad<{ domain: string | null }>(() => acall('vlpds.identity.getHandleDomain'), [d?.handle])
   return (
     <>
       <PageHead title="Handle and email" desc="Your handle is how people find you; your email is used for sign-in recovery." />
@@ -17,10 +18,10 @@ export function Identity() {
         <Loading />
       ) : (
         <>
-          {desc.data ? (
-            <HandleChange current={d.handle} did={d.did} domain={desc.data.availableUserDomains[0] ?? ''} onDone={info.reload} />
-          ) : desc.error ? (
-            <ErrorNotice error={desc.error} />
+          {home.data ? (
+            <HandleChange current={d.handle} did={d.did} domain={home.data.domain ?? ''} onDone={info.reload} />
+          ) : home.error ? (
+            <ErrorNotice error={home.error} />
           ) : (
             <Loading />
           )}

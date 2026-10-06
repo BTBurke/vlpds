@@ -98,7 +98,7 @@ pub struct App {
     pub firehose: Arc<Firehose>,
     pub tids: TidClock,
     pub public_url: String,
-    pub handle_domain: String,
+    pub handle_domains: Arc<crate::handle_domains::HandleDomains>,
     /// Writes beyond this many in flight get a fast 503. A write's permit
     /// travels with its queued message, so it is held until its worker takes
     /// it, even if the handler is gone.
