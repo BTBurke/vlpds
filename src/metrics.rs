@@ -932,6 +932,11 @@ pub fn resident_bytes() -> Option<u64> {
     None
 }
 
+/// User plus system CPU seconds this process has used.
+pub fn cpu_seconds() -> Option<f64> {
+    sys::cpu_seconds().map(|(u, s)| u + s)
+}
+
 fn refresh_process() {
     if let Some((user, system)) = sys::cpu_seconds() {
         advance(&PROCESS_CPU.with_label_values(&["user"]), user);

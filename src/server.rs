@@ -631,6 +631,7 @@ pub fn spawn_reporters(app: &Arc<xrpc::App>) {
         }
     });
     stats::spawn_stall_detector();
+    crate::node_metrics::start();
 }
 
 /// Builds the app and serves it in background tasks. Returns the public

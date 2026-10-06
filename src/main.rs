@@ -1076,13 +1076,40 @@ fn read_secret_files(args: &mut Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A secret flag's value as the node uses it, for its fingerprint in
+/// `vlpds.admin.getConfig` (the value itself never leaves the process).
+fn effective_secret(a: &Args, id: &str) -> Option<String> {
+    let one = |v: &Option<String>| v.clone();
+    let many = |v: &Vec<String>| (!v.is_empty()).then(|| v.join(","));
+    match id {
+        "jwt_secret" => one(&a.jwt_secret),
+        "admin_token" => one(&a.admin_token),
+        "internal_token" => one(&a.internal_token),
+        "s3_access_key" => Some(a.s3_access_key.clone()),
+        "s3_secret_key" => Some(a.s3_secret_key.clone()),
+        "kek" => one(&a.kek),
+        "kek_old" => many(&a.kek_old),
+        "vault_approle_role_id" => one(&a.vault_approle_role_id),
+        "email_smtp_url" => one(&a.email_smtp_url),
+        "email_api_token" => one(&a.email_api_token),
+        "moderation_email_smtp_url" => one(&a.moderation_email_smtp_url),
+        "moderation_email_api_token" => one(&a.moderation_email_api_token),
+        "plc_rotation_key" => one(&a.plc_rotation_key),
+        "plc_rotation_key_old" => many(&a.plc_rotation_key_old),
+        "rate_limit_bypass_key" => one(&a.rate_limit_bypass_key),
+        _ => None,
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("admin") => return admin_main(AdminArgs::parse_from(std::env::args().skip(1))),
         Some("dashboards") => return dashboards_main(DashboardsArgs::parse_from(std::env::args().skip(1))),
         _ => {}
     }
-    let mut args = Args::parse();
+    let cmd = <Args as clap::CommandFactory>::command();
+    let matches = cmd.clone().get_matches();
+    let mut args = <Args as clap::FromArgMatches>::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     if args.generate_did_key {
         let key = vlpds::crypto::Keypair::generate();
         println!("private key (hex): {}", hex::encode(key.to_bytes().as_slice()));
@@ -1090,6 +1117,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     read_secret_files(&mut args)?;
+    vlpds::config_report::record(vlpds::config_report::from_matches(&cmd, &matches, |id| effective_secret(&args, id)));
     init_logging(args.log_format)?;
     vlpds::lifecycle::install_panic_hook();
     raise_nofile_limit();

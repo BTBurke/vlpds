@@ -625,6 +625,7 @@ impl Mailer for LogMailer {
         // Never the token or body, at any level: they are credentials (a
         // debug log is still shipped to log storage).
         tracing::info!(to = %m.to, subject = %m.subject, purpose = %m.purpose, has_token = m.token.is_some(), body_bytes = m.body.len(), "mail (log mailer: email disabled, not sent)");
+        crate::mail::MAIL_LOG.logged(&m.purpose, &m.to);
     }
 }
 
@@ -657,6 +658,7 @@ pub(super) async fn mail_permit(
     let route = format!("mail:{purpose}");
     let limited = |reason: &str| {
         crate::mail::MAIL_SUPPRESSED.with_label_values(&[purpose, reason]).inc();
+        crate::mail::MAIL_LOG.suppressed(purpose, to, reason);
         XrpcError {
             status: StatusCode::TOO_MANY_REQUESTS,
             error: "RateLimitExceeded".into(),
@@ -1185,6 +1187,51 @@ pub(super) async fn revoke_signed_in_with(app: &App, did: &str, auth_ref: &str) 
         }
     }
     Ok(())
+}
+
+/// The account's password and app-password sessions (`sess/` rows), one per
+/// session family: rotation adds rows, the family stays.
+pub(super) async fn legacy_sessions(app: &App, did: &str) -> XResult<Vec<J>> {
+    let mut fams: HashMap<String, RefreshState> = HashMap::new();
+    for (_, v) in super::internal::scan_private_anywhere(app, did, "sess/").await? {
+        let Ok(st) = serde_json::from_slice::<RefreshState>(&v) else { continue };
+        let live = |s: &RefreshState| (s.next_id.is_none(), s.created_at);
+        match fams.get(&st.family) {
+            Some(cur) if live(cur) >= live(&st) => {}
+            _ => {
+                fams.insert(st.family.clone(), st);
+            }
+        }
+    }
+    let now = now_secs();
+    let mut out: Vec<J> = fams
+        .into_values()
+        .filter(|st| st.exp > now)
+        .map(|st| {
+            // the family id starts with its issue time (micros, hex)
+            let started = u64::from_str_radix(st.family.get(..16).unwrap_or(""), 16).ok().map(|us| us / 1000);
+            json!({
+                "id": format!("legacy:{}", st.family),
+                "kind": if st.app_password.is_some() { "appPassword" } else { "legacy" },
+                "appPassword": st.app_password.as_ref().map(|a| &a.name),
+                "privileged": st.app_password.as_ref().is_some_and(|a| a.privileged),
+                "signedInAt": started,
+                "refreshedAt": st.created_at * 1000,
+                "expiresAt": st.exp * 1000,
+                "passkey": st.auth_cred.is_some(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|j| std::cmp::Reverse(j["refreshedAt"].as_u64()));
+    Ok(out)
+}
+
+/// One password or app-password session family: its refresh rows and its
+/// access tokens. How many rows went.
+pub(super) async fn revoke_legacy_family(app: &App, did: &str, family: &str) -> XResult<usize> {
+    let gone = delete_sessions_where(app, did, |_, st| st.family == family).await?;
+    revoke_families(app, did, &[family.to_string()]).await?;
+    Ok(gone.len())
 }
 
 async fn revoke_app_password_sessions(app: &App, did: &str, name: &str) -> XResult<()> {
@@ -2077,18 +2124,28 @@ async fn revoke_app_password(
 ) -> XResult<StatusCode> {
     // app passwords can't revoke app passwords (stricter than the reference)
     let did = full_access(&creds)?;
-    let e = ext(&app);
-    let _g = e.lock(&did).await;
-    let name = inp.name.trim().to_string();
-    if let Some(meta) = get_json::<J>(&app, &did, &format!("apppass/{name}")).await? {
-        let mut muts = vec![pmut(&did, &format!("apppass/{name}"), None)];
-        if let Some(h) = meta["hash"].as_str() {
-            muts.push(pmut(&did, &format!("apphash/{h}"), None));
-        }
-        app.put_private(&did, muts).await?;
-    }
-    revoke_app_password_sessions(&app, &did, &name).await?;
+    remove_app_password(&app, &did, inp.name.trim()).await?;
     Ok(StatusCode::OK)
+}
+
+/// The password and the sessions it signed in. False if there was none by
+/// that name (its sessions are ended all the same).
+pub(super) async fn remove_app_password(app: &App, did: &str, name: &str) -> XResult<bool> {
+    let e = ext(app);
+    let _g = e.lock(did).await;
+    let found = match get_json::<J>(app, did, &format!("apppass/{name}")).await? {
+        Some(meta) => {
+            let mut muts = vec![pmut(did, &format!("apppass/{name}"), None)];
+            if let Some(h) = meta["hash"].as_str() {
+                muts.push(pmut(did, &format!("apphash/{h}"), None));
+            }
+            app.put_private(did, muts).await?;
+            true
+        }
+        None => false,
+    };
+    revoke_app_password_sessions(app, did, name).await?;
+    Ok(found)
 }
 
 /// [`App::mutate_account`] that always writes; returns the account as written.
