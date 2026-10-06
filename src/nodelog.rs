@@ -927,7 +927,8 @@ async fn run_sequencer(
                 }
             }
             let o = std::mem::replace(&mut open, Open::new(&log_id));
-            metrics::SEGMENT_EVENTS.observe(o.frames.len() as f64);
+            metrics::SEGMENT_ENTRIES.observe(o.frames.len() as f64);
+            metrics::SEGMENT_EVENTS.observe(o.frames.iter().filter(|(_, r)| !r.is_empty()).count() as f64);
             metrics::COMMIT_STAGE
                 .with_label_values(&["seal_wait"])
                 .observe(o.acks.first().map_or(0.0, |a| a.3.elapsed().as_secs_f64()));
