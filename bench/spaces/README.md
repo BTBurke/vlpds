@@ -62,6 +62,10 @@ vlpds build, `npm install`), and each UI run builds the boards web UI into its o
 `STORE=r2` runs vlpds on a real bucket instead of MinIO, so latency and request counts are the
 network's and not loopback's. The PLC and the reference PDSes stay local.
 
+The `vlpds-bench` bucket and its key were removed after the 2026-10-05 runs. To run again, bring
+back `deploy/cloudflare/r2_bench.tf` from git history (the opentofu token then needs Account API
+Tokens read/edit for the bucket key) and write its output to `R2_ENV`.
+
 ```
 STORE=r2 VLPDS_BIN=... bench/spaces/run.sh cost
 STORE=r2 SCALE=r2 bench/spaces/run.sh boards all-vlpds
