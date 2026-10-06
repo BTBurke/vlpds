@@ -295,8 +295,9 @@ async fn rows_without_suffixes_are_seeded() {
     let mut stripped = 0;
     for p in s.app.partitions.owned() {
         for (k, (t, _)) in totals_rows(&p).await {
-            let b = vlpds::totals::Totals { suffixes: Default::default(), ..t }.encode();
-            p.db.put(&k, &b[..b.len() - 1]).await.unwrap();
+            let b = vlpds::totals::Totals { suffixes: Default::default(), unconfirmed: 0, no2fa: 0, ..t }.encode();
+            // the suffix count and the two flag counts, all zero: one byte each
+            p.db.put(&k, &b[..b.len() - 3]).await.unwrap();
             stripped += 1;
         }
         p.db.flush().await.unwrap();
