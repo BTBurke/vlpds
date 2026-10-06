@@ -3,8 +3,8 @@ import { DataTable } from '../../components/console/DataTable'
 import { Banners, Chip, ErrorState, Glyph, KV, Loading, Meter, Mini, Minis, NeedsVersion, PageHead, Panel, PanelBody, Seg, Spark, Src, Swatch, Tiles, type BannerSpec } from '../../components/console/kit'
 import { registerPalette } from '../../components/console/Palette'
 import { useClusterView } from '../../lib/console/cluster'
-import { fmtMs, fmtNum, fmtSi } from '../../lib/console/fmt'
-import { configPoll, maxLatest, nodeSeries, sumLatest, sumMean, sumSeries, useNodeMetrics, worstSeries, type NodeSeries } from '../../lib/console/sys'
+import { fmtBytes, fmtMs, fmtNum, fmtSi } from '../../lib/console/fmt'
+import { configPoll, storageStatsPoll, maxLatest, nodeSeries, sumLatest, sumMean, sumSeries, useNodeMetrics, worstSeries, type NodeSeries } from '../../lib/console/sys'
 import { navigate } from '../../lib/router'
 
 // Object store: billable request rates (class A: writes, lists, CAS; class B: reads) and what
@@ -107,7 +107,11 @@ export function Storage() {
   const { view } = useClusterView()
   const m = useNodeMetrics()
   const cfg = configPoll.use()
-  const [gb, setGb] = useState<number | undefined>(readGb)
+  const [gbTyped, setGb] = useState<number | undefined>(readGb)
+  const stats = storageStatsPoll.use()
+  const measured = stats.data?.supported ? stats.data.data : undefined
+  // a typed figure wins: the operator may know the bill's number better
+  const gb = gbTyped ?? (measured ? measured.totalBytes / 1e9 : undefined)
   const self = cfg.data?.find((x) => x.config && x.self)?.config ?? cfg.data?.find((x) => x.config)?.config
   const setting = (f: string) => self?.settings.find((s) => s.flag === f)?.value
   const endpoint = setting('--s3-endpoint')
@@ -270,9 +274,9 @@ export function Storage() {
                     className="cx-inp mono"
                     style={{ width: 80, height: 24, display: 'inline-block' }}
                     inputMode="decimal"
-                    placeholder="—"
+                    placeholder={measured ? fmtNum(measured.totalBytes / 1e9, 1) : '—'}
                     aria-label="GB stored"
-                    value={gb ?? ''}
+                    value={gbTyped ?? ''}
                     onChange={(e) => {
                       const v = e.target.value === '' ? undefined : Number(e.target.value)
                       setGb(v)
@@ -285,7 +289,7 @@ export function Storage() {
                     }}
                   />
                 </label>{' '}
-                <span className="muted">(the console can't list the bucket to measure it)</span>
+                <span className="muted">{measured ? '(measured; type to override)' : '(this server can’t measure it yet)'}</span>
               </>
             }
           >
@@ -350,6 +354,29 @@ export function Storage() {
               ]}
             />
           </Panel>
+          <Panel title="Stored by component" src={<Src isNew={!measured}>getStorageStats</Src>} right={measured ? <span className="muted sm">{fmtBytes(measured.totalBytes)} in all</span> : undefined}>
+            {stats.data && !stats.data.supported ? (
+              <NeedsVersion what="Objects and bytes by component" nsid="vlpds.admin.getStorageStats" />
+            ) : stats.error ? (
+              <ErrorState error={stats.error} retry={storageStatsPoll.refresh} />
+            ) : !measured ? (
+              <Loading />
+            ) : (
+              <DataTable
+                compact
+                rows={[...measured.components].sort((x, y) => y.bytes - x.bytes)}
+                rowKey={(r) => r.component}
+                open={(r) => ({ type: 'storecomp', id: r.component })}
+                empty={<div className="cx-empty">Nothing counted yet.</div>}
+                cols={[
+                  { id: 'c', label: 'Component', render: (r) => <b>{componentName(r.component)}</b> },
+                  { id: 'o', label: 'Objects', r: true, render: (r) => <span className="mono">{fmtNum(r.objects)}</span> },
+                  { id: 'b', label: 'Size', r: true, render: (r) => <span className="mono">{fmtBytes(r.bytes)}</span> },
+                  { id: 'm', label: `${priceAt}/month`, r: true, render: (r) => <span className="mono">{usd((r.bytes / 1e9) * PRICE[priceAt].gb)}</span> },
+                ]}
+              />
+            )}
+          </Panel>
           <Panel title="Bucket">
             <PanelBody>
               <KV
@@ -364,7 +391,7 @@ export function Storage() {
                 ]}
               />
               <p className="muted sm" style={{ margin: '10px 0 0' }}>
-                Object counts and sizes by prefix would mean listing the bucket, so the console doesn't show them. Never edit or delete objects by hand: <span className="mono">assign/</span> and{' '}
+                The console never lists the bucket. Never edit or delete objects by hand: <span className="mono">assign/</span> and{' '}
                 <span className="mono">nodes/</span> are how nodes agree on ownership.
               </p>
             </PanelBody>

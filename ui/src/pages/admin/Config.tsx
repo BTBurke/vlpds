@@ -30,7 +30,7 @@ export const SOURCE_KIND: Record<Setting['source'], ChipKind> = { flag: 'plain',
 export const sourceChip = (s?: Setting) => (s ? <Chip k={SOURCE_KIND[s.source]} glyph={false}>{s.source}</Chip> : <span className="muted">—</span>)
 
 /** What a node shows for a flag, for comparing nodes: a secret by its fingerprint. */
-export const shown = (s?: Setting) => (!s ? '' : s.secret ? (s.source === 'unset' ? 'unset' : (s.fingerprint ?? 'set')) : (s.value ?? (s.source === 'unset' ? '' : '')))
+export const shown = (s?: Setting) => (!s ? '' : s.secret ? (s.source === 'unset' ? 'unset' : (s.fingerprint ?? 'set')) : (s.value ?? ''))
 
 export type FlagRow = {
   flag: string
@@ -93,6 +93,18 @@ registerPalette({
 
 type Filter = 'set' | 'all' | 'differs'
 
+// Fields newer getConfig answers add (peer certificate expiry, when a secret was set). Read
+// loosely: they light up when present and the panels say what's missing when not.
+const asMs = (v: unknown): number | undefined => (typeof v === 'number' ? v : typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? Date.parse(v) : undefined)
+export function certExpiry(c?: NodeConfigResult['config']): number | undefined {
+  const x = c as Record<string, any> | undefined
+  return asMs(x?.peerTls?.notAfter ?? x?.peerTls?.expiresAt ?? x?.peerCertExpiresAt ?? x?.peerCert?.notAfter)
+}
+export function secretSetAt(s?: Setting): number | undefined {
+  const x = s as Record<string, any> | undefined
+  return asMs(x?.setAt ?? x?.changedAt ?? x?.modifiedAt) ?? (typeof x?.ageMs === 'number' ? Date.now() - x.ageMs : undefined)
+}
+
 export function Config() {
   const cfg = configPoll.use()
   const { view } = useClusterView()
@@ -118,6 +130,12 @@ export function Config() {
   const differ = rows.filter((r) => r.differs && !r.byDesign)
   const revs = new Set(okNodes.map((r) => r.config!.rev))
   const multi = okNodes.length > 1
+  const hasCert = okNodes.some((r) => certExpiry(r.config) !== undefined)
+  const hasAge = rows.some((r) => r.secret && [...r.per.values()].some((x) => secretSetAt(x) !== undefined))
+  const soon = okNodes.filter((r) => {
+    const e = certExpiry(r.config)
+    return e !== undefined && e - Date.now() < 14 * 86400_000
+  })
 
   const banners: BannerSpec[] = []
   if (failed.length) banners.push({ id: 'fail', tone: 'warn', title: `${failed.map((f) => f.node).join(', ')} didn't answer getConfig`, desc: 'Differences below leave those nodes out.' })
@@ -142,6 +160,7 @@ export function Config() {
           }
         : { id: 'agree', tone: 'info', title: `All ${okNodes.length} nodes agree`, desc: 'apart from their addresses and --node-id. Secrets show whether they’re set and a fingerprint, never their value.' },
     )
+  if (soon.length) banners.push({ id: 'cert', tone: 'err', title: `Peer certificate expires within 14 days on ${soon.map((r) => r.node).join(', ')}`, desc: 'Nodes stop talking to each other when it lapses. Reissue it from the cluster CA.' })
   if (cur && !cur.config!.recorded) banners.push({ id: 'norec', tone: 'info', title: `${cur.node} recorded no command line`, desc: 'A test or embedded node: its flags aren’t known.' })
 
   const ql = q.trim().toLowerCase()
@@ -271,6 +290,19 @@ export function Config() {
                   },
                 },
                 { id: 'fp', label: 'Fingerprint', render: (r) => <span className="mono sm t2">{r.per.get(cur?.node ?? '')?.fingerprint ?? ''}</span> },
+                ...(hasAge
+                  ? [
+                      {
+                        id: 'age',
+                        label: 'Set',
+                        r: true,
+                        render: (r: FlagRow) => {
+                          const at = secretSetAt(r.per.get(cur?.node ?? ''))
+                          return at ? <span className="t2 sm">{ago(at)}</span> : null
+                        },
+                      },
+                    ]
+                  : []),
                 { id: 'd', label: '', r: true, render: (r) => (r.differs ? <Chip k="warn">differs</Chip> : null) },
               ]}
             />
@@ -289,7 +321,10 @@ export function Config() {
               </PanelBody>
             </Panel>
           )}
-          <Panel title="Builds">
+          <Panel
+            title="Builds"
+            foot={!hasCert || !hasAge ? <span>Peer certificate expiry and secret age need a newer vlpds (getConfig adds them).</span> : undefined}
+          >
             <DataTable
               compact
               rows={results}
@@ -308,6 +343,21 @@ export function Config() {
                 },
                 { id: 'v', label: 'Version', render: (r) => (r.config ? <span className="mono sm">{r.config.version}</span> : <Chip k="err">no answer</Chip>) },
                 { id: 'r', label: 'Rev', render: (r) => <span className="mono sm t2">{r.config?.rev.slice(0, 12) ?? '—'}</span> },
+                ...(hasCert
+                  ? [
+                      {
+                        id: 'cert',
+                        label: 'Peer cert',
+                        r: true,
+                        render: (r: NodeConfigResult) => {
+                          const exp = certExpiry(r.config)
+                          if (!exp) return <span className="muted">—</span>
+                          const days = (exp - Date.now()) / 86400_000
+                          return <Chip k={days < 14 ? 'err' : days < 45 ? 'warn' : 'ok'}>{days < 0 ? 'expired' : `expires in ${Math.floor(days)}d`}</Chip>
+                        },
+                      },
+                    ]
+                  : []),
               ]}
             />
           </Panel>

@@ -304,3 +304,22 @@ export async function configs(): Promise<NodeConfigResult[]> {
   )
 }
 export const configPoll = createPoller(configs, 30_000)
+
+// ---------------------------------------------------------------- storage stats
+
+/** Objects and bytes per key component (vlpds.admin.getStorageStats, a newer call). */
+export type StorageStats = { components: { component: string; objects: number; bytes: number }[]; totalBytes: number }
+
+/** `supported: false` on a vlpds without getStorageStats. Reads the answer loosely until its API settles. */
+export const storageStatsPoll = createPoller(async (): Promise<{ supported: false } | { supported: true; data: StorageStats }> => {
+  try {
+    const r = await admin<Record<string, unknown>>('vlpds.admin.getStorageStats')
+    const raw = (Array.isArray(r.components) ? r.components : Array.isArray(r.byComponent) ? r.byComponent : []) as Record<string, unknown>[]
+    const components = raw.map((c) => ({ component: String(c.component ?? c.name ?? ''), objects: Number(c.objects ?? c.count ?? 0), bytes: Number(c.bytes ?? 0) }))
+    const totalBytes = typeof r.totalBytes === 'number' ? r.totalBytes : components.reduce((t, c) => t + c.bytes, 0)
+    return { supported: true, data: { components, totalBytes } }
+  } catch (e) {
+    if (isUnsupported(e)) return { supported: false }
+    throw e
+  }
+}, 60_000)
