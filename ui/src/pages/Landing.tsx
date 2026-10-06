@@ -1,3 +1,4 @@
+import { Fragment } from 'react'
 import { Topbar, CopyText, Status } from '../components/ui'
 import { useLoad, useSession } from '../lib/hooks'
 import { Link } from '../lib/router'
@@ -58,10 +59,11 @@ export function Landing() {
               <dt>Handles</dt>
               <dd>
                 {info ? (
-                  info.availableUserDomains.map((x) => (
-                    <span key={x} className="mono">
-                      you{x}{' '}
-                    </span>
+                  info.availableUserDomains.map((x, i) => (
+                    <Fragment key={x}>
+                      {i > 0 && ', '}
+                      <span className="mono">you{x}</span>
+                    </Fragment>
                   ))
                 ) : d.error ? (
                   <span className="muted">Server info unavailable</span>

@@ -929,9 +929,7 @@ pub(super) fn normalize_handle(h: &str) -> XResult<String> {
     if !super::syntax::valid_handle(&h) {
         return Err(XrpcError::bad("InvalidHandle", "Input/handle must be a valid handle"));
     }
-    const DISALLOWED_TLDS: &[&str] =
-        &[".local", ".arpa", ".invalid", ".localhost", ".internal", ".example", ".alt", ".onion"];
-    if DISALLOWED_TLDS.iter().any(|t| h.ends_with(t)) {
+    if super::syntax::disallowed_handle_tld(&h) {
         return Err(XrpcError::bad("InvalidHandle", "Handle TLD is invalid or disallowed"));
     }
     Ok(h)
@@ -948,8 +946,7 @@ pub(super) fn ensure_no_slur(handle: &str) -> XResult<()> {
 
 /// The reference's ensureHandleServiceConstraints.
 pub(super) fn ensure_service_handle(app: &App, handle: &str, allow_reserved: bool) -> XResult<()> {
-    let suffix = format!(".{}", app.handle_domain);
-    let Some(front) = handle.strip_suffix(&suffix) else {
+    let Some((front, _)) = app.handle_domains.under(handle) else {
         return Err(XrpcError::bad("UnsupportedDomain", "Not a supported handle domain"));
     };
     if front.contains('.') {
@@ -1283,7 +1280,7 @@ async fn describe_server(State(app): AppState) -> Json<J> {
     }
     let mut out = json!({
         "did": app.jwt.service_did,
-        "availableUserDomains": [format!(".{}", app.handle_domain)],
+        "availableUserDomains": app.handle_domains.names().iter().map(|d| format!(".{d}")).collect::<Vec<_>>(),
         "inviteCodeRequired": app.config.invite_required,
         "blobUploadLimit": app.config.max_blob_size,
         "links": links,
@@ -1451,7 +1448,7 @@ async fn create_account_checked(app: &App, inp: CreateAccountIn, requester: Opti
         }
     };
     let claim = match &invite {
-        Some(code) => Some(super::admin::claim_invite_use(app, code, &did).await?),
+        Some(code) => Some(super::admin::claim_invite_use(app, code, &did, &handle).await?),
         None => None,
     };
     let release = |handle_ok: bool, email_ok: bool, claim: Option<super::admin::InviteClaim>| {
@@ -2817,6 +2814,8 @@ async fn reset_password(State(app): AppState, Json(inp): Json<ResetPasswordIn>) 
 struct CreateInviteCodeIn {
     use_count: i64,
     for_account: Option<String>,
+    /// vlpds: limit the code to handles under this served domain.
+    handle_domain: Option<String>,
 }
 
 async fn create_invite_code(
@@ -2827,7 +2826,9 @@ async fn create_invite_code(
     super::admin::require_admin(&creds)?;
     let account = inp.for_account.unwrap_or_else(|| "admin".into());
     let code = super::admin::gen_invite_code(&app);
-    super::admin::create_invites(&app, &account, std::slice::from_ref(&code), inp.use_count, false, "admin").await?;
+    let domain = inp.handle_domain.as_deref();
+    super::admin::create_invites(&app, &account, std::slice::from_ref(&code), inp.use_count, false, "admin", domain)
+        .await?;
     Ok(Json(json!({"code": code})))
 }
 
@@ -2838,6 +2839,7 @@ struct CreateInviteCodesIn {
     code_count: usize,
     use_count: i64,
     for_accounts: Option<Vec<String>>,
+    handle_domain: Option<String>,
 }
 
 fn one() -> usize {
@@ -2854,7 +2856,8 @@ async fn create_invite_codes(
     let mut out = Vec::new();
     for account in accounts {
         let codes: Vec<String> = (0..inp.code_count.min(1000)).map(|_| super::admin::gen_invite_code(&app)).collect();
-        super::admin::create_invites(&app, &account, &codes, inp.use_count, false, "admin").await?;
+        let domain = inp.handle_domain.as_deref();
+        super::admin::create_invites(&app, &account, &codes, inp.use_count, false, "admin", domain).await?;
         out.push(json!({"account": account, "codes": codes}));
     }
     Ok(Json(json!({"codes": out})))
@@ -2919,7 +2922,7 @@ async fn create_earned_invites(
     }
     let new: Vec<String> = (0..n).map(|_| super::admin::gen_invite_code(app)).collect();
     let disabled = acct.extra.get("invitesDisabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    super::admin::create_invites(app, did, &new, 1, disabled, did).await?;
+    super::admin::create_invites(app, did, &new, 1, disabled, did, None).await?;
     let after = super::admin::account_invites(app, did).await?;
     if after.iter().filter(|c| c.created_by != "admin").count() as i64 > total {
         return Err(XrpcError::bad("DuplicateCreate", "attempted to create additional codes in another request"));
@@ -3103,7 +3106,8 @@ async fn check_handle_availability(State(app): AppState, Query(q): Query<HandleA
             "result": {"$type": "com.atproto.temp.checkHandleAvailability#resultAvailable"},
         })));
     }
-    let suffix = format!(".{}", app.handle_domain);
+    let domain = app.handle_domains.served(&handle).unwrap_or_else(|| app.handle_domains.primary().to_string());
+    let suffix = format!(".{domain}");
     let base: String =
         handle.split('.').next().unwrap_or("user").chars().filter(|c| c.is_ascii_alphanumeric()).take(14).collect();
     let base = if base.len() < 3 { format!("{base}user") } else { base };
@@ -3465,6 +3469,7 @@ mod invite_interval_tests {
             created_by: by.into(),
             created_at: iso(at_ms),
             uses: vec![],
+            handle_domain: None,
         }
     }
 

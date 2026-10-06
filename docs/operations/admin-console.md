@@ -3,7 +3,7 @@ title: Admin console and CLI
 section: Operations
 order: 111
 status: ready
-summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, takedowns, rate limits, relays, firehose subscribers, cluster status and metrics."
+summary: "The operator console (on the tailnet) and the admin CLI: accounts, invites, handle domains, takedowns, rate limits, relays, firehose subscribers, cluster status and metrics."
 ---
 
 ```hero
@@ -24,7 +24,7 @@ diagram:
     - "api -> owner: per DID"
     - { from: caddy.t, to: api.b, label: never public, dash: true, arrow: none }
 facts:
-  - { value: "8", unit: pages, label: in the console, note: "cluster, live metrics, accounts, moderation, invites, rate limits, relays, firehose" }
+  - { value: "9", unit: pages, label: in the console, note: "cluster, live metrics, accounts, moderation, invites, handle domains, rate limits, relays, firehose" }
   - { value: "2 s", label: cluster view refresh, note: "getClusterStatus polled from the node you opened", tone: blue }
   - { value: "pdsadmin", label: every command covered, note: "plus the reference's maintenance scripts and cluster ops", tone: violet }
   - { value: "0", label: direct bucket access, note: "the CLI needs only a node URL and the admin token", tone: amber }
@@ -80,6 +80,7 @@ cluster, and account pages are routed to each account's owner.
 | Live metrics | Commits and record ops, HTTP requests by method, commit to durable, segment PUT latency, firehose, cold repo loads, forwarded requests, rejected requests, memory | Read only. Needs `/metrics` on the console's origin. Buttons at the bottom download the [Grafana dashboards](monitoring.md#import-into-your-own-grafana). |
 | Accounts | Search by email prefix (every node's shards, paged), or jump by handle or DID · an account's details and moderation status, with the date a [scheduled deletion](email-and-moderation.md#scheduled-deletion) is due · the dev mailbox in `--dev-mode` | The handle opens the account, and a DID or email copies when you click it · take down (with a reference) and reverse it · change handle, email or password · enable or disable its invites · reset its two-factor sign-in (passkeys, TOTP, recovery codes and trusted browsers, with a reason, audited and mailed to the user) · delete (type the handle to confirm). |
 | Moderation | Look up a subject from a bsky.app URL, at:// URI, handle, DID or DID + blob CID, and see the account, the record's JSON and its blobs (previews load on request, blurred) · active takedowns by kind · cases · the audit log · accounts over their blob quota | Take down or restore an account, record or blob with a reason, filed under a case · open and update cases (notes, status, subjects) · change an account's blob quota. See [Email and moderation](email-and-moderation.md#operator-moderation). |
+| Handle domains | The primary (`--handle-domain`) and the domains added here, each with its active accounts, when it was added and by whom | Add a domain · remove one (refused while it has active accounts, with Remove anyway to force it). See [Handle domains](handle-domains.md). |
 | Invite codes | Every code, newest first, one per row: uses left out of its total, when it was made, who made it and for whom, who used it, and whether it's active, disabled or used up | Create codes (count, uses, for an account) · copy a code, or a usable code's migrate or sign-up link · disable one code, or select several and disable them together. |
 | Rate limits | Each bucket's busiest key, 429s in the last minute and 15 minutes, a 429/s chart, top keys, recent 429s by route, and each node's applied config version | Change a bucket's points, window or on/off · add routes · add IP, CIDR or DID overrides (exempt or a custom limit) · a global off switch. Changes apply to every node within seconds and are kept, with your name, in the last 50 changes. See [Rate limits](rate-limits.md#changing-limits-live). |
 | Relays | The relays asked to crawl this PDS (`--crawlers`, or a list stored from here), each one's last ask and result, and the minimum interval | Add or remove relays, reset to the flag's list, change the interval, request a crawl now · click a relay to copy it. See [Relays and crawling](relays-and-crawling.md#crawl-requests). |
@@ -87,7 +88,7 @@ cluster, and account pages are routed to each account's owner.
 
 The rate-limit config lives in the bucket (`config/ratelimits.json`), so it survives restarts and
 every node reads the same one. `{}` means the built-in defaults. The relay list lives next to it in
-`config/crawlers.json`.
+`config/crawlers.json`, and the added handle domains in `config/handle-domains.json`.
 
 Each node serves its own firehose subscribers, so the Firehose page calls
 `vlpds.admin.listFirehoseSubscribers` on the node you opened and that node asks its peers over the
@@ -135,7 +136,8 @@ first, and refuse to run off a terminal without `--yes`.
 | Group | Commands |
 |---|---|
 | Accounts (`pdsadmin account …`) | `account list [--email PREFIX]`, `create EMAIL HANDLE`, `delete DID`, `takedown DID [--ref R]`, `untakedown DID`, `reset-password DID`, `info DID` |
-| Invites and relays | `create-invite-code [--uses N] [--count N] [--for-account DID]`, `request-crawl [RELAY,…]` |
+| Invites and relays | `create-invite-code [--uses N] [--count N] [--for-account DID] [--handle-domain D]`, `request-crawl [RELAY,…]` |
+| Handle domains | `handle-domain list`, `handle-domain add DOMAIN`, `handle-domain remove DOMAIN [--force]` |
 | Identity | `publish-identity [DID…] [--file F]`, `rotate-keys [DID…] [--generate]`, `rotate-plc-keys`, `ensure-recovery-key` |
 | Repos | `check-repo DID`, `rebuild-repo DID [--dry-run]` |
 | Secrets | `rewrap-secrets [--dry-run] [--check-versions]` |

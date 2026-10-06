@@ -323,6 +323,13 @@ vlpds_acme_email: ""
 #               request is checked against /tls-check instead: unknown
 #               handles get an empty 404 and never reach vlpds.
 vlpds_caddy_wildcard_dns: ""
+# cloudflare: more handle domains to hold a wildcard certificate for, one
+# `*.<domain>` site each (no leading dot). vlpds serves handles under a domain
+# once it's added at runtime (`vlpds admin handle-domain add`, or the
+# console's Handle domains page); this list only gets Caddy its certificate,
+# so the DNS token must control these zones too. The on-demand mode ("")
+# needs nothing here: any host whose DNS points at the node is asked about.
+vlpds_extra_handle_domains: []
 # cloudflare: an API token with Zone:Zone:Read + Zone:DNS:Edit on the handle
 # domain's zone only (a secret). Caddy gets it as the env var CF_API_TOKEN.
 vlpds_cloudflare_dns_token: ""

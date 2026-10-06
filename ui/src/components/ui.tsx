@@ -193,6 +193,30 @@ export function Field({ label, hint, action, children }: { label: string; hint?:
   )
 }
 
+/** The domain after a handle input in an `.affix`: plain text when the server serves one domain, a picker when it serves several. */
+export function DomainAffix({
+  domains,
+  value,
+  onChange,
+  placeholder = '…',
+}: {
+  domains: string[]
+  value: string
+  onChange: (d: string) => void
+  placeholder?: string
+}) {
+  if (domains.length <= 1) return <span className="mono">{domains[0] || placeholder}</span>
+  return (
+    <select className="mono" aria-label="Handle domain" value={value} onChange={(e) => onChange(e.target.value)}>
+      {domains.map((d) => (
+        <option key={d} value={d}>
+          {d}
+        </option>
+      ))}
+    </select>
+  )
+}
+
 export function Status({ kind, children }: { kind: 'ok' | 'warn' | 'bad' | 'idle'; children: ReactNode }) {
   return <span className={`status ${kind}`}>{children}</span>
 }

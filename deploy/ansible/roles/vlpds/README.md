@@ -159,6 +159,20 @@ With wildcard handle certificates, `vlpds_caddy_hostname_dns01: true` makes
 Caddy get the hostname's certificate by DNS-01 as well, so a node can hold it
 before DNS points at it.
 
+### More handle domains
+
+vlpds serves handles under more domains than `vlpds_handle_domain` once an
+operator adds them at runtime (`vlpds admin handle-domain add <domain>` or the
+console's Handle domains page). Ansible doesn't push that set. It only gets
+Caddy the certificates:
+
+- On-demand mode (`vlpds_caddy_wildcard_dns: ""`) needs only DNS. The site
+  catches every other name and asks `/tls-check` before issuing, so an `A`
+  record for `*.<domain>` pointing at the node is enough.
+- Wildcard mode (`cloudflare`) needs each domain in
+  `vlpds_extra_handle_domains`, which renders one `*.<domain>` site per
+  domain. The DNS-01 token must have Zone:DNS:Edit on those zones too.
+
 ## Monitoring
 
 - **Metrics**: `roles/alloy/templates/vlpds-monitoring.alloy.j2` scrapes

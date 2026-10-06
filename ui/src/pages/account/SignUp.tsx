@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from 'react'
-import { ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
+import { DomainAffix, ErrorNotice, Field, Notice, Spinner, Topbar } from '../../components/ui'
+import { domainOf } from '../../lib/domains'
 import { useLoad } from '../../lib/hooks'
 import { Link, navigate, useSearch } from '../../lib/router'
 import { call, setSession } from '../../lib/xrpc'
@@ -18,16 +19,21 @@ export function SignUp() {
   const [invite, setInvite] = useState(q.get('invite') ?? '')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
-  const domain = d.data?.availableUserDomains[0] ?? ''
+  const [picked, setPicked] = useState<string>()
+  const domains = d.data?.availableUserDomains ?? []
+  // ?domain=at.example.org: an operator's sign-up link for one of the domains
+  const linked = `.${(q.get('domain') ?? '').trim().toLowerCase().replace(/^[@.]+/, '')}`
+  const domain = picked ?? (domains.includes(linked) ? linked : (domains[0] ?? ''))
   const inviteRequired = !!d.data?.inviteCodeRequired
   const label = handle.trim().replace(/^@/, '').toLowerCase()
+  const under = domainOf(label, domains)
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
     setBusy(true)
     setError(undefined)
     try {
-      const full = domain && label.endsWith(domain) ? label : `${label}${domain}`
+      const full = under ? label : `${label}${domain}`
       const out = await call('com.atproto.server.createAccount', {
         body: { handle: full, email: email.trim(), password, inviteCode: invite.trim() || undefined },
       })
@@ -56,7 +62,11 @@ export function SignUp() {
                   <input
                     type="text"
                     value={handle}
-                    onChange={(e) => setHandle(e.target.value)}
+                    onChange={(e) => {
+                      setHandle(e.target.value)
+                      const u = domainOf(e.target.value.trim().replace(/^@/, '').toLowerCase(), domains)
+                      if (u) setPicked(u)
+                    }}
                     autoComplete="username"
                     autoCapitalize="none"
                     spellCheck={false}
@@ -64,7 +74,14 @@ export function SignUp() {
                     required
                     autoFocus
                   />
-                  <span className="mono">{domain || '…'}</span>
+                  <DomainAffix
+                    domains={domains}
+                    value={domain}
+                    onChange={(x) => {
+                      setPicked(x)
+                      if (under) setHandle(label.slice(0, -under.length))
+                    }}
+                  />
                 </span>
               </Field>
               <Field label="Email" hint="For password resets and account deletion codes.">

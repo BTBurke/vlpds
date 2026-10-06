@@ -56,7 +56,14 @@ pub enum Cmd {
         /// The account the codes belong to (default: admin).
         #[arg(long)]
         for_account: Option<String>,
+        /// Only for handles under this served domain.
+        #[arg(long)]
+        handle_domain: Option<String>,
     },
+    /// The domains handles are given out under: the primary
+    /// (--handle-domain) and any added at runtime, for the whole cluster.
+    #[command(subcommand)]
+    HandleDomain(HandleDomainCmd),
     /// Ask relays to crawl this PDS (pdsadmin request-crawl). Relays:
     /// hostnames or URLs, comma-separated (default: the node's --crawlers).
     RequestCrawl {
@@ -170,6 +177,21 @@ pub enum ClusterCmd {
 }
 
 #[derive(clap::Subcommand, Debug)]
+pub enum HandleDomainCmd {
+    /// Every served domain with its active accounts.
+    List,
+    /// Serve handles under another domain (DNS for it must point here).
+    Add { domain: String },
+    /// Stop serving a domain. Refused while active accounts have handles
+    /// under it, unless forced: their handles then stop resolving.
+    Remove {
+        domain: String,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
 pub enum AccountCmd {
     /// Every account: handle, email, DID.
     List {
@@ -268,6 +290,34 @@ impl Client {
     }
 }
 
+async fn handle_domain(c: &Client, cmd: HandleDomainCmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
+    let r = match cmd {
+        HandleDomainCmd::List => c.get("vlpds.admin.listHandleDomains", &[]).await?,
+        HandleDomainCmd::Add { domain } => c.post("vlpds.admin.addHandleDomain", &json!({"domain": domain})).await?,
+        HandleDomainCmd::Remove { domain, force } => {
+            let r = c.post("vlpds.admin.removeHandleDomain", &json!({"domain": domain, "force": force})).await?;
+            if opts.json {
+                return pretty(out, &r);
+            }
+            writeln!(out, "removed {} ({} active accounts under it)", s(&r["domain"]), s(&r["accounts"]))?;
+            return Ok(());
+        }
+    };
+    if opts.json {
+        return pretty(out, &r);
+    }
+    let mut rows = vec![vec!["DOMAIN".to_string(), "ACCOUNTS".into(), "ADDED".into()]];
+    for d in r["domains"].as_array().into_iter().flatten() {
+        let added = if d["primary"] == json!(true) { "primary (--handle-domain)".into() } else { s(&d["addedAt"]) };
+        rows.push(vec![s(&d["domain"]), s(&d["accounts"]), added]);
+    }
+    write!(out, "{}", table(&rows))?;
+    if r["countsPartial"] == json!(true) {
+        writeln!(out, "(some nodes or shards didn't answer: counts may be low)")?;
+    }
+    Ok(())
+}
+
 /// Like pdsadmin's.
 fn generate_password() -> String {
     use rand::Rng;
@@ -355,12 +405,15 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
         ),
         Cmd::ReshardAbort => pretty(out, &c.post("vlpds.admin.abortReshard", &json!({})).await?),
         Cmd::Account(a) => account(&c, a, opts, out).await,
-        Cmd::CreateInviteCode { uses, count, for_account } => {
+        Cmd::CreateInviteCode { uses, count, for_account, handle_domain } => {
             let mut codes = Vec::new();
             for _ in 0..count.max(1) {
                 let mut body = json!({"useCount": uses});
                 if let Some(a) = &for_account {
                     body["forAccount"] = json!(a);
+                }
+                if let Some(d) = &handle_domain {
+                    body["handleDomain"] = json!(d);
                 }
                 let r = c.post("com.atproto.server.createInviteCode", &body).await?;
                 codes.push(r["code"].as_str().context("no code in reply")?.to_string());
@@ -373,6 +426,7 @@ pub async fn run(cmd: Cmd, opts: &Opts, out: &mut dyn Write) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::HandleDomain(h) => handle_domain(&c, h, opts, out).await,
         Cmd::RequestCrawl { relays } => {
             let r = c.post("vlpds.admin.requestCrawl", &json!({"relays": relays})).await?;
             let results = r["results"].as_array().cloned().unwrap_or_default();

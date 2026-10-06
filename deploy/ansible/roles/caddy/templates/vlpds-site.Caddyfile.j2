@@ -54,10 +54,11 @@
 	import vlpds_proxy
 }
 {% if _wildcard %}
+{% for _domain in [vlpds_handle_domain] + vlpds_extra_handle_domains %}
 
-# Handles: <name>.{{ vlpds_handle_domain }}, one wildcard certificate (ACME
+# Handles: <name>.{{ _domain }}, one wildcard certificate (ACME
 # DNS-01 through Cloudflare; token from the container's environment).
-*.{{ vlpds_handle_domain }} {
+*.{{ _domain }} {
 	tls {
 		dns cloudflare {env.CF_API_TOKEN}
 		resolvers {{ vlpds_caddy_dns_resolvers | join(' ') }}
@@ -80,11 +81,22 @@
 	}
 	import vlpds_proxy
 }
+{% endfor %}
 {% else %}
 
 # Handles: <name>.{{ vlpds_handle_domain }}/.well-known/atproto-did (and anything
 # else clients send there).
 *.{{ vlpds_handle_domain }} {
+	tls {
+		on_demand
+	}
+	import vlpds_proxy
+}
+
+# Handles under the domains added at runtime (vlpds admin handle-domain add):
+# any other name gets a certificate only when vlpds' /tls-check says it's an
+# active local handle, so DNS is all a new domain needs.
+https:// {
 	tls {
 		on_demand
 	}

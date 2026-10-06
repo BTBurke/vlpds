@@ -1669,6 +1669,8 @@ async fn authorize_sign_in(
 #[derive(Default)]
 struct SignupValues {
     handle: String,
+    /// Empty: the primary.
+    domain: String,
     email: String,
     invite_code: String,
 }
@@ -1676,11 +1678,14 @@ struct SignupValues {
 fn signup_page(app: &App, flow: &Flow, v: &SignupValues, error: Option<&str>, status: StatusCode) -> Response {
     let csrf = flow.csrf(app);
     let name = server_name(app);
+    let domains = app.handle_domains.names();
+    let domain = domains.iter().find(|d| **d == v.domain).unwrap_or(&domains[0]);
     let body = ui::signup(
         &flow.ctx(&csrf, &name),
         &ui::SignupForm {
             handle: &v.handle,
-            domain: &app.handle_domain,
+            domain,
+            domains: &domains,
             email: &v.email,
             invite_code: &v.invite_code,
             invite_required: app.config.invite_required,
@@ -1707,6 +1712,7 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
     let field = |k: &str| f.get(k).map(|v| v.trim().to_string()).unwrap_or_default();
     let v = SignupValues {
         handle: field("handle").trim_start_matches('@').to_ascii_lowercase(),
+        domain: field("domain").to_ascii_lowercase(),
         email: field("email"),
         invite_code: field("invite_code"),
     };
@@ -1714,9 +1720,14 @@ async fn authorize_sign_up(State(app): AppState, headers: HeaderMap, body: AxByt
         let msg = "Too many sign-up attempts. Please try again later.";
         return signup_page(&app, &flow, &v, Some(msg), StatusCode::TOO_MANY_REQUESTS);
     }
-    // the form asks for the first label; a full handle under our domain is fine too
-    let suffix = format!(".{}", app.handle_domain);
-    let handle = if v.handle.ends_with(&suffix) { v.handle.clone() } else { format!("{}{suffix}", v.handle) };
+    // the form asks for the first label; a full handle under a served domain is fine too
+    let handle = match app.handle_domains.under(&v.handle) {
+        Some(_) => v.handle.clone(),
+        None => {
+            let domain = app.handle_domains.served(&v.domain).filter(|d| *d == v.domain);
+            format!("{}.{}", v.handle, domain.as_deref().unwrap_or(app.handle_domains.primary()))
+        }
+    };
     let inp = super::server::CreateAccountIn {
         handle,
         email: Some(v.email.clone()),

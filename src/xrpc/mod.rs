@@ -14,6 +14,7 @@ mod email2fa;
 pub mod extract;
 mod feature_level;
 pub mod firehose_subs;
+mod handle_domains;
 mod identity;
 pub mod import_budget;
 pub mod import_stream;
@@ -104,7 +105,8 @@ pub struct App {
     pub firehose: Arc<Firehose>,
     pub tids: TidClock,
     pub public_url: String,
-    pub handle_domain: String,
+    /// `--handle-domain` and the domains added at runtime.
+    pub handle_domains: Arc<crate::handle_domains::HandleDomains>,
     /// Writes beyond this many in flight get a fast 503. A write's permit
     /// travels with its queued message, so it is held until its worker takes
     /// it, even if the handler is gone.
@@ -333,6 +335,7 @@ pub fn router(app: Arc<App>) -> Router {
                 .merge(admin::routes())
                 .merge(admin_tools::routes())
                 .merge(crawlers::routes())
+                .merge(handle_domains::routes())
                 .merge(space_ops::routes())
                 .merge(match app.config.spaces {
                     true => space::routes()
@@ -365,6 +368,7 @@ pub fn router(app: Arc<App>) -> Router {
         .fallback(proxy::fallback);
     ratelimits::start(&app);
     crawlers::start(&app);
+    handle_domains::start(&app);
     let r = oauth::with_dpop_layer(r, &app);
     let r = if app.config.rate_limits_enabled {
         let limiter = app.ratelimit.clone();

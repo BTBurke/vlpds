@@ -175,6 +175,9 @@ pub(super) struct InviteCode {
     pub created_at: String,
     #[serde(default)]
     pub uses: Vec<InviteUse>,
+    /// vlpds: only for handles under this served domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle_domain: Option<String>,
 }
 
 fn invite_routing(code: &str) -> String {
@@ -195,6 +198,7 @@ pub(super) fn fixture_rows(did: &str) -> Vec<super::private_rows::PrivateRow> {
             used_by: "did:plc:invitee000000000000000".into(),
             used_at: "2026-10-01T00:01:00.000Z".into(),
         }],
+        handle_domain: None,
     };
     vec![
         (invite_routing(code), "c".into(), super::private_rows::enc(&inv)),
@@ -254,7 +258,8 @@ async fn update_invite(app: &App, code: &str, mut f: impl FnMut(&mut InviteCode)
 }
 
 /// `account`: a DID or "admin". `created_by`: "admin", or the account itself
-/// for codes earned with `--invite-interval`.
+/// for codes earned with `--invite-interval`. `handle_domain`: a served
+/// domain the codes are limited to.
 pub(super) async fn create_invites(
     app: &App,
     account: &str,
@@ -262,7 +267,13 @@ pub(super) async fn create_invites(
     use_count: i64,
     disabled: bool,
     created_by: &str,
+    handle_domain: Option<&str>,
 ) -> XResult<()> {
+    if let Some(d) = handle_domain {
+        if !app.handle_domains.names().iter().any(|n| n == d) {
+            return Err(invalid_request(format!("{d} is not a served handle domain")));
+        }
+    }
     let now = crate::events::now_rfc3339();
     for code in codes {
         let inv = InviteCode {
@@ -273,6 +284,7 @@ pub(super) async fn create_invites(
             created_by: created_by.into(),
             created_at: now.clone(),
             uses: Vec::new(),
+            handle_domain: handle_domain.map(str::to_string),
         };
         put_invite(app, &inv).await?;
     }
@@ -308,11 +320,16 @@ pub(super) struct InviteClaim {
 /// create of `invite-use/{code}/{slot}`, so concurrent signups on any node
 /// can't over-use it. Released ([`release_invite_use`]) if account creation
 /// then fails, else recorded ([`record_invite_use`]).
-pub(super) async fn claim_invite_use(app: &App, code: &str, did: &str) -> XResult<InviteClaim> {
+pub(super) async fn claim_invite_use(app: &App, code: &str, did: &str, handle: &str) -> XResult<InviteClaim> {
     let unavailable = || XrpcError::bad("InvalidInviteCode", "Provided invite code not available");
     let inv = get_invite(app, code).await?.ok_or_else(unavailable)?;
     if inv.disabled || inv.available <= inv.uses.len() as i64 {
         return Err(unavailable());
+    }
+    if let Some(d) = &inv.handle_domain {
+        if app.handle_domains.under(handle).is_none_or(|(_, under)| under != *d) {
+            return Err(XrpcError::bad("InvalidInviteCode", format!("This invite code is for handles under .{d}")));
+        }
     }
     if inv.for_account.starts_with("did:") {
         if let Ok(a) = app.account(&inv.for_account).await {
@@ -651,7 +668,7 @@ async fn update_account_handle(
     let handle = normalize_handle(&inp.handle)?;
     // reference allowAnyValid: no slur or reserved-name checks, but a
     // service-domain handle still has to be one 3-18 char label
-    if handle.ends_with(&format!(".{}", app.handle_domain)) {
+    if app.handle_domains.under(&handle).is_some() {
         super::server::ensure_service_handle(&app, &handle, true)?;
     }
     ensure_account(&app, &inp.did).await?;

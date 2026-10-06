@@ -218,6 +218,14 @@ const SHARED_SUFFIXES: &[&str] = &[
     "workers.dev",
 ];
 
+/// A multi-tenant platform's suffix, or a ccTLD's `co.`-style second
+/// level: names under it belong to different owners.
+pub fn is_public_suffix(name: &str) -> bool {
+    let labels: Vec<&str> = name.split('.').collect();
+    let n = labels.len();
+    SHARED_SUFFIXES.contains(&name) || (n == 2 && labels[1].len() == 2 && SECOND_LEVELS.contains(&labels[0]))
+}
+
 /// What sends to `endpoint` share a host cap by: its registrable domain
 /// (approximately: the last two labels, three under a ccTLD's `co.`-style
 /// second level, one past a [`SHARED_SUFFIXES`] platform), an IPv4
