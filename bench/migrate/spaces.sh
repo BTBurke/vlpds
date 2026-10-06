@@ -19,6 +19,16 @@ export PLC_PORT MAIL_PORT REF_SPACES_PORT COMPOSE_PROFILES=spaces
 export VLPDS="http://127.0.0.1:$VLPDS_PORT" SRC_VLPDS="http://localhost:$SRC_PORT" REF_SPACES="http://localhost:$REF_SPACES_PORT" PLC="http://127.0.0.1:$PLC_PORT" MAILPIT="http://127.0.0.1:$MAIL_PORT"
 project=vlpds-migrate-spaces
 
+# The published reference image is amd64 only: on arm64 (Apple Silicon) use the
+# native build of the same pin that bench/spaces/refpds.sh makes, building it
+# the first time.
+if [ -z "${REF_SPACES_IMAGE:-}" ] && [[ "$(uname -m)" == arm64 || "$(uname -m)" == aarch64 ]]; then
+  "$root/bench/spaces/refpds.sh"
+  pin="$(sed -n 's/^PIN=//p' "$root/bench/spaces/refpds.sh")"
+  REF_SPACES_IMAGE="vlpds-spaces-refpds:${pin:0:8}"
+fi
+export REF_SPACES_IMAGE="${REF_SPACES_IMAGE:-ghcr.io/bluesky-social/atproto:pds-spaces-alpha}"
+
 for p in $PLC_PORT $MAIL_PORT $REF_SPACES_PORT $VLPDS_PORT $SRC_PORT; do
   if lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1; then
     echo "port $p is in use (an earlier run? docker compose -p $project down -v)" >&2

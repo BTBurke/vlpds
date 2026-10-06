@@ -444,7 +444,7 @@ async function verify(a) {
 
 mkdirSync(OUT, { recursive: true })
 const md = await fetch(`${VLPDS}/oauth/client-metadata.json`).then((r) => r.json())
-const uiScope = /CLIENT_SCOPE = '([^']+)'/.exec(readFileSync(new URL('../../ui/src/lib/oauth.ts', import.meta.url), 'utf8'))?.[1]
+const uiScope = /CLIENT_SCOPE =\s*'([^']+)'/.exec(readFileSync(new URL('../../ui/src/lib/oauth.ts', import.meta.url), 'utf8'))?.[1]
 check(md.scope === uiScope, 'the served client metadata lists the UI client scope', `${md.scope} vs ${uiScope}`)
 check(
   JSON.stringify(md.redirect_uris) === JSON.stringify([`${VLPDS}/migrate/oauth/callback`, `${VLPDS}/account/oauth/callback`]) && md.token_endpoint_auth_method === 'none' && md.dpop_bound_access_tokens === true,
