@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
-import { call, admin } from '../../lib/xrpc'
+import { listAccounts } from '../../lib/adminApi'
+import { withAdmin } from '../../lib/console/adminAdapter'
 import { navigate } from '../../lib/router'
+import { openPanel } from './nav'
 import { Kbd } from './kit'
 
 // ⌘K. Items come from providers: the shell's (sections, actions, nodes, lookups) and any a
@@ -74,25 +76,24 @@ export const lookupProvider: PalProvider = {
   items: (q) => {
     const out: PalItem[] = []
     if (q.startsWith('did:'))
-      out.push({ group: 'Look up', glyph: '⌕', title: `Open account ${q.length > 40 ? `${q.slice(0, 40)}…` : q}`, desc: 'getAccountInfo', run: () => navigate(`/admin/accounts/${encodeURIComponent(q)}`) })
+      out.push({ group: 'Look up', glyph: '⌕', title: `Open account ${q.length > 40 ? `${q.slice(0, 40)}…` : q}`, desc: 'getAccountInfo', run: () => openPanel('account', q) })
     if (/^(at:\/\/|https:\/\/bsky\.app\/)/.test(q))
       out.push({ group: 'Look up', glyph: '⌕', title: `Look up “${q.length > 48 ? `${q.slice(0, 48)}…` : q}”`, desc: 'in Moderation', run: () => navigate(`/admin/moderation?q=${encodeURIComponent(q)}`) })
     return out
   },
+  // accounts on this PDS by handle prefix, email prefix or DID
   async: async (q, signal) => {
     const v = q.replace(/^@/, '')
-    if (v.length < 3 || /\s/.test(v) || v.startsWith('did:') || v.includes('://')) return []
-    if (v.includes('@')) {
-      const r: { accounts: { did: string; handle: string; email?: string }[] } = await admin('com.atproto.admin.searchAccounts', { params: { email: v, limit: 8 }, signal })
-      return r.accounts.map((a) => ({ group: 'Accounts', glyph: '@', title: `@${a.handle}`, desc: a.email, hay: a.did, run: () => navigate(`/admin/accounts/${encodeURIComponent(a.did)}`) }))
-    }
-    if (!v.includes('.')) return []
-    try {
-      const r: { did: string } = await call('com.atproto.identity.resolveHandle', { params: { handle: v }, signal })
-      return [{ group: 'Accounts', glyph: '@', title: `@${v}`, desc: r.did, hay: r.did, run: () => navigate(`/admin/accounts/${encodeURIComponent(r.did)}`) }]
-    } catch {
-      return []
-    }
+    if (v.length < 2 || /\s/.test(v) || v.includes('://')) return []
+    const r = await withAdmin((c) => listAccounts(c, { q: v, limit: 8 }, signal))
+    return r.accounts.map((a) => ({
+      group: 'Accounts',
+      glyph: '@',
+      title: `@${a.handle}`,
+      desc: `${a.email ?? a.did}${a.status === 'active' ? '' : ` · ${a.status}`}`,
+      hay: `${a.did} ${a.email ?? ''} ${a.handle}`,
+      run: () => openPanel('account', a.did),
+    }))
   },
 }
 

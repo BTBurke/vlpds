@@ -8,13 +8,11 @@ import { findEvent, useFirehose, useHandle } from '../../lib/console/firehose'
 import { clock, dur, fmtBytes, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural, seqMillis, seqWriter } from '../../lib/console/fmt'
 import { col, last, nodeGauges, nodePoints, useMetrics } from '../../lib/console/metrics'
 import { isSlow, subscribersPoll } from '../../lib/console/polls'
-import { Link } from '../../lib/router'
 import { LeaseCell, NodeTag, ShardMap } from './clusterUi'
 
 // Slide-over / full-page details for the cluster sections: node, shard, firehose event,
 // firehose connection. Registered on import (AdminApp imports this file).
 
-const accountPath = (did: string) => `/admin/accounts/${encodeURIComponent(did)}`
 
 registerDetail('node', {
   kind: 'Node',
@@ -194,7 +192,7 @@ registerDetail('event', {
           <Sec title="Repo" digest={handle ? `@${handle}` : e.did} open>
             <KV
               rows={[
-                ['account', <Link to={accountPath(e.did)}>{handle ? `@${handle}` : e.did}</Link>],
+                ['account', <button type="button" className="cx-linklike" onClick={() => openPanel('account', e.did)}>{handle ? `@${handle}` : e.did}</button>],
                 ['DID', <Copy text={e.did} />],
                 ...(e.rev ? [['rev', <span className="mono">{e.rev}</span>] as [string, React.ReactNode]] : []),
                 ...(e.commit ? [['commit', <Copy text={e.commit} />] as [string, React.ReactNode]] : []),

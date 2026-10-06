@@ -104,7 +104,7 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 | Nodes & shards | `/admin/nodes` | Built. Old page at `/admin/cluster`, charts at `/admin/metrics` |
 | Object store | `/admin/storage` | Placeholder |
 | Firehose & relays | `/admin/firehose` | Legacy (`Firehose` + `Relays`). Detail kinds `event` and `sub` exist |
-| Accounts | `/admin/accounts` | Legacy, plus `/admin/accounts/:did` |
+| Accounts | `/admin/accounts` | Built. Detail kind `account` (`accountDetail.tsx`, actions in `accountActions.tsx`), full page at `/admin/accounts/account/<did>`; the old `/admin/accounts/<did>` still lands there |
 | Moderation | `/admin/moderation` | Legacy, plus `/admin/moderation/cases/:id` |
 | Limits & lockouts | `/admin/limits` | Legacy (`RateLimits`), alias `/admin/ratelimits` |
 | Domains & invites | `/admin/domains` | Legacy (`HandleDomains` + `Invites`) |
