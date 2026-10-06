@@ -226,3 +226,19 @@ async fn lockouts_survive_a_restart() {
         assert!(p.db.get(vlpds::state::lockout_key(&a.did, f)).await.unwrap().is_none(), "{f} index entry cleared");
     }
 }
+
+/// A passkey is a second factor for the no-2FA count: registering one takes
+/// the account out of it, removing the last puts it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn passkeys_move_the_no2fa_count() {
+    use crate::common::webauthn::{register_passkey, SoftKey};
+    let s = TestServer::spawn().await;
+    let a = s.create_account("pkc").await;
+    let before = counts(&s).await["no2fa"].as_i64().unwrap();
+    let mut k = SoftKey::new(&s.url);
+    register_passkey(&s, &a, &mut k, "phone").await;
+    assert_eq!(counts(&s).await["no2fa"].as_i64().unwrap(), before - 1);
+    let rm = json!({"id": k.id_b64(), "password": a.password});
+    s.xrpc.post("vlpds.server.removePasskey", &rm, &a.auth()).await.ok();
+    assert_eq!(counts(&s).await["no2fa"].as_i64().unwrap(), before);
+}

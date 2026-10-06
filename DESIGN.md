@@ -233,8 +233,12 @@ swappable.
     follows / blocks of that subject: the backlink index createRecord
     prunes duplicates with (see "Backlinks").
   - `S/{did}` → the repo's counts for checkAccountStatus (records, MST
-    nodes, distinct referenced blobs; 3 × u64), a stored mut of each commit
-    that changes them (see "checkAccountStatus counts").
+    nodes, distinct referenced blobs) and the console's repo bytes (record
+    blocks, node blocks); 5 × u64, or 3 in a row from before bytes were
+    counted, which the repo's next load counts. A stored mut of each commit
+    that changes the counts (see "checkAccountStatus counts"); the bytes are
+    kept close without reading what a commit replaces
+    (`state::RepoBytes::commit`) and made exact by `vlpds.admin.recountRepo`.
   - `a/{did}`, `n/{handle}` → account. The account row carries the repo
     signing key only wrapped under the KEK (`Account::wrapped_signing_key`,
     bound to the DID) next to its public key (`signing_pubkey`, which DID
@@ -243,6 +247,10 @@ swappable.
   - `G/{did}` → `ImportState`: a staged import (generation, driver nonce,
     reserved rev) and the generations left to sweep; absent otherwise (see
     "Staged imports").
+  - `L/{did}\0{factor}` → locked until (u64 BE seconds): the lockout index
+    `vlpds.admin.listLockouts` scans, put or deleted by the conditional
+    write of the account's lockout row (`mfa`, `eotp_lock`) in the same
+    batch (`xrpc::mfa::lockout_index`).
   - `D/{did}` → the account's `deleteAfter`, put or deleted with every
     account row its worker writes and left by the repo delete, so the
     owner's scheduled-deletion sweep finds due accounts (and unfinished
@@ -4820,7 +4828,10 @@ the next count. Now the totals are kept exact as part of the state:
 - **One row per slot**, `0x01 ‖ slot ‖ T/`, holding the slot's account
   count per status and, per UTC day, how many of its repos have their
   latest commit on that day (the last 32 days, zigzag varints, ~100 bytes
-  when a slot has activity on every day). Since the rows are slot-major,
+  when a slot has activity on every day), plus the console's filter counts
+  (email unconfirmed; active with no second factor on the account row),
+  which are flags of the account row moved by the same deltas.
+ Since the rows are slot-major,
   they split, merge and move with their slots like every other key. A
   per-shard row would need splitting and merging logic, and no per-shard
   summary can be divided at a split point.

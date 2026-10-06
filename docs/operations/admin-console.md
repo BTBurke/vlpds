@@ -123,16 +123,19 @@ another one over peer mTLS.
 
 | Method | Input | Answer |
 |---|---|---|
-| `listAccounts` (GET) | `q?` (handle prefix, email prefix or DID), `filter?` (`all`, `attention`, `deactivated`, `takendown`, `no2fa`, `unconfirmed`), `sort?` (`recent` or `slot`), `cursor?`, `limit?` (1-200, default 50) | `accounts`, each with its status, shard and node, email and whether it's confirmed, second factors, records, MST nodes, blobs and blob bytes from the repo's kept counts, head rev and `lastCommitAt` · `cursor` while there's more · `missingShards` like `searchAccounts` |
+| `listAccounts` (GET) | `q?` (handle prefix, email prefix or DID), `filter?` (`all`, `attention`, `deactivated`, `takendown`, `no2fa`, `unconfirmed`), `sort?` (`recent` or `slot`), `cursor?`, `limit?` (1-200, default 50) | `accounts`, each with its status, shard and node, email and whether it's confirmed, second factors, records, MST nodes, blobs and blob bytes from the repo's kept counts, `repoBytes` (`recordBytes` + `mstBytes`, see below), head rev and `lastCommitAt` · `counts`: `total`, `active`, `deactivated`, `takendown`, `suspended`, `unconfirmed` and `no2fa` over every account, with `approximate` while a shard's totals are loading, a node didn't answer or a shard has no owner · `cursor` while there's more · `missingShards` like `searchAccounts` |
 | `getAccountSecurity` (GET) | `did` | Passkeys (name, created, last used, synced, suspect), TOTP, email codes, recovery codes left, wrong-code counts and locks, trusted browsers, app passwords, OAuth-only and app-password switches, recent sign-ins |
-| `listSessions` (GET) | `did` | `sessions`: OAuth grants (client, scope, device, signed in, last refresh) and password or app-password sessions (one per session family). Each has an `id` for `revokeSessions` |
+| `getAccountKeys` (GET) | `did`, `refresh?` | The account's signing key and any pending one · the DID document's `verificationMethods` (from the resolver's cache, refetched with `refresh=true`), each with `matchesAccount` · for a did:plc, the directory's `rotationKeys`, each with its role (`server` for this PDS's current or retired key, `operator_recovery`, `other`). The rotation keys cost one request to the directory, so only an operator opening this asks |
+| `createAccount` | `{handle, email, password?, reason?}` | Creates an account as `com.atproto.server.createAccount` does (the same checks, claims and DID registration) with no invite code needed. Without `password` one is generated and returned once as `password`. Audited as `account.create`, without the password |
+| `recountRepo` | `{did}` | Counts the repo's records, nodes, blobs and bytes from a snapshot and replaces its kept counts, if no commit landed since (else `InvalidSwap`: run it again). Reads the whole repo, as `checkRepo` does |
+| `listSessions` (GET) | `did` | `sessions`: OAuth grants (client, scope, device, signed in, last refresh) and password or app-password sessions (one per session family), each with `ip` (the client address at its latest refresh) and `signedInIp` (at sign-in), as the rate limits resolve it behind trusted proxies. Each has an `id` for `revokeSessions` |
 | `revokeSessions` | `{did, ids?, reason?}` | Without `ids`, every session, OAuth grant, device sign-in and trusted browser, as a password change does. App passwords keep working. Audited as `sessions.revoke` |
 | `revokeAppPassword` | `{did, name, reason?}` | The password and the sessions it signed in. Audited as `app_password.revoke` |
 | `listRepoOps` (GET) | `did`, `limit?` (1-100, default 25) | The account's `#commit` (with its ops), `#sync`, `#identity` and `#account` events, newest first, from the firehose ring in memory. `reachesBackTo` says how far back it looked and `ringExhausted` that nothing older is in memory |
 | `getNodeMetrics` (GET) | `since?` | Per node: commits, ops, HTTP, 5xx, 429s, firehose events and bytes, repo loads, class A and B object-store requests per second, CPU cores busy, memory, subscribers, cached repos, mail queue, and commit, segment PUT and firehose emit p50/p99. `series` holds one point per 2 s for the last 3 minutes (only those after `since`), `latest` the last 10 s · `storeComponents`: class A and B per second by key component over the kept window (`storeWindowMs`), busiest first |
 | `listSegments` (GET) | `since?` (default the last 20 s) | Per node: its log, durable ordinal, watermark and its lag, and each segment's ordinal, seq range, entries against firehose events, bytes before and after compression, when it was sealed and when it was durable (null while its PUT is in flight) · the firehose's last emitted seq and min watermark |
 | `listMail` (GET) | `limit?` (default 100) | Every node's recent mail, newest first: purpose, the recipient's domain only, status (`queued`, `retrying`, `sent`, `failed`, `dropped`, `suppressed`, `logged`), attempts, the provider's error with any address removed, and the budget that suppressed it · each node's queue depth |
-| `listLockouts` (GET) | | Accounts whose TOTP and recovery codes (`second_factor`) or email codes (`email_code`) are locked after wrong codes, with the count and when the lock ends |
+| `listLockouts` (GET) | | Accounts whose TOTP and recovery codes (`second_factor`) or email codes (`email_code`) are locked after wrong codes, with the count and when the lock ends, from the lockout index of every node's shards |
 | `clearLockout` | `{did, reason}` | Clears both locks and their counts. Audited as `lockout.clear`. The sign-in rate-limit buckets are separate: a DID override on the Rate limits page lifts those |
 | `getConfig` (GET) | | This node's flags, each with its source (`flag`, `env`, `default`, `unset`, or `file` for a secret set by its `-file` flag) and value · settings stored in the bucket (handle domains, rate-limit version, shard layout, feature level) · version and build rev |
 | `kickSubscriber` | `{conn}` | Closes that firehose connection on this node with reason `kicked`. The client can reconnect with its cursor |
@@ -146,13 +149,39 @@ What these never return:
   the outcome, and an error loses every word with an `@` in it.
 
 Each node keeps the last 1,024 segments it sealed, the last 200 mails and 3 minutes of metrics in
-memory, so none of this reads the bucket. A restart starts them empty. The lockout list is a hint
-kept by the node that set the lock, so after a restart a lock in force shows on the account's
-security panel but not in the list until the next wrong code. `listRepoOps` reads only the ring,
+memory, so none of this reads the bucket. A restart starts them empty. Lockouts are indexed in the
+shards (`L/{did}\0{factor}`, written in the same batch as the lock), so the list survives restarts
+and shard moves; an entry whose lock has run out is dropped the next time the list finds it.
+`listRepoOps` reads only the ring,
 so a quiet account's older events aren't there. The prefix sizes the Object store page could show
 would mean listing the bucket, so they aren't part of this API.
 
+### Repo bytes and filter counts
+
+`repoBytes` is the repo's record blocks plus its MST node blocks, leaves included: what a
+`getRepo` CAR carries, less the commit and the framing. It is not what the repo's rows take in
+the bucket. It rides in the repo's counts row (`S/`), which the commits that change the counts
+already write, so it costs no read and no extra write. A created record adds its exact size and
+a new node its own. The blocks a commit replaces aren't read, so a deleted record takes off the
+repo's mean record size, a replaced node the mean node size, and an update is taken to keep the
+record's size: close, not exact. `recountRepo` makes it exact again. A counts row written before
+bytes were counted has none (`repoBytes` is absent); the repo's next load counts them, a read of
+the whole repo once.
+
+The filter counts ride in each slot's account totals (crate::totals), moved by the same
+account changes that move the status counts: they are exact once a shard's totals have loaded.
+`unconfirmed` is accounts whose email isn't confirmed, `no2fa` active accounts with no second
+factor on their account row (TOTP, email codes or a passkey; the passkey count is written to the
+row with each passkey change). A totals row written before they were counted is counted from the
+slot's account rows when the shard opens. `attention` has no count: it depends on blob quotas and
+lockouts, which the totals don't follow.
+
+`listCases` takes `did` and `subject?` (a record's at:// URI or a blob's CID) to list the cases
+about one account or one of its records. It filters every case: cases are few. Past a few
+thousand, a subject index written with each case would replace the scan.
+
 ## Admin CLI
+
 
 ```diagram
 caption: "`vlpds admin` is the same binary in client mode. Per-account calls go to any node and are routed to the owner. Per-node maintenance runs on every node `getClusterStatus` lists, and shards that moved mid-run are rerun on their new owner."
