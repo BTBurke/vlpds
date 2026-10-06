@@ -21,6 +21,7 @@
 //! S/{did}                 -> repo counts (`RepoStats`: checkAccountStatus)
 //! G/{did}                 -> `ImportState`: a staged import, generations left to sweep
 //! D/{did}                 -> the account's `deleteAfter` (crate::xrpc::scheduled_deletion)
+//! L/{did}\0{factor}       -> locked until, u64 BE secs: the lockout index (crate::xrpc::mfa)
 //!
 //! `{gen}` is the repo's generation (`Account::repo_gen`, LEB128): importRepo
 //! stages the new repo under a fresh one and moves the account to it in one
@@ -163,7 +164,14 @@ pub fn blob_ref_prefix(did: &str, gen: u64) -> Vec<u8> {
     gen_prefix(BLOB_REF_FAMILY, did, gen)
 }
 
+pub const LOCKOUT_FAMILY: &[u8] = b"L/";
+
+pub fn lockout_key(did: &str, factor: &str) -> Vec<u8> {
+    keyed(did, LOCKOUT_FAMILY, &[did.as_bytes(), b"\0", factor.as_bytes()])
+}
+
 pub fn private_key(did: &str, name: &str) -> Vec<u8> {
+
     keyed(did, b"p/", &[did.as_bytes(), b"\0", name.as_bytes()])
 }
 

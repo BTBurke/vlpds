@@ -359,7 +359,7 @@ pub fn attempt(st: &mut TotpState, m: &mut Mfa, did: &str, code: &str, now: u64)
         return Err(locked_out());
     }
     let r = consume(st, m, did, code, now);
-    mfa::settle(m, did, r, now)
+    mfa::settle(m, r, now)
 }
 
 #[cfg(test)]

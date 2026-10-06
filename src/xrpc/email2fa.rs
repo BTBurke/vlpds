@@ -178,9 +178,7 @@ async fn check_email_code(app: &App, acct: &Account, email: Option<&str>, code: 
             Err(e) if e.error != "InvalidToken" => return Err(e),
             Err(e) => {
                 crate::totp::record_failure_in(&mut lk.failures, &mut lk.locked_until, now);
-                if now < lk.locked_until {
-                    super::mfa::note_lockout(did, super::mfa::EMAIL_LOCK, lk.locked_until);
-                }
+
                 let e = if now < lk.locked_until { crate::totp::locked_out() } else { e };
                 (Err(e), vec![Op::put(LOCKOUT_NAME, Some(Bytes::from(to_json_bytes(&lk))))])
             }

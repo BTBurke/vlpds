@@ -265,8 +265,14 @@ fn matches_q(q: &str, a: &Account) -> bool {
     a.handle.starts_with(q) || a.did.starts_with(q) || a.email.as_deref().is_some_and(|e| e.starts_with(q))
 }
 
-fn locked_dids() -> std::collections::HashSet<String> {
-    super::mfa::noted_lockouts().into_iter().map(|(d, _, _)| d).collect()
+/// The DIDs the lockout index of this node's shards lists as locked now:
+/// only for the attention filter, the one that needs them.
+async fn locked_dids(app: &App, f: Filter) -> XResult<std::collections::HashSet<String>> {
+    if f != Filter::Attention {
+        return Ok(Default::default());
+    }
+    let now = crate::totp::now_secs();
+    Ok(indexed_lockouts(app).await?.0.into_iter().filter(|l| l.2 > now).map(|(d, _, _)| d).collect())
 }
 
 /// This node's half of listAccounts: `{owned, accounts, resumeAt}`.
@@ -288,7 +294,7 @@ async fn local_accounts(app: &App, q: &AccountsQ) -> XResult<J> {
         }
         return Ok(json!({"owned": ids, "accounts": out, "resumeAt": null}));
     }
-    let locked = locked_dids();
+    let locked = locked_dids(app, pq.filter).await?;
     if pq.recent {
         let cursor = q.cursor.as_deref().filter(|c| !c.is_empty()).map(split_cursor).transpose()?;
         let rows = recent_accounts(app, &owned, &pq, cursor, &locked).await?;
@@ -1061,24 +1067,60 @@ async fn list_mail(State(app): AppState, Auth(creds): Auth, Query(q): Query<Limi
 
 // ----------------------------------------------------------------- lockouts
 
-/// The factor locks noted on this node that its rows still show.
-async fn local_lockouts(app: &App) -> Vec<J> {
+/// (did, factor, locked until) of every lockout index entry of this node's
+/// shards (`mfa::lockout_index`), and the keys that don't parse.
+async fn indexed_lockouts(app: &App) -> XResult<(Vec<(String, &'static str, u64)>, Vec<(Arc<Partition>, Bytes)>)> {
+    let (mut entries, mut junk) = (Vec::new(), Vec::new());
+    for p in app.partitions.owned() {
+        let mut it = state::FamilyScan::new(p.db.as_ref(), state::LOCKOUT_FAMILY, None, &Default::default())
+            .await
+            .map_err(XrpcError::from_err)?;
+        while let Some(kv) = it.next().await.map_err(XrpcError::from_err)? {
+            let body = &state::key_body(&kv.key)[state::LOCKOUT_FAMILY.len()..];
+            let parsed = body.iter().rposition(|b| *b == 0).and_then(|i| {
+                let did = std::str::from_utf8(&body[..i]).ok()?;
+                let factor = super::mfa::lockout_factor(&body[i + 1..])?;
+                let until = u64::from_be_bytes(kv.value.as_ref().try_into().ok()?);
+                Some((did.to_string(), factor, until))
+            });
+            match parsed {
+                Some(l) => entries.push(l),
+                None => junk.push((p.clone(), kv.key)),
+            }
+        }
+    }
+    Ok((entries, junk))
+}
+
+/// The lockouts in this node's shards' index, as their rows show them now.
+/// An entry whose row no longer locks (it expired, or the account is gone)
+/// is dropped by writing the row back unchanged under the conditional
+/// write's lock, which deletes the entry with it: a lockout set meanwhile
+/// fails the condition and keeps its entry.
+async fn local_lockouts(app: &App) -> XResult<Vec<J>> {
+    use super::cas::{Cond, Op};
     let now = crate::totp::now_secs();
     let mut out = Vec::new();
-    for (did, factor, _) in super::mfa::noted_lockouts() {
-        let (failures, until) = match factor {
-            super::mfa::FACTOR_LOCK => match super::mfa::load_raw(app, &did).await {
-                Ok((m, _)) => (m.failures, m.locked_until),
-                Err(_) => continue,
-            },
-            _ => match super::server::get_json::<super::email2fa::Lockout>(app, &did, super::email2fa::LOCKOUT_NAME)
-                .await
-            {
-                Ok(Some(l)) => (l.failures, l.locked_until),
-                _ => continue,
-            },
+    let (entries, junk) = indexed_lockouts(app).await?;
+    for (did, factor, _) in entries {
+        let name = match factor {
+            super::mfa::FACTOR_LOCK => super::mfa::ROW,
+            _ => super::email2fa::LOCKOUT_NAME,
+        };
+        let raw = app.get_private(&did, name).await?;
+        let (failures, until) = match (factor, raw.as_deref()) {
+            (_, None) => (0, 0),
+            (super::mfa::FACTOR_LOCK, Some(v)) => {
+                serde_json::from_slice::<super::mfa::Mfa>(v).map_or((0, 0), |m| (m.failures, m.locked_until))
+            }
+            (_, Some(v)) => serde_json::from_slice::<super::email2fa::Lockout>(v)
+                .map_or((0, 0), |l| (l.failures, l.locked_until)),
         };
         if until <= now {
+            let (conds, ops) = (vec![Cond::eq(name, raw.clone())], vec![Op::put(name, raw)]);
+            if let Err(e) = app.private_cas(&did, conds, ops).await {
+                tracing::debug!(%did, "dropping a lockout index entry: {}", e.message);
+            }
             continue;
         }
         let handle = internal::account_anywhere(app, &did).await.ok().map(|a| a.handle);
@@ -1090,17 +1132,20 @@ async fn local_lockouts(app: &App) -> Vec<J> {
             "lockedUntil": secs_ms(until),
         }));
     }
-    out
+    for (p, key) in junk {
+        let _ = super::write_private_local(&p, vec![crate::segment::Mutation { key, val: None }]).await;
+    }
+    Ok(out)
 }
 
 async fn internal_lockouts(State(app): AppState, headers: HeaderMap) -> XResult<Json<J>> {
     internal::check(&app, &headers)?;
-    Ok(Json(json!({"lockouts": local_lockouts(&app).await})))
+    Ok(Json(json!({"lockouts": local_lockouts(&app).await?})))
 }
 
 async fn list_lockouts(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let mine = json!({"lockouts": local_lockouts(&app).await});
+    let mine = json!({"lockouts": local_lockouts(&app).await?});
     let g = internal::gather(&app, "/internal/v1/console/lockouts", &[]).await;
     let (nodes, unreachable) = gathered_nodes(&app, mine, g);
     let mut seen: HashMap<(String, String), J> = HashMap::new();
@@ -1155,8 +1200,8 @@ async fn clear_lockout(
     if !done {
         return Err(crate::totp::conflict());
     }
-    super::mfa::forget_lockouts(did);
     let e =
+
         audit(&app, &who(inp.actor, ip), "lockout.clear", Some(&SubjectRef::account(did)), Some(&reason), None, None)
             .await?;
     Ok(Json(json!({"did": did, "auditId": e.id})))
