@@ -11,16 +11,19 @@ import { basic, call, setAdminToken } from '../../lib/xrpc'
 import { Accounts } from './Accounts'
 import { Cluster } from './Cluster'
 import './clusterDetails'
+import { Config } from './Config'
 import { Domains } from './Domains'
 import { Firehose } from './Firehose'
+import { Mail } from './Mail'
 import { Metrics } from './Metrics'
 import { Moderation } from './Moderation'
 import { Nodes } from './Nodes'
 import { Overview } from './Overview'
-import { Legacy, Placeholder } from './Placeholder'
+import { Legacy } from './Placeholder'
 import { Limits } from './Limits'
-import { Relays } from './Relays'
-import { SpaceDetail, Spaces } from './Spaces'
+import { SpaceByUri, Spaces } from './Spaces'
+import { Storage } from './Storage'
+import './systemDetails'
 
 // The operator console: the token gate, then the shell around one page per route. Sections
 // still on their pre-console pages render them inside <Legacy> until they're rebuilt
@@ -45,29 +48,14 @@ function route(p: string): Route {
     case '/admin/nodes':
       return { section: S.nodes, page: <Nodes /> }
     case '/admin/metrics':
-      return { section: S.nodes, page: <Legacy><Metrics /></Legacy>, crumbs: crumb(S.nodes, 'Live metrics') }
+      return { section: S.nodes, page: <Metrics />, crumbs: crumb(S.nodes, 'Live metrics') }
     case '/admin/cluster':
       return { section: S.nodes, page: <Legacy><Cluster /></Legacy>, crumbs: crumb(S.nodes, 'Classic view') }
     case '/admin/storage':
-      return {
-        section: S.storage,
-        page: (
-          <Placeholder section={S.storage} what="Request rates and spend by component, latency, prefixes in the bucket">
-            Until then, segment PUT latency and object-store request rates are on the <Link to="/admin">Overview</Link> and in <Link to="/admin/metrics">Live metrics</Link>.
-          </Placeholder>
-        ),
-      }
+      return { section: S.storage, page: <Storage /> }
     case '/admin/firehose':
     case '/admin/relays':
-      return {
-        section: S.firehose,
-        page: (
-          <Legacy>
-            <Firehose />
-            <Relays />
-          </Legacy>
-        ),
-      }
+      return { section: S.firehose, page: <Firehose /> }
     case '/admin/accounts':
       return { section: S.accounts, page: <Accounts /> }
     case '/admin/moderation':
@@ -80,13 +68,13 @@ function route(p: string): Route {
     case '/admin/handle-domains':
       return { section: S.domains, page: <Domains /> }
     case '/admin/spaces':
-      return { section: S.spaces, page: <Legacy><Spaces /></Legacy> }
+      return { section: S.spaces, page: <Spaces /> }
     case '/admin/spaces/space':
-      return { section: S.spaces, page: <Legacy><SpaceDetail /></Legacy>, crumbs: crumb(S.spaces, 'Space') }
+      return { section: S.spaces, page: <SpaceByUri />, crumbs: crumb(S.spaces, 'Space') }
     case '/admin/mail':
-      return { section: S.mail, page: <Placeholder section={S.mail} what="Queue, sends by purpose, the daily budget and a log of recent messages" nsid="vlpds.admin.getMailLog" /> }
+      return { section: S.mail, page: <Mail /> }
     case '/admin/config':
-      return { section: S.config, page: <Placeholder section={S.config} what="Every flag, default and stored setting each node runs with; secrets as set or unset" nsid="vlpds.admin.getConfig" /> }
+      return { section: S.config, page: <Config /> }
   }
   // the pre-console account page's path, which other pages still link to
   if ((m = match('/admin/accounts/:did', p)) && m.did.startsWith('did:')) return { section: S.accounts, page: <DetailPage key="account" type="account" id={m.did} />, crumbs: crumb(S.accounts, m.did) }

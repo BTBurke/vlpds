@@ -700,6 +700,12 @@ textarea.cx-inp {
 select.cx-inp {
   padding-right: 6px;
 }
+/* styles.css stretches every select to the full width */
+.cx select.cx-inp {
+  width: auto;
+  min-height: 0;
+  padding: 0 6px;
+}
 .cx-seg {
   display: inline-flex;
   border: 1px solid var(--rule);

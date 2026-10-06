@@ -8,7 +8,7 @@ The console at `/admin` is a status-first shell: a top bar with the strata rule,
 | --- | --- |
 | `src/console.css` | Tokens and every console class. All classes start with `cx-` (or sit under one) because `styles.css` is global and already owns `.btn`, `.tile`, `.seg`, `.empty`. |
 | `src/components/console/` | The kit: `kit.tsx` (small parts), `DataTable.tsx`, `Drawer.tsx` (detail kinds), `dialogs.tsx` (confirm and form dialogs), `toast.tsx`, `LiveTail.tsx`, `Strata.tsx`, `Palette.tsx`, `Shell.tsx`, `sections.tsx` (the IA), `nav.ts` (slide-over URLs). |
-| `src/lib/console/` | Data: `live.ts` (pause, stale, shared pollers), `cluster.ts` (getClusterStatus + derived view), `metrics.ts` (getNodeMetrics series, or local /metrics scrapes to rates), `firehose.ts` (subscribeRepos tail, handle lookups), `polls.ts` (subscribers, cases, audit, lockouts), `segments.ts` (listSegments for the strata), `adminAdapter.ts` (the way into `lib/adminApi.ts`), `fmt.ts`. |
+| `src/lib/console/` | Data: `live.ts` (pause, stale, shared pollers), `cluster.ts` (getClusterStatus + derived view), `metrics.ts` (getNodeMetrics series, or local /metrics scrapes to rates), `firehose.ts` (subscribeRepos tail, handle lookups), `polls.ts` (subscribers, cases, audit, lockouts), `segments.ts` (listSegments for the strata), `sys.ts` (the system sections: raw getNodeMetrics series with per-component store rates, per-connection firehose rates, relays, mail, config and Spaces health from every node, `adminAt` for one node's answer), `adminAdapter.ts` (the way into `lib/adminApi.ts`), `fmt.ts`. |
 | `src/pages/admin/` | Pages. `AdminApp.tsx` routes. `Overview.tsx` and `Nodes.tsx` are built on the kit, `clusterUi.tsx` holds what they share, `clusterDetails.tsx` registers the node, shard, event and sub details. The rest are the pre-console pages, shown inside `<Legacy>`. |
 
 ## Building a section
@@ -101,16 +101,16 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 | Section | Path | State |
 | --- | --- | --- |
 | Overview | `/admin` | Built |
-| Nodes & shards | `/admin/nodes` | Built. Old page at `/admin/cluster`, charts at `/admin/metrics` |
-| Object store | `/admin/storage` | Placeholder |
-| Firehose & relays | `/admin/firehose` | Legacy (`Firehose` + `Relays`). Detail kinds `event` and `sub` exist |
+| Nodes & shards | `/admin/nodes` | Built. Old page at `/admin/cluster`. Live metrics at `/admin/metrics` (`Metrics.tsx`, every getNodeMetrics series per node) |
+| Object store | `/admin/storage` | Built (`Storage.tsx`). Detail kind `storecomp` (a key component). No bucket listing |
+| Firehose & relays | `/admin/firehose` | Built, alias `/admin/relays`. Detail kinds `event`, `sub` (live or disconnected, id `node/conn`), `relay` |
 | Accounts | `/admin/accounts` | Built. Detail kind `account` (`accountDetail.tsx`, actions in `accountActions.tsx`), full page at `/admin/accounts/account/<did>`; the old `/admin/accounts/<did>` still lands there |
 | Moderation | `/admin/moderation` | Built. Detail kinds `case`, `subject` (id: what resolveSubject takes), `audit`. `?q=` and `/admin/moderation/cases/:id` still land |
 | Limits & lockouts | `/admin/limits` | Built, alias `/admin/ratelimits`. Detail kinds `bucket`, `override`. Every edit goes through `editLimits` (diff, then updateRateLimits with ifVersion) |
 | Domains & invites | `/admin/domains` | Built. Detail kinds `domain`, `invite` |
-| Spaces | `/admin/spaces` | Legacy, plus `/admin/spaces/space` |
-| Mail | `/admin/mail` | Placeholder (needs `getMailLog`) |
-| Config | `/admin/config` | Placeholder (needs `getConfig`) |
+| Spaces | `/admin/spaces` | Built. Detail kind `space` (id: the space URI); `/admin/spaces/space?uri=` shows its full page |
+| Mail | `/admin/mail` | Built. Detail kind `mail` (id `node:id`). Budgets from getRateLimits' `mail-*` buckets |
+| Config | `/admin/config` | Built. Detail kind `cfg` (id: the flag). getConfig from every node, relayed by `x-vlpds-node` |
 
 ## Trying it
 

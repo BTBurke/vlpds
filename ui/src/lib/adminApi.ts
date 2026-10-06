@@ -266,6 +266,9 @@ export type NodeMetrics = NodeTagged & {
   series?: MetricsPoint[]
   /** The last 10 s. */
   latest?: MetricsPoint | null
+  /** Object-store requests by key component over the whole kept window (`storeWindowMs`), busiest first. */
+  storeComponents?: { component: string; classAPerSec: number; classBPerSec: number }[]
+  storeWindowMs?: number
   intervalMs?: number
   cpuLimitCores?: number
   memoryLimitBytes?: number

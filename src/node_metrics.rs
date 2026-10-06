@@ -7,7 +7,7 @@
 use crate::metrics;
 use parking_lot::Mutex;
 use prometheus::core::Collector;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -30,6 +30,8 @@ struct Sample {
     class_a: u64,
     class_b: u64,
     store_errors: u64,
+    /// Class A and B requests by key component (objstats::component).
+    store: BTreeMap<String, [u64; 2]>,
     cpu_s: f64,
     rss: i64,
     subscribers: i64,
@@ -120,6 +122,19 @@ fn sample() -> Sample {
         }
         store_class(label(l, "op"))
     });
+    let mut store: BTreeMap<String, [u64; 2]> = BTreeMap::new();
+    for mf in metrics::OBJ_REQUESTS.collect() {
+        for m in mf.get_metric() {
+            let labels: Vec<(&str, &str)> = m.get_label().iter().map(|l| (l.name(), l.value())).collect();
+            if matches!(label(&labels, "result"), "timeout" | "error") {
+                continue;
+            }
+            if let Some(i) = store_class(label(&labels, "op")) {
+                store.entry(label(&labels, "component").to_string()).or_default()[i] +=
+                    m.get_counter().get_value() as u64;
+            }
+        }
+    }
     Sample {
         t_ms: crate::tid::now_micros() / 1000,
         commits: s.commits.load(Ordering::Relaxed),
@@ -133,6 +148,7 @@ fn sample() -> Sample {
         class_a,
         class_b,
         store_errors,
+        store,
         cpu_s: metrics::cpu_seconds().unwrap_or(0.0),
         rss: metrics::resident_bytes().map_or(0, |b| b as i64),
         subscribers: metrics::FIREHOSE_SUBSCRIBERS.get(),
@@ -235,11 +251,43 @@ fn point(a: &Sample, b: &Sample, bd: &Bounds) -> Point {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ComponentRate {
+    pub component: String,
+    pub class_a_per_sec: f64,
+    pub class_b_per_sec: f64,
+}
+
+/// Class A and B rates by key component between two samples, busiest first.
+fn components(a: &Sample, b: &Sample) -> Vec<ComponentRate> {
+    let secs = (b.t_ms.saturating_sub(a.t_ms) as f64 / 1000.0).max(0.001);
+    let mut out: Vec<ComponentRate> = b
+        .store
+        .iter()
+        .map(|(c, [ca, cb])| {
+            let [pa, pb] = a.store.get(c).copied().unwrap_or_default();
+            ComponentRate {
+                component: c.clone(),
+                class_a_per_sec: ca.saturating_sub(pa) as f64 / secs,
+                class_b_per_sec: cb.saturating_sub(pb) as f64 / secs,
+            }
+        })
+        .filter(|r| r.class_a_per_sec + r.class_b_per_sec > 0.0)
+        .collect();
+    out.sort_by(|x, y| (y.class_a_per_sec + y.class_b_per_sec).total_cmp(&(x.class_a_per_sec + x.class_b_per_sec)));
+    out
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Report {
     /// Oldest first, one per interval ending after `since`.
     pub series: Vec<Point>,
     /// Over the last [`SUMMARY_SAMPLES`] intervals (steadier than one point).
     pub latest: Option<Point>,
+    /// Object-store requests by key component over every kept sample (up to
+    /// 3 minutes: steadier than `latest` for slow pollers like leases).
+    pub store_components: Vec<ComponentRate>,
+    pub store_window_ms: u64,
     pub interval_ms: u64,
     pub cpu_limit_cores: f64,
     pub memory_limit_bytes: i64,
@@ -267,10 +315,16 @@ pub fn report(since_ms: u64) -> Report {
         let a = &samples[samples.len().saturating_sub(SUMMARY_SAMPLES + 1)];
         point(a, &samples[samples.len() - 1], &bd)
     });
+    let (store_components, store_window_ms) = match (samples.first(), samples.last()) {
+        (Some(a), Some(b)) if samples.len() >= 2 => (components(a, b), b.t_ms.saturating_sub(a.t_ms)),
+        _ => (Vec::new(), 0),
+    };
     crate::lifecycle::refresh_metrics();
     Report {
         series,
         latest,
+        store_components,
+        store_window_ms,
         interval_ms: EVERY.as_millis() as u64,
         cpu_limit_cores: std::thread::available_parallelism().map_or(0, |n| n.get()) as f64,
         memory_limit_bytes: metrics::MEMORY_LIMIT.get(),
@@ -293,6 +347,22 @@ mod tests {
         assert_eq!(quantile(0.5, &bounds, &b, &b), None, "no observations in between");
         // everything past the last bound
         assert_eq!(quantile(0.99, &bounds, &a, &[0, 0, 0, 5]), Some(4.0));
+    }
+
+    #[test]
+    fn component_rates_busiest_first() {
+        let at = |t_ms: u64, store: &[(&str, [u64; 2])]| Sample {
+            t_ms,
+            store: store.iter().map(|(c, v)| (c.to_string(), *v)).collect(),
+            ..Default::default()
+        };
+        let a = at(0, &[("ctl_lease", [10, 10]), ("blob", [5, 0])]);
+        let b = at(2000, &[("ctl_lease", [14, 12]), ("blob", [5, 0]), ("log_segment", [20, 2])]);
+        let r = components(&a, &b);
+        let names: Vec<&str> = r.iter().map(|c| c.component.as_str()).collect();
+        assert_eq!(names, ["log_segment", "ctl_lease"], "idle components are left out");
+        assert_eq!((r[0].class_a_per_sec, r[0].class_b_per_sec), (10.0, 1.0), "new since `a`: counted from 0");
+        assert_eq!((r[1].class_a_per_sec, r[1].class_b_per_sec), (2.0, 1.0));
     }
 
     #[test]
