@@ -36,7 +36,7 @@ export class DpopKey {
 }
 
 /** POST a form to the authorization server with DPoP, retrying once for a nonce. */
-async function asPost(base, key, path, form) {
+export async function asPost(base, key, path, form) {
   const htu = `${base}${path}`
   for (let i = 0; i < 3; i++) {
     const res = await hfetch(htu, {
