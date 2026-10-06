@@ -64,13 +64,36 @@ and the relay list. Every node loads it at startup and re-reads it every 10 s wi
 GET, which costs one request per node every 10 s. A change also nudges every peer to re-read at
 once. If the object is unreadable, a node keeps the last set it loaded and logs a warning.
 
+## Counting accounts
+
+The console and `vlpds admin handle-domain list` show each domain's active accounts (no status:
+not deactivated, taken down, suspended or deleted). An account counts under the longest served
+domain its handle is under, and a bring-your-own handle under none of them counts nowhere.
+
+Those counts are cheap to read, so the console page refreshes every 5 s. Each shard keeps them
+in its [totals rows](../state-storage.md#key-layout), counted by the handle minus its first label
+(`alice.at.group-a.org` counts under `at.group-a.org`). Every create, handle change, status change
+and delete moves the count in the same write, and the counts move with their shards. A list asks
+every node for its shards' counts and maps each suffix to a domain when it reads. So a domain you
+add counts the handles already under it right away, and removing one needs no recount.
+
+A shard's counts load in the background for a second or so after it opens on a node. Until then
+the list says the counts are partial and names the shards that are loading. The first time a
+shard opens on a build that keeps these counts, it reads its account rows once to fill them in,
+then writes them back.
+
+`vlpds admin handle-domain list --recount` (or `listHandleDomains?recount=true`) counts every
+account row on every node instead, which is what each list used to do. Use it to check the kept
+counts. It reads every account in the cluster, so don't put it on a schedule.
+
 ## Removing a domain
 
-`vlpds admin handle-domain remove at.group-a.org` (or Remove in the console) counts the active
+`vlpds admin handle-domain remove at.group-a.org` (or Remove in the console) reads the active
 accounts under the domain first, across every node's shards. If there are any, it refuses with the
-count. It also refuses when a node or shard didn't answer, since the count could be low. Pass
-`--force` (Remove anyway in the console) to remove it regardless. The primary can't be removed.
-Change `--handle-domain` and restart for that.
+count. It also refuses when a node didn't answer or a shard's counts are still loading, since the
+count could be low. That lasts a second or so after a shard opens. Pass `--force` (Remove anyway in
+the console) to remove it regardless. The primary can't be removed. Change `--handle-domain` and
+restart for that.
 
 A forced removal doesn't touch accounts. Each one keeps its handle, its repo and its sign-in. But
 the PDS stops answering for the domain:
@@ -115,7 +138,7 @@ bring-your-own one. Codes without a limit work for every domain.
 
 | Method | Input | Answer |
 |---|---|---|
-| `vlpds.admin.listHandleDomains` (GET) | | `primary`, `domains` (primary first, each with `accounts`, `addedAt`, `addedBy`), `countsPartial` and the missing nodes or shards when a count is incomplete |
+| `vlpds.admin.listHandleDomains` (GET) | `recount?` (count every account row instead of the kept counts) | `primary`, `domains` (primary first, each with `accounts`, `addedAt`, `addedBy`), `recounted` · `countsPartial` with the missing nodes or shards and `loadingShards` when a count is incomplete |
 | `vlpds.admin.addHandleDomain` | `{domain}` | `InvalidDomain` or `DomainExists` on a bad or served domain |
 | `vlpds.admin.removeHandleDomain` | `{domain, force?}` | `{domain, accounts}` · `DomainInUse` (409) with the count · `CannotRemovePrimary` · `DomainNotFound` |
 

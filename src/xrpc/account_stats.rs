@@ -11,10 +11,16 @@ use crate::totals::{self, Totals};
 /// loaded, as of the last entry each one's sequencer took, and how many
 /// are still loading (left out: a shard counts whole or not at all).
 pub fn totals_loading(app: &App) -> (Totals, usize) {
+    sum_shards(app, true)
+}
+
+/// Scrapes skip the suffixes: only the handle domains page reads them.
+fn sum_shards(app: &App, suffixes: bool) -> (Totals, usize) {
     let (mut t, mut loading) = (Totals::default(), 0);
     for s in app.log.sinks.all() {
         match s.totals.lock().sum() {
-            Some(sum) => t.merge(sum),
+            Some(sum) if suffixes => t.merge(sum),
+            Some(sum) => t.merge_counts(sum),
             None => loading += 1,
         }
     }
@@ -26,7 +32,7 @@ pub fn totals(app: &App) -> Totals {
 }
 
 fn export(app: &App) {
-    let (t, loading) = totals_loading(app);
+    let (t, loading) = sum_shards(app, false);
     metrics::TOTALS_LOADING.set(loading as i64);
     for (i, s) in totals::STATUSES.iter().enumerate() {
         metrics::ACCOUNTS.with_label_values(&[s]).set(t.accounts[i]);
@@ -59,14 +65,17 @@ pub fn export_account_totals(app: &Arc<App>) {
     });
 }
 
-/// The same totals counted from scratch: every account and head row of
-/// this node's shards, from a snapshot each. Costs a read of every account;
-/// for checking the kept totals (tests, debugging), never on a schedule.
+/// The same totals counted from scratch, suffixes too: every account and
+/// head row of this node's shards, from a snapshot each. Costs a read of
+/// every account; for checking the kept totals (tests, debugging), never on
+/// a schedule.
 /// Its `days` are uncut: compare windows, not the vector.
 #[doc(hidden)]
 pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
     #[derive(serde::Deserialize)]
     struct Status<'a> {
+        #[serde(borrow)]
+        handle: std::borrow::Cow<'a, str>,
         #[serde(borrow, default)]
         status: Option<std::borrow::Cow<'a, str>>,
     }
@@ -90,8 +99,16 @@ pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
             if !in_range(&kv.key) {
                 break;
             }
-            let status = serde_json::from_slice::<Status>(&kv.value).ok().and_then(|s| s.status);
-            t.accounts[totals::status_index(status.as_deref()) as usize] += 1;
+            let Ok(a) = serde_json::from_slice::<Status>(&kv.value) else {
+                t.accounts[totals::status_index(None) as usize] += 1;
+                continue;
+            };
+            t.accounts[totals::status_index(a.status.as_deref()) as usize] += 1;
+            if a.status.is_none() {
+                if let Some(s) = crate::handle_domains::handle_suffix(&a.handle) {
+                    *t.suffixes.entry(s).or_default() += 1;
+                }
+            }
         }
         let mut heads = state::FamilyScan::new(
             snap.as_ref(),

@@ -1,6 +1,7 @@
 //! The operator's handle domains (`crate::handle_domains`): list them with
-//! their active accounts, add and remove them. A change is stored for the
-//! cluster and every peer is nudged to re-read it.
+//! their active accounts (from the kept totals, `crate::totals`; counted
+//! from every account row with `recount`), add and remove them. A change is
+//! stored for the cluster and every peer is nudged to re-read it.
 
 use super::admin::require_admin;
 use super::internal::HDR as INTERNAL_HDR;
@@ -32,9 +33,41 @@ fn node_id(app: &App) -> String {
     app.cluster.as_ref().map(|c| c.cfg.node_id.clone()).unwrap_or_else(|| "single".into())
 }
 
-/// Active accounts per domain of `domains` (each counted under its longest
-/// match), per shard of this node.
-async fn counts_local(app: &App, domains: &[String]) -> XResult<Vec<(crate::slots::ShardId, BTreeMap<String, u64>)>> {
+type ShardCounts = Vec<(crate::slots::ShardId, BTreeMap<String, u64>)>;
+
+/// The longest of `domains` that `suffix` is or is under.
+fn domain_of<'d>(suffix: &str, domains: &'d [String]) -> Option<&'d str> {
+    hd::longest(suffix, domains.iter().map(String::as_str)).map(|(_, d)| d)
+}
+
+/// Active accounts per domain of `domains`, per shard of this node, from
+/// the kept totals (`crate::totals` counts them by handle suffix); and the
+/// shards whose totals are still loading, left out.
+fn counts_kept(app: &App, domains: &[String]) -> (ShardCounts, Vec<crate::slots::ShardId>) {
+    let (mut out, mut loading) = (Vec::new(), Vec::new());
+    for sink in app.log.sinks.all() {
+        // copied out: the sequencer takes this lock for every account change
+        let suffixes = match sink.totals.lock().sum() {
+            Some(t) => t.suffixes.clone(),
+            None => {
+                loading.push(sink.id);
+                continue;
+            }
+        };
+        let mut counts: BTreeMap<String, u64> = domains.iter().map(|d| (d.clone(), 0)).collect();
+        for (s, n) in suffixes {
+            if let Some(d) = domain_of(&s, domains) {
+                *counts.entry(d.to_string()).or_default() += n.max(0) as u64;
+            }
+        }
+        out.push((sink.id, counts));
+    }
+    (out, loading)
+}
+
+/// [`counts_kept`] counted from scratch: every account row of this node's
+/// shards. For `recount`, never on a schedule.
+async fn counts_scanned(app: &App, domains: &[String]) -> XResult<ShardCounts> {
     #[derive(serde::Deserialize)]
     struct Row<'a> {
         #[serde(borrow)]
@@ -54,13 +87,24 @@ async fn counts_local(app: &App, domains: &[String]) -> XResult<Vec<(crate::slot
             if a.status.is_some() {
                 continue;
             }
-            if let Some((_, d)) = hd::longest(&a.handle, domains.iter().map(String::as_str)) {
+            if let Some(d) = hd::handle_suffix(&a.handle).as_deref().and_then(|s| domain_of(s, domains)) {
                 *counts.entry(d.to_string()).or_default() += 1;
             }
         }
         out.push((p.id, counts));
     }
     Ok(out)
+}
+
+async fn counts_local(
+    app: &App,
+    domains: &[String],
+    recount: bool,
+) -> XResult<(ShardCounts, Vec<crate::slots::ShardId>)> {
+    match recount {
+        true => Ok((counts_scanned(app, domains).await?, Vec::new())),
+        false => Ok(counts_kept(app, domains)),
+    }
 }
 
 struct Counts {
@@ -71,16 +115,22 @@ struct Counts {
 
 /// Cluster-wide [`counts_local`]; a shard reported twice (mid-move) counts
 /// once.
-async fn counts(app: &App, domains: &[String]) -> XResult<Counts> {
-    let mut by_shard: BTreeMap<crate::slots::ShardId, BTreeMap<String, u64>> =
-        counts_local(app, domains).await?.into_iter().collect();
-    let g = super::internal::gather(app, "/internal/v1/handle-domains/counts", &[("domains", domains.join(","))]).await;
+async fn counts(app: &App, domains: &[String], recount: bool) -> XResult<Counts> {
+    let (local, mut loading) = counts_local(app, domains, recount).await?;
+    let mut by_shard: BTreeMap<crate::slots::ShardId, BTreeMap<String, u64>> = local.into_iter().collect();
+    let mut query = vec![("domains", domains.join(","))];
+    if recount {
+        query.push(("recount", "true".into()));
+    }
+    let g = super::internal::gather(app, "/internal/v1/handle-domains/counts", &query).await;
     for r in g.replies {
-        let shards: Vec<(crate::slots::ShardId, BTreeMap<String, u64>)> =
-            serde_json::from_value(r.body["shards"].clone()).unwrap_or_default();
+        let shards: ShardCounts = serde_json::from_value(r.body["shards"].clone()).unwrap_or_default();
         for (s, c) in shards {
             by_shard.entry(s).or_insert(c);
         }
+        loading.extend(
+            serde_json::from_value::<Vec<crate::slots::ShardId>>(r.body["loading"].clone()).unwrap_or_default(),
+        );
     }
     let covered: HashSet<crate::slots::ShardId> = by_shard.keys().copied().collect();
     let mut by_domain: BTreeMap<String, u64> = domains.iter().map(|d| (d.clone(), 0)).collect();
@@ -91,6 +141,12 @@ async fn counts(app: &App, domains: &[String]) -> XResult<Counts> {
     }
     let mut res = json!({});
     super::admin::partial_fields(app, &mut res, g.unreachable, g.unsupported, &covered, 0);
+    loading.retain(|s| !covered.contains(s));
+    if !loading.is_empty() {
+        loading.sort();
+        loading.dedup();
+        res["loadingShards"] = json!(loading);
+    }
     let partial = res.as_object().is_some_and(|o| !o.is_empty()).then_some(res);
     Ok(Counts { by_domain, partial })
 }
@@ -112,14 +168,22 @@ fn rows(app: &App, counts: Option<&Counts>) -> Vec<J> {
         .collect()
 }
 
-async fn list_handle_domains(State(app): AppState, Auth(creds): Auth) -> XResult<Json<J>> {
+#[derive(Deserialize, Default)]
+struct ListQ {
+    /// Count every account row instead of reading the kept totals.
+    #[serde(default)]
+    recount: bool,
+}
+
+async fn list_handle_domains(State(app): AppState, Auth(creds): Auth, Query(q): Query<ListQ>) -> XResult<Json<J>> {
     require_admin(&creds)?;
-    let c = counts(&app, &app.handle_domains.names()).await?;
+    let c = counts(&app, &app.handle_domains.names(), q.recount).await?;
     let mut out = json!({
         "primary": app.handle_domains.primary(),
         "domains": rows(&app, Some(&c)),
         "refreshSecs": hd::REFRESH_EVERY.as_secs(),
         "updatedAt": app.handle_domains.updated_at(),
+        "recounted": q.recount,
     });
     if let Some(p) = c.partial {
         out["countsPartial"] = json!(true);
@@ -204,7 +268,7 @@ async fn remove_handle_domain(State(app): AppState, Auth(creds): Auth, Json(inp)
     if !names.contains(&domain) {
         return Err(save_error(SaveError::NotFound(domain)));
     }
-    let c = counts(&app, &names).await?;
+    let c = counts(&app, &names, false).await?;
     let n = c.by_domain.get(&domain).copied().unwrap_or(0);
     if !inp.force && (n > 0 || c.partial.is_some()) {
         let accounts = if n == 1 {
@@ -212,7 +276,11 @@ async fn remove_handle_domain(State(app): AppState, Auth(creds): Auth, Json(inp)
         } else {
             format!("{n} active accounts have handles")
         };
-        let unsure = if c.partial.is_some() { " (some shards didn't answer, so there may be more)" } else { "" };
+        let unsure = if c.partial.is_some() {
+            " (some shards didn't answer or are still loading their totals, so there may be more)"
+        } else {
+            ""
+        };
         return Err(XrpcError {
             status: StatusCode::CONFLICT,
             error: "DomainInUse".into(),
@@ -246,6 +314,8 @@ async fn internal_reload(State(app): AppState, headers: HeaderMap) -> XResult<Js
 #[derive(Deserialize)]
 struct CountsQ {
     domains: String,
+    #[serde(default)]
+    recount: bool,
 }
 
 async fn internal_counts(State(app): AppState, headers: HeaderMap, Query(q): Query<CountsQ>) -> XResult<Json<J>> {
@@ -254,7 +324,7 @@ async fn internal_counts(State(app): AppState, headers: HeaderMap, Query(q): Que
     if domains.is_empty() {
         return Err(XrpcError::bad("InvalidRequest", "no domains"));
     }
-    let shards = counts_local(&app, &domains).await?;
+    let (shards, loading) = counts_local(&app, &domains, q.recount).await?;
     let owned: Vec<_> = shards.iter().map(|(s, _)| *s).collect();
-    Ok(Json(json!({"owned": owned, "shards": shards})))
+    Ok(Json(json!({"owned": owned, "shards": shards, "loading": loading})))
 }

@@ -304,7 +304,7 @@ impl ShardHost for Node {
                 barrier: Default::default(),
                 totals: Mutex::new(crate::totals::ShardTotals::unloaded()),
             });
-            crate::totals::spawn_load(&sink, &self.cluster.cfg.node_id);
+            crate::totals::spawn_load(&sink, &self.cluster.cfg.node_id, self.log.tx.clone());
             self.log.sinks.insert(sink);
             self.table.set(
                 shard,

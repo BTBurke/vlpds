@@ -4865,6 +4865,39 @@ the next count. Now the totals are kept exact as part of the state:
   shard, and still need a flush schedule. Day buckets keyed by the head's
   rev are exact, split with their slot, and cost one ~100-byte put per
   repo per active day.
+- **Handle suffixes** (`vlpds.admin.listHandleDomains`). The row also
+  counts the slot's active accounts (no status) by handle suffix: the
+  handle without its first label, lowercased (`totals::suffix_of`). The
+  worker puts the suffix change on the same `Delta` for a create and every
+  account op (handle change, status change, import, delete). Commits never
+  change it, so they carry none. A list asks every node for its loaded
+  shards' suffix counts and maps each suffix to the longest served domain
+  it is or is under, which is the longest one the handle is strictly
+  under. Keying by served domain instead would make every add and remove a
+  recount of every slot, ordered against concurrent writes on every shard,
+  while the new set reaches nodes a moment apart. A suffix depends only on
+  the account row, so it splits, moves and replays with the rest of the row
+  and a domain change costs nothing. The cost is one entry per distinct
+  suffix in each row (one for most slots, more with bring-your-own
+  handles), written only when the slot's row is. A shard still loading is
+  reported (`loadingShards`) and left out, so `removeHandleDomain` refuses
+  without `force` for that second or so. `?recount=true` keeps the old
+  scan of every account row.
+- **Seeding suffix counts.** Rows written before suffixes were counted end
+  after the days (old delta rows too). The load reads a slot's rows and
+  account rows from one snapshot, and when any of the slot's rows lacks the
+  suffix section it counts the slot's account rows instead. The snapshot's
+  delta rows add only their status and day counts then (the account rows
+  already hold their changes), and delta rows taken since the open that
+  the snapshot missed add their suffixes too. The load then sends the
+  shard's log entries that write the seeded rows, 512 slots each
+  (`Delta::save_seeded`), so the next open reads them. Until written, a
+  reopen seeds those slots again, which is just as exact.
+  (`totals::tests::matches_truth_through_lazy_loads` rewrites every row to
+  the old format now and then; `tests/all/handle_domains.rs`
+  `rows_without_suffixes_are_seeded`.) An older build refuses a row with
+  the suffix section (trailing bytes), so rolling back past this build
+  leaves its shards' totals loading, with a warning, until rolled forward.
 - **Reconciling.** `xrpc::scan_totals` still counts everything from
   snapshots. Only tests and debugging call it
   (`tests/all/account_totals.rs`: random lifecycles, splits, merges and
