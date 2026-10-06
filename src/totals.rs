@@ -465,7 +465,7 @@ impl ShardTotals {
             #[serde(flatten)]
             extra: serde_json::Map<String, serde_json::Value>,
         }
-        let snap = db.snapshot().await?;
+        let snap = db.snapshot()?;
         let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
         let mut scan = state::FamilyScan::new(snap.as_ref(), FAMILY, None, &opts).await?;
         let mut out: Vec<SlotRows> = Vec::new();

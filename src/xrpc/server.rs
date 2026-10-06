@@ -2361,7 +2361,7 @@ async fn check_account_status(State(app): AppState, Auth(creds): Auth) -> XResul
     let did = user_did(&creds)?;
     let acct = app.account(&did).await?;
     let p = app.partition(&did)?;
-    let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+    let snap = p.db.snapshot().map_err(XrpcError::from_err)?;
     let (hv, sv) = tokio::try_join!(
         slatedb::DbReadOps::get(snap.as_ref(), state::head_key(&did)),
         slatedb::DbReadOps::get(snap.as_ref(), state::repo_stats_key(&did))

@@ -616,7 +616,7 @@ impl App {
         let p = self.partition(did)?;
         let _g = p.apply_lock.read().await;
         let view = cell.read().clone();
-        let snap = p.db.snapshot().await.map_err(XrpcError::from_err)?;
+        let snap = p.db.snapshot().map_err(XrpcError::from_err)?;
         Ok((view, snap))
     }
 

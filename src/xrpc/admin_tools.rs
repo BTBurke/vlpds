@@ -185,7 +185,7 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
     let p = app.partition(did)?;
     let snap = {
         let _g = p.apply_lock.read().await;
-        p.db.snapshot().await.map_err(XrpcError::from_err)?
+        p.db.snapshot().map_err(XrpcError::from_err)?
     };
     let get = |k: Vec<u8>| {
         let snap = snap.clone();
@@ -486,7 +486,7 @@ async fn check_space(
     let p = app.partition(&q.did)?;
     let snap = {
         let _g = p.apply_lock.read().await;
-        p.db.snapshot().await.map_err(XrpcError::from_err)?
+        p.db.snapshot().map_err(XrpcError::from_err)?
     };
     let rows = check::load(snap.as_ref(), &q.did, &q.space).await.map_err(XrpcError::from_err)?;
     if rows.is_empty() {

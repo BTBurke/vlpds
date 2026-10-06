@@ -89,7 +89,7 @@ pub async fn scan_totals(app: &App) -> anyhow::Result<Totals> {
     let opts = slatedb::config::ScanOptions { read_ahead_bytes: 1 << 20, max_fetch_tasks: 2, ..Default::default() };
     for range in &layout.shards {
         let Some(p) = app.partitions.get(range.id) else { continue };
-        let snap = p.db.snapshot().await?;
+        let snap = p.db.snapshot()?;
         let lo = range.lo as u16;
         let in_range = |key: &[u8]| state::key_slot(key).is_some_and(|s| (s as u32) < range.hi);
         let mut accts = state::FamilyScan::new(

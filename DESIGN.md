@@ -1673,27 +1673,19 @@ slot by slot: `state::FamilyScan` keeps one iterator over the shard and
 `seek`s past slots without the family, so empty slots cost nothing and a
 populated one costs one seek.
 
-*Patched SlateDB (fork).* A projection keeps each SST view's
-id, so right after a split both children hold the parent's L0 SSTs under
+*Patched SlateDB (fork).* A projection used to keep each SST view's
+id, so right after a split both children held the parent's L0 SSTs under
 the parent's view ids (each with its half as the visible range). Merging
 them back before either compacted those L0s gave the union's L0 one view
-id twice, and SlateDB 0.17's compactor keys L0 views by id: the merged
-shard's first compaction of such a view rewrote one half and dropped both
-from the manifest, so the other half's keys (acked writes, account and
-handle keys) were gone from the shard and from every later clone of it.
-This was `split_and_merge_under_write_load`'s rare "acked record lost"
-(the merged shard compacted only when its L0 ran deep under load). vlpds
-builds slatedb (and slatedb-common) from the fork
-`github.com/jazware/slatedb`, branch `vlpds-0.17-submit-dest-guard`, rev
-`68106cc0` (0.17.0 = upstream `c1e36fc` plus this fix, its test update,
-the synchronous-`next` / `next_batch` scan fast path, and a compactor guard:
-an admin-submitted spec, i.e. reshard GC's forced compactions, is failed
-instead of promoted when it collides with a claimed job's destination or
-sources, which the executor's `assert!` would otherwise panic on; via
-`[patch.crates-io]`), whose `Manifest::cloned_from_union` gives repeated
-L0 view ids fresh ids (same timestamp; the union has no L0 watermark that
-could name the old ones). Pending an upstream report; drop the patch once
-a release carries a fix. `partition.rs`
+id twice, and SlateDB's compactor keys L0 views by id: the merged shard's
+first compaction of such a view rewrote one half and dropped both from
+the manifest, so the other half's keys (acked writes, account and handle
+keys) were gone from the shard and from every later clone of it. This was
+`split_and_merge_under_write_load`'s rare "acked record lost" (the merged
+shard compacted only when its L0 ran deep under load). Upstream #2132
+fixes it: a projection that changes a view's range gives it a new id, a
+union gives any id still repeated a fresh one, and the compactor refuses a
+compaction whose L0 sources are ambiguous. `partition.rs`
 `merging_a_splits_halves_keeps_their_shared_l0s` pins it.
 
 The same merged L0 also has one SST behind two views (one per half), out
@@ -1708,10 +1700,19 @@ and the writer's next flush re-added one older than the L0 watermark and
 failed with `InvalidClockTick`. A reopen from that manifest would have lost
 those rows. It needs a merge of halves that still hold more than 8 views of
 their parent's L0s, i.e. a merge soon after a split of a shard with a deep
-L0. The fork branch `fix/l0-view-merge-dup-sst` (rev `c7b29a06`, on top of
-the above) cuts at the view id and uses the SST id only for a V1 marker
-without one; `partition.rs` `merging_halves_that_share_many_l0s_keeps_them`
-pins it.
+L0. Upstream #2134 cuts at the view id and uses the SST id only for a
+marker without one; `partition.rs`
+`merging_halves_that_share_many_l0s_keeps_them` pins it.
+
+vlpds builds slatedb (and slatedb-common) from the fork
+`github.com/jazware/slatedb` via `[patch.crates-io]`, pinned by rev to the
+fork's `main`: upstream `main` at `8c1c6c33`, which carries both fixes
+above, plus the patches in the fork's `PATCHES.md` (the synchronous
+`next` / `next_batch` scan fast path; a compactor guard that fails an
+admin-submitted spec, i.e. reshard GC's forced compactions, instead of
+promoting it when it collides with a claimed job's destination or sources,
+which the executor's `assert!` would otherwise panic on; compaction output
+seeded into the DB cache; and a cache peek before building a loader).
 
 **Protocol.** One reshard op at a time, cluster-wide, recorded in the
 layout as `op = {id, parents, children, driver}`:
