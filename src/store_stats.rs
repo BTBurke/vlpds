@@ -48,13 +48,15 @@ pub const SIZES_KEPT: usize = 262_144;
 pub const WINDOW_KEPT: usize = 200_000;
 /// A page's read time is known to the listing node's clock: changes this
 /// close to it on another node's clock are uncertain.
-const SKEW_MS: u64 = 250;
+const SKEW_US: u64 = 250_000;
 /// A runner that hasn't saved its place for this long can be taken over.
 const RUNNER_STALE_MS: u64 = 120_000;
 const SAVE_EVERY_PAGES: u64 = 20;
 const SAVE_EVERY: Duration = Duration::from_secs(15);
 pub const DEFAULT_PAGES_PER_SECOND: f64 = 2.0;
 pub const MAX_PAGES_PER_SECOND: f64 = 50.0;
+/// A slower runner would go longer than [`RUNNER_STALE_MS`] between saves.
+pub const MIN_PAGES_PER_SECOND: f64 = 0.1;
 pub const MAX_REQUESTS: u64 = 1_000_000;
 /// S3, GCS and R2 list 1,000 keys a request.
 pub const PAGE: u64 = 1000;
@@ -66,6 +68,10 @@ const BACKFILL_DOC: &str = "stats/backfill";
 /// hasn't seen is more likely a replace than a create.
 fn overwrites_in_place(comp: &str) -> bool {
     comp.starts_with("ctl_") || matches!(comp, "retention_report" | "state_gc_boundary" | "state_other" | "other")
+}
+
+pub fn now_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
 }
 
 pub fn now_ms() -> u64 {
@@ -169,7 +175,7 @@ struct WindowOp {
     path: Box<str>,
     comp: &'static str,
     d: Counts,
-    /// Unix ms: the change landed between the two.
+    /// Unix µs: the change landed between the two.
     start: u64,
     end: u64,
 }
@@ -180,6 +186,10 @@ struct Window {
     ops: Vec<WindowOp>,
     /// Past [`WINDOW_KEPT`]: kept as uncertain.
     overflow: Comps,
+    /// Changes from before the window not yet folded: the listing has
+    /// them, so a finished backfill drops them; until then they fold as
+    /// usual.
+    pre: Comps,
 }
 
 #[derive(Default)]
@@ -189,8 +199,7 @@ struct Inner {
     window: Option<Window>,
     /// Component means (bytes per object) from the last totals read.
     means: HashMap<String, i64>,
-    /// prefix -> (objects, bytes, unix ms) of the latest complete LIST of it.
-    observed: BTreeMap<String, (u64, u64, u64)>,
+    observed: Observed,
     /// The first fold of this process is done.
     folded: bool,
 }
@@ -286,7 +295,7 @@ impl StatsDoc {
 }
 
 /// One page of a backfill's listing: requested at `s`, answered at `r`
-/// (unix ms on the listing node), ending at key `last` (None: the end).
+/// (unix µs on the listing node), ending at key `last` (None: the end).
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Page {
     pub s: u64,
@@ -354,25 +363,25 @@ pub enum Side {
 
 /// `timeline` in listing order; the key's page is the first whose `last`
 /// is at or past it (None: the end).
-pub fn side(timeline: &[Page], path: &str, start: u64, end: u64) -> Side {
+pub fn side(timeline: &[Page], path: &str, start: u64, end: u64, skew: u64) -> Side {
     let i = timeline.partition_point(|p| p.last.as_deref().is_some_and(|l| l < path));
     let Some(p) = timeline.get(i) else {
         // past every page read: a listing that stopped early never read it
         return Side::After;
     };
-    if end + SKEW_MS < p.s {
+    if end + skew < p.s {
         Side::Before
-    } else if start > p.r + SKEW_MS {
+    } else if start > p.r + skew {
         Side::After
     } else {
         Side::Unsure
     }
 }
 
-fn classify(timeline: &[Page], w: Window) -> Comps {
+fn classify(timeline: &[Page], w: Window, skew: u64) -> Comps {
     let mut out = w.overflow;
     for op in w.ops {
-        let d = match side(timeline, &op.path, op.start, op.end) {
+        let d = match side(timeline, &op.path, op.start, op.end, skew) {
             Side::Before => continue,
             Side::After => op.d,
             Side::Unsure => op.d.uncertain(),
@@ -454,7 +463,7 @@ impl StoreStats {
         let mut i = self.inner.lock();
         match i.window.as_mut() {
             Some(w) if w.ops.len() < WINDOW_KEPT => {
-                w.ops.push(WindowOp { path: path.into(), comp, d, start, end: now_ms() });
+                w.ops.push(WindowOp { path: path.into(), comp, d, start, end: now_us() });
             }
             Some(w) => w.overflow.entry(comp.to_string()).or_default().add(&d.uncertain()),
             None => i.pending.entry(comp.to_string()).or_default().add(&d),
@@ -521,35 +530,27 @@ impl StoreStats {
         prefix.is_some_and(|p| p.trim_end_matches('/') != self.prefix)
     }
 
-    /// Objects the latest complete LISTs this node saw add up to, counting
-    /// a prefix only when no observed prefix contains it.
     pub fn observed(&self) -> (u64, u64, usize) {
-        let i = self.inner.lock();
-        let keys: Vec<&String> = i.observed.keys().collect();
-        let (mut objects, mut bytes, mut n) = (0, 0, 0);
-        for (k, (o, b, _)) in &i.observed {
-            let nested = keys.iter().any(|p| *p != k && k.starts_with(&format!("{}/", p.trim_end_matches('/'))));
-            if !nested {
-                objects += o;
-                bytes += b;
-                n += 1;
-            }
-        }
-        (objects, bytes, n)
+        observed_total(&self.observed_map())
+    }
+
+    pub fn observed_map(&self) -> Observed {
+        self.inner.lock().observed.clone()
     }
 
     /// This node's part of getStorageStats.
     pub fn local(&self) -> serde_json::Value {
         let i = self.inner.lock();
         let (window_ops, window_epoch) = i.window.as_ref().map_or((0, None), |w| (w.ops.len(), Some(w.epoch)));
-        drop(i);
-        let (oo, ob, on) = self.observed();
-        let i = self.inner.lock();
+        let mut pending = i.pending.clone();
+        if let Some(w) = &i.window {
+            add_all(&mut pending, &w.pre);
+        }
         serde_json::json!({
-            "pending": i.pending,
+            "pending": pending,
             "windowEpoch": window_epoch,
             "windowChanges": window_ops,
-            "observed": {"objects": oo, "bytes": ob, "prefixes": on},
+            "observed": i.observed,
         })
     }
 
@@ -583,9 +584,15 @@ impl StoreStats {
                     continue;
                 }
             }
-            let (pending, overflow, folded) = {
+            let (pending, overflow, pre, folded) = {
                 let i = self.inner.lock();
-                (i.pending.clone(), i.window.as_ref().map(|w| w.overflow.clone()).unwrap_or_default(), i.folded)
+                let w = i.window.as_ref();
+                (
+                    i.pending.clone(),
+                    w.map(|w| w.overflow.clone()).unwrap_or_default(),
+                    w.map(|w| w.pre.clone()).unwrap_or_default(),
+                    i.folded,
+                )
             };
             if !folded && doc.nodes.get(&me).is_some_and(|n| n.open) {
                 doc.lost = true;
@@ -596,6 +603,7 @@ impl StoreStats {
                 true => add_all(&mut doc.late, &all_uncertain(&pending)),
                 false => add_all(&mut doc.deltas, &pending),
             }
+            add_all(&mut doc.deltas, &pre);
             add_all(&mut doc.late, &overflow);
             doc.nodes.insert(me.clone(), NodeMark { flushed_at: now_ms(), open: !closing });
             if !write_json(&ctl, DOC, &doc, ver).await? {
@@ -605,9 +613,12 @@ impl StoreStats {
             sub_all(&mut i.pending, &pending);
             if let Some(w) = i.window.as_mut() {
                 sub_all(&mut w.overflow, &overflow);
+                sub_all(&mut w.pre, &pre);
             }
             if unaware && !closing {
-                i.window = Some(Window { epoch: doc.epoch, ..Default::default() });
+                // what came in during the fold is from the window, unsorted
+                let during = all_uncertain(&std::mem::take(&mut i.pending));
+                i.window = Some(Window { epoch: doc.epoch, overflow: during, ..Default::default() });
             }
             i.folded = true;
             i.means = means(&doc.folded());
@@ -625,16 +636,16 @@ impl StoreStats {
         let r = self.fold(false, Some(epoch)).await;
         let mut i = self.inner.lock();
         if i.window.as_ref().is_none_or(|w| w.epoch != epoch) {
-            let old = i.window.replace(Window { epoch, ..Default::default() });
-            if let Some(w) = old {
-                // a backfill that was overtaken: none of its window is known
-                let mut kept = Comps::new();
+            let mut pre = std::mem::take(&mut i.pending);
+            if let Some(w) = i.window.take() {
+                // a backfill that was overtaken: none of its window is sorted
                 for op in &w.ops {
-                    kept.entry(op.comp.to_string()).or_default().add(&op.d.uncertain());
+                    pre.entry(op.comp.to_string()).or_default().add(&op.d.uncertain());
                 }
-                add_all(&mut kept, &w.overflow);
-                add_all(&mut i.pending, &kept);
+                add_all(&mut pre, &w.overflow);
+                add_all(&mut pre, &w.pre);
             }
+            i.window = Some(Window { epoch, pre, ..Default::default() });
         }
         r
     }
@@ -650,9 +661,10 @@ impl StoreStats {
         let mut i = self.inner.lock();
         let Some(w) = i.window.take_if(|w| w.epoch == epoch) else { return Ok(()) };
         let kept = if doc.epoch == epoch && doc.phase == "done" {
-            classify(&doc.timeline, w)
+            classify(&doc.timeline, w, if doc.runner == self.node_id() { 0 } else { SKEW_US })
         } else {
             let mut k = w.overflow;
+            add_all(&mut k, &w.pre);
             for op in w.ops {
                 k.entry(op.comp.to_string()).or_default().add(&op.d.uncertain());
             }
@@ -695,6 +707,33 @@ impl StoreStats {
     }
 }
 
+/// prefix -> (objects, bytes, unix ms) of the latest complete LIST of it.
+pub type Observed = BTreeMap<String, (u64, u64, u64)>;
+
+/// What the observed LISTs add up to, counting a prefix only when no
+/// observed prefix contains it: (objects, bytes, prefixes counted).
+pub fn observed_total(m: &Observed) -> (u64, u64, usize) {
+    let (mut objects, mut bytes, mut n) = (0, 0, 0);
+    for (k, (o, b, _)) in m {
+        let nested = m.keys().any(|p| p != k && k.starts_with(&format!("{}/", p.trim_end_matches('/'))));
+        if !nested {
+            objects += o;
+            bytes += b;
+            n += 1;
+        }
+    }
+    (objects, bytes, n)
+}
+
+/// Merges another node's observations: the later LIST of a prefix wins.
+pub fn merge_observed(into: &mut Observed, from: &Observed) {
+    for (k, v) in from {
+        if into.get(k).is_none_or(|o| o.2 < v.2) {
+            into.insert(k.clone(), *v);
+        }
+    }
+}
+
 fn means(t: &Comps) -> HashMap<String, i64> {
     t.iter().filter(|(_, c)| c.objects > 0).map(|(k, c)| (k.clone(), c.bytes.max(0) / c.objects)).collect()
 }
@@ -711,8 +750,12 @@ pub struct BackfillOpts {
 
 /// Tells every node a window began (`"begin"`) or ended (`"end"`); returns
 /// the nodes that didn't hear it.
-pub type Broadcast =
-    Arc<dyn Fn(u64, &'static str) -> futures::future::BoxFuture<'static, Vec<String>> + Send + Sync>;
+pub type Broadcast = Arc<dyn Fn(u64, &'static str) -> futures::future::BoxFuture<'static, Vec<String>> + Send + Sync>;
+
+/// A run whose runner saved its place lately.
+pub fn runner_alive(d: &BackfillDoc) -> bool {
+    d.phase == "running" && now_ms().saturating_sub(d.heartbeat_at) < RUNNER_STALE_MS
+}
 
 #[derive(Debug)]
 pub enum StartError {
@@ -814,11 +857,13 @@ async fn run(stats: &Arc<StoreStats>, listing: &Store, mut doc: BackfillDoc) -> 
     use futures::StreamExt;
     let ctl = stats.ctl()?;
     let root = Path::from(listing.prefix.clone());
+    // some stores read everything when the stream is made, not when polled
+    let mut opened = Some(now_us());
     let mut stream = match &doc.cursor {
         Some(c) => listing.raw.list_with_offset(Some(&root), &Path::from(c.as_str())),
         None => listing.raw.list(Some(&root)),
     };
-    let pps = doc.pages_per_second.clamp(0.01, MAX_PAGES_PER_SECOND);
+    let pps = doc.pages_per_second.clamp(MIN_PAGES_PER_SECOND, MAX_PAGES_PER_SECOND);
     let gap = Duration::from_secs_f64(1.0 / pps);
     let mut next_page = tokio::time::Instant::now();
     let (mut spent, mut since_save, mut saved_at) = (0u64, 0u64, tokio::time::Instant::now());
@@ -843,13 +888,13 @@ async fn run(stats: &Arc<StoreStats>, listing: &Store, mut doc: BackfillDoc) -> 
         }
         tokio::time::sleep_until(next_page).await;
         next_page = tokio::time::Instant::now() + gap;
-        let s = now_ms();
+        let s = opened.take().unwrap_or_else(now_us);
         let (mut n, mut r, mut last) = (0u64, 0u64, None::<String>);
         while n < PAGE {
             match stream.next().await {
                 Some(Ok(meta)) => {
                     if n == 0 {
-                        r = now_ms();
+                        r = now_us();
                     }
                     n += 1;
                     let loc = meta.location.to_string();
@@ -871,7 +916,7 @@ async fn run(stats: &Arc<StoreStats>, listing: &Store, mut doc: BackfillDoc) -> 
             }
         }
         if n == 0 {
-            r = now_ms();
+            r = now_us();
         }
         spent += 1;
         doc.requests += 1;
@@ -925,7 +970,11 @@ mod tests {
 
     fn memstore(prefix: &str, stats: &Arc<StoreStats>) -> Store {
         let raw: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
-        Store { raw: crate::objstats::counted_with(raw, prefix, "state", Some(stats.clone())), prefix: prefix.into(), latency: None }
+        Store {
+            raw: crate::objstats::counted_with(raw, prefix, "state", Some(stats.clone())),
+            prefix: prefix.into(),
+            latency: None,
+        }
     }
 
     fn node(prefix: &str, id: &str, raw: &Arc<dyn ObjectStore>) -> (Arc<StoreStats>, Store) {
@@ -945,7 +994,11 @@ mod tests {
 
     async fn put(store: &Store, rel: &str, n: usize, mode: PutMode) -> object_store::Result<()> {
         let p = Path::from(format!("{}/{rel}", store.prefix));
-        store.raw.put_opts(&p, PutPayload::from(vec![7u8; n]), PutOptions { mode, ..Default::default() }).await.map(|_| ())
+        store
+            .raw
+            .put_opts(&p, PutPayload::from(vec![7u8; n]), PutOptions { mode, ..Default::default() })
+            .await
+            .map(|_| ())
     }
 
     async fn del(store: &Store, rel: &str) {
@@ -1042,16 +1095,16 @@ mod tests {
             Page { s: 5_000, r: 5_100, last: Some("p/m".into()) },
             Page { s: 9_000, r: 9_100, last: None },
         ];
-        assert_eq!(side(&tl, "p/a", 100, 200), Side::Before);
-        assert_eq!(side(&tl, "p/a", 2_000, 2_010), Side::After);
-        assert_eq!(side(&tl, "p/a", 1_050, 1_060), Side::Unsure);
+        assert_eq!(side(&tl, "p/a", 100, 200, 250), Side::Before);
+        assert_eq!(side(&tl, "p/a", 2_000, 2_010, 250), Side::After);
+        assert_eq!(side(&tl, "p/a", 1_050, 1_060, 250), Side::Unsure);
         // the second page read p/c..p/m at 5 s
-        assert_eq!(side(&tl, "p/c", 2_000, 2_010), Side::Before);
-        assert_eq!(side(&tl, "p/m", 6_000, 6_010), Side::After);
-        assert_eq!(side(&tl, "p/z", 8_000, 8_010), Side::Before);
-        assert_eq!(side(&tl, "p/z", 9_500, 9_510), Side::After);
+        assert_eq!(side(&tl, "p/c", 2_000, 2_010, 250), Side::Before);
+        assert_eq!(side(&tl, "p/m", 6_000, 6_010, 250), Side::After);
+        assert_eq!(side(&tl, "p/z", 8_000, 8_010, 250), Side::Before);
+        assert_eq!(side(&tl, "p/z", 9_500, 9_510, 250), Side::After);
         // a listing that stopped before reaching it
-        assert_eq!(side(&tl[..1], "p/z", 100, 200), Side::After);
+        assert_eq!(side(&tl[..1], "p/z", 100, 200, 250), Side::After);
     }
 
     fn opts(max_requests: u64) -> BackfillOpts {
@@ -1095,7 +1148,7 @@ mod tests {
         let capped = wait_phase(&a, "capped").await;
         assert_eq!((capped.requests, capped.keys), (3, 3_000), "resumed after its cursor");
         // a write during the run, after the listing passed its key: kept
-        tokio::time::sleep(Duration::from_millis(2 * SKEW_MS)).await;
+        tokio::time::sleep(Duration::from_micros(2 * SKEW_US)).await;
         put(&sa, "blob/did/00001x", 5, PutMode::Create).await.unwrap();
         start_backfill(&a, sa.clone(), opts(10), quiet()).await.unwrap();
         let done = wait_phase(&a, "done").await;
@@ -1123,9 +1176,9 @@ mod tests {
         start_backfill(&a, sa.clone(), opts(1), quiet()).await.unwrap();
         wait_phase(&a, "capped").await;
         // ahead of the cursor: the resumed listing reads it
-        tokio::time::sleep(Duration::from_millis(2 * SKEW_MS)).await;
+        tokio::time::sleep(Duration::from_micros(2 * SKEW_US)).await;
         put(&sa, "blob/did/99999", 4, PutMode::Create).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(2 * SKEW_MS)).await;
+        tokio::time::sleep(Duration::from_micros(2 * SKEW_US)).await;
         start_backfill(&a, sa.clone(), opts(5), quiet()).await.unwrap();
         wait_phase(&a, "done").await;
         a.flush(false).await.unwrap();
@@ -1166,6 +1219,6 @@ mod tests {
         assert_eq!(d.requests, 4);
         assert!(started.elapsed() >= Duration::from_millis(300), "{:?}", started.elapsed());
         let gaps: Vec<u64> = d.timeline.windows(2).map(|w| w[1].s - w[0].s).collect();
-        assert!(gaps.iter().all(|g| *g >= 95), "{gaps:?}");
+        assert!(gaps.iter().all(|g| *g >= 95_000), "{gaps:?}");
     }
 }

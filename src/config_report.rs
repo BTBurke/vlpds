@@ -111,6 +111,42 @@ pub fn settings() -> &'static [Setting] {
     SETTINGS.get().map_or(&[], Vec::as_slice)
 }
 
+/// A `-file` flag that holds a secret: its plain sibling is secret, or its
+/// name says so (`--kek-old-file` has no plain sibling).
+fn is_secret_file(flag: &str, all: &[Setting]) -> bool {
+    let Some(base) = flag.strip_suffix("-file") else { return false };
+    all.iter().any(|s| s.flag == base && s.secret)
+        || ["secret", "token", "key", "kek", "credentials", "jwt"].iter().any(|w| base.contains(w))
+}
+
+/// The secret files the node was started with and when each last changed
+/// (a rotation shows as a recent `modifiedAt`), read when asked. The paths
+/// are the flag values getConfig already shows.
+pub fn secret_files(all: &[Setting]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for s in all.iter().filter(|s| s.source != "unset" && is_secret_file(&s.flag, all)) {
+        for path in s.value.as_deref().unwrap_or("").split(',').filter(|p| !p.is_empty()) {
+            let meta = std::fs::metadata(path);
+            if s.source == "default" && meta.is_err() {
+                continue;
+            }
+            let modified = meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            out.push(serde_json::json!({
+                "flag": s.flag,
+                "path": path,
+                "modifiedAt": modified,
+                "error": meta.err().map(|e| e.kind().to_string()),
+            }));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +173,36 @@ mod tests {
         assert_eq!(get("--jwt-secret").fingerprint, None);
         assert_eq!(strip_userinfo("https://u:p@host.example/x@y"), "https://host.example/x@y");
         assert_eq!(strip_userinfo("bsky.network,https://a@b.example"), "bsky.network,https://b.example");
+    }
+
+    #[test]
+    fn secret_file_ages() {
+        let dir = std::env::temp_dir().join(format!("vlpds-cfg-{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tok = dir.join("admin-token");
+        std::fs::write(&tok, "x").unwrap();
+        let p = tok.to_string_lossy().into_owned();
+        let set = |flag: &str, source: &str, value: Option<&str>, secret: bool| Setting {
+            flag: flag.into(),
+            env: None,
+            source: source.into(),
+            value: value.map(String::from),
+            secret,
+            fingerprint: None,
+            help: String::new(),
+        };
+        let all = vec![
+            set("--admin-token", "file", None, true),
+            set("--admin-token-file", "flag", Some(&p), false),
+            set("--exit-state-file", "flag", Some(&p), false),
+            set("--kek-old-file", "flag", Some(&format!("{p},{}/gone", dir.display())), false),
+            set("--vault-k8s-jwt-file", "default", Some("/nonexistent/vlpds/token"), false),
+        ];
+        let got = secret_files(&all);
+        let flags: Vec<&str> = got.iter().map(|v| v["flag"].as_str().unwrap()).collect();
+        assert_eq!(flags, ["--admin-token-file", "--kek-old-file", "--kek-old-file"], "{got:?}");
+        assert!(got[0]["modifiedAt"].as_u64().unwrap() > 1_700_000_000_000);
+        assert!(got[2]["modifiedAt"].is_null() && got[2]["error"].is_string());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

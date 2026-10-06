@@ -258,7 +258,7 @@ impl ObjectStore for Counting {
         let req = Req::new(op, comp, self.client);
         let size = payload.content_length() as u64;
         bytes("up", comp, self.client, size);
-        let (kind, start) = (crate::store_stats::PutKind::from(&opts.mode), crate::store_stats::now_ms());
+        let (kind, start) = (crate::store_stats::PutKind::from(&opts.mode), crate::store_stats::now_us());
         self.write_delay().await;
         let r = self.inner.put_opts(location, payload, opts).await;
         req.finish(&r);
@@ -281,7 +281,7 @@ impl ObjectStore for Counting {
             stats: self.stats.clone(),
             path: location.to_string(),
             size: 0,
-            start: crate::store_stats::now_ms(),
+            start: crate::store_stats::now_us(),
         }))
     }
 
@@ -303,6 +303,10 @@ impl ObjectStore for Counting {
         if !head {
             bytes("down", comp, self.client, r.range.end - r.range.start);
         }
+        // a read tells the object's size, so its later delete or overwrite is exact
+        if let Some(st) = &self.stats {
+            st.listed(location.as_ref(), r.meta.size);
+        }
         Ok(r)
     }
 
@@ -310,7 +314,7 @@ impl ObjectStore for Counting {
     /// per object.
     fn delete_stream(&self, locations: BoxStream<'static, Result<Path>>) -> BoxStream<'static, Result<Path>> {
         let (prefix, client) = (self.prefix.clone(), self.client);
-        let (stats, start) = (self.stats.clone(), crate::store_stats::now_ms());
+        let (stats, start) = (self.stats.clone(), crate::store_stats::now_us());
         // an error may not name its key: count it under the last one sent
         let last = Arc::new(parking_lot::Mutex::new("other"));
         let sent = last.clone();
@@ -365,7 +369,7 @@ impl ObjectStore for Counting {
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let comp = self.comp(to);
         let req = Req::new("copy", comp, self.client);
-        let start = crate::store_stats::now_ms();
+        let start = crate::store_stats::now_us();
         self.write_delay().await;
         let r = self.inner.copy_opts(from, to, options).await;
         req.finish(&r);

@@ -397,8 +397,7 @@ pub async fn build(cfg: Config) -> anyhow::Result<Arc<xrpc::App>> {
             )
         }
         Some(s3) => (
-            Store::s3(s3, &cfg.prefix, cfg.inject_latency, log_limits.connections())?
-                .counted_into("log", &store_stats),
+            Store::s3(s3, &cfg.prefix, cfg.inject_latency, log_limits.connections())?.counted_into("log", &store_stats),
             Store::s3(s3, &cfg.prefix, None, state_limits.connections())?.counted_into("state", &store_stats),
             Store::s3_ctl(
                 s3,
