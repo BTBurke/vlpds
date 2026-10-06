@@ -8,7 +8,8 @@ type Domain = { domain: string; primary: boolean; accounts: number | null; added
 type Listing = PartialResult & { primary: string; domains: Domain[]; updatedAt?: string; refreshSecs: number; countsPartial?: boolean }
 
 export function HandleDomains() {
-  const l = useLoad<Listing>(() => admin('vlpds.admin.listHandleDomains'), [], 10_000)
+  // not polled: each load reads every account row in the cluster to count them
+  const l = useLoad<Listing>(() => admin('vlpds.admin.listHandleDomains'), [])
   const [added, setAdded] = useState('')
   const [notice, setNotice] = useState<string>()
   const [inUse, setInUse] = useState<{ domain: string; message: string }>()
