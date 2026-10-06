@@ -11,15 +11,14 @@ import { basic, call, setAdminToken } from '../../lib/xrpc'
 import { Accounts } from './Accounts'
 import { Cluster } from './Cluster'
 import './clusterDetails'
+import { Domains } from './Domains'
 import { Firehose } from './Firehose'
-import { HandleDomains } from './HandleDomains'
-import { Invites } from './Invites'
 import { Metrics } from './Metrics'
-import { CaseDetail, Moderation } from './Moderation'
+import { Moderation } from './Moderation'
 import { Nodes } from './Nodes'
 import { Overview } from './Overview'
 import { Legacy, Placeholder } from './Placeholder'
-import { RateLimits } from './RateLimits'
+import { Limits } from './Limits'
 import { Relays } from './Relays'
 import { SpaceDetail, Spaces } from './Spaces'
 
@@ -72,23 +71,14 @@ function route(p: string): Route {
     case '/admin/accounts':
       return { section: S.accounts, page: <Accounts /> }
     case '/admin/moderation':
-      return { section: S.moderation, page: <Legacy><Moderation /></Legacy> }
+      return { section: S.moderation, page: <Moderation /> }
     case '/admin/limits':
     case '/admin/ratelimits':
-      return { section: S.limits, page: <Legacy><RateLimits /></Legacy> }
+      return { section: S.limits, page: <Limits /> }
     case '/admin/domains':
     case '/admin/invites':
     case '/admin/handle-domains':
-      return {
-        section: S.domains,
-        page: (
-          <Legacy>
-            <HandleDomains />
-            <div style={{ height: 24 }} />
-            <Invites />
-          </Legacy>
-        ),
-      }
+      return { section: S.domains, page: <Domains /> }
     case '/admin/spaces':
       return { section: S.spaces, page: <Legacy><Spaces /></Legacy> }
     case '/admin/spaces/space':
@@ -100,7 +90,7 @@ function route(p: string): Route {
   }
   // the pre-console account page's path, which other pages still link to
   if ((m = match('/admin/accounts/:did', p)) && m.did.startsWith('did:')) return { section: S.accounts, page: <DetailPage key="account" type="account" id={m.did} />, crumbs: crumb(S.accounts, m.did) }
-  if ((m = match('/admin/moderation/cases/:id', p))) return { section: S.moderation, page: <Legacy><CaseDetail id={m.id} /></Legacy>, crumbs: crumb(S.moderation, m.id) }
+  if ((m = match('/admin/moderation/cases/:id', p))) return { section: S.moderation, page: <DetailPage key="case" type="case" id={m.id} />, crumbs: crumb(S.moderation, m.id) }
   // a detail kind's full page: /admin/<section>/<type>/<id>
   if ((m = match('/admin/:section/:type/:id', p)) && detailKind(m.type)) {
     const section = sectionOf(p)

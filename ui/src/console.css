@@ -1168,6 +1168,8 @@ a.cx-tile:hover {
   height: 64px;
 }
 .cx-spark.empty {
+  /* styles.css has a global .empty with padding */
+  padding: 0;
   background: repeating-linear-gradient(135deg, var(--hatch) 0 4px, transparent 4px 8px);
   border-radius: 3px;
 }

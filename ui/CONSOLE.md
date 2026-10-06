@@ -105,9 +105,9 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 | Object store | `/admin/storage` | Placeholder |
 | Firehose & relays | `/admin/firehose` | Legacy (`Firehose` + `Relays`). Detail kinds `event` and `sub` exist |
 | Accounts | `/admin/accounts` | Built. Detail kind `account` (`accountDetail.tsx`, actions in `accountActions.tsx`), full page at `/admin/accounts/account/<did>`; the old `/admin/accounts/<did>` still lands there |
-| Moderation | `/admin/moderation` | Legacy, plus `/admin/moderation/cases/:id` |
-| Limits & lockouts | `/admin/limits` | Legacy (`RateLimits`), alias `/admin/ratelimits` |
-| Domains & invites | `/admin/domains` | Legacy (`HandleDomains` + `Invites`) |
+| Moderation | `/admin/moderation` | Built. Detail kinds `case`, `subject` (id: what resolveSubject takes), `audit`. `?q=` and `/admin/moderation/cases/:id` still land |
+| Limits & lockouts | `/admin/limits` | Built, alias `/admin/ratelimits`. Detail kinds `bucket`, `override`. Every edit goes through `editLimits` (diff, then updateRateLimits with ifVersion) |
+| Domains & invites | `/admin/domains` | Built. Detail kinds `domain`, `invite` |
 | Spaces | `/admin/spaces` | Legacy, plus `/admin/spaces/space` |
 | Mail | `/admin/mail` | Placeholder (needs `getMailLog`) |
 | Config | `/admin/config` | Placeholder (needs `getConfig`) |
