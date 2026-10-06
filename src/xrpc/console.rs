@@ -410,8 +410,7 @@ async fn internal_accounts(State(app): AppState, headers: HeaderMap, Query(q): Q
     Ok(Json(out))
 }
 
-const COUNT_KEYS: [&str; 7] =
-    ["total", "active", "deactivated", "takendown", "suspended", "unconfirmed", "no2fa"];
+const COUNT_KEYS: [&str; 7] = ["total", "active", "deactivated", "takendown", "suspended", "unconfirmed", "no2fa"];
 
 /// The filter counts of this node's open shards, from their totals
 /// (crate::totals): in memory, no reads. A shard whose totals are still
@@ -419,7 +418,8 @@ const COUNT_KEYS: [&str; 7] =
 fn local_counts(app: &App) -> J {
     let (t, loading) = super::totals_loading(app);
     let n = [t.repos(), t.accounts[0], t.accounts[1], t.accounts[2], t.accounts[3], t.unconfirmed, t.no2fa];
-    let mut out: serde_json::Map<String, J> = COUNT_KEYS.iter().zip(n).map(|(k, v)| (k.to_string(), json!(v))).collect();
+    let mut out: serde_json::Map<String, J> =
+        COUNT_KEYS.iter().zip(n).map(|(k, v)| (k.to_string(), json!(v))).collect();
     out.insert("loadingShards".into(), json!(loading));
     J::Object(out)
 }
@@ -529,7 +529,6 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         res["unsupportedNodes"] = json!(unsupported);
     }
     if res["cursor"].is_null() {
-
         res.as_object_mut().map(|o| o.remove("cursor"));
     }
     Ok(Json(res))
@@ -1113,8 +1112,9 @@ async fn local_lockouts(app: &App) -> XResult<Vec<J>> {
             (super::mfa::FACTOR_LOCK, Some(v)) => {
                 serde_json::from_slice::<super::mfa::Mfa>(v).map_or((0, 0), |m| (m.failures, m.locked_until))
             }
-            (_, Some(v)) => serde_json::from_slice::<super::email2fa::Lockout>(v)
-                .map_or((0, 0), |l| (l.failures, l.locked_until)),
+            (_, Some(v)) => {
+                serde_json::from_slice::<super::email2fa::Lockout>(v).map_or((0, 0), |l| (l.failures, l.locked_until))
+            }
         };
         if until <= now {
             let (conds, ops) = (vec![Cond::eq(name, raw.clone())], vec![Op::put(name, raw)]);
@@ -1201,7 +1201,6 @@ async fn clear_lockout(
         return Err(crate::totp::conflict());
     }
     let e =
-
         audit(&app, &who(inp.actor, ip), "lockout.clear", Some(&SubjectRef::account(did)), Some(&reason), None, None)
             .await?;
     Ok(Json(json!({"did": did, "auditId": e.id})))

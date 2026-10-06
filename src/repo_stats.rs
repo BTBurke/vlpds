@@ -100,7 +100,6 @@ pub async fn walk<R: slatedb::DbReadOps + Sync + ?Sized>(db: &R, did: &str, gen:
         blobs: blobs.len() as u64,
         bytes: Some(RepoBytes { records: record_bytes, nodes: node_bytes }),
     })
-
 }
 
 #[cfg(test)]
@@ -121,7 +120,8 @@ mod tests {
 
     #[test]
     fn commits_keep_bytes_close() {
-        let before = RepoStats { records: 10, nodes: 4, blobs: 0, bytes: Some(RepoBytes { records: 1000, nodes: 400 }) };
+        let before =
+            RepoStats { records: 10, nodes: 4, blobs: 0, bytes: Some(RepoBytes { records: 1000, nodes: 400 }) };
         let mut b = before.bytes.unwrap();
         // two creates of 150 bytes and one delete (the mean, 100); a new
         // node of 120 bytes and one replaced (the mean, 100)

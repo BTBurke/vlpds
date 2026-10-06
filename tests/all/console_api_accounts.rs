@@ -38,7 +38,8 @@ async fn scanned(s: &TestServer) -> [i64; 6] {
         let r = admin_get(s, "vlpds.admin.listAccounts", &[("filter", f), ("sort", "slot"), ("limit", "200")]).await;
         r["accounts"].as_array().unwrap().len() as i64
     };
-    let (all, deact, td, unconf, no2fa) = (n("all").await, n("deactivated").await, n("takendown").await, n("unconfirmed").await, n("no2fa").await);
+    let (all, deact, td, unconf, no2fa) =
+        (n("all").await, n("deactivated").await, n("takendown").await, n("unconfirmed").await, n("no2fa").await);
     [all, all - deact - td, deact, td, unconf, no2fa]
 }
 
@@ -101,12 +102,18 @@ async fn repo_bytes_and_recount() {
     let check = admin_get(&s, "vlpds.admin.checkRepo", &[("did", &a.did)]).await;
     let counted = check["stats"]["counted"].clone();
     let r = row(admin_get(&s, "vlpds.admin.listAccounts", &[("q", &a.did)]).await);
-    let (kept, exact) = (r["repoBytes"].as_f64().unwrap(), (counted["recordBytes"].as_u64().unwrap() + counted["nodeBytes"].as_u64().unwrap()) as f64);
+    let (kept, exact) = (
+        r["repoBytes"].as_f64().unwrap(),
+        (counted["recordBytes"].as_u64().unwrap() + counted["nodeBytes"].as_u64().unwrap()) as f64,
+    );
     assert!((kept - exact).abs() / exact < 0.25, "kept {kept}, exact {exact}");
     let rc = s.xrpc.post("vlpds.admin.recountRepo", &json!({"did": a.did}), &Auth::Admin).await.ok();
     assert_eq!(rc["after"], counted, "{rc}");
     let r = row(admin_get(&s, "vlpds.admin.listAccounts", &[("q", &a.did)]).await);
-    assert_eq!((r["recordBytes"].clone(), r["mstBytes"].clone()), (counted["recordBytes"].clone(), counted["nodeBytes"].clone()));
+    assert_eq!(
+        (r["recordBytes"].clone(), r["mstBytes"].clone()),
+        (counted["recordBytes"].clone(), counted["nodeBytes"].clone())
+    );
     s.xrpc.post("vlpds.admin.recountRepo", &json!({"did": a.did}), &a.auth()).await.err(401, "AuthenticationRequired");
 }
 
@@ -127,7 +134,8 @@ async fn cases_by_subject() {
     let c2 = case(json!([{"kind": "record", "did": a.did, "uri": p.uri}])).await;
     let c3 = case(json!([{"kind": "account", "did": b.did}])).await;
     let ids = |r: J| {
-        let mut v: Vec<String> = r["cases"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().into()).collect();
+        let mut v: Vec<String> =
+            r["cases"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().into()).collect();
         v.sort();
         v
     };
@@ -177,7 +185,8 @@ async fn operator_creates_an_account_without_an_invite() {
     assert!(r2.get("password").is_none(), "{r2}");
     s.login(&h2, "a-long-enough-password", None).await.ok();
     let log = admin_get(&s, "vlpds.admin.getAuditLog", &[("did", r["did"].as_str().unwrap())]).await;
-    let e = log["entries"].as_array().unwrap().iter().find(|e| e["action"] == "account.create").expect("audited").clone();
+    let e =
+        log["entries"].as_array().unwrap().iter().find(|e| e["action"] == "account.create").expect("audited").clone();
     assert_eq!(e["reason"], "support ticket", "{e}");
     assert!(!log.to_string().contains(&password), "the password isn't audited");
     // and without the admin token, nothing
@@ -216,7 +225,8 @@ async fn lockouts_survive_a_restart() {
     let s = on_store(&store).await;
     let r = admin_get(&s, "vlpds.admin.listLockouts", &[]).await;
     assert!(listed(&r), "still listed after the restart: {r}");
-    let attention = admin_get(&s, "vlpds.admin.listAccounts", &[("filter", "attention"), ("sort", "slot"), ("limit", "200")]).await;
+    let attention =
+        admin_get(&s, "vlpds.admin.listAccounts", &[("filter", "attention"), ("sort", "slot"), ("limit", "200")]).await;
     assert!(attention["accounts"].as_array().unwrap().iter().any(|x| x["did"] == a.did.as_str()), "{attention}");
 
     s.xrpc.post("vlpds.admin.clearLockout", &json!({"did": a.did, "reason": "verified"}), &Auth::Admin).await.ok();

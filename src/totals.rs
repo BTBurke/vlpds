@@ -726,7 +726,6 @@ mod tests {
 
     #[test]
     fn statuses() {
-
         assert_eq!(status_index(None), 0);
         assert_eq!(status_index(Some("deactivated")), 1);
         assert_eq!(status_index(Some("takendown")), 2);

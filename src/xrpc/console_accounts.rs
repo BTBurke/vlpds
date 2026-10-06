@@ -121,12 +121,7 @@ async fn create_account(
     let password = generated.clone().or(inp.password);
     let acct = super::server::create_account_by_operator(
         &app,
-        super::server::CreateAccountIn {
-            handle: inp.handle,
-            email: Some(inp.email),
-            password,
-            ..Default::default()
-        },
+        super::server::CreateAccountIn { handle: inp.handle, email: Some(inp.email), password, ..Default::default() },
     )
     .await?;
     let actor = inp
@@ -136,8 +131,16 @@ async fn create_account(
         .unwrap_or_else(|| "admin".into());
     let who = Who { actor, ip: ip.map(|i| i.to_string()) };
     let detail = json!({"handle": acct.handle, "generatedPassword": generated.is_some()});
-    let e = audit(&app, &who, "account.create", Some(&SubjectRef::account(&acct.did)), reason.as_deref(), None, Some(detail))
-        .await?;
+    let e = audit(
+        &app,
+        &who,
+        "account.create",
+        Some(&SubjectRef::account(&acct.did)),
+        reason.as_deref(),
+        None,
+        Some(detail),
+    )
+    .await?;
     let mut out = json!({"did": acct.did, "handle": acct.handle, "auditId": e.id});
     if let Some(p) = generated {
         out["password"] = json!(p);

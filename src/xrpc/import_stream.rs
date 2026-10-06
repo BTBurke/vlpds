@@ -317,7 +317,6 @@ fn stream(input: &mut Input, sink: &mut Sink) -> Result<(Bytes, u64, u64, crate:
     sink.flush()?;
     let block = root.bytes.as_deref().map(Bytes::copy_from_slice).ok_or(Stop::Depart)?;
     Ok((block, records, nodes, crate::state::RepoBytes { records: sink.record_bytes, nodes: node_bytes }))
-
 }
 
 #[derive(PartialEq)]

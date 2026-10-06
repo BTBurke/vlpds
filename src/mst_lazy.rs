@@ -195,7 +195,6 @@ impl StreamBuilder {
         let (root, len) = finish_sized(top as i32, std::mem::take(&mut self.open[top]), true)?;
         self.node_bytes += len as u64;
         if top >= 1 {
-
             out.push((
                 root.cid.ok_or(MstError::Invalid("unwritten node"))?,
                 root.bytes.clone().ok_or(MstError::Invalid("root without its block"))?,

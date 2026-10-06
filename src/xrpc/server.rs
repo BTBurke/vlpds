@@ -1232,7 +1232,6 @@ pub(super) async fn legacy_sessions(app: &App, did: &str) -> XResult<Vec<J>> {
                 "ip": st.ip,
                 "signedInIp": st.created_ip,
             })
-
         })
         .collect();
     out.sort_by_key(|j| std::cmp::Reverse(j["refreshedAt"].as_u64()));
@@ -1473,7 +1472,6 @@ async fn create_account_checked(
     }
     let invite = inp.invite_code.as_deref().map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
     if app.config.invite_required && invite.is_none() && !operator {
-
         return Err(XrpcError::bad("InvalidInviteCode", "No invite code provided"));
     }
     // the request's spelling, echoed in "Email already taken" as the reference does

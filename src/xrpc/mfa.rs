@@ -135,7 +135,6 @@ pub fn settle(m: &mut Mfa, r: XResult<()>, now: u64) -> XResult<()> {
         Err(e) => {
             crate::totp::record_failure_in(&mut m.failures, &mut m.locked_until, now);
             Err(if now < m.locked_until { crate::totp::locked_out() } else { e })
-
         }
     }
 }

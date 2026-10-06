@@ -850,8 +850,7 @@ async fn create_session_inner(
     let auth_ref = used.cred.auth_ref();
     super::cas::pause_point("passkey_session", &did).await;
     let (access, refresh) =
-        super::server::create_session_tokens(app, &did, None, false, Some(&epoch), Some(auth_ref.clone()), ip)
-            .await?;
+        super::server::create_session_tokens(app, &did, None, false, Some(&epoch), Some(auth_ref.clone()), ip).await?;
     // a removal racing this either found the session above or left the
     // passkey gone for this check (it writes the row before its scan)
     if !still_registered(app, &did, Some(&auth_ref)).await? {

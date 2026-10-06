@@ -2096,7 +2096,6 @@ async fn refresh_grant(
         s.ip = ip;
     }
     issue_tokens(app, client, &mut s, store::SessionGuard::Row(raw)).await
-
 }
 
 /// RFC 7009.

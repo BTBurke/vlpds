@@ -1010,8 +1010,7 @@ async fn list_cases(State(app): AppState, Auth(creds): Auth, Query(q): Query<Cas
     let about = |c: &Case| {
         did.is_none_or(|d| {
             c.subjects.iter().any(|s| {
-                s.did == d
-                    && subject.is_none_or(|x| s.uri.as_deref() == Some(x) || s.cid.as_deref() == Some(x))
+                s.did == d && subject.is_none_or(|x| s.uri.as_deref() == Some(x) || s.cid.as_deref() == Some(x))
             })
         })
     };

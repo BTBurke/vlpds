@@ -171,7 +171,6 @@ pub fn lockout_key(did: &str, factor: &str) -> Vec<u8> {
 }
 
 pub fn private_key(did: &str, name: &str) -> Vec<u8> {
-
     keyed(did, b"p/", &[did.as_bytes(), b"\0", name.as_bytes()])
 }
 

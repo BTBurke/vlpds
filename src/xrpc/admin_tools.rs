@@ -234,8 +234,8 @@ async fn inspect(app: &App, did: &str) -> XResult<Inspection> {
                 crate::repo_stats::tree_bytes(&tree).map_err(XrpcError::from_err)?,
             ))
         })
-    .await
-    .map_err(XrpcError::from_err)??;
+        .await
+        .map_err(XrpcError::from_err)??;
     let matches_head = rebuilt == head.data;
     let (mut have, mut corrupt, mut stale_keys) = (HashSet::new(), Vec::new(), Vec::new());
     let mut extra = Vec::new();
@@ -442,7 +442,6 @@ async fn recount_repo(
 }
 
 pub fn space_routes() -> Router<Arc<App>> {
-
     Router::new().route("/xrpc/vlpds.admin.checkSpace", get(check_space))
 }
 
