@@ -1,20 +1,29 @@
 import { useEffect, useRef } from 'react'
 import { logHistory, type ClusterView } from '../../lib/console/cluster'
 import { getLive } from '../../lib/console/live'
+import { segmentsPoll } from '../../lib/console/segments'
 
 // "Logs → watermark → firehose": one lane per node's log over the last 15 s. Each block is a
-// log segment (a batch of commits written with one PUT); the amber ticks are each log's
-// watermark and the dashed line the slowest one, which the merged firehose emits up to.
-// Until the server has a per-segment feed, blocks come from the durable ordinal advancing
-// between two getClusterStatus polls, spread over the interval.
+// log segment (a batch of commits written with one PUT), placed where it was sealed, sized by
+// its events and outlined until its PUT is durable (listSegments). The amber ticks are each
+// log's watermark and the dashed line the slowest one, which the merged firehose emits up to.
+// A server without listSegments gets blocks from the durable ordinal advancing between two
+// getClusterStatus polls, spread over the interval.
 
 const SPAN = 15_000
 const LANE = 30
 
-type Seg = { start: number; log: string }
+type Seg = { start: number; log: string; events?: number; inflight?: boolean }
 
 function segmentsFrom(): { segs: Seg[]; latest?: number } {
   const h = logHistory()
+  const feed = segmentsPoll.get().data?.lanes
+  if (feed) {
+    const segs: Seg[] = []
+    for (const [log, list] of Object.entries(feed.logs))
+      for (const s of list) segs.push({ log, start: s.sealedAt, events: s.events, inflight: s.durableAt == null })
+    return { segs, latest: h[h.length - 1]?.t ?? feed.time }
+  }
   const segs: Seg[] = []
   for (let i = 1; i < h.length; i++) {
     const a = h[i - 1]
@@ -30,6 +39,8 @@ function segmentsFrom(): { segs: Seg[]; latest?: number } {
 }
 
 export function Strata({ view, fetchedAt }: { view: ClusterView; fetchedAt?: number }) {
+  // keeps the feed polling while the canvas is up; the draw loop reads it with get()
+  segmentsPoll.use()
   const ref = useRef<HTMLCanvasElement>(null)
   const viewRef = useRef(view)
   viewRef.current = view
@@ -112,9 +123,17 @@ export function Strata({ view, fetchedAt }: { view: ClusterView; fetchedAt?: num
         for (const s of mine) {
           const x = X(s.start)
           if (x < x0 || x > x1) continue
+          const w = s.events !== undefined ? Math.max(1.5, Math.min(bw, 3 + s.events * 0.8)) : bw
+          if (s.inflight) {
+            g.strokeStyle = col.ink3
+            g.setLineDash([2, 2])
+            g.strokeRect(x + 0.5, y + 5.5, w, 13)
+            g.setLineDash([])
+            continue
+          }
           g.globalAlpha = minWm === undefined || s.start <= minWm ? 1 : 0.45
           g.fillStyle = bad ? col.idle : color
-          g.fillRect(x, y + 5, bw, 14)
+          g.fillRect(x, y + 5, w, 14)
           g.globalAlpha = 1
         }
         if (n.wmLagMs !== undefined) {

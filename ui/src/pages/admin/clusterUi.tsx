@@ -5,7 +5,7 @@ import { Chip, Meter, MiniBar, Spark, Swatch, type BannerSpec } from '../../comp
 import { openPanel } from '../../components/console/nav'
 import type { ClusterView, NodeView } from '../../lib/console/cluster'
 import { clusterPoll } from '../../lib/console/cluster'
-import { dur, fmtBytes, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural } from '../../lib/console/fmt'
+import { dur, factorName, fmtBytes, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural } from '../../lib/console/fmt'
 import type { Optional, Lockout } from '../../lib/console/adminAdapter'
 import { col, last, nodeGauges, nodePoints, type MetricsState } from '../../lib/console/metrics'
 import { isSlow, type SubscriberList } from '../../lib/console/polls'
@@ -136,7 +136,7 @@ export function clusterBanners(view: ClusterView, subs?: SubscriberList, locks?:
       ),
     })
   }
-  const lk = locks?.supported ? locks.data.filter((l) => l.kind === 'account') : []
+  const lk = locks?.supported ? locks.data : []
   if (lk.length)
     out.push({
       id: 'locked',
@@ -147,12 +147,11 @@ export function clusterBanners(view: ClusterView, subs?: SubscriberList, locks?:
       body: (
         <>
           {lk.map((l) => (
-            <div key={l.did}>
-              @{l.handle ?? l.did}: {l.bucket} {l.used}/{l.limit}
-              {l.ips && l.ips > 1 ? ` from ${l.ips} addresses` : ''}, clears in {dur(l.resetsAt - Date.now())}.
+            <div key={`${l.did}/${l.factor}`}>
+              @{l.handle ?? l.did}: {factorName(l.factor)} locked after {l.failures} wrong codes, clears in {dur(l.lockedUntil - Date.now())}.
             </div>
           ))}
-          <div style={{ marginTop: 4 }}>Live sessions keep working while sign-in is held.</div>
+          <div style={{ marginTop: 4 }}>Live sessions keep working while the code is locked.</div>
         </>
       ),
     })

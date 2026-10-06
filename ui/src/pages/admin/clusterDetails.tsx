@@ -59,9 +59,15 @@ registerDetail('node', {
               <Mini label="commit → durable p99" value={fmtSec(last(p, 'durP99'))}>
                 <Spark data={col(p, 'durP99')} l2={col(p, 'durP50')} color="amber" />
               </Mini>
-              <Mini label="lease renew ÷ TTL p99" value={last(p, 'leaseRatioP99')?.toFixed(3) ?? '—'}>
-                <Spark data={col(p, 'leaseRatioP99')} color="violet" th={0.2} />
-              </Mini>
+              {last(p, 'leaseRatioP99') !== undefined ? (
+                <Mini label="lease renew ÷ TTL p99" value={last(p, 'leaseRatioP99')!.toFixed(3)}>
+                  <Spark data={col(p, 'leaseRatioP99')} color="violet" th={0.2} />
+                </Mini>
+              ) : (
+                <Mini label="segment PUT p99" value={fmtSec(last(p, 'putP99'))}>
+                  <Spark data={col(p, 'putP99')} l2={col(p, 'putP50')} color="violet" />
+                </Mini>
+              )}
             </Minis>
           )}
           <Sec title="Lease" digest={view.single ? 'single node' : n.leaseValid ? 'valid' : 'expired'} open>
@@ -279,7 +285,7 @@ registerDetail('sub', {
                         items: ['Closes the websocket with reason “kicked”.', 'The client can reconnect with its cursor and backfill what it missed.'],
                         word: `#${s.conn}`,
                         action: 'Disconnect',
-                        call: `vlpds.admin.kickSubscriber {"node": "${s.node}", "conn": "${s.conn}"}`,
+                        call: `vlpds.admin.kickSubscriber {"conn": "${s.conn}"} → ${s.node}`,
                         run: async () => {
                           const r = await kickSubscriber(s.node, s.conn)
                           if (!r.supported) throw new Error(`This server has no ${r.nsid} yet: update vlpds to disconnect subscribers from the console.`)

@@ -8,7 +8,7 @@ The console at `/admin` is a status-first shell: a top bar with the strata rule,
 | --- | --- |
 | `src/console.css` | Tokens and every console class. All classes start with `cx-` (or sit under one) because `styles.css` is global and already owns `.btn`, `.tile`, `.seg`, `.empty`. |
 | `src/components/console/` | The kit: `kit.tsx` (small parts), `DataTable.tsx`, `Drawer.tsx` (detail kinds), `dialogs.tsx` (confirm and form dialogs), `toast.tsx`, `LiveTail.tsx`, `Strata.tsx`, `Palette.tsx`, `Shell.tsx`, `sections.tsx` (the IA), `nav.ts` (slide-over URLs). |
-| `src/lib/console/` | Data: `live.ts` (pause, stale, shared pollers), `cluster.ts` (getClusterStatus + derived view), `metrics.ts` (Prometheus scrapes to rates), `firehose.ts` (subscribeRepos tail, handle lookups), `polls.ts` (subscribers, cases, audit, lockouts), `adminAdapter.ts` (endpoints older servers lack), `fmt.ts`. |
+| `src/lib/console/` | Data: `live.ts` (pause, stale, shared pollers), `cluster.ts` (getClusterStatus + derived view), `metrics.ts` (getNodeMetrics series, or local /metrics scrapes to rates), `firehose.ts` (subscribeRepos tail, handle lookups), `polls.ts` (subscribers, cases, audit, lockouts), `segments.ts` (listSegments for the strata), `adminAdapter.ts` (the way into `lib/adminApi.ts`), `fmt.ts`. |
 | `src/pages/admin/` | Pages. `AdminApp.tsx` routes. `Overview.tsx` and `Nodes.tsx` are built on the kit, `clusterUi.tsx` holds what they share, `clusterDetails.tsx` registers the node, shard, event and sub details. The rest are the pre-console pages, shown inside `<Legacy>`. |
 
 ## Building a section
@@ -38,7 +38,7 @@ All from `components/console/kit.tsx` unless noted.
 - `Src` tags where a panel's data comes from. They only show with "Show data sources" (sidebar foot or ⌘K), so leave them in.
 - `DataTable rows cols rowKey open onRow sort dim empty` (`DataTable.tsx`). Columns are `{ id, label, r, sort, render, title, style }`. Rows that open carry `data-open="type:id"`, which is all the shell's `j` / `k` / `Enter` handling needs. A row whose detail is open gets `.sel`.
 - `LiveTail height max nodeFilter` (`LiveTail.tsx`) is the merged firehose. It's pausable (global space), filterable by text, kind and node, and keeps your place when you've scrolled down.
-- `Strata view fetchedAt` (`Strata.tsx`) is the logs → watermark → firehose canvas.
+- `Strata view fetchedAt` (`Strata.tsx`) is the logs → watermark → firehose canvas. Blocks are real segments from `listSegments` (outlined while the PUT is in flight), or the durable ordinal's steps on a server without it.
 - `toast(msg, { err })` (`toast.tsx`).
 
 ## Details: slide-over and full page
@@ -79,9 +79,9 @@ The footer shows `call`, the request it makes. `run` errors stay in the dialog. 
 
 - `createPoller(fetch, ms, { heartbeat })` (`live.ts`) is one shared poll per thing. It runs only while something renders `poll.use()` and skips ticks while paused. `getClusterStatus` is the heartbeat: when it fails the shell shows "Not updating", hatches live values and greys the sparklines.
 - `useClusterView()` gives the status plus node colours, shard counts, watermark lag per log, lease time left and `health` per node.
-- `useMetrics()` gives per-node and merged `Point[]` (3 minutes at 2 s) and gauges. The source is the peer fan-out when the server has it, else this node's `/metrics`. Production keeps `/metrics` off the app port, so expect `source: 'none'` there until `getNodeMetrics` lands, and show `NeedsVersion`.
+- `useMetrics()` gives per-node and merged `Point[]` (3 minutes at 2 s) and gauges. The source is `getNodeMetrics` (every node's series, gathered by the node you reach), else this node's `/metrics`, else `'none'` (show `NeedsVersion`). The fan-out has no hedge, lease-ratio or mail-budget figures, so hide what's `undefined` rather than drawing an empty spark.
 - `useFirehose()` is the live tail. `useHandle(did)` batches handle lookups through `getAccountInfos`.
-- `adminAdapter.ts` is the only place that calls endpoints older servers don't have. Each call returns `{ supported: true, data }` or `{ supported: false, nsid }`. When `lib/adminApi.ts` lands, these bodies call it and the pages don't change. The NSIDs there are placeholders until then.
+- `adminAdapter.ts` is the way into `lib/adminApi.ts`. `withAdmin(c => api.listAccounts(c, …))` hands a call the admin token and turns its errors into `XrpcError`s (a 401 goes back to the token form). The `optional` wrappers (`nodeMetrics`, `segmentFeed`, `lockouts`, `mailLog`, `getConfig`, `kickSubscriber`) answer `{ supported: true, data }` or `{ supported: false, nsid }` for servers older than the console API.
 - `useLoad` and `admin()` from `lib/hooks.ts` and `lib/xrpc.ts` still work for one-off loads inside a section.
 
 ## Keyboard

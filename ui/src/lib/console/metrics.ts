@@ -1,12 +1,13 @@
 import { useSyncExternalStore } from 'react'
 import { parseProm, quantile, rate, sum, type Sample, type Scrape } from '../prom'
-import { nodeMetrics } from './adminAdapter'
+import { nodeMetrics, type MetricsPoint } from './adminAdapter'
 import { getLive } from './live'
 
-// Prometheus scrapes, every 2 s while a console page reads them, turned into rates and
-// quantiles client-side (lib/prom.ts). Per node when the server fans /metrics out to its peers
-// (adminAdapter.nodeMetrics), else this node's own /metrics; with neither (production keeps
-// /metrics off the app port unless --metrics-listen app) the source is "none" and tiles say so.
+// Rates and latencies per node, every 2 s while a console page reads them. getNodeMetrics
+// gathers every node's series (each keeps 3 minutes in memory), so it works where /metrics is
+// off the app port. A server without it falls back to scraping this node's own /metrics into
+// rates client-side (lib/prom.ts); with neither the source is "none" and the tiles say so.
+// The fan-out has no hedge, lease-ratio or mail-budget figures: those stay empty.
 
 export const INTERVAL = 2000
 export const KEEP = 90 // 3 minutes
@@ -113,16 +114,10 @@ let fanout: boolean | undefined
 
 const push = (arr: Point[] | undefined, p: Point) => [...(arr ?? []), p].slice(-KEEP)
 
-async function scrapeAll(): Promise<{ node: string; s: Scrape }[] | null> {
-  if (fanout !== false) {
-    const r = await nodeMetrics()
-    if (r.supported) {
-      fanout = true
-      const t = Date.now()
-      return r.data.filter((n) => n.text).map((n) => ({ node: n.node, s: parseProm(n.text!, t) }))
-    }
-    fanout = false
-  }
+/** Newest point per node from getNodeMetrics, for the next call's `since`. */
+const lastT: Record<string, number> = {}
+
+async function scrapeLocal(): Promise<{ node: string; s: Scrape }[] | null> {
   const res = await fetch('/metrics')
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`/metrics answered ${res.status}`)
@@ -131,11 +126,88 @@ async function scrapeAll(): Promise<{ node: string; s: Scrape }[] | null> {
   return [{ node, s }]
 }
 
+const sec = (ms: number | null | undefined) => (ms === null || ms === undefined ? undefined : ms / 1000)
+
+function pointOf(p: MetricsPoint, limitCores?: number): Point {
+  return {
+    t: p.t,
+    commits: p.commitsPerSec,
+    ops: p.opsPerSec,
+    http: p.httpPerSec,
+    http5xx: p.http5xxPerSec,
+    durP50: sec(p.commitP50Ms),
+    durP99: sec(p.commitP99Ms),
+    putP50: sec(p.putP50Ms),
+    putP99: sec(p.putP99Ms),
+    emitP99: sec(p.emitP99Ms),
+    loads: p.repoLoadsPerSec,
+    fhEvents: p.firehoseEventsPerSec,
+    fhBytes: p.firehoseBytesPerSec,
+    objA: p.classAPerSec,
+    objB: p.classBPerSec,
+    objErr: p.storeErrorsPerSec,
+    limited: p.rateLimitedPerSec,
+    cpu: limitCores ? (p.cpuCores / limitCores) * 100 : undefined,
+  }
+}
+
+const RATES = ['commits', 'ops', 'http', 'http5xx', 'loads', 'fhEvents', 'fhBytes', 'objA', 'objB', 'objErr', 'limited'] as const
+const WORST = ['durP50', 'durP99', 'putP50', 'putP99', 'emitP99', 'cpu'] as const
+
+/** The cluster line from per-node series: rates add up, latencies and CPU take the worst node. */
+function mergeNodes(byNode: Record<string, Point[]>, interval: number): Point[] {
+  const series = Object.values(byNode).filter((s) => s.length)
+  if (!series.length) return []
+  // a bucket only some nodes have reported yet would dip, so stop at the slowest node's newest
+  const upTo = Math.min(...series.map((s) => Math.round(s[s.length - 1].t / interval)))
+  const buckets = new Map<number, Point>()
+  for (const s of series)
+    for (const p of s) {
+      const k = Math.round(p.t / interval)
+      if (k > upTo) continue
+      const m = buckets.get(k) ?? { t: k * interval }
+      for (const f of RATES) if (p[f] !== undefined) m[f] = (m[f] ?? 0) + p[f]!
+      for (const f of WORST) if (p[f] !== undefined) m[f] = Math.max(m[f] ?? 0, p[f]!)
+      buckets.set(k, m)
+    }
+  return [...buckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([, p]) => p)
+    .slice(-KEEP)
+}
+
+/** False when the server has no getNodeMetrics. */
+async function tickFanout(): Promise<boolean> {
+  const seen = Object.values(lastT)
+  const r = await nodeMetrics(seen.length ? Math.min(...seen) : undefined)
+  if (!r.supported) return false
+  const byNode = { ...st.byNode }
+  const gauges: Record<string, Gauges> = {}
+  let interval = INTERVAL
+  for (const n of r.data.nodes) {
+    if (!n.reachable) continue
+    interval = n.intervalMs ?? interval
+    const fresh = (n.series ?? []).filter((p) => p.t > (lastT[n.node] ?? 0))
+    if (fresh.length) {
+      byNode[n.node] = [...(byNode[n.node] ?? []), ...fresh.map((p) => pointOf(p, n.cpuLimitCores))].slice(-KEEP)
+      lastT[n.node] = fresh[fresh.length - 1].t
+    }
+    const g = n.latest ?? n.series?.[n.series.length - 1]
+    gauges[n.node] = { cachedRepos: g?.cachedRepos, mailQueue: g?.mailQueue, resident: g?.rssBytes, memLimit: n.memoryLimitBytes, subscribers: g?.subscribers }
+  }
+  st = { source: 'fanout', cluster: mergeNodes(byNode, interval), byNode, gauges, version: st.version + 1 }
+  return true
+}
+
 async function tick() {
   if (busy || getLive().paused) return
   busy = true
   try {
-    const got = await scrapeAll()
+    if (fanout !== false) {
+      fanout = await tickFanout()
+      if (fanout) return
+    }
+    const got = await scrapeLocal()
     if (!got) {
       st = { ...st, source: 'none', version: st.version + 1 }
       return
@@ -159,14 +231,7 @@ async function tick() {
       prev.set(node, s)
     }
     const cluster = mergedB.length ? push(st.cluster, derive({ t: ta, samples: mergedA }, { t: tb, samples: mergedB })) : st.cluster
-    st = {
-      source: fanout ? 'fanout' : 'local',
-      cluster,
-      byNode,
-      gauges,
-      localNode: fanout ? undefined : got[0]?.node,
-      version: st.version + 1,
-    }
+    st = { source: 'local', cluster, byNode, gauges, localNode: got[0]?.node, version: st.version + 1 }
   } catch (e) {
     st = { ...st, error: e instanceof Error ? e.message : String(e), version: st.version + 1 }
   } finally {
@@ -174,6 +239,7 @@ async function tick() {
     subs.forEach((l) => l())
   }
 }
+
 
 function subscribe(l: () => void) {
   subs.add(l)
