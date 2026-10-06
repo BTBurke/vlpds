@@ -163,7 +163,12 @@ fn backlinks() -> Vec<u8> {
 
 /// A repo's counts (`S/`, checkAccountStatus): its key and value.
 fn repo_stats() -> Vec<u8> {
-    let st = vlpds::state::RepoStats { records: 1_000_003, nodes: 270_001, blobs: 4_096 };
+    let st = vlpds::state::RepoStats {
+        records: 1_000_003,
+        nodes: 270_001,
+        blobs: 4_096,
+        bytes: Some(vlpds::state::RepoBytes { records: 412_345_678, nodes: 61_234_567 }),
+    };
     let k: BTreeMap<&str, String> =
         [("key S/", hex::encode(vlpds::state::repo_stats_key(DID))), ("value", hex::encode(st.encode()))]
             .into_iter()
@@ -856,6 +861,8 @@ async fn check(level: u32, name: &str, b: &[u8]) {
             let v = hex::decode(&k["value"]).unwrap();
             let st = vlpds::state::RepoStats::decode(&v).unwrap();
             assert_eq!((st.records, st.nodes, st.blobs), (1_000_003, 270_001, 4_096));
+            assert_eq!(st.bytes.map(|b| (b.records, b.nodes)), Some((412_345_678, 61_234_567)));
+
             assert!(st.encode() == v);
         }
         "segment/fence.bin" => {

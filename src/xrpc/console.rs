@@ -215,6 +215,12 @@ async fn account_row(app: &App, p: &Partition, a: &Account) -> XResult<J> {
         row["records"] = json!(s.records);
         row["mstNodes"] = json!(s.nodes);
         row["blobs"] = json!(s.blobs);
+        // absent until the repo's next load counts it (state::RepoBytes)
+        if let Some(b) = s.bytes {
+            row["repoBytes"] = json!(b.total());
+            row["recordBytes"] = json!(b.records);
+            row["mstBytes"] = json!(b.nodes);
+        }
     }
     if let Some(h) = &head {
         row["rev"] = json!(h.rev.to_string());
@@ -393,7 +399,46 @@ async fn recent_accounts(
 
 async fn internal_accounts(State(app): AppState, headers: HeaderMap, Query(q): Query<AccountsQ>) -> XResult<Json<J>> {
     internal::check(&app, &headers)?;
-    Ok(Json(local_accounts(&app, &q).await?))
+    let mut out = local_accounts(&app, &q).await?;
+    out["counts"] = local_counts(&app);
+    Ok(Json(out))
+}
+
+const COUNT_KEYS: [&str; 7] =
+    ["total", "active", "deactivated", "takendown", "suspended", "unconfirmed", "no2fa"];
+
+/// The filter counts of this node's open shards, from their totals
+/// (crate::totals): in memory, no reads. A shard whose totals are still
+/// loading counts nothing yet (`loadingShards`).
+fn local_counts(app: &App) -> J {
+    let (t, loading) = super::totals_loading(app);
+    let n = [t.repos(), t.accounts[0], t.accounts[1], t.accounts[2], t.accounts[3], t.unconfirmed, t.no2fa];
+    let mut out: serde_json::Map<String, J> = COUNT_KEYS.iter().zip(n).map(|(k, v)| (k.to_string(), json!(v))).collect();
+    out.insert("loadingShards".into(), json!(loading));
+    J::Object(out)
+}
+
+/// Sums each node's counts. Approximate while a shard's totals are loading,
+/// a node didn't answer, or some shard has no owner.
+fn sum_counts(app: &App, bodies: &[J], covered: &std::collections::HashSet<crate::slots::ShardId>) -> J {
+    let mut sum = [0i64; COUNT_KEYS.len()];
+    let mut approximate = false;
+    for b in bodies {
+        let c = &b["counts"];
+        if !c.is_object() {
+            approximate = true;
+            continue;
+        }
+        approximate |= c["loadingShards"].as_u64().unwrap_or(0) > 0;
+        for (s, k) in sum.iter_mut().zip(COUNT_KEYS) {
+            *s += c[k].as_i64().unwrap_or(0);
+        }
+    }
+    approximate |= app.partitions.layout().shards.iter().any(|r| !covered.contains(&r.id));
+    let mut out: serde_json::Map<String, J> =
+        COUNT_KEYS.iter().zip(sum).map(|(k, v)| (k.to_string(), json!(v.max(0)))).collect();
+    out.insert("approximate".into(), json!(approximate));
+    J::Object(out)
 }
 
 fn query_pairs(q: &AccountsQ) -> Vec<(&'static str, String)> {
@@ -425,7 +470,8 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         };
         return Ok(Json(json!({"accounts": rows, "exact": true})));
     }
-    let mine = local_accounts(&app, &q).await?;
+    let mut mine = local_accounts(&app, &q).await?;
+    mine["counts"] = local_counts(&app);
     let g = internal::gather(&app, "/internal/v1/console/accounts", &query_pairs(&q)).await;
     let mut covered: std::collections::HashSet<crate::slots::ShardId> =
         serde_json::from_value(mine["owned"].clone()).unwrap_or_default();
@@ -435,6 +481,7 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         covered.extend(r.owned);
         bodies.push(r.body);
     }
+    let counts = sum_counts(&app, &bodies, &covered);
     let mut res = if pq.recent {
         let mut rows: Vec<J> =
             bodies.iter().flat_map(|b| b["accounts"].as_array().cloned().unwrap_or_default()).collect();
@@ -468,6 +515,7 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         super::admin::partial_fields(&app, &mut res, Vec::new(), Vec::new(), &covered, from);
         res
     };
+    res["counts"] = counts;
     if !unreachable.is_empty() {
         res["unreachableNodes"] = json!(unreachable);
     }
@@ -475,6 +523,7 @@ async fn list_accounts(State(app): AppState, Auth(creds): Auth, Query(q): Query<
         res["unsupportedNodes"] = json!(unsupported);
     }
     if res["cursor"].is_null() {
+
         res.as_object_mut().map(|o| o.remove("cursor"));
     }
     Ok(Json(res))
@@ -506,6 +555,11 @@ async fn exact_row(app: &App, a: &Account) -> XResult<J> {
 #[derive(Deserialize)]
 struct DidQ {
     did: String,
+}
+
+#[derive(Deserialize)]
+pub(super) struct DidIn {
+    pub did: String,
 }
 
 fn secs_ms(s: u64) -> u64 {

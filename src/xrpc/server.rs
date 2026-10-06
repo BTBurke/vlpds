@@ -3210,6 +3210,7 @@ pub(super) async fn reset_second_factors(app: &App, did: &str, revoke_sessions: 
     ];
     app.private_cas(did, Vec::new(), ops).await?;
     set_totp_flag(app, did, false).await?;
+    super::passkeys::note_count(app, did, 0).await?;
     if revoke_sessions {
         revoke_everything(app, did).await?;
     } else {
