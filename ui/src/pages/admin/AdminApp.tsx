@@ -8,7 +8,7 @@ import { ErrorNotice, Field, Spinner, Topbar } from '../../components/ui'
 import { useAdminToken } from '../../lib/hooks'
 import { Link, match } from '../../lib/router'
 import { basic, call, setAdminToken } from '../../lib/xrpc'
-import { AccountDetail, Accounts } from './Accounts'
+import { Accounts } from './Accounts'
 import { Cluster } from './Cluster'
 import './clusterDetails'
 import { Firehose } from './Firehose'
@@ -70,7 +70,7 @@ function route(p: string): Route {
         ),
       }
     case '/admin/accounts':
-      return { section: S.accounts, page: <Legacy><Accounts /></Legacy> }
+      return { section: S.accounts, page: <Accounts /> }
     case '/admin/moderation':
       return { section: S.moderation, page: <Legacy><Moderation /></Legacy> }
     case '/admin/limits':
@@ -98,7 +98,8 @@ function route(p: string): Route {
     case '/admin/config':
       return { section: S.config, page: <Placeholder section={S.config} what="Every flag, default and stored setting each node runs with; secrets as set or unset" nsid="vlpds.admin.getConfig" /> }
   }
-  if ((m = match('/admin/accounts/:did', p))) return { section: S.accounts, page: <Legacy><AccountDetail did={m.did} /></Legacy>, crumbs: crumb(S.accounts, m.did) }
+  // the pre-console account page's path, which other pages still link to
+  if ((m = match('/admin/accounts/:did', p)) && m.did.startsWith('did:')) return { section: S.accounts, page: <DetailPage key="account" type="account" id={m.did} />, crumbs: crumb(S.accounts, m.did) }
   if ((m = match('/admin/moderation/cases/:id', p))) return { section: S.moderation, page: <Legacy><CaseDetail id={m.id} /></Legacy>, crumbs: crumb(S.moderation, m.id) }
   // a detail kind's full page: /admin/<section>/<type>/<id>
   if ((m = match('/admin/:section/:type/:id', p)) && detailKind(m.type)) {

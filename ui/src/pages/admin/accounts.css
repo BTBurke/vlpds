@@ -1,0 +1,48 @@
+/* Accounts section: the second-factor marks and a few drawer bits. Tokens come from .cx (console.css). */
+
+.cx-2fa {
+  display: inline-flex;
+  gap: 3px;
+}
+.cx-2fa span {
+  font-size: 10px;
+  font-family: var(--mono);
+  padding: 0 4px;
+  border-radius: 3px;
+  line-height: 16px;
+  border: 1px solid var(--rule);
+  color: var(--ink3);
+}
+.cx-2fa span.on {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--rule));
+  color: var(--accent);
+  background: var(--accent-wash);
+}
+
+.cx-acc-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.cx-acc-more {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.cx-acc-check {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--ink2);
+}
+.cx-acc-check ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.cx-drawer .cx-banners,
+.cx-fullpage .cx-banners {
+  margin-bottom: 10px;
+}

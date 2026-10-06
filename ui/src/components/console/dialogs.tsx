@@ -89,8 +89,9 @@ export function confirmAction(spec: ConfirmSpec): Promise<boolean> {
           finish(false)
         }}
         onDone={() => {
-          close()
+          // before close(): closing settles the promise as cancelled
           finish(true)
+          close()
         }}
       />
     ))

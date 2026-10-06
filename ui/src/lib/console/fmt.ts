@@ -33,3 +33,6 @@ export const clock = (ms: number) => new Date(ms).toLocaleTimeString('en-GB', { 
 export const shortDid = (d: string) => (d.length > 22 ? `${d.slice(0, 14)}…${d.slice(-4)}` : d)
 
 export const plural = (n: number, w: string, p?: string) => `${n.toLocaleString()} ${n === 1 ? w : (p ?? `${w}s`)}`
+
+/** A factor lock from listLockouts or getAccountSecurity. */
+export const factorName = (f: string) => (f === 'second_factor' ? '2FA and recovery codes' : f === 'email_code' ? 'email codes' : f)

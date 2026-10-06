@@ -4,8 +4,9 @@ import { openPanel } from '../../components/console/nav'
 import { SECTION } from '../../components/console/sections'
 import { Strata } from '../../components/console/Strata'
 import { clusterPoll, useClusterView, type ClusterView } from '../../lib/console/cluster'
-import { ago, dur, fmtBytes, fmtMs, fmtNum, fmtSec, fmtSi, seqMillis, seqWriter } from '../../lib/console/fmt'
+import { ago, dur, factorName, fmtBytes, fmtMs, fmtNum, fmtSec, fmtSi, seqMillis, seqWriter } from '../../lib/console/fmt'
 import { col, last, useMetrics, type MetricsState } from '../../lib/console/metrics'
+import { segmentsPoll } from '../../lib/console/segments'
 import { auditPoll, isSlow, isThisBrowser, lockoutsPoll, openCasesPoll, subscribersPoll, type SubscriberList } from '../../lib/console/polls'
 import { clusterBanners, NodesTable } from './clusterUi'
 
@@ -120,7 +121,7 @@ function lockSub(): string {
   const l = lockoutsPoll.get().data
   if (!l) return '…'
   if (!l.supported) return 'lockouts need a newer vlpds'
-  const a = l.data.filter((x) => x.kind === 'account').length
+  const a = new Set(l.data.map((x) => x.did)).size
   return a ? `${a} accounts locked out` : 'nobody locked out'
 }
 
@@ -141,7 +142,7 @@ function WritePath({ m }: { m: MetricsState }) {
       tiles={[
         { label: 'Commits / s', right: `ops/s ${n1(last(c, 'ops'))}`, value: n1(last(c, 'commits')), spark: <Spark data={col(c, 'commits')} color="accent" />, to: P.nodes.path },
         { label: 'Commit → durable', right: 'p99 · p50 dashed', value: ms(last(c, 'durP99')), sec: `p50 ${ms(last(c, 'durP50'))}`, spark: <Spark data={col(c, 'durP99')} l2={col(c, 'durP50')} color="amber" th={0.5} /> },
-        { label: 'Segment PUT', right: `hedges ${n1(last(c, 'hedges'))}/s`, value: ms(last(c, 'putP99')), sec: `p50 ${ms(last(c, 'putP50'))}`, spark: <Spark data={col(c, 'putP99')} l2={col(c, 'putP50')} color="amber" />, to: P.storage.path },
+        { label: 'Segment PUT', right: last(c, 'hedges') === undefined ? 'p99 · p50 dashed' : `hedges ${n1(last(c, 'hedges'))}/s`, value: ms(last(c, 'putP99')), sec: `p50 ${ms(last(c, 'putP50'))}`, spark: <Spark data={col(c, 'putP99')} l2={col(c, 'putP50')} color="amber" />, to: P.storage.path },
         { label: 'HTTP requests / s', right: `5xx ${http ? `${(((e5 ?? 0) / http) * 100).toFixed(2)}%` : '—'}`, value: n1(http), spark: <Spark data={col(c, 'http')} color="c2" /> },
         { label: 'Firehose emit delay', right: 'p99', value: ms(last(c, 'emitP99')), spark: <Spark data={col(c, 'emitP99')} color="violet" th={2} />, to: P.firehose.path },
         { label: 'Cold repo loads / s', right: `${fmtNum(cached)} in memory`, value: n1(last(c, 'loads')), spark: <Spark data={col(c, 'loads')} color="c6" /> },
@@ -205,9 +206,11 @@ function Rail({ view, m, subs }: { view: ClusterView; m: MetricsState; subs?: Su
             <RRow x={<span className="mono">{n1(last(c, 'objErr') ?? 0)}/s</span>}>
               <span className="nm">Errors and timeouts</span>
             </RRow>
-            <RRow x={<span className="mono">{n1(last(c, 'hedges'))}/s</span>}>
-              <span className="nm">Hedged segment PUTs</span>
-            </RRow>
+            {last(c, 'hedges') !== undefined && (
+              <RRow x={<span className="mono">{n1(last(c, 'hedges'))}/s</span>}>
+                <span className="nm">Hedged segment PUTs</span>
+              </RRow>
+            )}
           </>
         )}
       </Panel>
@@ -247,9 +250,9 @@ function Rail({ view, m, subs }: { view: ClusterView; m: MetricsState; subs?: Su
           <NeedsVersion what="Who is locked out" nsid={locks.data.nsid} />
         ) : (
           locks.data?.data.slice(0, 5).map((l, i) => (
-            <RRow key={i} x={`${l.bucket.split(' ')[0]} · clears in ${dur(l.resetsAt - Date.now())}`}>
+            <RRow key={i} onClick={() => openPanel('account', l.did)} x={`${factorName(l.factor)} · clears in ${dur(l.lockedUntil - Date.now())}`}>
               <Glyph k="warn" />
-              <span className="nm">{l.kind === 'account' ? `@${l.handle ?? l.did}` : <span className="mono sm">{l.ip}</span>}</span>
+              <span className="nm">{l.handle ? `@${l.handle}` : <span className="mono sm">{l.did}</span>}</span>
             </RRow>
           ))
         )}
@@ -318,6 +321,7 @@ export function Overview() {
   const m = useMetrics()
   const subs = subscribersPoll.use()
   const locks = lockoutsPoll.use()
+  const feed = segmentsPoll.use().data?.supported
   openCasesPoll.use()
   if (!view) return error ? <ErrorState error={error} retry={clusterPoll.refresh} /> : <Loading label="Asking the cluster…" />
   return (
@@ -331,13 +335,19 @@ export function Overview() {
           </Panel>
           <Panel
             title="Logs → watermark → firehose"
-            src={<Src>getClusterStatus · firehose.sources</Src>}
+            src={<Src>{feed ? 'listSegments · getClusterStatus · 2 s' : 'getClusterStatus · durable ordinals'}</Src>}
             right={
               <span className="cx-legend">
                 <span>
                   <i style={{ background: 'var(--amber)' }} />
                   min watermark
                 </span>
+                {feed && (
+                  <span>
+                    <i style={{ background: 'var(--ink3)' }} />
+                    PUT in flight
+                  </span>
+                )}
               </span>
             }
           >
@@ -345,8 +355,8 @@ export function Overview() {
               <Strata view={view} fetchedAt={at} />
               <div className="lg">
                 <span>
-                  Each block is a log segment, a batch of commits written with one PUT, placed from the durable ordinal between polls. The firehose emits everything left of the
-                  amber line: the slowest log's watermark.
+                  Each block is a log segment, a batch of commits written with one PUT{feed ? ', solid once durable' : ', placed from the durable ordinal between polls'}. The firehose emits
+                  everything left of the amber line: the slowest log's watermark.
                 </span>
               </div>
             </div>

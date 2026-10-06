@@ -8,13 +8,11 @@ import { findEvent, useFirehose, useHandle } from '../../lib/console/firehose'
 import { clock, dur, fmtBytes, fmtMs, fmtNum, fmtPct, fmtSec, fmtSi, plural, seqMillis, seqWriter } from '../../lib/console/fmt'
 import { col, last, nodeGauges, nodePoints, useMetrics } from '../../lib/console/metrics'
 import { isSlow, subscribersPoll } from '../../lib/console/polls'
-import { Link } from '../../lib/router'
 import { LeaseCell, NodeTag, ShardMap } from './clusterUi'
 
 // Slide-over / full-page details for the cluster sections: node, shard, firehose event,
 // firehose connection. Registered on import (AdminApp imports this file).
 
-const accountPath = (did: string) => `/admin/accounts/${encodeURIComponent(did)}`
 
 registerDetail('node', {
   kind: 'Node',
@@ -59,9 +57,15 @@ registerDetail('node', {
               <Mini label="commit → durable p99" value={fmtSec(last(p, 'durP99'))}>
                 <Spark data={col(p, 'durP99')} l2={col(p, 'durP50')} color="amber" />
               </Mini>
-              <Mini label="lease renew ÷ TTL p99" value={last(p, 'leaseRatioP99')?.toFixed(3) ?? '—'}>
-                <Spark data={col(p, 'leaseRatioP99')} color="violet" th={0.2} />
-              </Mini>
+              {last(p, 'leaseRatioP99') !== undefined ? (
+                <Mini label="lease renew ÷ TTL p99" value={last(p, 'leaseRatioP99')!.toFixed(3)}>
+                  <Spark data={col(p, 'leaseRatioP99')} color="violet" th={0.2} />
+                </Mini>
+              ) : (
+                <Mini label="segment PUT p99" value={fmtSec(last(p, 'putP99'))}>
+                  <Spark data={col(p, 'putP99')} l2={col(p, 'putP50')} color="violet" />
+                </Mini>
+              )}
             </Minis>
           )}
           <Sec title="Lease" digest={view.single ? 'single node' : n.leaseValid ? 'valid' : 'expired'} open>
@@ -188,7 +192,7 @@ registerDetail('event', {
           <Sec title="Repo" digest={handle ? `@${handle}` : e.did} open>
             <KV
               rows={[
-                ['account', <Link to={accountPath(e.did)}>{handle ? `@${handle}` : e.did}</Link>],
+                ['account', <button type="button" className="cx-linklike" onClick={() => openPanel('account', e.did)}>{handle ? `@${handle}` : e.did}</button>],
                 ['DID', <Copy text={e.did} />],
                 ...(e.rev ? [['rev', <span className="mono">{e.rev}</span>] as [string, React.ReactNode]] : []),
                 ...(e.commit ? [['commit', <Copy text={e.commit} />] as [string, React.ReactNode]] : []),
@@ -279,7 +283,7 @@ registerDetail('sub', {
                         items: ['Closes the websocket with reason “kicked”.', 'The client can reconnect with its cursor and backfill what it missed.'],
                         word: `#${s.conn}`,
                         action: 'Disconnect',
-                        call: `vlpds.admin.kickSubscriber {"node": "${s.node}", "conn": "${s.conn}"}`,
+                        call: `vlpds.admin.kickSubscriber {"conn": "${s.conn}"} → ${s.node}`,
                         run: async () => {
                           const r = await kickSubscriber(s.node, s.conn)
                           if (!r.supported) throw new Error(`This server has no ${r.nsid} yet: update vlpds to disconnect subscribers from the console.`)
