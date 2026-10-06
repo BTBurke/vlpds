@@ -10,12 +10,14 @@ import { Actor } from '../lib/actor.mjs'
 import { URLS, log } from '../lib/env.mjs'
 import { NotifyService } from '../lib/notifysvc.mjs'
 import { Vlpds } from '../lib/vlpds.mjs'
-import { Appview } from './appview.mjs'
-import { Bff } from './bff.mjs'
-import { BoardsClient, SCOPES } from './client.mjs'
+import { Bff, HttpReader } from '../../../../boards/src/bff.mjs'
+import { SCOPES } from '../../../../boards/src/client.mjs'
+import { DevAuth } from './devauth.mjs'
+import { BoardsClient, harnessAppview } from './harness.mjs'
 import { png } from './scenarios.mjs'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
+const webDir = fileURLToPath(new URL('../../../../boards/web/dist', import.meta.url))
 const PORT = Number(process.env.BOARDS_PORT ?? 2888)
 const PUBLIC = `http://127.0.0.1:${PORT}`
 
@@ -59,8 +61,8 @@ async function main() {
   vlpds = await new Vlpds({ memory: !!process.env.MEMORY }).start()
   const svc = await new NotifyService(2871).start()
   const bot = await Actor.create('vlpds', 'appview', { scope: SCOPES.reader })
-  const appview = new Appview({ port: PORT, account: bot, svc, pollMs: 2000, webDir: `${here}web/dist` })
-  const bff = new Bff({ appview, publicUrl: PUBLIC, vlpdsUrl: URLS.vlpds })
+  const appview = harnessAppview({ port: PORT, account: bot, svc, pollMs: 2000, webDir })
+  const bff = new Bff({ auth: new DevAuth({ publicUrl: PUBLIC, vlpdsUrl: URLS.vlpds }), reader: new HttpReader(appview, `http://127.0.0.1:${PORT}`) })
   appview.extraRoutes = bff.routes()
   await appview.start()
   const { board, accounts } = await seed(appview)

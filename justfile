@@ -133,8 +133,8 @@ spaces-fault seed="1" scale="small":
 spaces-cost host="vlpds" steps="":
     bench/spaces/run.sh cost {{host}} {{steps}}
 
-# boards, a Reddit-like private board on Spaces (bench/spaces/boards/README.md): user stories against its appview's
-# API and direct space reads (configs: all-vlpds vlpds-owner ref-owner; default all; CLUSTER=1 adds the kill -9 story)
+# boards (packages/boards), a Reddit-like private board on Spaces (bench/spaces/boards/README.md): user stories against
+# its appview's API and direct space reads (configs: all-vlpds vlpds-owner ref-owner; default all; CLUSTER=1 adds the kill -9 story)
 spaces-boards *configs:
     bench/spaces/run.sh boards {{configs}}
 
@@ -143,6 +143,12 @@ spaces-boards *configs:
 # UI_E2E=1 instead runs the headless two-person check (screenshots in bench/spaces/out/boards-ui/) and exits
 spaces-boards-ui:
     bench/spaces/run.sh boards-ui
+
+# The boards production server (as deployed at boards.example.com) on the local stack until Ctrl-C: confidential OAuth
+# at http://boards.localhost:2889 against vlpds, notifies to did:web:127.0.0.1%3A2889, a seeded board; UI_E2E=1 instead
+# runs the headless sign-in / post / invite / remove / restart check (screenshots in bench/spaces/out/boards-prod/)
+spaces-boards-prod:
+    bench/spaces/run.sh boards-prod
 
 # The WebAuthn verifier (src/webauthn.rs) against 1Password's passkey-rs; its own crate, since passkey-types
 # turns on serde_json's preserve_order, which would change every vlpds test build

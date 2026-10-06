@@ -14,16 +14,15 @@ import { P256Keypair } from '@atproto/crypto'
 import { Actor, RUN } from '../lib/actor.mjs'
 import { HOSTS, VLPDS_ADMIN_TOKEN, log } from '../lib/env.mjs'
 import { NotImplemented, attempt, hfetch, rawXrpc, setTimingScope, sleep, waitFor } from '../lib/http.mjs'
-import { DpopKey } from '../lib/oauth.mjs'
+import { DpopKey, asPost } from '../lib/oauth.mjs'
 import { FirehoseTap, SENTINEL, checkAuthor } from '../lib/leak.mjs'
 import { NotifyService } from '../lib/notifysvc.mjs'
 import { Report, summarize } from '../lib/report.mjs'
 import { SpaceCred, credentialFor } from '../lib/space.mjs'
 import { Vlpds } from '../lib/vlpds.mjs'
-import { Appview } from './appview.mjs'
-import { asPost } from './bff.mjs'
-import { BoardsClient, SCOPES, revokeCredentials, tid, voteRkey } from './client.mjs'
-import { C, boardView, materialize, parseRecordUri, sortPosts, thread } from './model.mjs'
+import { SCOPES, revokeCredentials, tid, voteRkey } from '../../../../boards/src/client.mjs'
+import { C, boardView, materialize, parseRecordUri, sortPosts, thread } from '../../../../boards/src/model.mjs'
+import { BoardsClient, harnessAppview } from './harness.mjs'
 
 export const CONFIGS = {
   'all-vlpds': { alice: 'vlpds', bob: 'vlpds', carol: 'vlpds', dave: 'vlpds', eve: 'vlpds', bot: 'vlpds', crowd: ['vlpds'] },
@@ -260,10 +259,10 @@ async function consentHtml(actor, scope) {
  * the boards lexicons as com.atproto.lexicon.schema records, and vlpds
  * restarts with boards.example.com pointed at it. Null when the flag is missing.
  */
-async function setupLexicons(env) {
+export async function setupLexicons(env) {
   if (!vlpdsSupports('--lexicon-authority-override')) return null
   const pub = await Actor.create('vlpds', 'lexicons', { oauth: false })
-  const dir = new URL('./lexicons/dev/example/boards/', import.meta.url)
+  const dir = new URL('../../../../boards/lexicons/dev/example/boards/', import.meta.url)
   for (const name of ['board', 'settings', 'post', 'comment', 'vote']) {
     const doc = JSON.parse(readFileSync(new URL(`${name}.json`, dir), 'utf8'))
     await pub.sessionClient.com.atproto.repo.putRecord({ repo: pub.did, collection: 'com.atproto.lexicon.schema', rkey: doc.id, record: { $type: 'com.atproto.lexicon.schema', ...doc } })
@@ -301,7 +300,7 @@ export async function runConfig(rep, cfg, env) {
     }
     for (const who of people) S[`${who}C`] = new BoardsClient(S[who], { onWrite })
     S.svc = await new NotifyService(NOTIFY_PORT).start()
-    S.appview = await new Appview({ port: API_PORT, account: S.bot, svc: S.svc, pollMs: 2000 }).start()
+    S.appview = await harnessAppview({ port: API_PORT, account: S.bot, svc: S.svc, pollMs: 2000 }).start()
     S.av = Object.fromEntries(people.map((who) => [who, S[`${who}C`].appview(`http://127.0.0.1:${API_PORT}`, S.appview.did)]))
     S.revs0 = new Map()
     for (const a of S.actors) S.revs0.set(a.did, await publicRev(a))

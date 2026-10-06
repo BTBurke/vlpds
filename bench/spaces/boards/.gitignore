@@ -1,3 +1,2 @@
-# seeded test passwords (boards/ui.mjs) and the built UI
+# seeded test passwords and the prod server's test env (ui.mjs, prod.mjs)
 .local/
-web/dist/

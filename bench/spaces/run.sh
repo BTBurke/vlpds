@@ -9,6 +9,7 @@
 #   bench/spaces/run.sh cost                    (just spaces-cost)
 #   bench/spaces/run.sh boards [config ...]     (just spaces-boards; boards/README.md)
 #   bench/spaces/run.sh boards-ui               (just spaces-boards-ui; UI_E2E=1 runs the headless check and exits)
+#   bench/spaces/run.sh boards-prod             (just spaces-boards-prod; the production server; UI_E2E=1 likewise)
 #
 # Env: VLPDS_BIN (skip the build), BRANCH (default: origin/spaces-1, else
 # origin/spaces-0), CLUSTER=1 (3 vlpds nodes on MinIO behind a balancer),
@@ -39,6 +40,9 @@ fi
 export VLPDS_BIN
 export VLPDS_REV="$(cat .scratch/built-branch 2>/dev/null || echo '?') $(cut -c1-12 .scratch/built-rev 2>/dev/null || echo '?')"
 npm install --no-audit --no-fund --silent
+# lib/space.mjs and lib/syncer.mjs run on the boards app's Spaces code (packages/boards)
+boards="$here/../../../boards"
+(cd "$boards" && npm install --no-audit --no-fund --silent)
 
 cleanup() {
   if [ "${KEEP:-}" = 1 ]; then
@@ -70,20 +74,23 @@ case "$mode" in
   fault) FAULTS=1 node sim.mjs "$@" ;;
   cost) node cost.mjs "$@" ;;
   boards) node boards/scenarios.mjs "$@" ;;
-  boards-ui)
-    (cd boards/web && npm install --no-audit --no-fund --silent && npm run build --silent) >/dev/null
+  boards-ui | boards-prod)
+    (cd "$boards/web" && npm install --no-audit --no-fund --silent && npm run build --silent) >/dev/null
+    if [ "$mode" = boards-ui ]; then runner=boards/ui.mjs seed=boards/.local/seed-accounts.json check=ui.mjs shots=out/boards-ui/
+    else runner=boards/prod.mjs seed=boards/.local/prod-seed.json check=prod.mjs shots=out/boards-prod/; fi
     if [ "${UI_E2E:-}" = 1 ]; then
-      rm -f boards/.local/seed-accounts.json
-      node boards/ui.mjs &
+      rm -f "$seed"
+      node "$runner" &
       ui=$!
-      until [ -f boards/.local/seed-accounts.json ]; do kill -0 "$ui" 2>/dev/null || exit 1; sleep 1; done
+      until [ -f "$seed" ]; do kill -0 "$ui" 2>/dev/null || exit 1; sleep 1; done
       rc=0
-      (cd boards/web && npx playwright install chromium >/dev/null && node e2e.mjs) || rc=$?
+      (cd "$boards/e2e" && npm install --no-audit --no-fund --silent && npx playwright install chromium >/dev/null &&
+        SEED_FILE="$here/$seed" SHOTS="$here/$shots" node "$check") || rc=$?
       kill "$ui"
       wait "$ui" || true
       exit "$rc"
     fi
-    node boards/ui.mjs
+    START_SERVER=1 node "$runner"
     ;;
-  *) echo "unknown mode $mode (e2e | sim | fault | cost | boards | boards-ui)" >&2; exit 2 ;;
+  *) echo "unknown mode $mode (e2e | sim | fault | cost | boards | boards-ui | boards-prod)" >&2; exit 2 ;;
 esac

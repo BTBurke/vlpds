@@ -1,8 +1,11 @@
 # boards
 
 boards is a small Reddit-like message board built on atproto Spaces. Each board is a private space,
-and members post, comment and vote in their own space repos. It exists to test vlpds's Spaces code
-through the flows a real app runs, on the harness stack in `bench/spaces` (README.md there).
+and members post, comment and vote in their own space repos. The app lives in `packages/boards`
+(its README.md covers the production server at boards.example.com). This directory runs it on the
+harness stack in `bench/spaces` (README.md there) to test vlpds's Spaces code through the flows a
+real app runs. `harness.mjs` wires the app to the harness's PLC and accounts, and `lib/space.mjs`
+and `lib/syncer.mjs` run on the app's Spaces client (`packages/boards/src/spaces/`).
 
 ```
 just spaces-boards                  # every story in all-vlpds, vlpds-owner and ref-owner
@@ -10,6 +13,8 @@ just spaces-boards ref-owner        # one config
 CLUSTER=1 just spaces-boards        # 3 vlpds nodes, and story 11 kills one mid-run
 just spaces-boards-ui               # the web UI on http://127.0.0.1:2888 until Ctrl-C
 UI_E2E=1 just spaces-boards-ui      # the UI in headless Chromium, then exit
+just spaces-boards-prod             # the production server on http://boards.localhost:2889 until Ctrl-C
+UI_E2E=1 just spaces-boards-prod    # the production server in headless Chromium, then exit
 ```
 
 `BRANCH=origin/spaces-2b` picks the vlpds branch, as for the other harness modes. `SCALE=small`
@@ -19,7 +24,7 @@ shrinks story 10 for quick runs and `SEED` fixes its workload. Reports land in
 ## The app
 
 A board is a simplespace space of type `dev.example.boards.board`, and its owner's DID is the
-authority. The lexicons are in `lexicons/dev/example/boards/`:
+authority. The lexicons are in `packages/boards/lexicons/dev/example/boards/`:
 
 | collection | what |
 |---|---|
@@ -29,7 +34,7 @@ authority. The lexicons are in `lexicons/dev/example/boards/`:
 | `comment` | the post's URI and an optional parent comment's URI |
 | `vote` | a subject URI and `up` or `down`. The rkey is a hash of the subject, so a member has one vote per subject and changing it is a `putRecord` |
 
-`client.mjs` is what an app does for a signed-in member: create a board, invite writers and lurkers,
+`packages/boards/src/client.mjs` is what an app does for a signed-in member: create a board, invite writers and lurkers,
 post (with `uploadBlob` for images), comment, vote, edit, delete, pin, remove a member, delete the
 board. Reads of other members' repos go through a space credential. vlpds resolves a bare `space:`
 grant's collections from the type's declaration over DNS (`_lexicon.boards.example.com`), which this
@@ -39,11 +44,11 @@ stack can't reach, so the client asks for explicit `collection=` scopes. When th
 `boards.example.com` pointed at it. Story `0.bare-grant` then covers the bare grant. Without the flag it
 reports not impl.
 
-`appview.mjs` is the indexer and API. The owner adds the appview's account as a read-only member and
+`packages/boards/src/appview.mjs` is the indexer and API. The owner adds the appview's account as a read-only member and
 calls `indexBoard`. The appview registers for notifies and syncs every member repo with the
-harness's `Syncer` (listRepos from a spaceRev checkpoint, listRepoOps with a running LtHash checked
+app's `SpaceSyncer` (listRepos from a spaceRev checkpoint, listRepoOps with a running LtHash checked
 against the signed commit, a verified getRepo on a mismatch). It holds nothing it didn't get that
-way. A poll every 2 s catches what nothing pushes, which today is a record takedown. `model.mjs`
+way. A poll every 2 s catches what nothing pushes, which today is a record takedown. `src/model.mjs`
 turns the synced repos into the board, and the scenario runner runs the same function over the
 writes it saw acked, so the two can be compared post for post.
 
@@ -90,12 +95,31 @@ on ref-b. Story 10's crowd is spread over the config's hosts.
 `http://127.0.0.1:2888`, then seeds a board with four accounts. It prints their handles, and the
 generated passwords go to `.local/seed-accounts.json` (git ignored). vlpds accounts sign in with
 atproto OAuth on vlpds's own pages (a loopback client). The reference PDSes here only serve OAuth over
-https, so their accounts sign in with a password. `bff.mjs` holds the sessions and does everything
-through `client.mjs` and the appview API. Each board has a Spaces debug drawer with the authority, the
+https, so their accounts sign in with a password. `devauth.mjs` holds those sessions, and the app's BFF
+(`packages/boards/src/bff.mjs`) does
+everything through the boards client and the appview API. Each board has a Spaces debug drawer with the authority, the
 member repos the appview syncs (rev, record count, LtHash), the last notify and the credential
 expiries.
 
-The UI lives in `web/` (Vite, React, TypeScript). `npm run dev` there proxies to a running
-`spaces-boards-ui`, though OAuth sign-ins come back to :2888. `web/e2e.mjs` signs alice (vlpds, OAuth)
+The UI lives in `packages/boards/web/` (Vite, React, TypeScript). `npm run dev` there proxies to a
+running `spaces-boards-ui`, though OAuth sign-ins come back to :2888. `packages/boards/e2e/ui.mjs`
+signs alice (vlpds, OAuth)
 and carol (ref-a, password) in, has them post, comment, reply and vote, checks each sees the other's
 changes, and saves screenshots to `bench/spaces/out/boards-ui/`.
+
+## The production server
+
+`just spaces-boards-prod` runs `packages/boards/src/server.mjs` as it's deployed, with vlpds
+standing in for real PDSes. `prod.mjs` publishes the boards lexicons from a local account and
+restarts vlpds with `--lexicon-authority-override`, so the bare `space:dev.example.boards.board`
+grant resolves. It seeds a board (alice owns it, bob writes, carol and dave aren't members) and
+writes the server's env and the accounts to `.local/prod-seed.json`. The server is a confidential
+OAuth client at `http://boards.localhost:2889` (Chromium and macOS resolve `*.localhost` to
+loopback, and vlpds in dev mode takes an http client_id that isn't a loopback client), resolves DIDs
+from the local PLC and handles through vlpds, and its notify target is `did:web:127.0.0.1%3A2889`.
+
+`packages/boards/e2e/prod.mjs` checks it in headless Chromium: the public documents, sign-in,
+posting with an image, bob opening the board by its link, comments and votes each way (notify
+driven), the notify registration, an invite and a removal, a non-member refused, the CSRF and
+origin checks, metrics, and a restart that keeps the sealed index and the sessions. Screenshots go
+to `bench/spaces/out/boards-prod/`.
