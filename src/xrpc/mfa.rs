@@ -14,6 +14,40 @@ use super::*;
 use sha2::{Digest, Sha256};
 
 pub(super) const ROW: &str = "mfa";
+/// [`Mfa`]'s lockout: TOTP codes and recovery codes.
+pub const FACTOR_LOCK: &str = "second_factor";
+/// The email sign-in code's own lockout (`email2fa`).
+pub const EMAIL_LOCK: &str = "email_code";
+
+/// Factor lockouts set on this node, for `vlpds.admin.listLockouts`. A hint
+/// kept in memory only (a restart forgets it); the listing reads each one's
+/// row back before showing it.
+static LOCKOUTS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<(String, &'static str), u64>>> =
+    std::sync::LazyLock::new(Default::default);
+const LOCKOUTS_KEPT: usize = 10_000;
+
+pub fn note_lockout(did: &str, factor: &'static str, until: u64) {
+    let now = crate::totp::now_secs();
+    let mut g = LOCKOUTS.lock();
+    if g.len() >= LOCKOUTS_KEPT {
+        g.retain(|_, u| *u > now);
+    }
+    if g.len() < LOCKOUTS_KEPT {
+        g.insert((did.to_string(), factor), until);
+    }
+}
+
+/// (did, factor, locked until) noted here and not yet expired.
+pub fn noted_lockouts() -> Vec<(String, &'static str, u64)> {
+    let now = crate::totp::now_secs();
+    let mut g = LOCKOUTS.lock();
+    g.retain(|_, u| *u > now);
+    g.iter().map(|((d, f), u)| (d.clone(), *f, *u)).collect()
+}
+
+pub fn forget_lockouts(did: &str) {
+    LOCKOUTS.lock().retain(|(d, _), _| d != did);
+}
 pub const RECOVERY_CODES: usize = 10;
 const CAS_ROUNDS: usize = 8;
 
@@ -93,7 +127,7 @@ pub fn cas_parts(m: &Mfa, read: Option<Bytes>) -> (Cond, Op) {
 /// Applies the outcome of one guess: a success clears the count, a failure
 /// adds to it and may lock. `Ok` passes through; a failure becomes 429
 /// while locked.
-pub fn settle(m: &mut Mfa, r: XResult<()>, now: u64) -> XResult<()> {
+pub fn settle(m: &mut Mfa, did: &str, r: XResult<()>, now: u64) -> XResult<()> {
     match r {
         Ok(()) => {
             m.failures = 0;
@@ -102,6 +136,9 @@ pub fn settle(m: &mut Mfa, r: XResult<()>, now: u64) -> XResult<()> {
         Err(e) if e.status.is_server_error() => Err(e),
         Err(e) => {
             crate::totp::record_failure_in(&mut m.failures, &mut m.locked_until, now);
+            if now < m.locked_until {
+                note_lockout(did, FACTOR_LOCK, m.locked_until);
+            }
             Err(if now < m.locked_until { crate::totp::locked_out() } else { e })
         }
     }
@@ -122,7 +159,7 @@ pub async fn use_recovery_code(app: &App, did: &str, code: &str) -> XResult<()> 
             return Err(crate::totp::locked_out());
         }
         let r = if m.take(did, code) { Ok(()) } else { Err(invalid_code()) };
-        let r = settle(&mut m, r, now);
+        let r = settle(&mut m, did, r, now);
         let (c, op) = cas_parts(&m, raw);
         if app.private_cas(did, vec![c], vec![op]).await?.applied {
             return r;
@@ -214,11 +251,11 @@ mod tests {
     fn settle_locks_after_repeated_failures() {
         let mut m = Mfa::default();
         for i in 0..crate::totp::MAX_FAILURES {
-            let e = settle(&mut m, Err(invalid_code()), 1000).unwrap_err();
+            let e = settle(&mut m, "did:plc:t", Err(invalid_code()), 1000).unwrap_err();
             assert_eq!(crate::totp::is_lockout(&e), i == crate::totp::MAX_FAILURES - 1);
         }
         assert!(m.locked_until > 1000);
-        assert!(settle(&mut m, Ok(()), 5000).is_ok());
+        assert!(settle(&mut m, "did:plc:t", Ok(()), 5000).is_ok());
         assert_eq!(m.failures, 0);
     }
 }

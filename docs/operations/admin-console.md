@@ -105,6 +105,50 @@ refresh. The `#conn` number is the `conn` label of
 `vlpds_firehose_subscriber_events_total`, so a line on the dashboard and a row here can be matched
 (see [Per-connection firehose series](monitoring.md#per-connection-firehose-series)).
 
+## Console API
+
+The console reads these `vlpds.admin.*` methods on top of the ones the pages above use. They take
+the admin token like the rest, and the role's Caddy keeps them off the public listener. The UI's
+typed client is `ui/src/lib/adminApi.ts`. Every time in an answer is unix milliseconds and every
+seq is a string, because seqs are past 2^53.
+
+They come in three shapes. Calls that name an account take its `did` and run on its owner, like
+`getAccountInfo`. Calls about the cluster ask every live node over the peer listener and merge
+the answers, naming any node that didn't answer in `unreachableNodes`. Calls about one node's own
+state answer for the node they reach, and an `x-vlpds-node: <node id>` header sends them to
+another one over peer mTLS.
+
+| Method | Input | Answer |
+|---|---|---|
+| `listAccounts` (GET) | `q?` (handle prefix, email prefix or DID), `filter?` (`all`, `attention`, `deactivated`, `takendown`, `no2fa`, `unconfirmed`), `sort?` (`recent` or `slot`), `cursor?`, `limit?` (1-200, default 50) | `accounts`, each with its status, shard and node, email and whether it's confirmed, second factors, records, MST nodes, blobs and blob bytes from the repo's kept counts, head rev and `lastCommitAt` · `cursor` while there's more · `missingShards` like `searchAccounts` |
+| `getAccountSecurity` (GET) | `did` | Passkeys (name, created, last used, synced, suspect), TOTP, email codes, recovery codes left, wrong-code counts and locks, trusted browsers, app passwords, OAuth-only and app-password switches, recent sign-ins |
+| `listSessions` (GET) | `did` | `sessions`: OAuth grants (client, scope, device, signed in, last refresh) and password or app-password sessions (one per session family). Each has an `id` for `revokeSessions` |
+| `revokeSessions` | `{did, ids?, reason?}` | Without `ids`, every session, OAuth grant, device sign-in and trusted browser, as a password change does. App passwords keep working. Audited as `sessions.revoke` |
+| `revokeAppPassword` | `{did, name, reason?}` | The password and the sessions it signed in. Audited as `app_password.revoke` |
+| `listRepoOps` (GET) | `did`, `limit?` (1-100, default 25) | The account's `#commit` (with its ops), `#sync`, `#identity` and `#account` events, newest first, from the firehose ring in memory. `reachesBackTo` says how far back it looked and `ringExhausted` that nothing older is in memory |
+| `getNodeMetrics` (GET) | `since?` | Per node: commits, ops, HTTP, 5xx, 429s, firehose events and bytes, repo loads, class A and B object-store requests per second, CPU cores busy, memory, subscribers, cached repos, mail queue, and commit, segment PUT and firehose emit p50/p99. `series` holds one point per 2 s for the last 3 minutes (only those after `since`), `latest` the last 10 s |
+| `listSegments` (GET) | `since?` (default the last 20 s) | Per node: its log, durable ordinal, watermark and its lag, and each segment's ordinal, seq range, entries against firehose events, bytes before and after compression, when it was sealed and when it was durable (null while its PUT is in flight) · the firehose's last emitted seq and min watermark |
+| `listMail` (GET) | `limit?` (default 100) | Every node's recent mail, newest first: purpose, the recipient's domain only, status (`queued`, `retrying`, `sent`, `failed`, `dropped`, `suppressed`, `logged`), attempts, the provider's error with any address removed, and the budget that suppressed it · each node's queue depth |
+| `listLockouts` (GET) | | Accounts whose TOTP and recovery codes (`second_factor`) or email codes (`email_code`) are locked after wrong codes, with the count and when the lock ends |
+| `clearLockout` | `{did, reason}` | Clears both locks and their counts. Audited as `lockout.clear`. The sign-in rate-limit buckets are separate: a DID override on the Rate limits page lifts those |
+| `getConfig` (GET) | | This node's flags, each with its source (`flag`, `env`, `default`, `unset`, or `file` for a secret set by its `-file` flag) and value · settings stored in the bucket (handle domains, rate-limit version, shard layout, feature level) · version and build rev |
+| `kickSubscriber` | `{conn}` | Closes that firehose connection on this node with reason `kicked`. The client can reconnect with its cursor |
+
+What these never return:
+
+- A secret's value. `getConfig` shows a secret flag as set or unset with `sha256:` and the first 8
+  hex digits of the value in use, enough to tell two nodes apart. A URL flag loses any
+  `user:password@`.
+- A recipient's address or a mail's body or token. The mail log keeps the purpose, the domain and
+  the outcome, and an error loses every word with an `@` in it.
+
+Each node keeps the last 1,024 segments it sealed, the last 200 mails and 3 minutes of metrics in
+memory, so none of this reads the bucket. A restart starts them empty. The lockout list is a hint
+kept by the node that set the lock, so after a restart a lock in force shows on the account's
+security panel but not in the list until the next wrong code. `listRepoOps` reads only the ring,
+so a quiet account's older events aren't there. The prefix sizes the Object store page could show
+would mean listing the bucket, so they aren't part of this API.
+
 ## Admin CLI
 
 ```diagram

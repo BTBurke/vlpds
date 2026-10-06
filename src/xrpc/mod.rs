@@ -8,6 +8,7 @@ pub mod authn;
 mod blob_quota;
 pub mod blobs;
 pub mod cas;
+mod console;
 pub mod crawlers;
 mod ctl_load;
 mod email2fa;
@@ -357,6 +358,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(crate::profiling::routes())
         .merge(ratelimits::routes())
         .merge(firehose_subs::routes())
+        .merge(console::routes())
         .merge(moderation::routes())
         .merge(feature_level::routes())
         .merge(webui::routes())

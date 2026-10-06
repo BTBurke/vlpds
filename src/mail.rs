@@ -46,6 +46,127 @@ lazy!(MAIL_RETRIES: IntCounter = register_int_counter!("vlpds_mail_retries_total
 lazy!(MAIL_QUEUE: IntGauge = register_int_gauge!("vlpds_mail_queue_depth", "Mails queued or being sent (all of this process's mailers)"));
 lazy!(MAIL_SEND_SECONDS: Histogram = register_histogram!("vlpds_mail_send_seconds", "One successful send, enqueue to accepted (incl. retries)", exponential_buckets(0.01, 2.0, 14).unwrap()));
 
+/// This process's recent mail for the console (`vlpds.admin.listMail`):
+/// purpose, the recipient's domain and the outcome. Never the address, the
+/// body or a token.
+pub static MAIL_LOG: LazyLock<MailLog> = LazyLock::new(MailLog::default);
+
+#[derive(Default)]
+pub struct MailLog {
+    inner: parking_lot::Mutex<(u64, std::collections::VecDeque<MailLogEntry>)>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MailLogEntry {
+    pub id: u64,
+    /// Unix ms it was queued (or refused).
+    pub at: u64,
+    pub purpose: String,
+    pub to_domain: String,
+    /// queued | retrying | sent | failed | dropped | suppressed | logged
+    /// (no mailer configured: written to the log only)
+    pub status: String,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// suppressed: the budget that refused it (recipient_limit, node_limit,
+    /// cluster_limit).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Unix ms of the final outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done_at: Option<u64>,
+    /// Queued to accepted, retries included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_ms: Option<u64>,
+}
+
+fn now_ms() -> u64 {
+    crate::tid::now_micros() / 1000
+}
+
+/// The part after the last `@`, which is all the console may show of a
+/// recipient.
+pub fn recipient_domain(to: &str) -> String {
+    let addr = to.rsplit_once('<').map_or(to, |(_, a)| a).trim().trim_end_matches('>');
+    addr.rsplit_once('@').map(|(_, d)| d.trim().to_ascii_lowercase()).unwrap_or_default()
+}
+
+/// Provider errors can quote the recipient back: every word with an `@` in
+/// it goes.
+pub fn redact_error(why: &str) -> String {
+    let s = why.split_whitespace().map(|w| if w.contains('@') { "[address]" } else { w }).collect::<Vec<_>>().join(" ");
+    s.chars().take(300).collect()
+}
+
+impl MailLog {
+    pub const KEPT: usize = 200;
+
+    fn push(&self, purpose: &str, to: &str, status: &str, f: impl FnOnce(&mut MailLogEntry)) -> u64 {
+        let mut g = self.inner.lock();
+        g.0 += 1;
+        let mut e = MailLogEntry {
+            id: g.0,
+            at: now_ms(),
+            purpose: purpose.to_string(),
+            to_domain: recipient_domain(to),
+            status: status.into(),
+            attempts: 0,
+            error: None,
+            reason: None,
+            done_at: None,
+            send_ms: None,
+        };
+        f(&mut e);
+        if g.1.len() >= Self::KEPT {
+            g.1.pop_front();
+        }
+        g.1.push_back(e);
+        g.0
+    }
+
+    pub fn queued(&self, purpose: &str, to: &str) -> u64 {
+        self.push(purpose, to, "queued", |_| {})
+    }
+
+    pub fn suppressed(&self, purpose: &str, to: &str, reason: &str) {
+        self.push(purpose, to, "suppressed", |e| {
+            e.reason = Some(reason.into());
+            e.done_at = Some(e.at);
+        });
+    }
+
+    pub fn logged(&self, purpose: &str, to: &str) {
+        self.push(purpose, to, "logged", |e| e.done_at = Some(e.at));
+    }
+
+    fn update(&self, id: u64, f: impl FnOnce(&mut MailLogEntry)) {
+        let mut g = self.inner.lock();
+        if let Some(e) = g.1.iter_mut().rev().find(|e| e.id == id) {
+            f(e);
+        }
+    }
+
+    fn finish(&self, id: u64, status: &str, attempts: u32, error: Option<&str>) {
+        self.update(id, |e| {
+            let now = now_ms();
+            e.status = status.into();
+            e.attempts = attempts;
+            e.error = error.map(redact_error);
+            e.done_at = Some(now);
+            if status == "sent" {
+                e.send_ms = Some(now.saturating_sub(e.at));
+            }
+        });
+    }
+
+    /// Newest first.
+    pub fn recent(&self, limit: usize) -> Vec<MailLogEntry> {
+        self.inner.lock().1.iter().rev().take(limit).cloned().collect()
+    }
+}
+
 /// For `server::Config`, which is `Clone + Debug`.
 #[derive(Clone)]
 pub struct SharedMailer(pub Arc<dyn Mailer>);
@@ -245,7 +366,7 @@ fn pick(v: Option<String>, k: &str) -> Option<String> {
 
 /// A bounded queue in front of one transport.
 pub struct QueueMailer {
-    tx: mpsc::Sender<Mail>,
+    tx: mpsc::Sender<(u64, Mail)>,
 }
 
 impl QueueMailer {
@@ -280,13 +401,15 @@ fn parse_from(from: &str) -> anyhow::Result<Mailbox> {
 
 impl Mailer for QueueMailer {
     fn send(&self, mail: &Mail) {
-        match self.tx.try_send(mail.clone()) {
+        let id = MAIL_LOG.queued(&mail.purpose, &mail.to);
+        match self.tx.try_send((id, mail.clone())) {
             Ok(()) => MAIL_QUEUE.inc(),
             Err(e) => {
                 let why = match e {
                     mpsc::error::TrySendError::Full(_) => "queue full",
                     mpsc::error::TrySendError::Closed(_) => "mailer stopped",
                 };
+                MAIL_LOG.finish(id, "dropped", 0, Some(why));
                 MAIL_MESSAGES.with_label_values(&["dropped", &mail.purpose]).inc();
                 tracing::warn!(to = %mail.to, purpose = %mail.purpose, "mail dropped: {why}");
             }
@@ -548,13 +671,13 @@ impl Sender {
     }
 }
 
-async fn run(mut rx: mpsc::Receiver<Mail>, sender: Arc<Sender>, concurrency: usize) {
+async fn run(mut rx: mpsc::Receiver<(u64, Mail)>, sender: Arc<Sender>, concurrency: usize) {
     let slots = Arc::new(Semaphore::new(concurrency));
-    while let Some(mail) = rx.recv().await {
+    while let Some((id, mail)) = rx.recv().await {
         let Ok(slot) = slots.clone().acquire_owned().await else { break };
         let sender = sender.clone();
         tokio::spawn(async move {
-            send_one(&sender, mail).await;
+            send_one(&sender, id, mail).await;
             MAIL_QUEUE.dec();
             drop(slot);
         });
@@ -583,9 +706,10 @@ fn jitter(d: Duration) -> Duration {
     d.mul_f64(0.75 + rand::random::<f64>() * 0.5)
 }
 
-async fn send_one(s: &Sender, mail: Mail) {
+async fn send_one(s: &Sender, id: u64, mail: Mail) {
     let started = std::time::Instant::now();
     let fail = |why: &str, attempts: usize| {
+        MAIL_LOG.finish(id, "failed", attempts as u32, Some(why));
         MAIL_MESSAGES.with_label_values(&["failed", &mail.purpose]).inc();
         tracing::warn!(to = %mail.to, purpose = %mail.purpose, attempts, "mail not sent: {why}");
     };
@@ -598,6 +722,7 @@ async fn send_one(s: &Sender, mail: Mail) {
         attempt += 1;
         let f = match tokio::time::timeout(SEND_TIMEOUT, s.attempt(&p)).await {
             Ok(Ok(())) => {
+                MAIL_LOG.finish(id, "sent", attempt as u32, None);
                 MAIL_MESSAGES.with_label_values(&["sent", &mail.purpose]).inc();
                 MAIL_SEND_SECONDS.observe(started.elapsed().as_secs_f64());
                 tracing::info!(to = %mail.to, purpose = %mail.purpose, attempts = attempt, "mail sent");
@@ -610,6 +735,11 @@ async fn send_one(s: &Sender, mail: Mail) {
             return fail(&f.why, attempt);
         };
         MAIL_RETRIES.inc();
+        MAIL_LOG.update(id, |e| {
+            e.status = "retrying".into();
+            e.attempts = attempt as u32;
+            e.error = Some(redact_error(&f.why));
+        });
         tracing::info!(to = %mail.to, purpose = %mail.purpose, attempt, "mail send failed, retrying: {}", f.why);
         tokio::time::sleep(jitter(*wait)).await;
     }
@@ -679,6 +809,27 @@ mod tests {
         assert!(start("http://127.0.0.1:9/x").is_ok());
         assert!(start("http://localhost:9/x").is_ok());
         assert!(QueueMailer::start_api(ApiConfig::new("https://h/x", "bad\ntoken", "a@b.c")).is_err());
+    }
+
+    #[test]
+    fn mail_log_keeps_no_address() {
+        assert_eq!(recipient_domain("Alice <alice@Example.COM>"), "example.com");
+        assert_eq!(recipient_domain("bob@mail.example.org"), "mail.example.org");
+        assert_eq!(recipient_domain("nobody"), "");
+        assert_eq!(
+            redact_error("550 5.1.1 <bob@example.org>: Recipient address rejected"),
+            "550 5.1.1 [address] Recipient address rejected"
+        );
+        let log = MailLog::default();
+        let id = log.queued("confirm_email", "carol@example.net");
+        log.update(id, |e| e.status = "retrying".into());
+        log.finish(id, "failed", 3, Some("rejected carol@example.net"));
+        log.suppressed("reset_password", "dave@example.net", "recipient_limit");
+        let r = log.recent(10);
+        assert_eq!((r[0].status.as_str(), r[0].reason.as_deref()), ("suppressed", Some("recipient_limit")));
+        assert_eq!((r[1].status.as_str(), r[1].attempts), ("failed", 3));
+        let all = serde_json::to_string(&r).unwrap();
+        assert!(!all.contains("carol") && !all.contains("dave"), "{all}");
     }
 
     #[test]
